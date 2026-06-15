@@ -1,0 +1,78 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>UnityTranslator</AssemblyName>
+    <GenerateAssemblyInfo>False</GenerateAssemblyInfo>
+    <TargetFramework>net472</TargetFramework>
+  </PropertyGroup>
+  <PropertyGroup>
+    <LangVersion>Latest</LangVersion>
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+    <CheckForOverflowUnderflow>False</CheckForOverflowUnderflow>
+    <UnityManagedDir Condition="'$(UnityManagedDir)' == ''">$(MSBuildProjectDirectory)\UnityManagedRefs</UnityManagedDir>
+    <XUnityFullNetDir>$(MSBuildProjectDirectory)\..\..\UnityIL2CPP\XUnityAutoTranslator\BepInEx\plugins\XUnity.AutoTranslator\Translators\FullNET</XUnityFullNetDir>
+    <BepInExFlavor Condition="'$(BepInExFlavor)' == ''">5</BepInExFlavor>
+    <BepInEx5CoreDir Condition="'$(BepInEx5CoreDir)' == ''">$(MSBuildProjectDirectory)\..\..\UnityMonoRuntime\BepInEx\core</BepInEx5CoreDir>
+    <BepInEx6CoreDir Condition="'$(BepInEx6CoreDir)' == ''">$(MSBuildProjectDirectory)\..\..\UnityMonoRuntime6\BepInEx\core</BepInEx6CoreDir>
+    <DefineConstants Condition="'$(BepInExFlavor)' == '6'">$(DefineConstants);BEPINEX6</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup />
+  <ItemGroup />
+  <ItemGroup Condition="'$(BepInExFlavor)' != '6'">
+    <Reference Include="BepInEx">
+      <HintPath>$(BepInEx5CoreDir)\BepInEx.dll</HintPath>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(BepInEx5CoreDir)\0Harmony.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(BepInExFlavor)' == '6'">
+    <Reference Include="BepInEx.Core">
+      <HintPath>$(BepInEx6CoreDir)\BepInEx.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="BepInEx.Unity.Common">
+      <HintPath>$(BepInEx6CoreDir)\BepInEx.Unity.Common.dll</HintPath>
+    </Reference>
+    <Reference Include="BepInEx.Unity.Mono">
+      <HintPath>$(BepInEx6CoreDir)\BepInEx.Unity.Mono.dll</HintPath>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(BepInEx6CoreDir)\0Harmony.dll</HintPath>
+    </Reference>
+    <Reference Include="SemanticVersioning">
+      <HintPath>$(BepInEx6CoreDir)\SemanticVersioning.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="System.Core" />
+    <Reference Include="UnityEngine">
+      <HintPath>$(UnityManagedDir)\UnityEngine.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(UnityManagedDir)\UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(UnityManagedDir)\UnityEngine.TextRenderingModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>$(UnityManagedDir)\UnityEngine.UIModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(UnityManagedDir)\UnityEngine.UI.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.AssetBundleModule">
+      <HintPath>$(UnityManagedDir)\UnityEngine.AssetBundleModule.dll</HintPath>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(XUnityFullNetDir)\Newtonsoft.Json.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(UnityManagedDir)\Unity.TextMeshPro.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(UnityManagedDir)\UnityEngine.IMGUIModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(UnityManagedDir)\UnityEngine.InputLegacyModule.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>

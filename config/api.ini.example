@@ -1,0 +1,6 @@
+[api]
+endpoint=https://api.deepseek.com/v1/chat/completions
+model=deepseek-chat
+key=YOUR_API_KEY_HERE
+timeout_ms=15000
+concurrency=4

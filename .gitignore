@@ -1,0 +1,61 @@
+# Local secrets and user state
+config/*.ini
+!config/*.ini.example
+.env
+.env.*
+*.key
+*.secret
+
+# User/game translation memory and runtime logs
+translation_memory*.tsv
+*.tsv.bak*
+logs/
+*.log
+translator_*diag*.txt
+
+# Build products
+build/
+*.exe
+*.dll
+*.pdb
+*.mdb
+*.deps.json
+*.runtimeconfig.json
+bin/
+obj/
+
+# Archives and generated artifacts
+artifacts/
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+
+# Third-party/runtime payloads that must be acquired from upstream by users
+native/toolchain/
+payloads/UnityMonoRuntime/
+payloads/UnityMonoRuntime6/
+payloads/UnityIL2CPP/BepInExRuntime/
+payloads/UnityIL2CPP/XUnityAutoTranslator/
+payloads/UnityIL2CPP/TMPFontAssetBundles/
+payloads/UnityIL2CPP/DeepSeekTMPFontFallback/BepInEx/
+payloads/UnityTranslator/UnityTranslator.dll*
+payloads/UnityTranslator/UnityTranslator.BepInEx6.dll*
+payloads/UnityTranslator/Newtonsoft.Json.dll
+
+# Proprietary Unity/game assembly reference folders
+payloads/UnityTranslator/src/UnityManagedRefs/
+payloads/UnityIL2CPP/DeepSeekTMPFontFallback/src/UnityInteropRefs/
+
+# Fonts are redistributed only with explicit license review
+*.otf
+*.ttf
+*.ttc
+*.woff
+*.woff2
+
+# Editor/local assistant state
+.vscode/
+.cursor/
+.claude/
