@@ -45,6 +45,7 @@ $includeFiles = @(
     "SECURITY.md",
     "THIRD_PARTY_NOTICES.md",
     "TRADEMARKS.md",
+    "VERSION",
     "OPEN_SOURCE_RELEASE.md",
     "build_native.bat",
     "start_server.bat",
