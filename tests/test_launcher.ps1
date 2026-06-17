@@ -165,6 +165,10 @@ if ($deploySrc -notmatch 'www\\\\fonts' -or $deploySrc -notmatch 'ds_font\.ttf')
     throw "RPG Maker CJK font must be deployed under www\\fonts"
 }
 $buildSrc = Get-Content -LiteralPath (Join-Path $root "build_native.bat") -Raw
+$sourceReleaseSrc = Get-Content -LiteralPath (Join-Path $root "scripts\prepare_open_source_release.ps1") -Raw
+if ($sourceReleaseSrc -notmatch '\\_launcher_fixtures\\') {
+    throw "source release script must exclude launcher test fixtures from public archives"
+}
 if ($buildSrc -notmatch 'BepInExFlavor=5' -or $buildSrc -notmatch 'BepInExFlavor=6') {
     throw "build_native.bat must build both BepInEx 5 and BepInEx 6 UnityTranslator flavors"
 }

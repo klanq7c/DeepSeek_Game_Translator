@@ -67,7 +67,8 @@ $excludedPathParts = @(
     "\bin\",
     "\obj\",
     "\UnityManagedRefs\",
-    "\UnityInteropRefs\"
+    "\UnityInteropRefs\",
+    "\_launcher_fixtures\"
 )
 
 $excludedExtensions = @(

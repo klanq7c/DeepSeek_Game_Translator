@@ -18,6 +18,17 @@ publish it directly.
 
 4. Do not publish the live working directory unless the audit below is clean.
 
+For the downloadable Windows program package, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\prepare_program_release.ps1 -Version 0.3.1.7
+```
+
+The generated program package should contain the launcher and documentation
+only. The launcher embeds this project's first-party server and plugin DLLs;
+third-party runtime payloads are still installed by
+`scripts\install_runtime_payloads.ps1` on the user's machine.
+
 ## Files that must not be published
 
 - `config\api.ini`, `.env`, API keys, access tokens, cookies, credentials.

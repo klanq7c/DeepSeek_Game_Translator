@@ -49,29 +49,8 @@ Copy-ReleaseFile "LICENSE" "LICENSE"
 Copy-ReleaseFile "THIRD_PARTY_NOTICES.md" "THIRD_PARTY_NOTICES.md"
 Copy-ReleaseFile "docs\DEPENDENCY_POLICY.md" "docs\DEPENDENCY_POLICY.md"
 Copy-ReleaseFile "docs\RUNTIME_PAYLOADS.md" "docs\RUNTIME_PAYLOADS.md"
-
-$usageText = @(
-    "DS Translator $Version",
-    "",
-    "Quick start:",
-    "1. Run $DsName.exe.",
-    "2. On first launch it extracts/updates first-party components:",
-    "   - native\dst_server.exe",
-    "   - scripts\install_runtime_payloads.ps1",
-    "   - config\api.ini.example",
-    "   - first-party Unity plugin DLLs",
-    "3. Click the API configuration button and enter your own DeepSeek API key.",
-    "4. For Unity games, run:",
-    "   powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -All",
-    "5. Select the game folder in the launcher and start translation.",
-    "",
-    "Updating:",
-    "- In most cases, replace only $DsName.exe.",
-    "- The launcher syncs the first-party server and plugin DLLs on startup.",
-    "- BepInEx, XUnity, and Newtonsoft.Json are still downloaded by the installer script.",
-    "- Running games do not hot-reload plugin DLLs. Fully exit the game before redeploying."
-) -join "`r`n"
-Set-Content -LiteralPath (Join-Path $stage $UsageName) -Value $usageText -Encoding UTF8
+Copy-ReleaseFile "docs\USER_GUIDE.md" "docs\USER_GUIDE.md"
+Copy-ReleaseFile "docs\USER_GUIDE.md" $UsageName
 
 $allowedBinaries = @("$DsName.exe")
 $forbidden = @()

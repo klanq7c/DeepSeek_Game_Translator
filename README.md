@@ -45,6 +45,8 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 
 Ren'Py 和 RPG Maker 路径不需要下载 BepInEx/XUnity。Unity 路径如果缺少 payload，启动器日志会提示对应的安装命令。
 
+完整用户说明见 `docs/USER_GUIDE.md`。
+
 本地服务默认监听：
 
 ```text
@@ -116,6 +118,7 @@ concurrency=4
 - `THIRD_PARTY_NOTICES.md`
 - `docs/DEPENDENCY_POLICY.md`
 - `docs/RUNTIME_PAYLOADS.md`
+- `docs/USER_GUIDE.md`
 
 构建命令：
 
