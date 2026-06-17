@@ -12,9 +12,10 @@ source code, tests, scripts, documentation, and example configuration.
 ## Program packages
 
 Program packages may include this project's own compiled executables and
-plugins, plus scripts that download runtime payloads from upstream projects.
-They should not directly bundle third-party runtime payloads unless a release
-has an explicit redistribution manifest and license texts.
+plugins, including when they are embedded inside `ds翻译器.exe`, plus scripts
+that download runtime payloads from upstream projects. They should not directly
+bundle third-party runtime payloads unless a release has an explicit
+redistribution manifest and license texts.
 
 ## Never bundled
 

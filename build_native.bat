@@ -134,10 +134,32 @@ set "SVR_SRC=%SVR%\main.c %SVR%\util.c %SVR%\buf.c %SVR%\b64.c %SVR%\json.c %SVR
 gcc -std=c17 -O2 -D_CRT_SECURE_NO_WARNINGS -DWIN32_LEAN_AND_MEAN -I"%SVR%" %SVR_SRC% -lws2_32 -lwinhttp -o "%ROOT%native\dst_server.exe"
 if errorlevel 1 exit /b 1
 
-set "LCH=%ROOT%native\src\launcher"
-set "LCH_SRC=%LCH%\main.c %LCH%\globals.c %LCH%\fsutil.c %LCH%\engine.c %LCH%\deploy.c %LCH%\server_proc.c %LCH%\api_config.c %LCH%\warmup.c %LCH%\ui.c"
+set "RES_RC=%ROOT%build\launcher_payloads.rc"
+set "RES_OBJ=%ROOT%build\launcher_payloads.o"
+if not exist "%ROOT%build" mkdir "%ROOT%build"
+> "%RES_RC%" echo 101 RCDATA "native/dst_server.exe"
+>> "%RES_RC%" echo 102 RCDATA "scripts/install_runtime_payloads.ps1"
+>> "%RES_RC%" echo 103 RCDATA "config/api.ini.example"
+>> "%RES_RC%" echo 104 RCDATA "config/launcher.ini.example"
+if exist "%ROOT%payloads\UnityTranslator\UnityTranslator.dll" (
+    >> "%RES_RC%" echo 201 RCDATA "payloads/UnityTranslator/UnityTranslator.dll"
+)
+if exist "%ROOT%payloads\UnityTranslator\UnityTranslator.BepInEx6.dll" (
+    >> "%RES_RC%" echo 202 RCDATA "payloads/UnityTranslator/UnityTranslator.BepInEx6.dll"
+)
+if exist "%ROOT%payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll" (
+    >> "%RES_RC%" echo 203 RCDATA "payloads/UnityIL2CPP/DeepSeekXUnityTranslator/DeepSeekTranslate.dll"
+)
+if exist "%ROOT%payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll" (
+    >> "%RES_RC%" echo 204 RCDATA "payloads/UnityIL2CPP/DeepSeekTMPFontFallback/BepInEx/plugins/DeepSeekTMPFontFallback/DeepSeekTMPFontFallback.dll"
+)
+windres "%RES_RC%" -O coff -o "%RES_OBJ%"
+if errorlevel 1 exit /b 1
 
-gcc -std=c17 -O2 -municode -mwindows -D_CRT_SECURE_NO_WARNINGS -I"%LCH%" %LCH_SRC% -lcomctl32 -lshell32 -lole32 -lmsimg32 -lwinhttp -o "%ROOT%DeepSeekTranslator.exe"
+set "LCH=%ROOT%native\src\launcher"
+set "LCH_SRC=%LCH%\main.c %LCH%\globals.c %LCH%\fsutil.c %LCH%\engine.c %LCH%\deploy.c %LCH%\server_proc.c %LCH%\api_config.c %LCH%\warmup.c %LCH%\ui.c %LCH%\self_update.c"
+
+gcc -std=c17 -O2 -municode -mwindows -D_CRT_SECURE_NO_WARNINGS -I"%LCH%" %LCH_SRC% "%RES_OBJ%" -lcomctl32 -lshell32 -lole32 -lmsimg32 -lwinhttp -o "%ROOT%DeepSeekTranslator.exe"
 if errorlevel 1 exit /b 1
 
 echo Built native server and launcher.

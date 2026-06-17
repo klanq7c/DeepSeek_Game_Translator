@@ -89,6 +89,12 @@ void append_log(const WCHAR *fmt, ...) {
         if (*p == L'\r' || *p == L'\n' || *p == L'\t') *p = L' ';
     }
 
+    if (!g_log || !IsWindow(g_log)) {
+        OutputDebugStringW(line);
+        OutputDebugStringW(L"\n");
+        return;
+    }
+
     LRESULT count = SendMessageW(g_log, LB_GETCOUNT, 0, 0);
     while (count >= LOG_MAX_LINES) {
         SendMessageW(g_log, LB_DELETESTRING, 0, 0);

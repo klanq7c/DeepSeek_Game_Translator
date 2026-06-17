@@ -6,6 +6,7 @@
 #include "api_config.h"
 #include "fsutil.h"
 #include "server_proc.h"
+#include "self_update.h"
 #include "ui.h"
 
 #include <commctrl.h>
@@ -55,6 +56,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 0,0,0,0, hwnd, (HMENU)IDC_LOG, g_inst, NULL);
 
         apply_fonts();
+        sync_embedded_payloads();
         update_cache_card();
         append_log(L"原生启动器已就绪。");
         WCHAR last_game[MAX_PATH * 4];
@@ -203,12 +205,16 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
  * 注册窗口类 → 创建主窗口 → 进入消息循环 */
 int WINAPI wWinMain(HINSTANCE h, HINSTANCE prev, PWSTR cmd, int show) {
     (void)prev;
-    (void)cmd;
     g_inst = h;
-    dpi_enable_awareness();
     GetModuleFileNameW(NULL, g_root, MAX_PATH * 4);
     WCHAR *slash = wcsrchr(g_root, L'\\');
     if (slash) *slash = 0;
+    if (cmd && wcsstr(cmd, L"--sync-payloads-and-exit")) {
+        sync_embedded_payloads();
+        return 0;
+    }
+
+    dpi_enable_awareness();
 
     INITCOMMONCONTROLSEX ic = { sizeof(ic), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&ic);

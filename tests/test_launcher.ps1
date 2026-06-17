@@ -16,6 +16,16 @@ $mainSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\main.c
 if ($mainSrc -match '(?s)case\s+WM_DESTROY:.*stop_server\s*\(') {
     throw "launcher must not stop the translation server when the window closes"
 }
+if ($mainSrc -notmatch 'sync_embedded_payloads\(\)') {
+    throw "launcher must sync embedded first-party components on startup so exe-only updates work"
+}
+if ($mainSrc -notmatch '--sync-payloads-and-exit') {
+    throw "launcher must keep a headless embedded payload sync mode for release verification"
+}
+$uiSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\ui.c") -Raw
+if ($uiSrc -notmatch 'OutputDebugStringW\(line\)' -or $uiSrc -notmatch '!g_log \|\| !IsWindow\(g_log\)') {
+    throw "launcher logging must be safe before UI controls exist"
+}
 $serverProcSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\server_proc.c") -Raw
 if ($serverProcSrc -notmatch 'server_http_alive') {
     throw "launcher must detect an already-running translation server"
@@ -70,7 +80,6 @@ if ($warmupSrc -notmatch 'static size_t post_prefetch_all\(TextList \*prefetch\)
 if ($warmupSrc -notmatch 'size_t queued = post_prefetch_all\(&prefetch\);') {
     throw "Ren'Py/RPGM warmup logs must use successfully queued counts"
 }
-$uiSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\ui.c") -Raw
 if ($uiSrc -notmatch '(?s)ENGINE_RENPY\)\s*\{.{0,400}?launch_game\(a->dir\);.{0,400}?warmup_translations\(a->dir, a->engine\);') {
     throw "Ren'Py games must launch before the whole-script prefetch, not after"
 }
@@ -155,6 +164,15 @@ $buildSrc = Get-Content -LiteralPath (Join-Path $root "build_native.bat") -Raw
 if ($buildSrc -notmatch 'BepInExFlavor=5' -or $buildSrc -notmatch 'BepInExFlavor=6') {
     throw "build_native.bat must build both BepInEx 5 and BepInEx 6 UnityTranslator flavors"
 }
+if ($buildSrc -notmatch 'windres' -or $buildSrc -notmatch 'launcher_payloads\.rc' -or $buildSrc -notmatch 'launcher_payloads\.o') {
+    throw "build_native.bat must embed first-party payload resources into the launcher"
+}
+if ($buildSrc -notmatch 'native/dst_server\.exe' -or $buildSrc -notmatch 'scripts/install_runtime_payloads\.ps1' -or $buildSrc -notmatch 'payloads/UnityTranslator/UnityTranslator\.dll') {
+    throw "launcher resources must include the server, runtime installer script, and first-party Unity plugin"
+}
+if ($buildSrc -notmatch 'self_update\.c') {
+    throw "build_native.bat must link the embedded payload self-update module"
+}
 if ($buildSrc -notmatch 'UnityTranslator\.BepInEx6\.dll') {
     throw "build_native.bat must refresh the BepInEx6 UnityTranslator payload"
 }
@@ -232,6 +250,20 @@ if ($tmpFallbackSrc -notmatch '\\uff1f' -or $tmpFallbackSrc -notmatch '\\u2026')
 }
 if (-not (Test-Path (Join-Path $root "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll"))) {
     throw "IL2CPP TMP font fallback payload DLL must exist when source build is skipped"
+}
+$selfUpdateSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\self_update.c") -Raw
+if ($selfUpdateSrc -notmatch 'FindResourceW' -or $selfUpdateSrc -notmatch 'MoveFileExW' -or $selfUpdateSrc -notmatch 'file_matches_bytes') {
+    throw "embedded payload sync must read Win32 resources, compare bytes, and replace atomically"
+}
+if ($selfUpdateSrc -match 'Newtonsoft\.Json' -or $selfUpdateSrc -match 'BepInExRuntime' -or $selfUpdateSrc -match 'XUnityAutoTranslator') {
+    throw "embedded payload sync must not bundle third-party runtime payloads"
+}
+$programReleaseSrc = Get-Content -LiteralPath (Join-Path $root "scripts\prepare_program_release.ps1") -Raw
+if ($programReleaseSrc -notmatch 'singleExePath' -or $programReleaseSrc -notmatch 'Copy-ReleaseFile "DeepSeekTranslator\.exe" "\$DsName\.exe"') {
+    throw "program release script must produce a standalone ds translator exe asset"
+}
+if ($programReleaseSrc -notmatch '\(\^\|/\)native/' -or $programReleaseSrc -notmatch '\(\^\|/\)payloads/' -or $programReleaseSrc -notmatch 'Newtonsoft\\\.Json') {
+    throw "program release script must reject sidecar runtime payloads and third-party binaries"
 }
 $unityMonoSrc = Get-Content -LiteralPath (Join-Path $root "payloads\UnityTranslator\src\DeepSeekTranslator.cs") -Raw
 if ($unityMonoSrc -notmatch 'NormalizeTmpPunctuationForMissingGlyphs') {

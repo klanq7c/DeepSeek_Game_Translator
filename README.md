@@ -20,24 +20,28 @@ https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.3.1.7
 
 推荐下载：
 
-- `ds翻译器_0.3.1.7.zip`：Windows 可运行程序包，包含 `ds翻译器.exe`、本地服务端、自有 Unity 插件、依赖安装脚本、示例配置和文档。
+- `ds翻译器_0.3.1.7.exe`：单文件启动器。首次运行会自动释放/更新本项目自有服务端、脚本、示例配置和自有 Unity 插件。
+- `ds翻译器_0.3.1.7.zip`：带说明文档和许可文件的 Windows 程序包，核心仍是 `ds翻译器.exe`。
 - `DeepSeek_Game_Translator_source_0.3.1.7.zip`：源码包，只包含自有源码、测试和文档。
 
-为了降低侵权和授权风险，下载包不直接内置 BepInEx、XUnity、Unity 官方 DLL、游戏文件、字体包、翻译记忆或 API key。Unity 第三方运行时由用户在解压后通过命令行脚本从上游项目下载。
+为了降低侵权和授权风险，下载包不直接内置 BepInEx、XUnity、Unity 官方 DLL、游戏文件、字体包、翻译记忆或 API key。Unity 第三方运行时由用户通过命令行脚本从上游项目下载。
 
 ## 使用方式
 
-1. 解压 `ds翻译器_0.3.1.7.zip`。
-2. 复制 `config/api.ini.example` 为 `config/api.ini`。
-3. 在 `config/api.ini` 里填入自己的 API key。
-4. 如需翻译 Unity 游戏，在解压目录运行：
+1. 下载 `ds翻译器_0.3.1.7.exe`，或解压 `ds翻译器_0.3.1.7.zip` 后运行里面的 `ds翻译器.exe`。
+2. 首次运行时，启动器会自动生成/更新这些自有组件：
+   - `native\dst_server.exe`
+   - `scripts\install_runtime_payloads.ps1`
+   - `config\api.ini.example`
+   - 本项目自有 Unity 插件 DLL
+3. 在启动器里点击“配置 API”，填写自己的 API key。
+4. 如需翻译 Unity 游戏，在程序所在目录运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -All
 ```
 
-5. 双击运行 `ds翻译器.exe`。
-6. 在启动器里选择游戏目录，然后点击开始翻译。
+5. 回到启动器，选择游戏目录，然后点击开始翻译。
 
 Ren'Py 和 RPG Maker 路径不需要下载 BepInEx/XUnity。Unity 路径如果缺少 payload，启动器日志会提示对应的安装命令。
 
@@ -61,6 +65,20 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -U
 ```
 
 详见 `docs/RUNTIME_PAYLOADS.md`。
+
+## 更新方式
+
+从 `0.3.1.7` 起，启动器会把本项目自有组件嵌入 `ds翻译器.exe`。大多数更新只需要替换 `ds翻译器.exe`，再次启动后它会自动同步：
+
+- `native\dst_server.exe`
+- `scripts\install_runtime_payloads.ps1`
+- `config\*.example`
+- `payloads\UnityTranslator\UnityTranslator.dll`
+- `payloads\UnityTranslator\UnityTranslator.BepInEx6.dll`
+- `payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll`
+- `payloads\UnityIL2CPP\DeepSeekTMPFontFallback\...\DeepSeekTMPFontFallback.dll`
+
+不会自动覆盖真实的 `config\api.ini`、翻译记忆、日志、游戏目录或第三方运行时。若以后第三方依赖版本变化，启动器日志或发布说明会提示重新运行 `scripts\install_runtime_payloads.ps1 -All`。已经启动的游戏不会热更新插件 DLL，更新后请完全退出游戏再重新部署/启动。
 
 ## 配置示例
 
