@@ -1,3 +1,28 @@
+﻿/* ================================================================
+ * warmup.c — 翻译缓存预热实现
+ * ----------------------------------------------------------------
+ * 本文件是启动器的核心预热模块，功能包括：
+ *
+ *   1. 文本采集：扫描各引擎的数据文件，提取需要翻译的字符串
+ *      - Ren'Py：解析 .rpy 脚本中的字符串字面量
+ *      - RPG Maker MV/MZ：解析 www/data/*.json 中的对话/名称字段
+ *      - Unity：扫描 *_Data/*.assets 二进制文件中的 ASCII 字符串，
+ *        以及 XUnity 的 Translation/zh-CN/Text/*.txt 翻译文件
+ *
+ *   2. 文本过滤：通过 should_warm_text 等函数过滤掉 URL、文件名、
+ *      已含中文的文本、Unity 内部标识符等不需要翻译的内容
+ *
+ *   3. 去重：使用开放寻址哈希表（dedup_contains/dedup_add）
+ *      实现 O(1) 去重，替代旧的 O(n) 线性扫描
+ *
+ *   4. 批量提交：通过复用的 WinHTTP 会话（LocalHttp）将文本
+ *      分批 POST 到本地服务器的 /prefetch（后台排队）或
+ *      /cache/import（导入已有翻译）端点
+ *
+ *   5. XUnity 翻译文件回填：对已有翻译文件中空值的条目，
+ *      查询本地缓存补全翻译并回写文件
+ * ================================================================ */
+
 #include "warmup.h"
 #include "fsutil.h"
 #include "ui.h"
@@ -10,37 +35,40 @@
 #include <windows.h>
 #include <winhttp.h>
 
-#define WARMUP_MAX_ITEMS 1200
-#define UNITY_WARMUP_MAX_ITEMS 8000
-/* Ren'Py scripts are pure high-precision dialogue, and the server dedups and
-   queues misses asynchronously, so the whole script can be preheated. 1200
-   items only covered the first few files of a typical VN, leaving most lines
-   to translate lazily on first display (Chinese/English flip-flopping). */
-#define RENPY_WARMUP_MAX_ITEMS 30000
-#define WARMUP_BATCH_ITEMS 256
-#define WARMUP_MAX_TEXT_BYTES 1200
-#define UNITY_ASSET_SCAN_MAX_BYTES (64u * 1024u * 1024u)
-#define RENPY_SCRIPT_SCAN_MAX_BYTES (8u * 1024u * 1024u)
-#define RENPY_SCAN_MAX_DEPTH 12
+/* ---- 预热容量与扫描限制 ---- */
+#define WARMUP_MAX_ITEMS 1200              /* RPG Maker 默认最大采集条数 */
+#define UNITY_WARMUP_MAX_ITEMS 8000        /* Unity 资源扫描最大采集条数 */
+/* Ren'Py 脚本全是高质量对话，且服务器会去重并异步排队缺失项，
+   因此可以预热整个脚本。1200 条只够覆盖典型 VN 的前几个文件，
+   导致大部分台词在首次显示时才翻译（中英文闪烁）。 */
+#define RENPY_WARMUP_MAX_ITEMS 30000       /* Ren'Py 脚本最大采集条数 */
+#define WARMUP_BATCH_ITEMS 256             /* 每批提交到服务器的条数 */
+#define WARMUP_MAX_TEXT_BYTES 1200         /* 单条文本最大字节数 */
+#define UNITY_ASSET_SCAN_MAX_BYTES (64u * 1024u * 1024u)   /* Unity .assets 扫描上限 64MB */
+#define RENPY_SCRIPT_SCAN_MAX_BYTES (8u * 1024u * 1024u)   /* 单个 .rpy 扫描上限 8MB */
+#define RENPY_SCAN_MAX_DEPTH 12            /* .rpy 目录递归最大深度 */
 
+/* 键值对列表：用于 XUnity 翻译文件导入（key=原文, value=译文） */
 typedef struct {
     char **keys;
     char **vals;
     size_t n;
     size_t cap;
-    const char **seen; /* open-addressing dedup index over keys (lazily allocated) */
+    const char **seen; /* 开放寻址去重索引，按 key 去重（延迟分配） */
     size_t seen_cap;
 } PairList;
 
+/* 纯文本列表：用于后台预翻译排队 */
 typedef struct {
     char **items;
     size_t n;
     size_t cap;
-    const char **seen; /* open-addressing dedup index over items (lazily allocated) */
+    const char **seen; /* 开放寻址去重索引（延迟分配） */
     size_t seen_cap;
-    size_t max_items; /* 0 = WARMUP_MAX_ITEMS */
+    size_t max_items; /* 0 表示使用 WARMUP_MAX_ITEMS */
 } TextList;
 
+/* 返回列表的最大条目数上限 */
 static size_t textlist_limit(const TextList *l) {
     return l->max_items ? l->max_items : WARMUP_MAX_ITEMS;
 }
@@ -48,6 +76,15 @@ static size_t textlist_limit(const TextList *l) {
 static void textlist_add(TextList *l, const char *s);
 static int bb_init(ByteBuf *b, size_t cap);
 
+/* ======================== 通用字符串工具 ======================== */
+
+static int wide_ends_with_i(const WCHAR *s, const WCHAR *suffix) {
+    size_t sl = s ? wcslen(s) : 0;
+    size_t tl = suffix ? wcslen(suffix) : 0;
+    return sl >= tl && !_wcsicmp(s + sl - tl, suffix);
+}
+
+/* 复制 s 的前 n 个字节到新分配的内存（自动加 NUL 终止） */
 static char *dup_range(const char *s, size_t n) {
     char *p = (char *)malloc(n + 1);
     if (!p) return NULL;
@@ -56,6 +93,7 @@ static char *dup_range(const char *s, size_t n) {
     return p;
 }
 
+/* 去除字符串首尾的空白字符（空格/制表/回车/换行），原地修改 */
 static char *trim_ascii(char *s) {
     while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
     size_t n = strlen(s);
@@ -63,6 +101,10 @@ static char *trim_ascii(char *s) {
     return s;
 }
 
+/* ----------------------------------------------------------------
+ * has_cjk_utf8 — 检测 UTF-8 字符串是否含 CJK 汉字（U+4E00..U+9FFF）
+ * 手动解码 UTF-8 多字节序列，避免依赖外部库。
+ * ---------------------------------------------------------------- */
 static int has_cjk_utf8(const char *s) {
     const unsigned char *p = (const unsigned char *)s;
     while (*p) {
@@ -83,6 +125,15 @@ static int has_cjk_utf8(const char *s) {
     return 0;
 }
 
+/* ----------------------------------------------------------------
+ * should_warm_text — 判断通用文本是否值得预热
+ *
+ * 过滤规则：
+ *   - 长度过短（<2）或过长（>1200字节）
+ *   - 含路径分隔符、URL、媒体文件扩展名（.png/.ogg/.m4a）
+ *   - 不含任何字母或非 ASCII 字符（纯数字/符号）
+ *   - 已含 CJK 汉字（不需要翻译）
+ * ---------------------------------------------------------------- */
 static int should_warm_text(const char *s) {
     size_t len = strlen(s);
     if (len < 2 || len > WARMUP_MAX_TEXT_BYTES) return 0;
@@ -101,6 +152,7 @@ static int should_warm_text(const char *s) {
     return signal && !has_cjk_utf8(s);
 }
 
+/* 判断字符串是否纯 ASCII（无多字节 UTF-8 序列） */
 static int ascii_only(const char *s) {
     const unsigned char *p = (const unsigned char *)s;
     while (*p) {
@@ -110,6 +162,7 @@ static int ascii_only(const char *s) {
     return 1;
 }
 
+/* 检查 s 是否包含 chars 中的任一字符 */
 static int contains_any(const char *s, const char *chars) {
     for (; s && *s; s++) {
         if (strchr(chars, *s)) return 1;
@@ -117,12 +170,21 @@ static int contains_any(const char *s, const char *chars) {
     return 0;
 }
 
+/* 不区分大小写检查 s 是否以 word 开头，且后面是分隔符或行尾 */
 static int starts_with_word_i(const char *s, const char *word) {
     size_t n = strlen(word);
     return !_strnicmp(s, word, n) &&
            (s[n] == 0 || s[n] == ' ' || s[n] == '\t' || s[n] == ':' || s[n] == '(');
 }
 
+/* ----------------------------------------------------------------
+ * should_warm_renpy_text — Ren'Py 专用文本过滤
+ *
+ * 在通用过滤基础上增加：
+ *   - 排除过短（<3）的字符串
+ *   - 排除不含标点且太短（<18）的字符串（可能是变量名）
+ *   - 排除各种资源文件扩展名
+ * ---------------------------------------------------------------- */
 static int should_warm_renpy_text(const char *s) {
     if (!should_warm_text(s)) return 0;
     size_t len = strlen(s);
@@ -136,6 +198,16 @@ static int should_warm_renpy_text(const char *s) {
     return 1;
 }
 
+/* ----------------------------------------------------------------
+ * should_warm_unity_asset_text — Unity 资源字符串专用过滤
+ *
+ * Unity .assets 文件含大量非对话字符串（材质名、动画状态名、
+ * Shader 名等），需要严格过滤：
+ *   - 仅接受纯 ASCII 文本
+ *   - 排除 Unity 内部命名（Base Layer/Atlas/Material/Shader/...）
+ *   - 排除以特定前缀开头的标识符（_ / { / Unity / Render / ...）
+ *   - 排除带括号的命名（如 "XXX (Clone)"）
+ * ---------------------------------------------------------------- */
 static int should_warm_unity_asset_text(const char *s) {
     if (!should_warm_text(s) || !ascii_only(s)) return 0;
     if (!contains_any(s, " \t.?!,:;<>")) return 0;
@@ -164,10 +236,14 @@ static int should_warm_unity_asset_text(const char *s) {
     return 1;
 }
 
+/* ======================== ByteBuf 与 JSON 解析辅助 ======================== */
+
+/* 向 ByteBuf 追加单个字符 */
 static void bb_ch(ByteBuf *b, char c) {
     bb_add(b, &c, 1);
 }
 
+/* 十六进制字符转数值（0-15），非法字符返回 -1 */
 static int hex_value(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -175,6 +251,7 @@ static int hex_value(char c) {
     return -1;
 }
 
+/* 将 Unicode 码点编码为 UTF-8 并追加到 ByteBuf */
 static void bb_utf8(ByteBuf *b, unsigned cp) {
     if (cp < 0x80) {
         bb_ch(b, (char)cp);
@@ -193,6 +270,7 @@ static void bb_utf8(ByteBuf *b, unsigned cp) {
     }
 }
 
+/* 解析 4 位十六进制 Unicode 转义（\uXXXX） */
 static int json_u4(const char *p, unsigned *out) {
     if (!p[0] || !p[1] || !p[2] || !p[3]) return 0;
     int a = hex_value(p[0]), b = hex_value(p[1]), c = hex_value(p[2]), d = hex_value(p[3]);
@@ -201,11 +279,19 @@ static int json_u4(const char *p, unsigned *out) {
     return 1;
 }
 
+/* 跳过 JSON 空白字符 */
 static const char *json_ws(const char *p) {
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     return p;
 }
 
+/* ----------------------------------------------------------------
+ * json_string_at — 解析 JSON 字符串字面量
+ *
+ * 处理标准 JSON 转义序列（\n \r \t \uXXXX），
+ * 支持 UTF-16 代理对（surrogate pair）合并为完整码点。
+ * 返回新分配的 UTF-8 字符串，调用者负责 free。
+ * ---------------------------------------------------------------- */
 static char *json_string_at(const char **pp) {
     const char *p = json_ws(*pp);
     if (*p != '"') return NULL;
@@ -228,16 +314,17 @@ static char *json_string_at(const char **pp) {
                 unsigned cp = 0;
                 if (!json_u4(p, &cp)) break;
                 p += 4;
+                /* 处理 UTF-16 代理对：高位代理后跟低位代理 */
                 if (cp >= 0xd800 && cp <= 0xdbff) {
                     unsigned lo = 0;
                     if (p[0] == '\\' && p[1] == 'u' && json_u4(p + 2, &lo) && lo >= 0xdc00 && lo <= 0xdfff) {
                         cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
                         p += 6;
                     } else {
-                        cp = 0xfffd;
+                        cp = 0xfffd;  /* 孤立高位代理 → 替换字符 */
                     }
                 } else if (cp >= 0xdc00 && cp <= 0xdfff) {
-                    cp = 0xfffd;
+                    cp = 0xfffd;  /* 孤立低位代理 → 替换字符 */
                 }
                 bb_utf8(&b, cp);
             } else {
@@ -252,6 +339,9 @@ static char *json_string_at(const char **pp) {
     return b.data;
 }
 
+/* ======================== RPG Maker MV/MZ 文本字段判断 ======================== */
+
+/* 判断 JSON key 是否为 RPG Maker 中含可翻译文本的字段名 */
 static int rpgm_text_key(const char *key) {
     return !strcmp(key, "name") ||
            !strcmp(key, "nickname") ||
@@ -264,15 +354,28 @@ static int rpgm_text_key(const char *key) {
            !strcmp(key, "message4");
 }
 
+/* 判断 RPG Maker 事件命令 code 是否含对话/选项文本
+ *   101 = Show Choices（选项）
+ *   102 = Show Choices
+ *   401 = Show Text（对话）
+ *   405 = Show Scrolling Text（滚动文本）
+ */
 static int rpgm_text_command(int code) {
     return code == 101 || code == 102 || code == 401 || code == 405;
 }
 
+/* 采集单个字符串：修剪后若符合预热条件则加入 prefetch 列表 */
 static void collect_string(char *s, TextList *prefetch) {
     char *t = trim_ascii(s);
     if (should_warm_text(t)) textlist_add(prefetch, t);
 }
 
+/* ----------------------------------------------------------------
+ * collect_array_strings — 采集 JSON 数组中的所有字符串元素
+ *
+ * 遍历 [...] 结构，对每个字符串字面量调用 collect_string。
+ * 用于 RPG Maker 的 message1..4、parameters 等数组字段。
+ * ---------------------------------------------------------------- */
 static void collect_array_strings(const char **pp, TextList *prefetch) {
     const char *p = json_ws(*pp);
     if (*p != '[') return;
@@ -297,11 +400,19 @@ static void collect_array_strings(const char **pp, TextList *prefetch) {
     *pp = p;
 }
 
+/* ======================== Ren'Py 脚本解析 ======================== */
+
+/* ----------------------------------------------------------------
+ * renpy_string_at — 解析 Ren'Py 字符串字面量
+ *
+ * 支持 " 和 ' 两种引号，处理 \n \r \t \uXXXX 转义。
+ * 跳过三引号字符串（""" 或 '''）——这些通常是文档字符串。
+ * ---------------------------------------------------------------- */
 static char *renpy_string_at(const char **pp) {
     const char *p = *pp;
     char quote = *p;
     if (quote != '"' && quote != '\'') return NULL;
-    if (p[1] == quote && p[2] == quote) return NULL;
+    if (p[1] == quote && p[2] == quote) return NULL;  /* 三引号跳过 */
     p++;
     ByteBuf b = {0};
     if (!bb_init(&b, 64)) return NULL;
@@ -334,6 +445,13 @@ static char *renpy_string_at(const char **pp) {
     return b.data;
 }
 
+/* ----------------------------------------------------------------
+ * renpy_skip_statement — 判断 Ren'Py 行是否应跳过（非对话语句）
+ *
+ * 跳过注释、三引号、赋值语句、以及所有 Ren'Py 指令关键字
+ * （image/scene/show/hide/play/jump/call/screen/python/if/...）。
+ * first_quote 用于判断赋值号是否在引号之前（= 在引号前 → 赋值语句）。
+ * ---------------------------------------------------------------- */
 static int renpy_skip_statement(const char *line, const char *first_quote) {
     if (!line || !*line || *line == '#') return 1;
     if (strstr(line, "\"\"\"") || strstr(line, "'''")) return 1;
@@ -363,102 +481,13 @@ static int renpy_skip_statement(const char *line, const char *first_quote) {
            starts_with_word_i(line, "else") ||
            starts_with_word_i(line, "for") ||
            starts_with_word_i(line, "while") ||
-           *line == '$';
+           *line == '#';
 }
 
-static void collect_renpy_line_strings(char *line, TextList *prefetch) {
-    char *t = trim_ascii(line);
-    const char *dq = strchr(t, '"');
-    const char *sq = strchr(t, '\'');
-    const char *first = NULL;
-    if (dq && sq) first = (dq < sq) ? dq : sq;
-    else first = dq ? dq : sq;
-    if (!first || renpy_skip_statement(t, first)) return;
-
-    const char *p = first;
-    while (*p && prefetch->n < textlist_limit(prefetch)) {
-        if (*p == '"' || *p == '\'') {
-            char *s = renpy_string_at(&p);
-            if (s) {
-                char *v = trim_ascii(s);
-                if (should_warm_renpy_text(v)) textlist_add(prefetch, v);
-                free(s);
-            } else {
-                p++;
-            }
-        } else {
-            p++;
-        }
-    }
-}
-
-static int file_small_enough_to_scan(const WCHAR *path, DWORD max_bytes) {
-    WIN32_FILE_ATTRIBUTE_DATA d;
-    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &d)) return 0;
-    if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return 0;
-    if (d.nFileSizeHigh) return 0;
-    return d.nFileSizeLow <= max_bytes;
-}
-
-static int wide_ends_with_i(const WCHAR *s, const WCHAR *suffix) {
-    size_t n = wcslen(s), m = wcslen(suffix);
-    return n >= m && !_wcsicmp(s + n - m, suffix);
-}
-
-static int renpy_skip_dir(const WCHAR *name) {
-    return !wcscmp(name, L".") || !wcscmp(name, L"..") ||
-           !_wcsicmp(name, L"cache") ||
-           !_wcsicmp(name, L"saves") ||
-           !_wcsicmp(name, L"tl") ||
-           !_wcsicmp(name, L"__pycache__");
-}
-
-static void parse_renpy_rpy_file(const WCHAR *path, TextList *prefetch) {
-    if (!file_small_enough_to_scan(path, RENPY_SCRIPT_SCAN_MAX_BYTES)) return;
-    char *buf = NULL;
-    DWORD size = 0;
-    if (!read_file_bytes(path, &buf, &size)) return;
-    char *p = buf;
-    if (size >= 3 && (unsigned char)p[0] == 0xef && (unsigned char)p[1] == 0xbb && (unsigned char)p[2] == 0xbf) p += 3;
-
-    while (*p && prefetch->n < textlist_limit(prefetch)) {
-        char *line_start = p;
-        while (*p && *p != '\r' && *p != '\n') p++;
-        size_t line_len = (size_t)(p - line_start);
-        if (*p == '\r') p++;
-        if (*p == '\n') p++;
-        char *line = dup_range(line_start, line_len);
-        if (!line) continue;
-        collect_renpy_line_strings(line, prefetch);
-        free(line);
-    }
-    free(buf);
-}
-
-static void scan_renpy_script_dir(const WCHAR *dir, TextList *prefetch, int depth) {
-    if (!is_dir(dir) || depth > RENPY_SCAN_MAX_DEPTH || prefetch->n >= textlist_limit(prefetch)) return;
-    WCHAR pat[MAX_PATH * 4];
-    path_join(pat, MAX_PATH * 4, dir, L"*");
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!renpy_skip_dir(fd.cFileName)) {
-                WCHAR child[MAX_PATH * 4];
-                path_join(child, MAX_PATH * 4, dir, fd.cFileName);
-                scan_renpy_script_dir(child, prefetch, depth + 1);
-            }
-        } else if (wide_ends_with_i(fd.cFileName, L".rpy")) {
-            WCHAR p[MAX_PATH * 4];
-            path_join(p, MAX_PATH * 4, dir, fd.cFileName);
-            parse_renpy_rpy_file(p, prefetch);
-        }
-        if (prefetch->n >= textlist_limit(prefetch)) break;
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-}
-
+/* ----------------------------------------------------------------
+ * bb_json — 将字符串 JSON 转义后追加到 ByteBuf
+ * 转义 " \ \n \r \t，其他控制字符用 \uXXXX 形式输出
+ * ---------------------------------------------------------------- */
 static void bb_json(ByteBuf *b, const char *s) {
     bb_add(b, "\"", 1);
     for (; s && *s; s++) {
@@ -970,6 +999,12 @@ static void parse_translation_file(const WCHAR *path, PairList *imports, TextLis
     free(buf);
 }
 
+/* ----------------------------------------------------------------
+ * scan_text_dir — 扫描 XUnity 翻译目录中的 .txt 文件
+ *
+ * 跳过 XUnity 内部配置文件（_Substitutions / _Preprocessors /
+ * _Postprocessors），对其余文件调用 parse_translation_file。
+ * ---------------------------------------------------------------- */
 static void scan_text_dir(const WCHAR *dir, PairList *imports, TextList *prefetch) {
     if (!is_dir(dir)) return;
     WCHAR pat[MAX_PATH * 4];
@@ -991,6 +1026,12 @@ static void scan_text_dir(const WCHAR *dir, PairList *imports, TextList *prefetc
     FindClose(h);
 }
 
+/* ----------------------------------------------------------------
+ * unity_asset_file_name — 判断文件名是否为 Unity 资源文件
+ *
+ * 匹配 resources.assets、globalgamemanagers、sharedassets*.assets、
+ * level<N>（纯数字后缀的场景文件）。
+ * ---------------------------------------------------------------- */
 static int unity_asset_file_name(const WCHAR *name) {
     if (!_wcsicmp(name, L"resources.assets") ||
         !_wcsicmp(name, L"globalgamemanagers")) {
@@ -1009,6 +1050,7 @@ static int unity_asset_file_name(const WCHAR *name) {
     return 0;
 }
 
+/* 检查 .assets 文件大小是否在扫描上限内（防止扫描超大文件） */
 static int small_enough_to_scan(const WCHAR *path) {
     WIN32_FILE_ATTRIBUTE_DATA d;
     if (!GetFileAttributesExW(path, GetFileExInfoStandard, &d)) return 0;
@@ -1017,6 +1059,12 @@ static int small_enough_to_scan(const WCHAR *path) {
     return d.nFileSizeLow <= UNITY_ASSET_SCAN_MAX_BYTES;
 }
 
+/* ----------------------------------------------------------------
+ * valid_ascii_payload — 验证字节序列是否为可打印 ASCII 文本
+ *
+ * 要求：仅含可打印字符（32-126）和空白（\t \n \r），
+ * 且至少含一个字母（排除纯数字/符号的噪声）。
+ * ---------------------------------------------------------------- */
 static int valid_ascii_payload(const unsigned char *p, size_t n) {
     int alpha = 0;
     for (size_t i = 0; i < n; i++) {
@@ -1029,6 +1077,12 @@ static int valid_ascii_payload(const unsigned char *p, size_t n) {
     return alpha;
 }
 
+/* ----------------------------------------------------------------
+ * keep_rich_tag — 判断尖括号标签是否为富文本标签（应保留）
+ *
+ * 保留的标签：color/size/sprite/b/i（以及它们的闭合标签 </...>）。
+ * 其他标签（如游戏玩法标记）会被 strip_gameplay_tags 移除。
+ * ---------------------------------------------------------------- */
 static int keep_rich_tag(const char *tag, size_t n) {
     while (n && (*tag == '/' || *tag == ' ' || *tag == '\t')) {
         tag++;
@@ -1040,6 +1094,13 @@ static int keep_rich_tag(const char *tag, size_t n) {
            (n == 1 && (tag[0] == 'b' || tag[0] == 'i'));
 }
 
+/* ----------------------------------------------------------------
+ * strip_gameplay_tags — 移除游戏玩法标记，保留富文本标签
+ *
+ * Unity 资源中的对话可能含 <color=...>富文本</color> 和
+ * <customTag>玩法标记</customTag>。此函数移除非富文本标签，
+ * 提取纯文本版本用于翻译（原始含标签版本也会单独翻译）。
+ * ---------------------------------------------------------------- */
 static char *strip_gameplay_tags(const char *s) {
     ByteBuf b = {0};
     if (!bb_init(&b, strlen(s) + 1)) return NULL;
@@ -1061,6 +1122,12 @@ static char *strip_gameplay_tags(const char *s) {
     return b.data;
 }
 
+/* ----------------------------------------------------------------
+ * collect_unity_asset_text — 采集 Unity 资源中的文本字符串
+ *
+ * 原始文本和去除玩法标签后的纯文本版本都会加入 prefetch
+ * （如果两者不同），确保翻译能覆盖两种显示形式。
+ * ---------------------------------------------------------------- */
 static void collect_unity_asset_text(char *s, TextList *prefetch) {
     char *t = trim_ascii(s);
     if (!should_warm_unity_asset_text(t)) return;
@@ -1076,6 +1143,13 @@ static void collect_unity_asset_text(char *s, TextList *prefetch) {
     }
 }
 
+/* ----------------------------------------------------------------
+ * scan_unity_asset_file — 扫描 Unity .assets 二进制文件中的字符串
+ *
+ * Unity 序列化字符串以 小端 4 字节长度前缀 + UTF-8 数据 存储。
+ * 遍历文件寻找长度合理的 ASCII 载荷，通过 valid_ascii_payload
+ * 过滤非文本数据，再由 collect_unity_asset_text 采集。
+ * ---------------------------------------------------------------- */
 static void scan_unity_asset_file(const WCHAR *path, TextList *prefetch) {
     if (!small_enough_to_scan(path)) return;
     char *buf = NULL;
@@ -1084,6 +1158,7 @@ static void scan_unity_asset_file(const WCHAR *path, TextList *prefetch) {
 
     const unsigned char *bytes = (const unsigned char *)buf;
     for (DWORD i = 0; i + 8 < size && prefetch->n < textlist_limit(prefetch); i++) {
+        /* 读取小端 4 字节字符串长度 */
         unsigned n = (unsigned)bytes[i] |
                      ((unsigned)bytes[i + 1] << 8) |
                      ((unsigned)bytes[i + 2] << 16) |
@@ -1099,6 +1174,7 @@ static void scan_unity_asset_file(const WCHAR *path, TextList *prefetch) {
     free(buf);
 }
 
+/* 扫描单个 *_Data 目录下的所有资源文件 */
 static void scan_unity_data_dir(const WCHAR *data_dir, TextList *prefetch) {
     if (!is_dir(data_dir)) return;
     WCHAR pat[MAX_PATH * 4];
@@ -1117,6 +1193,7 @@ static void scan_unity_data_dir(const WCHAR *data_dir, TextList *prefetch) {
     FindClose(h);
 }
 
+/* 查找所有 *_Data 目录并扫描其中的资源文件 */
 static void scan_unity_assets(const WCHAR *dir, TextList *prefetch) {
     WCHAR pat[MAX_PATH * 4];
     path_join(pat, MAX_PATH * 4, dir, L"*_Data");
@@ -1133,6 +1210,16 @@ static void scan_unity_assets(const WCHAR *dir, TextList *prefetch) {
     FindClose(h);
 }
 
+/* ======================== RPG Maker MV/MZ 数据解析 ======================== */
+
+/* ----------------------------------------------------------------
+ * parse_rpgm_json_file — 解析 RPG Maker 数据 JSON 文件
+ *
+ * 解析 www/data/*.json，提取以下字段的文本：
+ *   - code 字段：记录事件命令码，用于判断是否为对话/选项
+ *   - parameters 数组：当 code 为对话命令（101/102/401/405）时采集
+ *   - 文本字段（name/nickname/description/profile/displayName/message1-4）
+ * ---------------------------------------------------------------- */
 static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
     char *buf = NULL;
     DWORD size = 0;
@@ -1180,6 +1267,7 @@ static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
     free(buf);
 }
 
+/* 扫描 www/data/ 目录下的所有 .json 数据文件 */
 static void scan_rpgm_data_dir(const WCHAR *dir, TextList *prefetch) {
     WCHAR data[MAX_PATH * 4], pat[MAX_PATH * 4];
     path_join(data, MAX_PATH * 4, dir, L"www\\data");
@@ -1198,6 +1286,16 @@ static void scan_rpgm_data_dir(const WCHAR *dir, TextList *prefetch) {
     FindClose(h);
 }
 
+/* ======================== 各引擎预热入口 ======================== */
+
+/* ----------------------------------------------------------------
+ * warmup_xunity — Unity (Mono/IL2CPP) 预热
+ *
+ * 1. 扫描多个可能的翻译目录（BepInEx/Translation、Translation、
+ *    AutoTranslator/Translation），解析已有翻译和待翻译文本
+ * 2. 扫描 *_Data/*.assets 资源文件中的字符串
+ * 3. 等待服务器就绪后，批量导入已有翻译 + 批量提交待翻译文本
+ * ---------------------------------------------------------------- */
 static void warmup_xunity(const WCHAR *dir) {
     PairList imports = {0};
     TextList prefetch = {0};
@@ -1243,6 +1341,12 @@ static void warmup_xunity(const WCHAR *dir) {
     textlist_free(&prefetch);
 }
 
+/* ----------------------------------------------------------------
+ * post_prefetch_all — 将文本列表全部提交到服务器后台队列
+ *
+ * 等待服务器就绪，分批 POST 到 /prefetch 端点。
+ * 返回成功排队的条数。
+ * ---------------------------------------------------------------- */
 static size_t post_prefetch_all(TextList *prefetch) {
     if (!prefetch->n) return 0;
     LocalHttp http = {0};
@@ -1262,6 +1366,69 @@ static size_t post_prefetch_all(TextList *prefetch) {
     return queued;
 }
 
+/* ----------------------------------------------------------------
+ * scan_renpy_script_dir — 递归扫描目录中的 .rpy 脚本文件
+ *
+ * 逐行解析 Ren'Py 脚本，用 renpy_skip_statement 过滤非对话行，
+ * 提取对话行中引号内的文本加入 prefetch 列表。
+ * depth 控制递归深度（上限 RENPY_SCAN_MAX_DEPTH），
+ * 超大的 .rpy 文件（> RENPY_SCRIPT_SCAN_MAX_BYTES）会被跳过。
+ * ---------------------------------------------------------------- */
+static void scan_renpy_script_dir(const WCHAR *dir, TextList *prefetch, int depth) {
+    if (depth > RENPY_SCAN_MAX_DEPTH) return;
+    if (!is_dir(dir)) return;
+    WCHAR pat[MAX_PATH * 4];
+    path_join(pat, MAX_PATH * 4, dir, L"*.rpy");
+    WIN32_FIND_DATAW fd;
+    HANDLE hf = FindFirstFileW(pat, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    do {
+        if (prefetch->n >= textlist_limit(prefetch)) { FindClose(hf); return; }
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!wide_ends_with_i(fd.cFileName, L".rpy")) continue;
+        /* 跳过超过大小上限的文件 */
+        ULARGE_INTEGER fsz = { fd.nFileSizeLow, fd.nFileSizeHigh };
+        if (fsz.QuadPart > (ULONGLONG)RENPY_SCRIPT_SCAN_MAX_BYTES) continue;
+        WCHAR full[MAX_PATH * 4];
+        path_join(full, MAX_PATH * 4, dir, fd.cFileName);
+        char *buf = NULL; DWORD size = 0;
+        if (!read_file_bytes(full, &buf, &size)) continue;
+        char *line = buf;
+        while (*line && prefetch->n < textlist_limit(prefetch)) {
+            char *nl = strchr(line, '\n');
+            if (nl) { *nl = 0; nl++; } else nl = line + strlen(line);
+            const char *fq = strchr(line, '"');
+            if (!renpy_skip_statement(line, fq) && fq) {
+                fq++;
+                const char *end = strchr(fq, '"');
+                if (end) {
+                    size_t tlen = (size_t)(end - fq);
+                    char *text = dup_range(fq, tlen);
+                    if (text) { collect_string(text, prefetch); free(text); }
+                }
+            }
+            line = nl;
+        }
+        free(buf);
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+    /* 递归扫描子目录 */
+    path_join(pat, MAX_PATH * 4, dir, L"*");
+    hf = FindFirstFileW(pat, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    do {
+        if (prefetch->n >= textlist_limit(prefetch)) { FindClose(hf); return; }
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+            WCHAR sub[MAX_PATH * 4];
+            path_join(sub, MAX_PATH * 4, dir, fd.cFileName);
+            scan_renpy_script_dir(sub, prefetch, depth + 1);
+        }
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+}
+
+/* RPG Maker MV/MZ 预热：扫描 www/data/ 的 JSON 并批量提交 */
 static void warmup_rpgm(const WCHAR *dir) {
     TextList prefetch = {0};
     scan_rpgm_data_dir(dir, &prefetch);
@@ -1270,6 +1437,7 @@ static void warmup_rpgm(const WCHAR *dir) {
     textlist_free(&prefetch);
 }
 
+/* Ren'Py 预热：递归扫描 game/ 下的 .rpy 脚本并批量提交 */
 static void warmup_renpy(const WCHAR *dir) {
     TextList prefetch = {0};
     prefetch.max_items = RENPY_WARMUP_MAX_ITEMS;
@@ -1281,6 +1449,11 @@ static void warmup_renpy(const WCHAR *dir) {
     textlist_free(&prefetch);
 }
 
+/* ----------------------------------------------------------------
+ * warmup_translations — 预热入口（由 launcher 主流程调用）
+ *
+ * 根据检测到的引擎类型，分派到对应的预热函数。
+ * ---------------------------------------------------------------- */
 void warmup_translations(const WCHAR *dir, Engine engine) {
     if (!dir || !dir[0]) return;
     if (engine == ENGINE_RENPY) warmup_renpy(dir);

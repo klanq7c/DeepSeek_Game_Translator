@@ -1,22 +1,38 @@
+/* ================================================================
+ * api_config.c — API 配置对话框实现
+ * ----------------------------------------------------------------
+ * 创建模态窗口，包含 API 地址、模型名称、API Key 三个编辑框，
+ * 用户填写后点"保存"写入 INI 配置文件，供本地 C 服务器启动时读取。
+ * ================================================================ */
+
 #include "api_config.h"
 #include "fsutil.h"
 #include "ui.h"
 
 #include <string.h>
 
+/* 对话框内部状态：保存各控件句柄和完成标志 */
 typedef struct {
-    HWND endpoint;
-    HWND model;
-    HWND key;
-    int done;
+    HWND endpoint;   /* API 地址编辑框 */
+    HWND model;      /* 模型名称编辑框 */
+    HWND key;        /* API Key 编辑框 */
+    int done;        /* 对话框结束标志 */
 } ApiDialog;
 
+/* ----------------------------------------------------------------
+ * api_wndproc — API 配置窗口的消息处理
+ *
+ * WM_CREATE：从 INI 文件读取现有配置并填充编辑框
+ * WM_COMMAND：保存按钮将编辑框内容写回 INI；取消按钮关闭窗口
+ * WM_CLOSE：设置完成标志并关闭
+ * ---------------------------------------------------------------- */
 static LRESULT CALLBACK api_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     ApiDialog *d = (ApiDialog *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     switch (msg) {
     case WM_CREATE: {
         d = (ApiDialog *)((CREATESTRUCTW *)lp)->lpCreateParams;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)d);
+        /* 从 INI 读取已有配置，若不存在则使用默认值 */
         WCHAR cfg[MAX_PATH * 4];
         get_api_config_path(cfg, MAX_PATH * 4);
         WCHAR endpoint[1024], model[256], key[1024];
@@ -24,6 +40,7 @@ static LRESULT CALLBACK api_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         GetPrivateProfileStringW(L"api", L"model", L"deepseek-chat", model, 256, cfg);
         GetPrivateProfileStringW(L"api", L"key", L"", key, 1024, cfg);
 
+        /* 创建标签 + 编辑框 + 按钮 */
         CreateWindowW(L"STATIC", L"API 地址", WS_CHILD | WS_VISIBLE, 24, 24, 120, 22, hwnd, NULL, g_inst, NULL);
         d->endpoint = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", endpoint, WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
                                       24, 50, 520, 30, hwnd, (HMENU)IDC_API_ENDPOINT, g_inst, NULL);
@@ -35,6 +52,7 @@ static LRESULT CALLBACK api_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                  24, 190, 520, 30, hwnd, (HMENU)IDC_API_KEY, g_inst, NULL);
         CreateWindowW(L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 318, 246, 104, 34, hwnd, (HMENU)IDC_API_SAVE, g_inst, NULL);
         CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE, 440, 246, 104, 34, hwnd, (HMENU)IDC_API_CANCEL, g_inst, NULL);
+        /* 应用全局字体 */
         SendMessageW(d->endpoint, WM_SETFONT, (WPARAM)g_font_body, TRUE);
         SendMessageW(d->model, WM_SETFONT, (WPARAM)g_font_body, TRUE);
         SendMessageW(d->key, WM_SETFONT, (WPARAM)g_font_body, TRUE);
@@ -42,6 +60,7 @@ static LRESULT CALLBACK api_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_API_SAVE && d) {
+            /* 将编辑框内容写入 INI 文件 */
             WCHAR cfgdir[MAX_PATH * 4], cfg[MAX_PATH * 4], endpoint[1024], model[256], key[1024];
             get_config_dir(cfgdir, MAX_PATH * 4);
             ensure_dir(cfgdir);
@@ -72,6 +91,13 @@ static LRESULT CALLBACK api_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/* ----------------------------------------------------------------
+ * show_api_config — 显示 API 配置对话框（模态）
+ *
+ * 注册窗口类（仅首次），创建窗口并运行局部消息循环，
+ * 直到对话框关闭（d.done == 1）。期间禁用主窗口。
+ * 对话框关闭后恢复主窗口并重新激活。
+ * ---------------------------------------------------------------- */
 void show_api_config(void) {
     static int registered = 0;
     if (!registered) {

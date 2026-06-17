@@ -20,24 +20,47 @@ https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.3.1.7
 
 推荐下载：
 
-- `ds翻译器_0.3.1.7.zip`：最小可运行程序包，包含 `ds翻译器.exe` 和本地服务端。
+- `ds翻译器_0.3.1.7.zip`：Windows 可运行程序包，包含 `ds翻译器.exe`、本地服务端、自有 Unity 插件、依赖安装脚本、示例配置和文档。
 - `DeepSeek_Game_Translator_source_0.3.1.7.zip`：源码包，只包含自有源码、测试和文档。
 
-为了降低侵权和授权风险，下载包不内置 BepInEx、XUnity、Unity DLL、游戏文件、字体包、翻译记忆或 API key。Unity 等运行时依赖需要按文档从上游项目或你有权使用的本地环境准备。
+为了降低侵权和授权风险，下载包不直接内置 BepInEx、XUnity、Unity 官方 DLL、游戏文件、字体包、翻译记忆或 API key。Unity 第三方运行时由用户在解压后通过命令行脚本从上游项目下载。
 
 ## 使用方式
 
 1. 解压 `ds翻译器_0.3.1.7.zip`。
 2. 复制 `config/api.ini.example` 为 `config/api.ini`。
 3. 在 `config/api.ini` 里填入自己的 API key。
-4. 双击运行 `ds翻译器.exe`。
-5. 在启动器里选择游戏目录，然后点击开始翻译。
+4. 如需翻译 Unity 游戏，在解压目录运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -All
+```
+
+5. 双击运行 `ds翻译器.exe`。
+6. 在启动器里选择游戏目录，然后点击开始翻译。
+
+Ren'Py 和 RPG Maker 路径不需要下载 BepInEx/XUnity。Unity 路径如果缺少 payload，启动器日志会提示对应的安装命令。
 
 本地服务默认监听：
 
 ```text
 http://127.0.0.1:19999
 ```
+
+## 按需安装 Unity 依赖
+
+```powershell
+# 旧版 Unity Mono / BepInEx 5
+powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -UnityMono5
+
+# Unity 6+ Mono / BepInEx 6
+powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -UnityMono6
+
+# Unity IL2CPP / BepInEx 6 + XUnity
+powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -UnityIL2CPP
+```
+
+详见 `docs/RUNTIME_PAYLOADS.md`。
 
 ## 配置示例
 
@@ -74,6 +97,7 @@ concurrency=4
 
 - `THIRD_PARTY_NOTICES.md`
 - `docs/DEPENDENCY_POLICY.md`
+- `docs/RUNTIME_PAYLOADS.md`
 
 构建命令：
 

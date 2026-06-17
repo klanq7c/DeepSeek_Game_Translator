@@ -1,5 +1,9 @@
+/*
+ * globals.c —— 启动器全局变量定义（声明见 globals.h）。
+ */
 #include "globals.h"
 
+/* 窗口/控件句柄，初始值 NULL，由 ui.c 的 CreateWindow 赋值。 */
 HINSTANCE g_inst;
 HWND g_main;
 HWND g_title;
@@ -14,12 +18,15 @@ HWND g_log;
 HWND g_btn_server;
 HWND g_btn_api;
 
+/* 路径缓冲——MAX_PATH*4 预留长路径（游戏目录可能嵌套很深）。 */
 WCHAR g_root[MAX_PATH * 4];
 WCHAR g_game[MAX_PATH * 4];
 
+/* 服务器子进程信息——server_proc.c 写入，deploy.c/ui.c 读取。 */
 PROCESS_INFORMATION g_server_pi;
 int g_server_started;
 
+/* 字体句柄——ui.c 在 WM_CREATE 时创建，WM_DESTROY 时 DeleteObject。 */
 HFONT g_font_title;
 HFONT g_font_heading;
 HFONT g_font_body;
@@ -27,11 +34,13 @@ HFONT g_font_small;
 HFONT g_font_mono;
 HFONT g_font_mono_small;
 
+/* 预创建画刷——避免每帧重复 CreateSolidBrush。 */
 HBRUSH g_brush_page;
 HBRUSH g_brush_edit;
 HBRUSH g_brush_log;
 HBRUSH g_brush_transparent;
 
+/* 暗色主题色板定义。背景由深到浅，文本由亮到暗，accent 用于重点高亮。 */
 const COLORREF C_PAGE        = RGB(8, 14, 24);
 const COLORREF C_RAIL        = RGB(13, 20, 32);
 const COLORREF C_CARD        = RGB(20, 28, 44);

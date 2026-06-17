@@ -1,8 +1,7 @@
 # Dependency and Redistribution Policy
 
 The public source repository should be source-only. Runtime dependencies are
-external inputs unless a release explicitly includes a reviewed binary bundle
-with complete notices.
+external inputs installed by the user with `scripts/install_runtime_payloads.ps1`.
 
 ## Allowed in Source Releases
 
@@ -23,11 +22,13 @@ with complete notices.
   reviewed and included in the release notices.
 - User caches, translation memory, logs, diagnostics, or local configuration.
 
-## Binary Releases
+## Program Packages
 
-A binary release is a separate legal/packaging decision from a source release.
-Before publishing a binary release, create a manifest listing every included
-file, its upstream project, version, license, source URL, and reason for
-redistribution.
+Program packages may include this project's own compiled `.exe` and plugin
+`.dll` files. Third-party BepInEx/XUnity/Newtonsoft payloads should normally be
+downloaded on the user's machine by `scripts/install_runtime_payloads.ps1`.
 
-If that manifest cannot be produced, publish source only.
+If a future binary release directly bundles third-party runtime files, create a
+manifest listing every included file, its upstream project, version, license,
+source URL, and reason for redistribution. Without that manifest, keep the
+runtime as a post-download installer step.

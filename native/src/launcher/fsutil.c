@@ -1,3 +1,6 @@
+/*
+ * fsutil.c —— 文件系统与 DPI 工具函数实现（详见 fsutil.h）。
+ */
 #include "fsutil.h"
 
 #include <stdio.h>
@@ -6,22 +9,27 @@
 #include <string.h>
 #include <wchar.h>
 
+/* 拼接两个路径段：a 末尾无 '\' 时自动补上。 */
 void path_join(WCHAR *out, size_t cap, const WCHAR *a, const WCHAR *b) {
     _snwprintf(out, cap, L"%s%s%s", a,
                (a[0] && a[wcslen(a) - 1] != L'\\') ? L"\\" : L"", b);
     out[cap - 1] = 0;
 }
 
+/* 路径是否存在（文件或目录均可）。 */
 int exists_path(const WCHAR *p) {
     DWORD a = GetFileAttributesW(p);
     return a != INVALID_FILE_ATTRIBUTES;
 }
 
+/* 是否为目录。 */
 int is_dir(const WCHAR *p) {
     DWORD a = GetFileAttributesW(p);
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/* 递归创建目录：逐级扫描 '\' 分隔符，逐级 CreateDirectory。
+   已存在的中间目录跳过，最终 CreateDirectory 失败但 ERROR_ALREADY_EXISTS 也算成功。 */
 int ensure_dir(const WCHAR *path) {
     if (is_dir(path)) return 1;
     WCHAR tmp[MAX_PATH * 4];
@@ -39,6 +47,7 @@ int ensure_dir(const WCHAR *path) {
     return CreateDirectoryW(tmp, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
+/* 以 CREATE_ALWAYS 写 UTF-8 文本，返回是否写入完整。 */
 int write_text_file_utf8(const WCHAR *path, const char *bytes) {
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
@@ -53,6 +62,8 @@ int write_text_file_utf8(const WCHAR *path, const char *bytes) {
     return ok && written == (DWORD)len;
 }
 
+/* 读取文件全部内容到新分配缓冲。返回 1=成功，*out 和 *size 由调用方负责。
+   限制文件大小 < 4GB 且 != UINT32_MAX，超出则拒绝。 */
 int read_file_bytes(const WCHAR *path, char **out, DWORD *size) {
     HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
@@ -68,12 +79,13 @@ int read_file_bytes(const WCHAR *path, char **out, DWORD *size) {
     int ok = ReadFile(h, buf, sz, &rd, NULL);
     CloseHandle(h);
     if (!ok) { free(buf); return 0; }
-    buf[rd] = 0;
+    buf[rd] = 0;  /* 方便当 C 字符串用 */
     *out = buf;
     *size = rd;
     return 1;
 }
 
+/* 写入原始字节到文件，CREATE_ALWAYS 覆盖。 */
 int write_file_bytes(const WCHAR *path, const char *buf, DWORD size) {
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
@@ -83,6 +95,7 @@ int write_file_bytes(const WCHAR *path, const char *buf, DWORD size) {
     return ok && wr == size;
 }
 
+/* 复制单个文件。自动确保目标父目录已存在。FALSE = 覆盖已有。 */
 int copy_file_safe(const WCHAR *from, const WCHAR *to) {
     WCHAR parent[MAX_PATH * 4];
     size_t len = wcslen(to);
@@ -93,6 +106,7 @@ int copy_file_safe(const WCHAR *from, const WCHAR *to) {
     return CopyFileW(from, to, FALSE);
 }
 
+/* 递归复制目录树。跳过 . 和 ..，目录递归，文件走 copy_file_safe。 */
 int copy_tree_safe(const WCHAR *from, const WCHAR *to) {
     if (!is_dir(from)) return 0;
     if (!ensure_dir(to)) return 0;
@@ -119,6 +133,7 @@ int copy_tree_safe(const WCHAR *from, const WCHAR *to) {
     return ok;
 }
 
+/* 往 ByteBuf 追加 n 字节。含溢出保护和按需 2 倍扩容。 */
 void bb_add(ByteBuf *b, const char *s, size_t n) {
     if (!b || !s || !n) return;
     if (b->len > SIZE_MAX - n - 1) return;
@@ -152,6 +167,7 @@ void bb_add(ByteBuf *b, const char *s, size_t n) {
     b->data[b->len] = 0;
 }
 
+/* 配置路径派生——全部基于 g_root。 */
 void get_config_dir(WCHAR *out, size_t cap) {
     path_join(out, cap, g_root, L"config");
 }
@@ -164,6 +180,7 @@ void get_launcher_config_path(WCHAR *out, size_t cap) {
     path_join(out, cap, g_root, L"config\\launcher.ini");
 }
 
+/* 把上次用户选择的游戏目录写入 launcher.ini，下次启动自动填充。 */
 int save_last_game_dir(const WCHAR *dir) {
     if (!dir || !dir[0] || !is_dir(dir)) return 0;
     WCHAR cfgdir[MAX_PATH * 4], cfg[MAX_PATH * 4];
@@ -173,6 +190,7 @@ int save_last_game_dir(const WCHAR *dir) {
     return WritePrivateProfileStringW(L"launcher", L"last_game_dir", dir, cfg);
 }
 
+/* 从 launcher.ini 读取上次目录。校验路径确实存在（可能被用户删了）。 */
 int load_last_game_dir(WCHAR *out, size_t cap) {
     if (!out || cap == 0) return 0;
     WCHAR cfg[MAX_PATH * 4];
@@ -183,12 +201,16 @@ int load_last_game_dir(WCHAR *out, size_t cap) {
     return is_dir(out);
 }
 
+/* DPI 全局状态：默认 96（100% 缩放）。 */
 int g_scale_dpi = 96;
 
+/* 把像素值按当前 DPI 缩放（96 基准）。所有 UI 尺寸必须过 sc()。 */
 int sc(int v) {
     return MulDiv(v, g_scale_dpi, 96);
 }
 
+/* 声明进程为 DPI 感知。优先用 Win8.1+ 的 Per-Monitor V2，降级到 V1，再降级到
+   WinVista 的 System-DPI。不设则系统会虚拟化，导致 UI 模糊。 */
 void dpi_enable_awareness(void) {
     HMODULE u = GetModuleHandleW(L"user32.dll");
     if (!u) return;
@@ -204,6 +226,8 @@ void dpi_enable_awareness(void) {
     if (q) q();
 }
 
+/* 为指定窗口检测 DPI 并更新全局 g_scale_dpi。优先用 Win10+ 的 GetDpiForWindow，
+   降级到 DC 的 GetDeviceCaps。DPI <= 0 时回退到 96。 */
 void dpi_set_for_window(HWND hwnd) {
     HMODULE u = GetModuleHandleW(L"user32.dll");
     int dpi = 96;
@@ -221,6 +245,7 @@ void dpi_set_for_window(HWND hwnd) {
     g_scale_dpi = dpi;
 }
 
+/* 按 DPI 缩放创建字体。高度取负值表示 pt -> 像素（CreateFontW 约定）。 */
 HFONT make_font(int pt, int weight, const WCHAR *face) {
     int h = -MulDiv(pt, g_scale_dpi, 72);
     return CreateFontW(h, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,

@@ -1,3 +1,20 @@
+/*
+ * http.c —— 内嵌 HTTP 服务器实现（详见 http.h）。
+ *
+ * 这是整个翻译系统的中枢。两类翻译任务在此分流：
+ *
+ *   1. 异步队列（async_*）：用于预热/预取。游戏侧发起 prefetch 后立即返回，
+ *      实际翻译在后台 worker 池中完成并写入缓存，绝不阻塞游戏。
+ *   2. 实时队列（live_*）：游戏侧发起的同步翻译。请求线程入队后阻塞等待，
+ *      由 live_worker 翻译后通过条件变量唤醒返回。
+ *
+ * 关键的优先级规则（AGENTS.md 运行时契约的体现）：实时（前台）请求优先于
+ * 异步（后台）请求。async_worker 在调用 API 前会等待前台清空，避免后台
+ * 预热把 API 通道占满而让游戏中实时出现的文本排队。
+ *
+ * 缓存契约：未命中/排队/透传原文一律不得当作"已翻译"回写缓存
+ * （见 is_resolved_translation 的守卫）。
+ */
 #include "http.h"
 #include "buf.h"
 #include "cache.h"
@@ -10,22 +27,26 @@
 #include <string.h>
 #include <time.h>
 
+/* 线程级上下文，工作线程通过它访问缓存、停止标志与 API 配置。 */
 static HttpCtx *g_ctx;
 
+/* 由主线程在启动工作线程前调用一次，设置全局上下文。 */
 void http_set_ctx(HttpCtx *ctx) { g_ctx = ctx; }
 
 /* Sized for whole-script Ren'Py warmups (30k lines): jobs are ~150 bytes, so
    the worst case stays around 10 MB while the queue drains through the API. */
-#define ASYNC_QUEUE_LIMIT 65536
-#define ASYNC_BATCH_MAX 16
-#define ASYNC_BATCH_CHAR_BUDGET 3200
-#define ASYNC_BATCH_COALESCE_MS 25
-#define ASYNC_FOREGROUND_YIELD_MS 25
-#define ASYNC_KNOWN_BUCKETS 8192
+#define ASYNC_QUEUE_LIMIT 65536              /* 异步队列上限，防失控占满内存 */
+#define ASYNC_BATCH_MAX 16                   /* 单批最多合并的文本数 */
+#define ASYNC_BATCH_CHAR_BUDGET 3200         /* 单批字符预算，控制单次 API 请求体量 */
+#define ASYNC_BATCH_COALESCE_MS 25           /* 合批等待窗口：攒够一批或超时即发 */
+#define ASYNC_FOREGROUND_YIELD_MS 25         /* 后台等待前台清空的轮询间隔 */
+#define ASYNC_KNOWN_BUCKETS 8192             /* 去重哈希桶数（须为 2 的幂） */
 #define LIVE_BATCH_MAX 16
 #define LIVE_BATCH_CHAR_BUDGET 3200
 #define LIVE_BATCH_COALESCE_MS 35
 
+/* 异步任务节点。同时挂在两个结构上：
+   qnext 串成 FIFO 等待队列；knext 串成去重桶的冲突链。 */
 typedef struct AsyncJob {
     char *text;
     uint64_t hash;
@@ -33,6 +54,7 @@ typedef struct AsyncJob {
     struct AsyncJob *knext;
 } AsyncJob;
 
+/* 实时任务节点。result/done/cv 构成"请求线程阻塞等待 worker 完成"的握手。 */
 typedef struct LiveJob {
     char *text;
     char *result;
@@ -41,25 +63,29 @@ typedef struct LiveJob {
     struct LiveJob *next;
 } LiveJob;
 
+/* 异步队列全局状态：锁 + 条件变量 + FIFO 头尾 + 去重桶 + 计数。 */
 static SRWLOCK g_async_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_async_cv = CONDITION_VARIABLE_INIT;
 static AsyncJob *g_async_head;
 static AsyncJob *g_async_tail;
 static AsyncJob *g_async_known[ASYNC_KNOWN_BUCKETS];
 static size_t g_async_len;
-static volatile LONG g_async_started;
+static volatile LONG g_async_started;        /* worker 池是否已启动（一次性） */
 
+/* 实时队列全局状态，结构对称。 */
 static SRWLOCK g_live_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_live_cv = CONDITION_VARIABLE_INIT;
 static LiveJob *g_live_head;
 static LiveJob *g_live_tail;
 static size_t g_live_len;
 static volatile LONG g_live_started;
+/* 当前活跃的前台（实时）请求数，用于后台 worker 判断是否该让路。 */
 static volatile LONG g_foreground_requests;
 
 static DWORD WINAPI async_worker(LPVOID arg);
 static DWORD WINAPI live_worker(LPVOID arg);
 
+/* 线程安全地读取异步队列长度（health 接口用）。 */
 static size_t async_queue_len(void) {
     AcquireSRWLockShared(&g_async_lock);
     size_t n = g_async_len;
@@ -67,6 +93,7 @@ static size_t async_queue_len(void) {
     return n;
 }
 
+/* 线程安全地读取实时队列长度。 */
 static size_t live_queue_len(void) {
     AcquireSRWLockShared(&g_live_lock);
     size_t n = g_live_len;
@@ -74,28 +101,35 @@ static size_t live_queue_len(void) {
     return n;
 }
 
+/* 进入前台临界区：实时请求开始前调用，计数 +1。 */
 static void foreground_enter(void) {
     InterlockedIncrement(&g_foreground_requests);
 }
 
+/* 离开前台临界区：实时请求结束后调用，计数 -1。 */
 static void foreground_leave(void) {
     InterlockedDecrement(&g_foreground_requests);
 }
 
+/* 是否有前台请求在进行（含实时队列未清空）。后台 worker 据此让路。 */
 static int foreground_active(void) {
     return InterlockedCompareExchange(&g_foreground_requests, 0, 0) > 0 || live_queue_len() > 0;
 }
 
+/* 服务器是否正在关闭（stop 标志被置位，或上下文未初始化）。 */
 static int server_stopping(void) {
     return !g_ctx || InterlockedCompareExchange(g_ctx->stop, 0, 0) != 0;
 }
 
+/* 后台 worker 在调 API 前调用：自旋等待直到没有前台请求，确保实时优先。
+   关闭信号到来时立即返回，避免关停卡死。 */
 static void async_wait_for_foreground(void) {
     while (!server_stopping() && foreground_active()) {
         Sleep(ASYNC_FOREGROUND_YIELD_MS);
     }
 }
 
+/* 把 n 字节可靠地全部发送出去，处理部分发送。失败返回 0。 */
 static int sendall(SOCKET s, const char *p, size_t n) {
     while (n) {
         int r = send(s, p, n > INT_MAX ? INT_MAX : (int)n, 0);
@@ -106,6 +140,7 @@ static int sendall(SOCKET s, const char *p, size_t n) {
     return 1;
 }
 
+/* 发送 JSON 响应：固定 CORS 头 + Connection: close。code/msg 为状态行，body 为正文。 */
 static void resp(SOCKET s, int code, const char *msg, const char *body) {
     const char *ctype = "application/json; charset=utf-8";
     char h[512];
@@ -124,6 +159,7 @@ static void resp(SOCKET s, int code, const char *msg, const char *body) {
     sendall(s, body, n);
 }
 
+/* 发送纯文本响应（/translate?text=... 这类 GET 走纯文本协议）。 */
 static void resp_plain(SOCKET s, int code, const char *msg, const char *body) {
     char h[512];
     size_t n = strlen(body ? body : "");
@@ -141,6 +177,7 @@ static void resp_plain(SOCKET s, int code, const char *msg, const char *body) {
     sendall(s, body ? body : "", n);
 }
 
+/* 单个十六进制字符转数值，非法返回 -1。 */
 static int hexval(char c) {
     if ('0' <= c && c <= '9') return c - '0';
     if ('a' <= c && c <= 'f') return c - 'a' + 10;
@@ -148,6 +185,7 @@ static int hexval(char c) {
     return -1;
 }
 
+/* URL 解码指定区间：'+' -> 空格，%XX -> 字节，其余原样。返回新分配缓冲。 */
 static char *url_decode_range(const char *s, size_t n) {
     char *out = xmalloc(n + 1);
     size_t j = 0;
@@ -170,6 +208,8 @@ static char *url_decode_range(const char *s, size_t n) {
     return out;
 }
 
+/* 从查询串 q 中取参数 name 的值（已 URL 解码）。未找到返回 NULL。
+   手写解析以避免引入完整 URL 库。 */
 static char *query_get(const char *q, const char *name) {
     if (!q || !name) return NULL;
     size_t nl = strlen(name);
@@ -186,6 +226,7 @@ static char *query_get(const char *q, const char *name) {
     return NULL;
 }
 
+/* 前 n 字节不区分大小写比较。 */
 static int mem_ieq(const char *a, const char *b, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return 0;
@@ -193,6 +234,9 @@ static int mem_ieq(const char *a, const char *b, size_t n) {
     return 1;
 }
 
+/* 在请求头区域中查找指定头名的值起点（跳过冒号后空白）。
+   headers_end 限定搜索边界（避免越过头部进入 body）。
+   返回的指针指向 headers_end 之前，调用方按行尾截断取值。 */
 static char *header_value(char *req, char *headers_end, const char *name) {
     size_t nl = strlen(name);
     char *p = strstr(req, "\r\n");
@@ -213,6 +257,8 @@ static char *header_value(char *req, char *headers_end, const char *name) {
     return NULL;
 }
 
+/* 取 JSON 体中某个布尔字段是否为真。先用 strstr 快速短路，避免对大 body
+   做完整 json_key 扫描。识别 true/1。 */
 static int json_bool_true(const char *json, const char *key) {
     /* If the key text isn't even a substring of the body, it can't be a key;
        skip json_key's allocating full-body scan (it parses every string). */
@@ -222,6 +268,8 @@ static int json_bool_true(const char *json, const char *key) {
     return !strncmp(p, "true", 4) || !strncmp(p, "1", 1);
 }
 
+/* 逐码点扫描 UTF-8，判断字符串是否含 CJK 汉字（U+4E00..U+9FFF）。
+   用于跳过已是中文的文本，避免无谓翻译。 */
 static int utf8_has_cjk(const char *s) {
     const unsigned char *p = (const unsigned char *)s;
     while (*p) {
@@ -242,6 +290,8 @@ static int utf8_has_cjk(const char *s) {
     return 0;
 }
 
+/* 是否存在"值得翻译的信号"：含字母（ASCII）或任何非 ASCII 字节。
+   纯标点/数字/空白视为无需翻译。 */
 static int has_translation_signal(const char *s) {
     const unsigned char *p = (const unsigned char *)s;
     while (*p) {
@@ -255,10 +305,13 @@ static int has_translation_signal(const char *s) {
     return 0;
 }
 
+/* 综合判定：非空 + 有翻译信号 + 不含 CJK（已是中文则不翻）。 */
 static int should_translate_text(const char *text) {
     return text && *text && has_translation_signal(text) && !utf8_has_cjk(text);
 }
 
+/* 判定是否为"有效翻译结果"：译文非空且与原文不同。
+   这是回写缓存的守卫——原文/空串/排队未决结果都不得当作翻译写入。 */
 static int is_resolved_translation(const char *original, const char *translated) {
     return original && translated && *translated && strcmp(original, translated) != 0;
 }
@@ -272,6 +325,8 @@ static int worker_pool_size(void) {
     return n;
 }
 
+/* 首次需要 worker 时启动一整池（数量 = 并发通道数）。started 用 CAS 保证
+   只启动一次；启动失败则回退标志，下次再试。返回是否已有可用 worker。 */
 static int ensure_worker_pool(volatile LONG *started, LPTHREAD_START_ROUTINE fn) {
     if (InterlockedCompareExchange(started, 1, 0) == 0) {
         int created = 0;
@@ -292,14 +347,18 @@ static int ensure_worker_pool(volatile LONG *started, LPTHREAD_START_ROUTINE fn)
     return 1;
 }
 
+/* 确保异步 worker 池已启动。 */
 static int ensure_async_worker(void) {
     return ensure_worker_pool(&g_async_started, async_worker);
 }
 
+/* 确保实时 worker 池已启动。 */
 static int ensure_live_worker(void) {
     return ensure_worker_pool(&g_live_started, live_worker);
 }
 
+/* 持锁查询某文本是否已在异步队列中（去重），避免重复排队。
+   用 hash 先定位桶，再桶内逐个 strcmp 确认。 */
 static int async_known_locked(const char *text, uint64_t hash) {
     size_t slot = (size_t)hash & (ASYNC_KNOWN_BUCKETS - 1);
     for (AsyncJob *j = g_async_known[slot]; j; j = j->knext) {
@@ -308,6 +367,9 @@ static int async_known_locked(const char *text, uint64_t hash) {
     return 0;
 }
 
+/* 把未命中的文本排入异步队列（若满足条件）。返回 1=已入队，0=未入队
+   （已缓存/已排队/不可译/队列满/worker 启动失败等）。调用方据此判断
+   source 标记为 queued 还是 miss。 */
 static int async_enqueue_miss(const char *text) {
     if (!g_ctx || !g_ctx->api || !g_ctx->api->enabled || !should_translate_text(text)) return 0;
 
@@ -341,6 +403,7 @@ static int async_enqueue_miss(const char *text) {
     return 1;
 }
 
+/* 持锁：从去重桶中摘除 job（翻译完成后调用，使相同文本可再次排队重译）。 */
 static void async_forget_locked(AsyncJob *job) {
     size_t slot = (size_t)job->hash & (ASYNC_KNOWN_BUCKETS - 1);
     AsyncJob **pp = &g_async_known[slot];
@@ -353,6 +416,7 @@ static void async_forget_locked(AsyncJob *job) {
     }
 }
 
+/* 持锁：从 FIFO 队首弹出并摘除一个 job。 */
 static AsyncJob *async_pop_locked(void) {
     AsyncJob *job = g_async_head;
     if (!job) return NULL;
@@ -363,6 +427,9 @@ static AsyncJob *async_pop_locked(void) {
     return job;
 }
 
+/* worker 取一批 job（最多 cap 个，受字符预算约束）。队空时阻塞等待条件变量。
+   合批逻辑：弹出首个后，若短暂等待窗口内还有新任务且不超字符预算，则继续攒，
+   从而把多个小文本合并成一次 API 请求，提升吞吐。 */
 static size_t async_pop_batch(AsyncJob **jobs, size_t cap) {
     size_t n = 0;
     size_t chars = 0;
@@ -394,6 +461,7 @@ static size_t async_pop_batch(AsyncJob **jobs, size_t cap) {
     return n;
 }
 
+/* 一批 job 处理完毕：从去重桶摘除并释放内存。 */
 static void async_finish_jobs(AsyncJob **jobs, size_t count) {
     AcquireSRWLockExclusive(&g_async_lock);
     for (size_t i = 0; i < count; i++) async_forget_locked(jobs[i]);
@@ -404,6 +472,10 @@ static void async_finish_jobs(AsyncJob **jobs, size_t count) {
     }
 }
 
+/* 翻译一批异步 job：先过滤掉已缓存/不可译的，剩下的调 API。
+   优先用批量接口 api_translate_batch；失败则降级为逐条 api_translate。
+   仅把"有效翻译结果"（is_resolved_translation）回写缓存。
+   每次调 API 前都等待前台清空 + 检查停止标志，保证实时优先与可关停。 */
 static void async_translate_pending(AsyncJob **jobs, size_t count) {
     AsyncJob *pending[ASYNC_BATCH_MAX];
     char *texts[ASYNC_BATCH_MAX];
@@ -449,6 +521,7 @@ static void async_translate_pending(AsyncJob **jobs, size_t count) {
     }
 }
 
+/* 异步 worker 主循环：取批 -> 翻译 -> 收尾，直到服务器关闭且队列空。 */
 static DWORD WINAPI async_worker(LPVOID arg) {
     (void)arg;
     for (;;) {
@@ -464,6 +537,7 @@ static DWORD WINAPI async_worker(LPVOID arg) {
     return 0;
 }
 
+/* 持锁：把实时 job 追加到 FIFO 尾部并唤醒 worker。 */
 static void live_enqueue_locked(LiveJob *job) {
     job->next = NULL;
     if (g_live_tail) g_live_tail->next = job;
@@ -473,6 +547,7 @@ static void live_enqueue_locked(LiveJob *job) {
     WakeConditionVariable(&g_live_cv);
 }
 
+/* 持锁：从实时 FIFO 队首弹出并摘除一个 job。 */
 static LiveJob *live_pop_locked(void) {
     LiveJob *job = g_live_head;
     if (!job) return NULL;
@@ -483,6 +558,7 @@ static LiveJob *live_pop_locked(void) {
     return job;
 }
 
+/* 实时 worker 取一批 job，合批逻辑与 async_pop_batch 对称（参数独立可单独调优）。 */
 static size_t live_pop_batch(LiveJob **jobs, size_t cap) {
     size_t n = 0;
     size_t chars = 0;
@@ -514,6 +590,8 @@ static size_t live_pop_batch(LiveJob **jobs, size_t cap) {
     return n;
 }
 
+/* 一批实时 job 翻译完成：写回结果、置 done、唤醒各自的等待条件变量。
+   results[i] 为 NULL 时回退为原文（保证请求方总能拿到非空结果）。 */
 static void live_finish_batch(LiveJob **jobs, char **results, size_t count) {
     AcquireSRWLockExclusive(&g_live_lock);
     for (size_t i = 0; i < count; i++) {
@@ -524,6 +602,10 @@ static void live_finish_batch(LiveJob **jobs, char **results, size_t count) {
     ReleaseSRWLockExclusive(&g_live_lock);
 }
 
+/* 翻译一批实时 job。先填缓存命中/不可译的结果，剩余调 API：
+   优先批量，失败则单条；仍失败的丢入异步队列后台补译，避免英文永久漏过实时路径。
+   注意：实时路径不等待前台（它本身就是前台），且失败时 results[i] 保持为 NULL，
+   由 live_finish_batch 回退为原文。 */
 static void live_translate_jobs(LiveJob **jobs, size_t count, char **results) {
     LiveJob *pending[LIVE_BATCH_MAX];
     char *texts[LIVE_BATCH_MAX];
@@ -583,6 +665,7 @@ static void live_translate_jobs(LiveJob **jobs, size_t count, char **results) {
     }
 }
 
+/* 实时 worker 主循环：取批 -> 翻译 -> 唤醒等待方，直到关闭且队列空。 */
 static DWORD WINAPI live_worker(LPVOID arg) {
     (void)arg;
     for (;;) {
@@ -599,6 +682,10 @@ static DWORD WINAPI live_worker(LPVOID arg) {
     return 0;
 }
 
+/* 同步翻译单条文本（实时路径）。构造 job 入队后阻塞在条件变量上等结果，
+   期间持有 live 锁（SleepConditionVariableSRW 会临时释放锁）。
+   foreground_enter/leave 包住整个过程，使后台 worker 主动让路。
+   返回新分配的结果（调用方负责 free），不可译/worker 不可用时返回 NULL。 */
 static char *live_translate_batched(const char *text) {
     if (!g_ctx || !g_ctx->api || !g_ctx->api->enabled || !should_translate_text(text)) return NULL;
     if (!ensure_live_worker()) return NULL;
@@ -621,6 +708,10 @@ static char *live_translate_batched(const char *text) {
     return job.result;
 }
 
+/* 单条文本的核心翻译决策（被 /translate、op_batch 共用）。
+   source 写入本次结果的来源标记（cache/pass/queued/miss/api_batch）。
+   优先级：缓存命中 -> 不可译透传 -> cache_only 模式(可入队异步) -> 实时翻译。
+   返回新分配字符串，调用方负责 free。 */
 static char *translate_value(const char *text, int cache_only, int queue_miss, const char **source) {
     char *v = cache_get(g_ctx->cache, text);
     if (v) {
@@ -649,6 +740,9 @@ static char *translate_value(const char *text, int cache_only, int queue_miss, c
     return xstrdup(text);
 }
 
+/* /health：返回服务运行状态——缓存条目数、异步/实时队列长度、API 是否启用、运行时长。
+   供 launcher 与钩子做就绪探测与健康检查。runtime_cache_only 固定为 false，
+   表示服务器具备调远程 API 的能力（非纯缓存模式）。 */
 static void op_health(Buf *b) {
     buf_add(b, "{\"status\":\"ok\",\"server\":\"dst_server_c\",\"cache_size\":");
     buf_int(b, (long long)cache_size(g_ctx->cache));
@@ -663,6 +757,8 @@ static void op_health(Buf *b) {
     buf_add(b, "}");
 }
 
+/* /cache/lookup：批量查缓存，只返回命中项。mark 记录写键前的位置，
+   若值未命中则回滚 len 到 mark，丢弃这次半成品写入。 */
 static void op_lookup(Buf *b, List *l) {
     int first = 1, hits = 0;
     buf_add(b, "{\"hits\":{");
@@ -686,6 +782,7 @@ static void op_lookup(Buf *b, List *l) {
     buf_add(b, "}");
 }
 
+/* /cache/dump：把整个缓存导出为 {cache:{k:v,...},count:n}。 */
 static void op_cache_dump(Buf *b) {
     buf_add(b, "{\"cache\":{");
     size_t n = cache_emit_json_map(g_ctx->cache, b);
@@ -694,6 +791,7 @@ static void op_cache_dump(Buf *b) {
     buf_add(b, "}");
 }
 
+/* /cache/export：导出为 {entries:[{key,value},...],count:n}，便于外部备份/迁移。 */
 static void op_cache_export(Buf *b) {
     buf_add(b, "{\"entries\":[");
     size_t n = cache_emit_json_entries(g_ctx->cache, b);
@@ -702,6 +800,15 @@ static void op_cache_export(Buf *b) {
     buf_add(b, "}");
 }
 
+/* /translate(POST 单条)与 /batch(POST 批量)的核心实现。
+   single=1 且仅一条时走轻量路径，复用 translate_value 并输出兼容旧契约的
+   translation/translated_text 双字段。否则走批量路径：
+     1) 先去重（同文本复用前面结果）、查缓存、判定可译性，把需要实时翻译的
+        下标收集进 miss[]；
+     2) foreground 包住 API 调用段（标记前台，让后台让路），按 ASYNC_BATCH_MAX
+        分批调 api_translate_batch，失败则逐条 api_translate 兜底；
+     3) 仍未得到的回退为原文（source=miss）；
+     4) 拼装 translations 映射 + results 数组 + sources 数组三个视图。 */
 static void op_batch(Buf *b, List *l, int single, int cache_only) {
     if (single && l->n == 1) {
         const char *source = "miss";
@@ -854,6 +961,9 @@ static const char *json_object_end(const char *p) {
     return NULL;
 }
 
+/* /cache/import：从 {entries:[{key,value},...]} 导入条目到缓存（仅写内存，
+   不落盘——导入的数据由后续新增翻译触发持久化，或保留在内存供本次运行使用）。
+   用 json_object_end 逐个对象切片再解析，避免 value 含 '}' 时误切。 */
 static void op_import(Buf *b, const char *json) {
     const char *p = json_key(json, "entries");
     int n = 0;
@@ -882,6 +992,8 @@ static void op_import(Buf *b, const char *json) {
     buf_add(b, "}");
 }
 
+/* /prefetch、/warmup：把文本批量排入异步队列后台翻译，立即返回已排队数。
+   不等待翻译完成——这正是预热的设计：游戏启动时先排进队列，worker 慢慢消化。 */
 static void op_prefetch(Buf *b, List *l) {
     int queued = 0;
     for (size_t i = 0; i < l->n; i++) {
@@ -892,6 +1004,10 @@ static void op_prefetch(Buf *b, List *l) {
     buf_add(b, "}");
 }
 
+/* 处理单个连接的完整生命周期：收请求 -> 解析方法/路径/查询/body -> 路由分发 -> 响应 -> 关闭。
+   这是 public API 契约的集中地，路由与响应字段改动需格外谨慎（AGENTS.md）。
+   接收策略：先设收发超时与 TCP_NODELAY；按需扩容缓冲，读到头部完整后按
+   Content-Length 判断 body 是否收齐，避免过度读取或阻塞。 */
 static void serve_one(SOCKET s) {
     DWORD timeout = HTTP_RECV_TIMEOUT_MS;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout);
@@ -931,6 +1047,7 @@ static void serve_one(SOCKET s) {
         }
     }
 
+    /* 解析请求行（方法 + 路径），拆出查询串，路径统一转小写以简化匹配。 */
     char method[16] = {0}, path[8192] = {0};
     sscanf(req, "%15s %8191s", method, path);
     char *query = NULL;
@@ -947,6 +1064,20 @@ static void serve_one(SOCKET s) {
     Buf out;
     buf_init(&out);
 
+    /* === 路由分发 ===
+       支持的端点（public API，保持稳定）：
+         OPTIONS *               CORS 预检
+         GET  /health            健康检查
+         GET  /capabilities      能力声明（XUnity 等钩子据此选择协议）
+         GET  /translate?text=   纯文本同步翻译（XUnity GET 协议）
+         POST /shutdown          关停服务器
+         POST /cache/import      导入缓存条目
+         GET  /cache/dump        导出缓存为 map
+         POST /cache/export      导出缓存为 entries 数组
+         POST /cache/lookup      批量查缓存（仅命中）
+         POST /translate,/batch,/   JSON 同步翻译（单条/批量）
+         POST /prefetch,/warmup     异步预热排队
+    */
     if (ieq(method, "OPTIONS")) {
         resp(s, 204, "No Content", "");
     } else if (ieq(method, "GET") && ieq(path, "/health")) {
@@ -965,6 +1096,8 @@ static void serve_one(SOCKET s) {
             const char *source = "miss";
             char *v = translate_value(text, cache_only, cache_only, &source);
             if (!cache_only && !strcmp(source, "miss") && should_translate_text(text)) {
+                /* 非缓存模式却仍然 miss：说明 API 不可用/翻译失败。返回 503
+                   而非原文，让 XUnity 这类客户端能区分"真未翻译"与"译为原文"。 */
                 resp_plain(s, 503, "Service Unavailable", "translation_unavailable");
             } else {
                 resp_plain(s, 200, "OK", v);
@@ -974,6 +1107,8 @@ static void serve_one(SOCKET s) {
         free(text);
         free(cache_only_s);
     } else if (ieq(method, "POST") && ieq(path, "/shutdown")) {
+        /* 置停止标志，并把监听套接字换成 INVALID_SOCKET 并关闭，
+           使主 accept 循环立即退出。 */
         InterlockedExchange(g_ctx->stop, 1);
         resp(s, 200, "OK", "{\"status\":\"shutting_down\"}");
         SOCKET prev = (SOCKET)(uintptr_t)InterlockedExchangePointer(
@@ -994,6 +1129,8 @@ static void serve_one(SOCKET s) {
         list_free(&l);
         resp(s, 200, "OK", out.data);
     } else if (ieq(method, "POST") && (ieq(path, "/translate") || ieq(path, "/batch") || ieq(path, "/"))) {
+        /* JSON 批量/单条翻译。兼容 texts 数组与单 text 字段两种入参；
+           "/" 别名用于某些钩子的默认端点。cache_only 从 body 读取。 */
         List l = json_array(body, "texts");
         char *one = NULL;
         if (!l.n) {
@@ -1009,6 +1146,7 @@ static void serve_one(SOCKET s) {
         free(one);
         list_free(&l);
     } else if (ieq(method, "POST") && (ieq(path, "/prefetch") || ieq(path, "/warmup"))) {
+        /* 异步预热：入参同上，但不等待翻译，立即返回排队数。 */
         List l = json_array(body, "texts");
         char *one = NULL;
         if (!l.n) {
@@ -1028,6 +1166,7 @@ static void serve_one(SOCKET s) {
     closesocket(s);
 }
 
+/* 连接处理线程入口：每个 accept 到的连接派发一个线程跑 serve_one。 */
 DWORD WINAPI http_serve_thread(LPVOID arg) {
     serve_one((SOCKET)(uintptr_t)arg);
     return 0;

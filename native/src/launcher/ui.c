@@ -1,3 +1,23 @@
+/* ================================================================
+ * ui.c — 启动器 UI 辅助函数与绘制实现
+ * ----------------------------------------------------------------
+ * 本文件实现启动器的所有 UI 逻辑：
+ *
+ *   1. 日志/状态管理：append_log 带时间戳追加并自动裁剪，
+ *      支持水平滚动宽度计算
+ *   2. 暗色主题绘制：paint_background 绘制左侧导航栏（品牌标识、
+ *      导航项、功能要点、版本标签）和主区域卡片（选择器卡片、
+ *      指标卡片、日志卡片、状态药丸）
+ *   3. 布局计算：compute_layout 根据 DPI 缩放和窗口尺寸计算
+ *      所有控件的精确坐标，layout 应用这些坐标
+ *   4. 按钮自绘：draw_button 区分主按钮（强调色填充）、
+ *      服务器按钮（运行态绿色）、普通按钮（卡片色）
+ *   5. 用户操作：浏览文件夹、启动游戏、一键翻译流程
+ *
+ * 一键翻译流程（start_translation）：
+ *   检测引擎 → 启动服务器 → 部署 hook → 后台线程预热缓存+启动游戏
+ * ================================================================ */
+
 #include "ui.h"
 #include "deploy.h"
 #include "engine.h"
@@ -15,12 +35,20 @@
 #include <string.h>
 #include <wchar.h>
 
-#define LOG_SOFT_LIMIT 900000
-#define LOG_TRIM_TARGET 600000
-#define LOG_MAX_LINES 2000
+/* ---- 日志限制 ---- */
+#define LOG_SOFT_LIMIT 900000   /* 日志缓冲区软上限（字节） */
+#define LOG_TRIM_TARGET 600000  /* 裁剪后目标大小（字节） */
+#define LOG_MAX_LINES 2000      /* 最大保留行数 */
 
+/* 日志水平滚动的最大像素宽度（随最长行动态增长） */
 static int g_log_extent_px = 0;
 
+/* ----------------------------------------------------------------
+ * invalidate_control_area — 使控件区域无效化以触发重绘
+ *
+ * 将控件的屏幕坐标转换为父窗口坐标，外扩 pad 像素后调用
+ * RedrawWindow，确保暗色背景正确重绘（避免残留）。
+ * ---------------------------------------------------------------- */
 void invalidate_control_area(HWND ctl, int pad) {
     if (!ctl || !IsWindow(ctl) || !g_main || !IsWindow(g_main)) return;
     RECT rc;
@@ -30,6 +58,14 @@ void invalidate_control_area(HWND ctl, int pad) {
     RedrawWindow(g_main, &rc, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
+/* ----------------------------------------------------------------
+ * append_log — 向活动日志追加一行
+ *
+ * 格式：[HH:MM:SS] <消息>
+ * 自动将回车/换行/制表符替换为空格（日志为单行列表项）。
+ * 超过 LOG_MAX_LINES 时从顶部删除旧行。
+ * 计算新行的像素宽度，动态扩展水平滚动范围。
+ * ---------------------------------------------------------------- */
 void append_log(const WCHAR *fmt, ...) {
     if (!g_log || !IsWindow(g_log)) return;
     SYSTEMTIME st;
@@ -79,6 +115,7 @@ void append_log(const WCHAR *fmt, ...) {
     }
 }
 
+/* 更新顶部状态栏（带 "STATUS · " 前缀） */
 void set_status(const WCHAR *text) {
     if (g_status && IsWindow(g_status)) {
         WCHAR buf[512];
@@ -90,6 +127,7 @@ void set_status(const WCHAR *text) {
     }
 }
 
+/* 刷新缓存卡片：读取 translation_memory_c.tsv 文件大小并显示 */
 void update_cache_card(void) {
     if (!g_cache || !IsWindow(g_cache)) return;
     invalidate_control_area(g_cache, 4);
@@ -110,6 +148,7 @@ void update_cache_card(void) {
     invalidate_control_area(g_cache, 4);
 }
 
+/* 刷新引擎卡片：从路径框读取目录，重新检测引擎类型并更新显示 */
 void refresh_engine(void) {
     if (!g_engine || !IsWindow(g_engine)) return;
     GetWindowTextW(g_path, g_game, MAX_PATH * 4);
@@ -119,6 +158,15 @@ void refresh_engine(void) {
     invalidate_control_area(g_engine, 4);
 }
 
+/* ----------------------------------------------------------------
+ * apply_fonts — 为所有控件应用全局字体
+ *
+ * 所有控件先用正文字体，然后按角色覆盖：
+ *   - 标题用大字体，副标题用小字体
+ *   - 标签/引擎/服务器/缓存用标题字体
+ *   - 状态栏用小等宽字体
+ *   - 日志用等宽字体，并根据字体高度设置列表项行高
+ * ---------------------------------------------------------------- */
 void apply_fonts(void) {
     HWND controls[] = {g_title, g_subtitle, g_path_label, g_path, g_engine, g_server, g_cache, g_status, g_log, g_btn_server, g_btn_api};
     size_t n = sizeof(controls) / sizeof(controls[0]);
@@ -147,6 +195,9 @@ void apply_fonts(void) {
     }
 }
 
+/* ======================== 绘制原语 ======================== */
+
+/* 绘制圆角矩形（指定填充色和边框色） */
 static void draw_round(HDC dc, RECT rc, COLORREF fill, COLORREF line, int radius) {
     HBRUSH b = CreateSolidBrush(fill);
     HPEN p = CreatePen(PS_SOLID, 1, line);
@@ -159,6 +210,7 @@ static void draw_round(HDC dc, RECT rc, COLORREF fill, COLORREF line, int radius
     DeleteObject(p);
 }
 
+/* 绘制带光晕的圆点（用于状态指示灯、列表标记） */
 static void draw_dot(HDC dc, int cx, int cy, int radius, COLORREF fill, COLORREF halo) {
     HBRUSH bh = CreateSolidBrush(halo);
     HGDIOBJ ob = SelectObject(dc, bh);
@@ -173,6 +225,7 @@ static void draw_dot(HDC dc, int cx, int cy, int radius, COLORREF fill, COLORREF
     DeleteObject(bf);
 }
 
+/* 在指定矩形内绘制文本（设置字体和颜色） */
 static void draw_text_x(HDC dc, const WCHAR *text, int x, int y, int w, int h, COLORREF color, HFONT font, UINT flags) {
     SelectObject(dc, font);
     SetTextColor(dc, color);
@@ -180,6 +233,7 @@ static void draw_text_x(HDC dc, const WCHAR *text, int x, int y, int w, int h, C
     DrawTextW(dc, text, -1, &r, flags);
 }
 
+/* 线性插值混合两个颜色（t=0 返回 a，t=1 返回 b） */
 static COLORREF mix(COLORREF a, COLORREF b, float t) {
     int ar = GetRValue(a), ag = GetGValue(a), ab = GetBValue(a);
     int br = GetRValue(b), bg = GetGValue(b), bb = GetBValue(b);
@@ -189,6 +243,7 @@ static COLORREF mix(COLORREF a, COLORREF b, float t) {
     return RGB(r, g, bl);
 }
 
+/* 绘制垂直渐变填充（top→bottom） */
 static void draw_vgradient(HDC dc, int x, int y, int w, int h, COLORREF top, COLORREF bot) {
     TRIVERTEX v[2] = {
         { x,     y,     (USHORT)(GetRValue(top) << 8), (USHORT)(GetGValue(top) << 8), (USHORT)(GetBValue(top) << 8), 0 },
@@ -198,6 +253,9 @@ static void draw_vgradient(HDC dc, int x, int y, int w, int h, COLORREF top, COL
     GradientFill(dc, v, 2, &gr, 1, GRADIENT_FILL_RECT_V);
 }
 
+/* ======================== 布局计算 ======================== */
+
+/* 所有 UI 元素的坐标集合，由 compute_layout 一次性计算 */
 typedef struct UiLayout {
     int rail;
     int pad;
@@ -231,10 +289,19 @@ typedef struct UiLayout {
     int log_edit_h;
 } UiLayout;
 
+/* 整数最大值辅助 */
 static int max_i(int a, int b) {
     return a > b ? a : b;
 }
 
+/* ----------------------------------------------------------------
+ * compute_layout — 根据窗口尺寸和 DPI 计算所有 UI 元素坐标
+ *
+ * 所有尺寸通过 sc() 做 DPI 缩放。布局分区：
+ *   - 左侧导航栏（rail 宽度固定）
+ *   - 主区域：英雄标题带 + 选择器卡片 + 指标卡片 + 日志卡片
+ * 主区域最小宽度 560（缩放后），保证小窗口下仍可用。
+ * ---------------------------------------------------------------- */
 static UiLayout compute_layout(HWND hwnd) {
     RECT r;
     GetClientRect(hwnd, &r);
@@ -285,6 +352,16 @@ static UiLayout compute_layout(HWND hwnd) {
     return ui;
 }
 
+/* ----------------------------------------------------------------
+ * paint_background — 绘制主窗口背景（WM_ERASEBKGND / WM_PAINT 调用）
+ *
+ * 绘制内容：
+ *   - 页面底色 + 左侧导航栏渐变 + 分割线
+ *   - 导航栏：品牌标识（菱形+DeepSeek Translator）、导航项（运行时汉化）、
+ *     功能要点（本地缓存优先/运行时不等待API/标签变量保护）、版本标签
+ *   - 主区域：状态药丸（ONLINE/OFFLINE）、选择器卡片、指标卡片（×3）、
+ *     日志卡片（含 ACTIVITY LOG 标题和 LIVE 指示灯）、路径输入框边框
+ * ---------------------------------------------------------------- */
 void paint_background(HWND hwnd, HDC dc) {
     RECT r;
     GetClientRect(hwnd, &r);
@@ -428,6 +505,13 @@ void paint_background(HWND hwnd, HDC dc) {
     draw_round(dc, peBorder, C_LOG, C_LINE_BRIGHT, sc(8));
 }
 
+/* ----------------------------------------------------------------
+ * layout — 根据计算好的布局移动所有子控件到正确位置
+ *
+ * 在 WM_SIZE 时调用，包括：英雄标题带、选择器卡片内容（路径标签/
+ * 输入框/浏览/打开按钮）、操作按钮行（开始/服务器/API）、指标卡片值、
+ * 日志列表。
+ * ---------------------------------------------------------------- */
 void layout(HWND hwnd) {
     UiLayout ui = compute_layout(hwnd);
     int x = ui.x;
@@ -465,6 +549,8 @@ void layout(HWND hwnd) {
     MoveWindow(g_log, x + sc(18), ui.log_edit_top, w - sc(36), ui.log_edit_h, TRUE);
 }
 
+/* 自绘按钮：处理 WM_DRAWITEM 消息，绘制圆角矩形按钮
+ * 根据按钮类型（主按钮/服务器切换/普通）和状态（按下/正常运行）选择配色 */
 void draw_button(const DRAWITEMSTRUCT *di) {
     WCHAR text[128];
     GetWindowTextW(di->hwndItem, text, 128);
@@ -516,6 +602,7 @@ void draw_button(const DRAWITEMSTRUCT *di) {
     DrawTextW(di->hDC, text, -1, &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
+/* 弹出文件夹浏览对话框，用户选择游戏根目录后更新路径栏并重新检测引擎 */
 void browse_folder(void) {
     BROWSEINFOW bi;
     ZeroMemory(&bi, sizeof bi);
@@ -534,6 +621,7 @@ void browse_folder(void) {
     }
 }
 
+/* 启动游戏进程：在指定目录中查找可执行文件并用 ShellExecuteW 打开 */
 void launch_game(const WCHAR *dir) {
     WCHAR exe[MAX_PATH * 4];
     if (!find_exe(dir, exe, MAX_PATH * 4)) {
@@ -544,6 +632,7 @@ void launch_game(const WCHAR *dir) {
     ShellExecuteW(g_main, L"open", exe, NULL, dir, SW_SHOWNORMAL);
 }
 
+/* 预热+启动工作线程参数：传递游戏目录和引擎类型到后台线程 */
 typedef struct {
     WCHAR dir[MAX_PATH * 4];
     Engine engine;
@@ -574,6 +663,8 @@ static DWORD WINAPI warmup_launch_thread(LPVOID p) {
     return 0;
 }
 
+/* 开始翻译主流程入口：验证路径 → 检测引擎 → 启动服务 → 部署钩子 → 创建后台线程执行预热和启动游戏
+ * 将耗时操作（预热 I/O + 同步 HTTP）放到工作线程，避免 UI 冻结 */
 void start_translation(void) {
     GetWindowTextW(g_path, g_game, MAX_PATH * 4);
     if (!is_dir(g_game)) {

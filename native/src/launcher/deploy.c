@@ -1,3 +1,15 @@
+/* ================================================================
+ * deploy.c — 翻译 hook 与插件 payload 部署实现
+ * ----------------------------------------------------------------
+ * 本文件负责将翻译器 hook 注入到不同引擎的游戏目录中。
+ * 包含：
+ *   - Ren'Py Python hook（嵌入字符串，运行时写入 .rpy 文件）
+ *   - RPG Maker MV/MZ JavaScript hook（嵌入字符串，运行时写入 .js 文件）
+ *   - Unity Mono BepInEx 插件部署（DLL 复制 + BepInEx 运行时安装）
+ *   - Unity IL2CPP BepInEx be.755 + XUnity AutoTranslator 全套部署
+ *   - CJK 字体部署（从系统 Fonts 复制到游戏目录供 hook 使用）
+ * ================================================================ */
+
 #include "deploy.h"
 #include "fsutil.h"
 #include "ui.h"
@@ -6,6 +18,22 @@
 #include <string.h>
 #include <wchar.h>
 
+/* ----------------------------------------------------------------
+ * RENPY_HOOK — Ren'Py 翻译 Python 脚本（嵌入源码）
+ *
+ * 功能概述：
+ *   1. Hook renpy.exports.say，将对话文本发送到本地 C 服务器翻译
+ *   2. 使用 cache_only 模式避免阻塞游戏：命中缓存立即返回，否则返回原文
+ *   3. 后台轮询线程（_ds_poll_loop）定期重试未命中的翻译
+ *   4. 部署 CJK 字体（ds_font.ttf/otf/ttc）替换所有 style 的 font 属性
+ *   5. replace_text hook 翻译 UI 界面文本（菜单、按钮等）
+ *
+ * 关键设计：
+ *   - _ds_memo: 内存缓存，避免重复调用本地服务器
+ *   - _ds_pending: 待翻译队列，后台线程批量提交
+ *   - _ds_state['down_until']: 熔断机制，服务器不可用时暂停 30 秒
+ *   - font_replacement_map: 将原字体映射到 CJK 字体
+ * ---------------------------------------------------------------- */
 static const char RENPY_HOOK[] =
 "init 999 python:\n"
 "    import json, os, time, threading\n"
@@ -200,6 +228,16 @@ static const char RENPY_HOOK[] =
 "        except Exception:\n"
 "            pass\n";
 
+/* ----------------------------------------------------------------
+ * RPGM_HOOK — RPG Maker MV/MZ 翻译 JavaScript 脚本（嵌入源码）
+ *
+ * 功能概述：
+ *   1. Hook Window_Base.drawTextEx 和 drawText，将显示文本发送到本地服务器翻译
+ *   2. 使用 cache_only 模式，仅缓存命中时替换（不阻塞游戏）
+ *   3. 注入 CJK @font-face（ds_font.ttf/ttc），确保中文能正确渲染
+ *   4. 覆盖 Window_Base.standardFontFace 和 Game_System.mainFontFace，
+ *      将 CJK 字体设为首选
+ * ---------------------------------------------------------------- */
 static const char RPGM_HOOK[] =
 "(function(){\n"
 "  'use strict';\n"
@@ -226,9 +264,14 @@ static const char RPGM_HOOK[] =
 "  if(window.Window_Base&&Window_Base.prototype.drawText){var old2=Window_Base.prototype.drawText; Window_Base.prototype.drawText=function(text,x,y,w,a){return old2.call(this,tr(text),x,y,w,a);};}\n"
 "})();\n";
 
-/* Ren'Py dialogue fonts rarely cover CJK; without a packaged font the
-   translated text renders as boxes. Ship a system CJK font next to the hook
-   so the hook's style override can pick it up. */
+/* ----------------------------------------------------------------
+ * deploy_renpy_font — 为 Ren'Py 游戏部署 CJK 字体
+ *
+ * Ren'Py 默认字体不含 CJK 字形，翻译后的中文会显示为方块。
+ * 从 Windows 系统 Fonts 目录复制一个 CJK 字体（优先 simhei.ttf 黑体，
+ * 回退 msyh.ttc 微软雅黑）到游戏的 game/ 目录，hook 脚本的
+ * style 覆盖会引用此字体。
+ * ---------------------------------------------------------------- */
 static void deploy_renpy_font(const WCHAR *game) {
     WCHAR ttc_dst[MAX_PATH * 4], ttf_dst[MAX_PATH * 4];
     path_join(ttc_dst, MAX_PATH * 4, game, L"ds_font.ttc");
@@ -238,9 +281,8 @@ static void deploy_renpy_font(const WCHAR *game) {
     WCHAR windir[MAX_PATH];
     if (!GetWindowsDirectoryW(windir, MAX_PATH)) return;
 
-    /* Prefer a plain .ttf: the "0@file.ttc" collection-index font spec is not
-       supported by every Ren'Py version this launcher may meet, while a plain
-       TTF file name works everywhere. */
+    /* 优先 TTF 格式："0@file.ttc" 集合索引语法并非所有 Ren'Py 版本都支持，
+       而普通 TTF 文件名在任何版本都可以工作。 */
     WCHAR src[MAX_PATH * 4];
     _snwprintf(src, MAX_PATH * 4, L"%s\\Fonts\\simhei.ttf", windir);
     src[MAX_PATH * 4 - 1] = 0;
@@ -257,9 +299,12 @@ static void deploy_renpy_font(const WCHAR *game) {
     append_log(L"Ren'Py：未找到系统中文字体（simhei.ttf/msyh.ttc），翻译文本可能显示为方块。");
 }
 
-/* RPG Maker MV/MZ render translated text on a canvas. The hook installs an
-   @font-face and engine font override, so deploy a CJK-capable system font
-   into www/fonts without changing translation memory or server output. */
+/* ----------------------------------------------------------------
+ * deploy_rpgm_font — 为 RPG Maker MV/MZ 部署 CJK 字体
+ *
+ * RPG Maker 在 canvas 上渲染文本，需要 @font-face 声明。
+ * 将系统 CJK 字体复制到 www/fonts/ 目录供 hook 脚本引用。
+ * ---------------------------------------------------------------- */
 static void deploy_rpgm_font(const WCHAR *dir) {
     WCHAR font_dir[MAX_PATH * 4], ttf_dst[MAX_PATH * 4], ttc_dst[MAX_PATH * 4];
     path_join(font_dir, MAX_PATH * 4, dir, L"www\\fonts");
@@ -289,6 +334,13 @@ static void deploy_rpgm_font(const WCHAR *dir) {
     append_log(L"RPGM MV/MZ: no system CJK font found (simhei.ttf/msyh.ttc); translated text may render as boxes.");
 }
 
+/* ----------------------------------------------------------------
+ * deploy_renpy — 部署 Ren'Py 翻译 hook
+ *
+ * 将 RENPY_HOOK Python 脚本写入 game/iron_deepseek.rpy，
+ * 并调用 deploy_renpy_font 部署 CJK 字体。
+ * init 999 保证 hook 在所有其他游戏脚本之后加载。
+ * ---------------------------------------------------------------- */
 int deploy_renpy(const WCHAR *dir) {
     WCHAR game[MAX_PATH * 4], hook[MAX_PATH * 4];
     path_join(game, MAX_PATH * 4, dir, L"game");
@@ -300,6 +352,13 @@ int deploy_renpy(const WCHAR *dir) {
     return 1;
 }
 
+/* ----------------------------------------------------------------
+ * deploy_rpgm — 部署 RPG Maker MV/MZ 翻译 hook
+ *
+ * 1. 将 RPGM_HOOK JS 脚本写入 www/js/hook_rpgm_mv.js
+ * 2. 调用 deploy_rpgm_font 部署 CJK 字体到 www/fonts/
+ * 3. 修改 www/index.html，在 </body> 前插入 <script> 标签引用 hook
+ * ---------------------------------------------------------------- */
 int deploy_rpgm(const WCHAR *dir) {
     WCHAR jsdir[MAX_PATH * 4], hook[MAX_PATH * 4], index[MAX_PATH * 4];
     path_join(jsdir, MAX_PATH * 4, dir, L"www\\js");
@@ -308,6 +367,7 @@ int deploy_rpgm(const WCHAR *dir) {
     if (!write_text_file_utf8(hook, RPGM_HOOK)) return 0;
     deploy_rpgm_font(dir);
 
+    /* 在 index.html 中注入 hook 脚本引用（仅当尚未注入时） */
     path_join(index, MAX_PATH * 4, dir, L"www\\index.html");
     char *html = NULL;
     DWORD sz = 0;
@@ -339,6 +399,9 @@ int deploy_rpgm(const WCHAR *dir) {
     return 1;
 }
 
+/* ======================== Unity Mono 部署辅助 ======================== */
+
+/* 在 payloads/UnityTranslator 中查找指定文件 */
 static int find_unity_payload_file(WCHAR *out, size_t cap, const WCHAR *leaf) {
     WCHAR base[MAX_PATH * 4];
     path_join(base, MAX_PATH * 4, g_root, L"payloads\\UnityTranslator");
@@ -348,6 +411,7 @@ static int find_unity_payload_file(WCHAR *out, size_t cap, const WCHAR *leaf) {
 
 static int files_equal(const WCHAR *a, const WCHAR *b);
 
+/* 查找 UnityTranslator.dll 模板（BepInEx 5 版） */
 int find_unity_template(WCHAR *out, size_t cap) {
     WCHAR p[MAX_PATH * 4];
     if (!find_unity_payload_file(p, MAX_PATH * 4, L"UnityTranslator.dll")) return 0;
@@ -357,6 +421,7 @@ int find_unity_template(WCHAR *out, size_t cap) {
     return 1;
 }
 
+/* 查找 UnityTranslator.BepInEx6.dll 模板（Unity 6+ BepInEx 6 版） */
 static int find_unity_bepinex6_template(WCHAR *out, size_t cap) {
     WCHAR p[MAX_PATH * 4];
     if (!find_unity_payload_file(p, MAX_PATH * 4, L"UnityTranslator.BepInEx6.dll")) return 0;
@@ -366,6 +431,7 @@ static int find_unity_bepinex6_template(WCHAR *out, size_t cap) {
     return 1;
 }
 
+/* 检查文件是否为本工具内置的 Unity Mono 插件（用于 IL2CPP 部署时禁用旧文件） */
 static int is_bundled_unity_mono_plugin(const WCHAR *path) {
     WCHAR src[MAX_PATH * 4];
     if (find_unity_template(src, MAX_PATH * 4) && files_equal(path, src)) return 1;
@@ -373,6 +439,7 @@ static int is_bundled_unity_mono_plugin(const WCHAR *path) {
     return 0;
 }
 
+/* 将文件重命名为 .disabled 后缀（不删除，保留备份） */
 static int disable_existing_file(const WCHAR *path) {
     if (!exists_path(path)) return 0;
     WCHAR disabled[MAX_PATH * 4];
@@ -382,6 +449,7 @@ static int disable_existing_file(const WCHAR *path) {
     return MoveFileExW(path, disabled, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
 }
 
+/* 二进制比较两个文件是否完全相同 */
 static int files_equal(const WCHAR *a, const WCHAR *b) {
     char *ab = NULL, *bb = NULL;
     DWORD asz = 0, bsz = 0;
@@ -394,6 +462,9 @@ static int files_equal(const WCHAR *a, const WCHAR *b) {
     return ok;
 }
 
+/* ======================== Unity IL2CPP 部署辅助 ======================== */
+
+/* 在 payloads/UnityIL2CPP 中查找指定子目录 */
 static int find_il2cpp_payload(WCHAR *out, size_t cap, const WCHAR *leaf) {
     WCHAR base[MAX_PATH * 4];
     path_join(base, MAX_PATH * 4, g_root, L"payloads\\UnityIL2CPP");
@@ -401,6 +472,7 @@ static int find_il2cpp_payload(WCHAR *out, size_t cap, const WCHAR *leaf) {
     return is_dir(out);
 }
 
+/* 从 payload 目录复制单个文件到游戏目录 */
 static int copy_payload_file(const WCHAR *payload_root, const WCHAR *rel, const WCHAR *game_dir) {
     WCHAR src[MAX_PATH * 4], dst[MAX_PATH * 4];
     path_join(src, MAX_PATH * 4, payload_root, rel);
@@ -409,6 +481,7 @@ static int copy_payload_file(const WCHAR *payload_root, const WCHAR *rel, const 
     return copy_file_safe(src, dst);
 }
 
+/* 从 payload 目录复制整个子目录树到游戏目录 */
 static int copy_payload_tree(const WCHAR *payload_root, const WCHAR *rel, const WCHAR *game_dir) {
     WCHAR src[MAX_PATH * 4], dst[MAX_PATH * 4];
     path_join(src, MAX_PATH * 4, payload_root, rel);
@@ -417,6 +490,13 @@ static int copy_payload_tree(const WCHAR *payload_root, const WCHAR *rel, const 
     return copy_tree_safe(src, dst);
 }
 
+/* ----------------------------------------------------------------
+ * pe_machine — 读取 PE 文件的机器类型
+ *
+ * 解析 PE 头获取 IMAGE_FILE_HEADER.Machine 字段。
+ * 用于判断 GameAssembly.dll 是 x64 (0x8664) 还是其他架构。
+ * pe 偏移量来自文件自身，做边界检查防止溢出。
+ * ---------------------------------------------------------------- */
 static int pe_machine(const WCHAR *path) {
     char *buf = NULL;
     DWORD size = 0;
@@ -424,7 +504,7 @@ static int pe_machine(const WCHAR *path) {
     if (!read_file_bytes(path, &buf, &size)) return 0;
     if (size >= 0x40 && buf[0] == 'M' && buf[1] == 'Z') {
         DWORD pe = *(DWORD *)(buf + 0x3c);
-        /* pe is file-controlled; check without overflow (pe + 6 could wrap). */
+        /* pe 偏移量是文件控制的；做边界检查防止 (pe + 6) 溢出 */
         if (pe < size && size - pe > 6 && !memcmp(buf + pe, "PE\0\0", 4)) {
             machine = *(unsigned short *)(buf + pe + 4);
         }
@@ -433,6 +513,13 @@ static int pe_machine(const WCHAR *path) {
     return machine;
 }
 
+/* ----------------------------------------------------------------
+ * write_xunity_config — 生成 XUnity.AutoTranslator 配置文件
+ *
+ * 写入 BepInEx/config/AutoTranslatorConfig.ini，
+ * 配置 XUnity 使用本地 DeepSeek 端点 (http://127.0.0.1:19999)，
+ * 语言方向 auto→zh-CN，并启用所有 UI 文本框架（UGUI/TMP/NGUI 等）。
+ * ---------------------------------------------------------------- */
 static void write_xunity_config(const WCHAR *dir) {
     WCHAR cfgdir[MAX_PATH * 4], cfg[MAX_PATH * 4];
     path_join(cfgdir, MAX_PATH * 4, dir, L"BepInEx\\config");
@@ -564,8 +651,14 @@ static void write_xunity_config(const WCHAR *dir) {
     write_text_file_utf8(cfg, XUNITY_CONFIG_FMT);
 }
 
-/* Read the Unity major version from <game>\*_Data\globalgamemanagers (the
-   version string, e.g. "6000.4.0f1" or "2022.3.62f3", sits in the header). */
+/* ----------------------------------------------------------------
+ * detect_unity_major — 从 globalgamemanagers 文件读取 Unity 大版本号
+ *
+ * <game>\*_Data\globalgamemanagers 文件头部包含版本字符串
+ * （如 "6000.4.0f1" 或 "2022.3.62f3"）。扫描前 4096 字节中
+ * 符合 Unity 版本模式的数字序列（5、2017-2023 或 6000+），
+ * 提取大版本号。用于决定部署 BepInEx 5 还是 BepInEx 6 运行时。
+ * ---------------------------------------------------------------- */
 static int detect_unity_major(const WCHAR *dir) {
     WCHAR pat[MAX_PATH * 4];
     path_join(pat, MAX_PATH * 4, dir, L"*_Data");
@@ -597,12 +690,26 @@ static int detect_unity_major(const WCHAR *dir) {
     return major;
 }
 
+/* 检查游戏是否已有 BepInEx 6 Unity.Mono 运行时 */
 static int unity_has_bepinex6_mono(const WCHAR *dir) {
     WCHAR p[MAX_PATH * 4];
     path_join(p, MAX_PATH * 4, dir, L"BepInEx\\core\\BepInEx.Unity.Mono.dll");
     return exists_path(p);
 }
 
+static void log_payload_install_command(const WCHAR *flag) {
+    append_log(L"Install runtime payloads with:");
+    append_log(L"  powershell -ExecutionPolicy Bypass -File scripts\\install_runtime_payloads.ps1 %s", flag);
+}
+
+/* ----------------------------------------------------------------
+ * install_bepinex_mono_runtime — 安装 BepInEx Mono 运行时到游戏目录
+ *
+ * 复制 winhttp.dll（doorstop 加载器）、doorstop_config.ini、
+ * .doorstop_version 以及 BepInEx/core 整个目录树。
+ * use_bepinex6 为真时使用 payloads/UnityMonoRuntime6（Unity 6+），
+ * 否则使用 payloads/UnityMonoRuntime（BepInEx 5）。
+ * ---------------------------------------------------------------- */
 static int install_bepinex_mono_runtime(const WCHAR *dir, int use_bepinex6) {
     WCHAR mono_rt[MAX_PATH * 4];
     path_join(mono_rt, MAX_PATH * 4, g_root, use_bepinex6 ? L"payloads\\UnityMonoRuntime6" : L"payloads\\UnityMonoRuntime");
@@ -610,6 +717,7 @@ static int install_bepinex_mono_runtime(const WCHAR *dir, int use_bepinex6) {
         append_log(use_bepinex6
             ? L"Unity: missing BepInEx 6 Mono runtime payload (payloads\\UnityMonoRuntime6)."
             : L"Unity: missing BepInEx 5 Mono runtime payload (payloads\\UnityMonoRuntime).");
+        log_payload_install_command(use_bepinex6 ? L"-UnityMono6" : L"-UnityMono5");
         return 0;
     }
 
@@ -622,6 +730,7 @@ static int install_bepinex_mono_runtime(const WCHAR *dir, int use_bepinex6) {
         append_log(use_bepinex6
             ? L"Unity: BepInEx 6 Mono runtime deployment is incomplete; check payloads\\UnityMonoRuntime6."
             : L"Unity: BepInEx 5 Mono runtime deployment is incomplete; check payloads\\UnityMonoRuntime.");
+        log_payload_install_command(use_bepinex6 ? L"-UnityMono6 -Force" : L"-UnityMono5 -Force");
         return 0;
     }
     append_log(use_bepinex6
@@ -630,9 +739,14 @@ static int install_bepinex_mono_runtime(const WCHAR *dir, int use_bepinex6) {
     return 1;
 }
 
-/* Auto-install a Mono BepInEx runtime when the game has none. Unity 6
-   (6000+) needs the BepInEx 6 Unity.Mono runtime; older Unity Mono keeps the
-   existing BepInEx 5 payload for compatibility. */
+/* ----------------------------------------------------------------
+ * ensure_bepinex_mono — 确保游戏有 BepInEx Mono 运行时
+ *
+ * 自动安装策略：
+ *   - Unity 6+ (major >= 6000) 需要 BepInEx 6 Unity.Mono 运行时
+ *   - 旧版 Unity 保持使用 BepInEx 5（兼容已有安装）
+ *   - 如果用户已自行安装 BepInEx，保留不覆盖（除非版本不匹配）
+ * ---------------------------------------------------------------- */
 static int ensure_bepinex_mono(const WCHAR *dir) {
     int major = detect_unity_major(dir);
     int use_bepinex6 = major >= 6000;
@@ -643,11 +757,20 @@ static int ensure_bepinex_mono(const WCHAR *dir) {
             append_log(L"Unity %d (Unity 6+): existing BepInEx is not Unity.Mono 6; updating runtime files.", major);
             return install_bepinex_mono_runtime(dir, 1);
         }
-        return 1; /* keep existing user-installed BepInEx for non-Unity6 paths */
+        return 1; /* 非Unity6路径保留用户已有的BepInEx */
     }
     return install_bepinex_mono_runtime(dir, use_bepinex6);
 }
 
+/* ----------------------------------------------------------------
+ * deploy_unity — 部署 Unity Mono 翻译插件
+ *
+ * 流程：
+ *   1. ensure_bepinex_mono — 安装/检查 BepInEx 运行时
+ *   2. 根据运行时版本选择 BepInEx 5 或 6 的插件 DLL
+ *   3. 复制 UnityTranslator.dll + Newtonsoft.Json.dll 到 BepInEx/plugins/
+ *   4. 复制 TMP 字体资源包（如有）到 BepInEx/font/
+ * ---------------------------------------------------------------- */
 int deploy_unity(const WCHAR *dir) {
     WCHAR plugins[MAX_PATH * 4], dll[MAX_PATH * 4], src[MAX_PATH * 4], json_src[MAX_PATH * 4], json_dst[MAX_PATH * 4], fontfix[MAX_PATH * 4];
     path_join(plugins, MAX_PATH * 4, dir, L"BepInEx\\plugins");
@@ -667,7 +790,8 @@ int deploy_unity(const WCHAR *dir) {
     path_join(dll, MAX_PATH * 4, plugins, L"UnityTranslator.dll");
     if (!copy_file_safe(src, dll)) return 0;
     if (!find_unity_payload_file(json_src, MAX_PATH * 4, L"Newtonsoft.Json.dll")) {
-        append_log(L"Unity：找不到 Newtonsoft.Json.dll 依赖，UnityTranslator 无法启动。");
+        append_log(L"Unity: missing Newtonsoft.Json.dll dependency; UnityTranslator cannot start.");
+        log_payload_install_command(L"-Newtonsoft");
         return 0;
     }
     path_join(json_dst, MAX_PATH * 4, plugins, L"Newtonsoft.Json.dll");
@@ -683,8 +807,26 @@ int deploy_unity(const WCHAR *dir) {
     return 1;
 }
 
+/* ----------------------------------------------------------------
+ * deploy_unity_il2cpp — 部署 Unity IL2CPP 翻译插件
+ *
+ * 完整部署流程：
+ *   1. PE 机器类型检查：仅支持 x64（0x8664）
+ *   2. 禁用旧的 Mono 版 UnityTranslator.dll（如有）
+ *   3. 从 payloads/UnityIL2CPP/BepInExRuntime 复制运行时：
+ *      - doorstop_config.ini, winhttp.dll, .doorstop_version
+ *      - dotnet/ 目录（自包含 .NET 运行时）
+ *      - BepInEx/core/ 和 BepInEx/patchers/
+ *   4. 从 payloads/UnityIL2CPP/XUnityAutoTranslator 复制：
+ *      - XUnity.Common.dll → BepInEx/core/
+ *      - XUnity.AutoTranslator/ → BepInEx/plugins/
+ *      - XUnity.ResourceRedirector/ → BepInEx/plugins/
+ *   5. 复制 TMP 字体资源包和字体回退插件
+ *   6. 禁用旧的 Il2Cppmscorlib.dll（避免遮挡新 interop）
+ *   7. 写入 XUnity 配置（AutoTranslatorConfig.ini）
+ * ---------------------------------------------------------------- */
 int deploy_unity_il2cpp(const WCHAR *dir) {
-    WCHAR dll[MAX_PATH * 4], pdb[MAX_PATH * 4], core[MAX_PATH * 4], il2cpp_mscorlib[MAX_PATH * 4], doorstop[MAX_PATH * 4], runtime[MAX_PATH * 4], xunity[MAX_PATH * 4], fontfix[MAX_PATH * 4], fontplugin[MAX_PATH * 4], gameasm[MAX_PATH * 4];
+    WCHAR dll[MAX_PATH * 4], pdb[MAX_PATH * 4], core[MAX_PATH * 4], il2cpp_mscorlib[MAX_PATH * 4], doorstop[MAX_PATH * 4], runtime[MAX_PATH * 4], xunity[MAX_PATH * 4], fontfix[MAX_PATH * 4], fontplugin[MAX_PATH * 4], gameasm[MAX_PATH * 4], endpoint_src[MAX_PATH * 4], endpoint_dst[MAX_PATH * 4];
     path_join(dll, MAX_PATH * 4, dir, L"BepInEx\\plugins\\UnityTranslator.dll");
     path_join(pdb, MAX_PATH * 4, dir, L"BepInEx\\plugins\\UnityTranslator.pdb");
     path_join(core, MAX_PATH * 4, dir, L"BepInEx\\core\\BepInEx.IL2CPP.dll");
@@ -692,12 +834,14 @@ int deploy_unity_il2cpp(const WCHAR *dir) {
     path_join(doorstop, MAX_PATH * 4, dir, L"doorstop_config.ini");
     path_join(gameasm, MAX_PATH * 4, dir, L"GameAssembly.dll");
 
+    /* 只支持 x64 IL2CPP 构建 */
     int machine = pe_machine(gameasm);
     if (machine && machine != 0x8664) {
         append_log(L"Unity IL2CPP：当前只内置 x64 插件运行时，已跳过非 x64 游戏。");
         return 0;
     }
 
+    /* 如果存在旧的 Mono 版插件，禁用它避免冲突 */
     if (is_bundled_unity_mono_plugin(dll) && disable_existing_file(dll)) {
         append_log(L"Unity IL2CPP：已禁用旧的 Mono UnityTranslator.dll：%s.disabled", dll);
         disable_existing_file(pdb);
@@ -705,15 +849,19 @@ int deploy_unity_il2cpp(const WCHAR *dir) {
         append_log(L"Unity IL2CPP：保留现有 UnityTranslator.dll（不是内置 Mono 模板）。");
     }
 
+    /* 查找 IL2CPP payload 目录 */
     if (!find_il2cpp_payload(runtime, MAX_PATH * 4, L"BepInExRuntime")) {
         append_log(L"Unity IL2CPP：找不到 BepInEx IL2CPP payload。");
+        log_payload_install_command(L"-UnityIL2CPP");
         return 0;
     }
     if (!find_il2cpp_payload(xunity, MAX_PATH * 4, L"XUnityAutoTranslator")) {
         append_log(L"Unity IL2CPP：找不到 XUnity AutoTranslator payload。");
+        log_payload_install_command(L"-UnityIL2CPP");
         return 0;
     }
 
+    /* 复制运行时和插件文件 */
     int ok = 1;
     ok &= copy_payload_file(runtime, L"doorstop_config.ini", dir);
     ok &= copy_payload_file(runtime, L"winhttp.dll", dir);
@@ -724,6 +872,15 @@ int deploy_unity_il2cpp(const WCHAR *dir) {
     ok &= copy_payload_file(xunity, L"BepInEx\\core\\XUnity.Common.dll", dir);
     ok &= copy_payload_tree(xunity, L"BepInEx\\plugins\\XUnity.AutoTranslator", dir);
     ok &= copy_payload_tree(xunity, L"BepInEx\\plugins\\XUnity.ResourceRedirector", dir);
+    path_join(endpoint_src, MAX_PATH * 4, g_root, L"payloads\\UnityIL2CPP\\DeepSeekXUnityTranslator\\DeepSeekTranslate.dll");
+    path_join(endpoint_dst, MAX_PATH * 4, dir, L"BepInEx\\plugins\\XUnity.AutoTranslator\\Translators\\DeepSeekTranslate.dll");
+    if (exists_path(endpoint_src)) {
+        ok &= copy_file_safe(endpoint_src, endpoint_dst);
+    } else {
+        append_log(L"Unity IL2CPP: missing DeepSeek XUnity endpoint payload (payloads\\UnityIL2CPP\\DeepSeekXUnityTranslator\\DeepSeekTranslate.dll).");
+        append_log(L"Download the full program package or run build_native.bat before deploying Unity IL2CPP.");
+        ok = 0;
+    }
     if (find_il2cpp_payload(fontfix, MAX_PATH * 4, L"TMPFontAssetBundles")) {
         ok &= copy_payload_tree(fontfix, L"BepInEx\\font", dir);
     } else {
@@ -737,13 +894,16 @@ int deploy_unity_il2cpp(const WCHAR *dir) {
 
     if (!ok) {
         append_log(L"Unity IL2CPP：插件运行时部署不完整，请检查 payloads\\UnityIL2CPP。");
+        log_payload_install_command(L"-UnityIL2CPP -Force");
         return 0;
     }
 
+    /* 禁用旧的 Il2Cppmscorlib.dll，避免遮挡新 interop 层 */
     if (exists_path(il2cpp_mscorlib) && disable_existing_file(il2cpp_mscorlib)) {
         append_log(L"Unity IL2CPP：已禁用旧的 core\\Il2Cppmscorlib.dll，避免遮挡新 interop。");
     }
 
+    /* 生成 XUnity 配置文件 */
     write_xunity_config(dir);
     append_log(L"Unity IL2CPP: deployed TMP Chinese system font fallback.");
     append_log(L"Unity IL2CPP：已部署 BepInEx be.755 + XUnity AutoTranslator。");

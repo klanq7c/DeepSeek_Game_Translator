@@ -82,6 +82,15 @@ if ($cacheSrc -notmatch 'io_lock') {
     throw "TSV appends must serialize on a dedicated io lock, not the reader lock"
 }
 $deploySrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\deploy.c") -Raw
+if (-not (Test-Path (Join-Path $root "scripts\install_runtime_payloads.ps1"))) {
+    throw "runtime payload installer script must ship with source and program packages"
+}
+if ($deploySrc -notmatch 'install_runtime_payloads\.ps1' -or $deploySrc -notmatch '-UnityMono5' -or $deploySrc -notmatch '-UnityMono6' -or $deploySrc -notmatch '-UnityIL2CPP') {
+    throw "Unity deploy must tell users the exact runtime payload install command when payloads are missing"
+}
+if ($deploySrc -notmatch 'DeepSeekXUnityTranslator\\\\DeepSeekTranslate\.dll' -or $deploySrc -notmatch 'Translators\\\\DeepSeekTranslate\.dll') {
+    throw "Unity IL2CPP deploy must copy the first-party DeepSeek XUnity endpoint outside the third-party XUnity payload"
+}
 if ($deploySrc -notmatch 'ds_font\.ttc') {
     throw "Ren'Py deploy must ship a CJK font next to the hook"
 }

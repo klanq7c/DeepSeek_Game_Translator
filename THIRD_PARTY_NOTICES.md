@@ -1,20 +1,27 @@
 # Third-Party Notices
 
-This repository is intended to publish only original source code, tests, and
-documentation. Runtime payloads and build references are not included in the
-open-source source package unless their redistribution has been reviewed for
-that specific release.
+This repository publishes only original source code, tests, scripts, and
+documentation. Third-party runtime payloads are downloaded by the user with
+`scripts/install_runtime_payloads.ps1` after unpacking the program package.
 
-## Not bundled in source releases
+## Source releases
 
-- Unity managed assemblies and IL2CPP interop assemblies: proprietary game or
-  Unity runtime files. Do not commit or redistribute them in this repository.
-- BepInEx runtime payloads: upstream project is licensed separately
-  (BepInEx states LGPL-2.1 for the main project).
-- XUnity.AutoTranslator runtime payloads: upstream project is licensed
-  separately and should be downloaded from upstream releases by users.
-- Harmony/HarmonyX, MonoMod, Mono.Cecil, Newtonsoft.Json, .NET runtime files,
-  and other DLL dependencies: obtain from upstream packages or runtime bundles.
+Source releases do not bundle runtime binaries. They only contain original
+source code, tests, scripts, documentation, and example configuration.
+
+## Program packages
+
+Program packages may include this project's own compiled executables and
+plugins, plus scripts that download runtime payloads from upstream projects.
+They should not directly bundle third-party runtime payloads unless a release
+has an explicit redistribution manifest and license texts.
+
+## Never bundled
+
+- Unity managed assemblies and IL2CPP interop assemblies copied from games or
+  Unity installations: proprietary game or Unity runtime files.
+- BepInEx and XUnity runtime folders in source releases. Users can install
+  them with `scripts/install_runtime_payloads.ps1`.
 - Noto or other CJK font files: publish only when the exact font file and
   license are included and reviewed for the release.
 - w64devkit and other compiler/toolchain binaries: obtain from upstream.
@@ -24,6 +31,7 @@ that specific release.
 ## Referenced upstream projects
 
 - BepInEx: https://github.com/BepInEx/BepInEx
+- BepInEx bleeding-edge builds: https://builds.bepinex.dev/projects/bepinex_be
 - HarmonyX: https://github.com/BepInEx/HarmonyX
 - Harmony: https://github.com/pardeike/Harmony
 - XUnity.AutoTranslator: https://github.com/bbepis/XUnity.AutoTranslator

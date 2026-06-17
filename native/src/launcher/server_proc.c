@@ -1,3 +1,11 @@
+/* ================================================================
+ * server_proc.c — 本地 C 服务器子进程管理实现
+ * ----------------------------------------------------------------
+ * 通过 CreateProcess 启动 dst_server.exe，使用 WinHTTP 进行
+ * 健康检查（GET /health）和优雅关停（POST /shutdown）。
+ * 服务器以隐藏窗口运行，用户通过启动器 UI 控制生命周期。
+ * ================================================================ */
+
 #include "server_proc.h"
 #include "fsutil.h"
 #include "ui.h"
@@ -6,6 +14,12 @@
 #include <string.h>
 #include <winhttp.h>
 
+/* ----------------------------------------------------------------
+ * server_http_alive — 通过 HTTP 请求检查服务器是否响应
+ *
+ * 向 127.0.0.1:19999/health 发送 GET 请求，超时由调用者指定。
+ * 作为进程句柄检查的补充：进程可能已被外部启动。
+ * ---------------------------------------------------------------- */
 static int server_http_alive(DWORD timeout) {
     int ok = 0;
     HINTERNET ses = WinHttpOpen(L"DeepSeek Game Translator Launcher/3.1",
@@ -42,6 +56,11 @@ static int server_http_alive(DWORD timeout) {
     return ok;
 }
 
+/* ----------------------------------------------------------------
+ * server_alive — 公开的存活检查
+ *
+ * 先检查进程句柄是否仍存在（非超时），再回退到 HTTP 检查。
+ * ---------------------------------------------------------------- */
 int server_alive(void) {
     if (!g_server_started) return 0;
     if (g_server_pi.hProcess &&
@@ -51,6 +70,7 @@ int server_alive(void) {
     return server_http_alive(120);
 }
 
+/* 关闭服务器进程句柄并重置状态标志 */
 static void reset_server_handle(void) {
     if (g_server_pi.hProcess) CloseHandle(g_server_pi.hProcess);
     if (g_server_pi.hThread) CloseHandle(g_server_pi.hThread);
@@ -58,6 +78,7 @@ static void reset_server_handle(void) {
     g_server_started = 0;
 }
 
+/* 更新 UI 中的服务器状态标签（带双缓冲重绘） */
 static void set_server_label(const WCHAR *text) {
     if (g_server && IsWindow(g_server)) {
         invalidate_control_area(g_server, 4);
@@ -66,10 +87,17 @@ static void set_server_label(const WCHAR *text) {
     }
 }
 
+/* 更新服务器控制按钮的文本 */
 static void set_btn_label(const WCHAR *text) {
     if (g_btn_server && IsWindow(g_btn_server)) SetWindowTextW(g_btn_server, text);
 }
 
+/* ----------------------------------------------------------------
+ * request_server_shutdown — 通过 HTTP 请求优雅关停服务器
+ *
+ * 发送 POST /shutdown 请求，让服务器自行清理并退出。
+ * 超时设为 500ms，快速失败以避免阻塞 UI。
+ * ---------------------------------------------------------------- */
 static void request_server_shutdown(void) {
     HINTERNET ses = WinHttpOpen(L"DeepSeek Game Translator Launcher/3.1",
                                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -100,10 +128,20 @@ static void request_server_shutdown(void) {
     WinHttpCloseHandle(ses);
 }
 
+/* ----------------------------------------------------------------
+ * start_server — 启动本地 C 服务器子进程
+ *
+ * 流程：
+ *   1. 如果已有进程且存活，直接返回
+ *   2. 检查端口是否被外部进程占用（HTTP /health 检测）
+ *   3. 构造命令行并 CreateProcess 启动 dst_server.exe
+ *   4. 等待 600ms 让服务器初始化，更新 UI 状态
+ * ---------------------------------------------------------------- */
 int start_server(void) {
     if (g_server_started && server_alive()) return 1;
     if (g_server_started) reset_server_handle();
 
+    /* 端口可能被外部进程占用 */
     if (server_http_alive(200)) {
         g_server_started = 1;
         set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
@@ -113,6 +151,7 @@ int start_server(void) {
         return 1;
     }
 
+    /* 构造命令行：dst_server.exe --port 19999 --cache <tsv> --api-config <ini> */
     WCHAR exe[MAX_PATH * 4], cache[MAX_PATH * 4], api_cfg[MAX_PATH * 4], cmd[MAX_PATH * 12];
     path_join(exe, MAX_PATH * 4, g_root, L"native\\dst_server.exe");
     path_join(cache, MAX_PATH * 4, g_root, L"translation_memory_c.tsv");
@@ -126,6 +165,7 @@ int start_server(void) {
                exe, cache, api_cfg);
     cmd[MAX_PATH * 12 - 1] = 0;
 
+    /* 以隐藏窗口启动服务器进程 */
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof si);
     ZeroMemory(&g_server_pi, sizeof g_server_pi);
@@ -146,6 +186,12 @@ int start_server(void) {
     return 1;
 }
 
+/* ----------------------------------------------------------------
+ * stop_server — 停止本地 C 服务器
+ *
+ * 先通过 HTTP /shutdown 优雅关停，等待最多 1500ms；
+ * 超时则 TerminateProcess 强制终止。最后重置所有状态和 UI。
+ * ---------------------------------------------------------------- */
 void stop_server(void) {
     if (!g_server_started && !server_http_alive(200)) {
         set_server_label(L"\u672A\u542F\u52A8");
@@ -169,6 +215,11 @@ void stop_server(void) {
     if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
 }
 
+/* ----------------------------------------------------------------
+ * toggle_server — 切换服务器运行状态
+ *
+ * 服务器按钮的回调：运行中则停止，否则启动。
+ * ---------------------------------------------------------------- */
 void toggle_server(void) {
     if (g_server_started && server_alive()) {
         stop_server();

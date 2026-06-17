@@ -1,3 +1,7 @@
+/* main.c — 启动器 WinMain 入口与窗口消息循环
+ * 负责注册窗口类、创建主窗口、处理所有 UI 消息分发。
+ * 关闭窗口时不终止翻译服务端，游戏仍可继续请求实时翻译。 */
+
 #include "globals.h"
 #include "api_config.h"
 #include "fsutil.h"
@@ -10,8 +14,10 @@
 #include <stdio.h>
 #include <wchar.h>
 
+/* 主窗口过程：处理创建、绘制、DPI 变化、命令分发、颜色主题、销毁等消息 */
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    /* ---- WM_CREATE：初始化 DPI、字体、画刷、所有子控件 ---- */
     case WM_CREATE: {
         dpi_set_for_window(hwnd);
         g_font_title       = make_font(22, FW_SEMIBOLD, L"Microsoft YaHei UI");
@@ -63,6 +69,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         layout(hwnd);
         return 0;
     }
+    /* ---- WM_PAINT：绘制深色页面背景 ---- */
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
@@ -70,22 +77,26 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         EndPaint(hwnd, &ps);
         return 0;
     }
+    /* ---- WM_SIZE：窗口尺寸变化时重新布局并重绘 ---- */
     case WM_SIZE:
         layout(hwnd);
         InvalidateRect(hwnd, NULL, TRUE);
         return 0;
+    /* ---- WM_GETMINMAXINFO：限制窗口最小尺寸 ---- */
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
         mmi->ptMinTrackSize.x = sc(1080);
         mmi->ptMinTrackSize.y = sc(700);
         return 0;
     }
+    /* ---- WM_TIMER：路径编辑框内容变化防抖，200ms 后重新检测引擎 ---- */
     case WM_TIMER:
         if (wp == 1) {
             KillTimer(hwnd, 1);
             refresh_engine();
         }
         return 0;
+    /* ---- WM_DPICHANGED：DPI 变化时重建字体、重新布局 ---- */
     case WM_DPICHANGED: {
         g_scale_dpi = HIWORD(wp);
         RECT *prc = (RECT *)lp;
@@ -104,11 +115,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, TRUE);
         return 0;
     }
+    /* ---- WM_ERASEBKGND：禁止系统擦除背景（由 WM_PAINT 自绘） ---- */
     case WM_ERASEBKGND:
         return 1;
+    /* ---- WM_DRAWITEM：自绘按钮 ---- */
     case WM_DRAWITEM:
         draw_button((const DRAWITEMSTRUCT *)lp);
         return TRUE;
+    /* ---- WM_CTLCOLORSTATIC：静态文本颜色主题 ---- */
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
         HWND ctl = (HWND)lp;
@@ -126,12 +140,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else SetTextColor(dc, C_TEXT);
         return (LRESULT)g_brush_transparent;
     }
+    /* ---- WM_CTLCOLOREDIT：路径编辑框颜色主题 ---- */
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)wp;
         SetTextColor(dc, C_TEXT);
         SetBkColor(dc, C_LOG);
         return (LRESULT)g_brush_edit;
     }
+    /* ---- WM_CTLCOLORLISTBOX：日志列表框颜色主题 ---- */
     case WM_CTLCOLORLISTBOX: {
         HDC dc = (HDC)wp;
         HWND ctl = (HWND)lp;
@@ -142,6 +158,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
+    /* ---- WM_COMMAND：按钮/菜单命令分发 ---- */
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_BROWSE) browse_folder();
         else if (LOWORD(wp) == IDC_START) start_translation();
@@ -158,6 +175,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(hwnd, 1, 200, NULL);
         }
         return 0;
+    /* ---- WM_CLOSE / WM_DESTROY：关闭窗口并释放 GDI 资源 ---- */
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -180,6 +198,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/* wWinMain：程序入口
+ * 初始化 DPI 感知 → 获取可执行文件路径 → 初始化 COM/公共控件 →
+ * 注册窗口类 → 创建主窗口 → 进入消息循环 */
 int WINAPI wWinMain(HINSTANCE h, HINSTANCE prev, PWSTR cmd, int show) {
     (void)prev;
     (void)cmd;
