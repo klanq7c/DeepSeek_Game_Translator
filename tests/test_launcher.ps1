@@ -94,6 +94,10 @@ $deploySrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\depl
 if (-not (Test-Path (Join-Path $root "scripts\install_runtime_payloads.ps1"))) {
     throw "runtime payload installer script must ship with source and program packages"
 }
+$runtimeInstallerSrc = Get-Content -LiteralPath (Join-Path $root "scripts\install_runtime_payloads.ps1") -Raw
+if ($runtimeInstallerSrc -notmatch 'Newtonsoft\.Json\.13\.0\.4\.zip' -or $runtimeInstallerSrc -notmatch 'Copy-Item -LiteralPath \$pkg -Destination \$zipPkg') {
+    throw "runtime payload installer must rename NuGet .nupkg to .zip before Expand-Archive for Windows PowerShell 5.1"
+}
 if ($deploySrc -notmatch 'install_runtime_payloads\.ps1' -or $deploySrc -notmatch '-UnityMono5' -or $deploySrc -notmatch '-UnityMono6' -or $deploySrc -notmatch '-UnityIL2CPP') {
     throw "Unity deploy must tell users the exact runtime payload install command when payloads are missing"
 }

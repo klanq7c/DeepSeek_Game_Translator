@@ -149,7 +149,9 @@ function Install-NewtonsoftJson {
     Assert-UnderRoot $tmp
 
     try {
-        Expand-Archive -LiteralPath $pkg -DestinationPath $tmp -Force
+        $zipPkg = Join-Path $tmp "Newtonsoft.Json.13.0.4.zip"
+        Copy-Item -LiteralPath $pkg -Destination $zipPkg -Force
+        Expand-Archive -LiteralPath $zipPkg -DestinationPath $tmp -Force
         $dll = Join-Path $tmp "lib\net45\Newtonsoft.Json.dll"
         if (-not (Test-Path -LiteralPath $dll)) {
             throw "Newtonsoft.Json.dll not found in downloaded package."
