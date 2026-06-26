@@ -44,6 +44,7 @@ void http_set_ctx(HttpCtx *ctx) { g_ctx = ctx; }
 #define LIVE_BATCH_MAX 16
 #define LIVE_BATCH_CHAR_BUDGET 3200
 #define LIVE_BATCH_COALESCE_MS 35
+#define HTTP_REQUEST_BUFFER_POOL_LIMIT 32    /* 仅缓存固定 64 KiB 初始块，常驻上限约 2 MiB */
 
 /* 异步任务节点。同时挂在两个结构上：
    qnext 串成 FIFO 等待队列；knext 串成去重桶的冲突链。 */
@@ -62,6 +63,21 @@ typedef struct LiveJob {
     CONDITION_VARIABLE cv;
     struct LiveJob *next;
 } LiveJob;
+
+/*
+ * HTTP 请求缓冲属于最短生命周期的一代：每个连接都需要一块初始 64 KiB。
+ * 这里复用固定大小块以减少高并发短连接造成的堆碎片；扩容过的请求属于“大对象”，
+ * 完成后直接 free，绝不进入池。池本身是进程级资源，但有硬上限，不会随流量增长。
+ */
+typedef struct RequestBufferNode {
+    struct RequestBufferNode *next;
+} RequestBufferNode;
+
+static SRWLOCK g_request_buffer_pool_lock = SRWLOCK_INIT;
+static RequestBufferNode *g_request_buffer_pool;
+static size_t g_request_buffer_pool_count;
+static volatile LONG g_request_buffer_pool_hits;
+static volatile LONG g_request_buffer_pool_misses;
 
 /* 异步队列全局状态：锁 + 条件变量 + FIFO 头尾 + 去重桶 + 计数。 */
 static SRWLOCK g_async_lock = SRWLOCK_INIT;
@@ -84,6 +100,51 @@ static volatile LONG g_foreground_requests;
 
 static DWORD WINAPI async_worker(LPVOID arg);
 static DWORD WINAPI live_worker(LPVOID arg);
+
+static char *request_buffer_acquire(void) {
+    RequestBufferNode *node = NULL;
+    AcquireSRWLockExclusive(&g_request_buffer_pool_lock);
+    if (g_request_buffer_pool) {
+        node = g_request_buffer_pool;
+        g_request_buffer_pool = node->next;
+        g_request_buffer_pool_count--;
+    }
+    ReleaseSRWLockExclusive(&g_request_buffer_pool_lock);
+
+    if (node) {
+        InterlockedIncrement(&g_request_buffer_pool_hits);
+        return (char *)node;
+    }
+    InterlockedIncrement(&g_request_buffer_pool_misses);
+    return xmalloc(HTTP_RECV_INITIAL + 1);
+}
+
+static void request_buffer_release(char *buffer, size_t capacity) {
+    if (!buffer) return;
+    if (capacity != HTTP_RECV_INITIAL) {
+        free(buffer);
+        return;
+    }
+
+    RequestBufferNode *node = (RequestBufferNode *)buffer;
+    int cached = 0;
+    AcquireSRWLockExclusive(&g_request_buffer_pool_lock);
+    if (g_request_buffer_pool_count < HTTP_REQUEST_BUFFER_POOL_LIMIT) {
+        node->next = g_request_buffer_pool;
+        g_request_buffer_pool = node;
+        g_request_buffer_pool_count++;
+        cached = 1;
+    }
+    ReleaseSRWLockExclusive(&g_request_buffer_pool_lock);
+    if (!cached) free(buffer);
+}
+
+static size_t request_buffer_pool_count(void) {
+    AcquireSRWLockShared(&g_request_buffer_pool_lock);
+    size_t n = g_request_buffer_pool_count;
+    ReleaseSRWLockShared(&g_request_buffer_pool_lock);
+    return n;
+}
 
 /* 线程安全地读取异步队列长度（health 接口用）。 */
 static size_t async_queue_len(void) {
@@ -740,7 +801,7 @@ static char *translate_value(const char *text, int cache_only, int queue_miss, c
     return xstrdup(text);
 }
 
-/* /health：返回服务运行状态——缓存条目数、异步/实时队列长度、API 是否启用、运行时长。
+/* /health：返回服务运行状态——缓存条目数、异步/实时队列长度、请求缓冲池、API 是否启用、运行时长。
    供 launcher 与钩子做就绪探测与健康检查。runtime_cache_only 固定为 false，
    表示服务器具备调远程 API 的能力（非纯缓存模式）。 */
 static void op_health(Buf *b) {
@@ -750,6 +811,14 @@ static void op_health(Buf *b) {
     buf_int(b, (long long)async_queue_len());
     buf_add(b, ",\"live_queue\":");
     buf_int(b, (long long)live_queue_len());
+    buf_add(b, ",\"request_buffer_pool_cached\":");
+    buf_int(b, (long long)request_buffer_pool_count());
+    buf_add(b, ",\"request_buffer_pool_limit\":");
+    buf_int(b, HTTP_REQUEST_BUFFER_POOL_LIMIT);
+    buf_add(b, ",\"request_buffer_pool_hits\":");
+    buf_int(b, (long long)(unsigned long)InterlockedCompareExchange(&g_request_buffer_pool_hits, 0, 0));
+    buf_add(b, ",\"request_buffer_pool_misses\":");
+    buf_int(b, (long long)(unsigned long)InterlockedCompareExchange(&g_request_buffer_pool_misses, 0, 0));
     buf_add(b, ",\"api_enabled\":");
     buf_add(b, (g_ctx->api && g_ctx->api->enabled) ? "true" : "false");
     buf_add(b, ",\"runtime_cache_only\":false,\"uptime_seconds\":");
@@ -824,12 +893,9 @@ static void op_batch(Buf *b, List *l, int single, int cache_only) {
         return;
     }
 
-    char **vals = calloc(l->n ? l->n : 1, sizeof *vals);
-    const char **sources = calloc(l->n ? l->n : 1, sizeof *sources);
-    size_t *miss = calloc(l->n ? l->n : 1, sizeof *miss);
-    if (!vals) die("oom");
-    if (!sources) die("oom");
-    if (!miss) die("oom");
+    char **vals = xcalloc(l->n ? l->n : 1, sizeof *vals);
+    const char **sources = xcalloc(l->n ? l->n : 1, sizeof *sources);
+    size_t *miss = xcalloc(l->n ? l->n : 1, sizeof *miss);
     size_t miss_n = 0;
 
     for (size_t i = 0; i < l->n; i++) {
@@ -1010,14 +1076,18 @@ static void op_prefetch(Buf *b, List *l) {
    Content-Length 判断 body 是否收齐，避免过度读取或阻塞。 */
 static void serve_one(SOCKET s) {
     DWORD timeout = HTTP_RECV_TIMEOUT_MS;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout);
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof timeout);
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout) == SOCKET_ERROR ||
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof timeout) == SOCKET_ERROR) {
+        /* 超时是连接线程生命周期的硬约束；设置失败时不能退化成无限阻塞。 */
+        closesocket(s);
+        return;
+    }
     BOOL nodelay = TRUE;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof nodelay);
+    (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof nodelay);
 
-    /* Grow-on-demand: most requests fit in 64 KB; only OOM-sized ones realloc. */
+    /* 固定初始块来自有界池；超过 64 KiB 的请求按需扩容，结束后不回池。 */
     size_t cap = HTTP_RECV_INITIAL;
-    char *req = xmalloc(cap + 1);
+    char *req = request_buffer_acquire();
     req[0] = 0;
     size_t n = 0;
     int r;
@@ -1162,7 +1232,7 @@ static void serve_one(SOCKET s) {
     }
 
     buf_free(&out);
-    free(req);
+    request_buffer_release(req, cap);
     closesocket(s);
 }
 

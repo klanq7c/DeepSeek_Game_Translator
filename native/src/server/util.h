@@ -16,8 +16,10 @@ __declspec(noreturn) void die(const char *m);
 _Noreturn void die(const char *m);
 #endif
 
-/* x* 系列分配：失败即 die("oom")，永不返回 NULL；n 为 0 时按 1 分配，避免实现定义行为。 */
+/* x* 系列分配：失败即 die("oom")，永不返回 NULL；0 字节按 1 字节分配。
+   xcalloc 同时检查 count*size 溢出，调用方不再各自重复易漏的乘法检查。 */
 void *xmalloc(size_t n);
+void *xcalloc(size_t count, size_t size);
 void *xrealloc(void *p, size_t n);
 char *xstrndup(const char *s, size_t n);   /* 复制前 n 字节，自动追加 '\0' */
 char *xstrdup(const char *s);              /* 全串复制，s 为 NULL 时视为空串 */

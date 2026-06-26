@@ -33,6 +33,10 @@ function Normalize-RequestText([string]$text) {
 $repo = Split-Path -Parent $PSScriptRoot
 $srcPath = Join-Path $repo "payloads\UnityTranslator\src\DeepSeekTranslator.cs"
 $src = Get-Content -LiteralPath $srcPath -Raw
+$il2cppEndpointPath = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src\DeepSeekTranslateEndpoint.cs"
+$tmpFallbackPath = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\src\TmpFontFallbackPlugin.cs"
+$tmpFallbackSrc = Get-Content -LiteralPath $tmpFallbackPath -Raw
+$unityCoreSourcePaths = @($srcPath, $il2cppEndpointPath, $tmpFallbackPath)
 $unusedPrototypePath = Join-Path $repo "payloads\UnityTranslator\src\UnityTranslator"
 
 if ($src -notmatch 'RichTextTagRegex\s*=\s*new Regex\("((?:\\.|[^"])*)"') {
@@ -410,6 +414,52 @@ It "Unity plugin source does not compile unused modular prototype code" {
     Assert-False ($src.Contains("HideTmpAwaitingTranslation")) "old pending-blanking helper must not linger after source-visible pending behavior"
 }
 
+It "Unity core private members stay connected to runtime paths" {
+    $implicitUnityMessages = @(
+        "Awake", "Start", "Update", "LateUpdate", "FixedUpdate",
+        "OnEnable", "OnDisable", "OnDestroy", "OnGUI", "Reset", "Validate"
+    )
+
+    foreach ($path in $unityCoreSourcePaths) {
+        $source = Get-Content -LiteralPath $path -Raw
+        # 注释中的名字不能替未接线代码“续命”；保留字符串字面量，因为 Harmony
+        # 的方法入口确实通过字符串名接线。
+        $clean = [regex]::Replace(
+            $source,
+            '/\*.*?\*/',
+            '',
+            [System.Text.RegularExpressions.RegexOptions]::Singleline
+        )
+        $clean = [regex]::Replace($clean, '(?m)^\s*//.*(?:\r?\n|$)', '')
+
+        $dead = [System.Collections.Generic.List[string]]::new()
+        foreach ($match in [regex]::Matches($clean, '(?m)^\s*private\s+(?:static\s+)?(?:async\s+)?[\w<>,\.\[\]\?]+\s+([A-Za-z_]\w*)\s*\(')) {
+            $name = $match.Groups[1].Value
+            $count = [regex]::Matches($clean, '(?<![A-Za-z0-9_])' + [regex]::Escape($name) + '(?![A-Za-z0-9_])').Count
+            if ($count -eq 1 -and $implicitUnityMessages -notcontains $name) {
+                $dead.Add("method $name")
+            }
+        }
+        foreach ($match in [regex]::Matches($clean, '(?m)^\s*private\s+(?:static\s+)?(?:readonly\s+)?(?:volatile\s+)?(?:const\s+)?[\w<>,\.\[\]\?]+\s+(_?[A-Za-z_]\w*)\s*(?:=|;)')) {
+            $name = $match.Groups[1].Value
+            $count = [regex]::Matches($clean, '(?<![A-Za-z0-9_])' + [regex]::Escape($name) + '(?![A-Za-z0-9_])').Count
+            if ($count -eq 1) {
+                $dead.Add("member $name")
+            }
+        }
+
+        Assert-True ($dead.Count -eq 0) ("unreferenced private symbols in {0}: {1}" -f (Split-Path $path -Leaf), (($dead | Sort-Object -Unique) -join ", "))
+    }
+
+    Assert-False ($src.Contains("TMPSetTextMethodPrefix")) "removed pass-through Harmony prefix must not return as dead code"
+    Assert-False ($src.Contains("_subMeshRescuedCount")) "write-only diagnostic counter must not return"
+    Assert-False ($src -match 'private\s+(?:(?:static\s+readonly)|const)\s+bool\s+\w+\s*=\s*(?:true|false)') "hard-coded feature switches must not masquerade as active runtime configuration"
+    Assert-False ($src.Contains("//IL_")) "decompiler warning comments must not obscure maintained source"
+
+    $tmpFallbackSource = Get-Content -LiteralPath $tmpFallbackPath -Raw
+    Assert-False ($tmpFallbackSource.Contains("CreateUnityFont(path)")) "UGUI system-font path branch is unreachable and must not return"
+}
+
 It "Unity alpha rescue sweep is wired into the active frame pump" {
     Assert-True ($src -match '(?s)private void PumpOnce\(string source\).*?RunOverlayValidationTick\(\);\s*RunAlphaSweepTick\(\);') "alpha rescue sweep must run from the active pump"
     Assert-True ($src.Contains("realtimeSinceStartup - _lastAlphaSweepRealtime < AlphaSweepIntervalSeconds")) "alpha sweep cadence must use its named constant"
@@ -420,7 +470,8 @@ It "Unity source treats typewriter suspects as settle-delayed, not hard-rejected
     # Classification only buys a longer debounce settle; final-but-odd-looking
     # prose (e.g. no trailing punctuation) must still translate.
     Assert-True ($src.Contains("GetTextSettleDelaySeconds(value.Text)")) "debounce must wait by text type"
-    Assert-True ($src -match '(?s)private static float GetTextSettleDelaySeconds\(string text\)\s*\{\s*if \(LooksLikeTypewriterFragment\(text\)\)\s*\{\s*return 0\.9f;') "fragment suspects must use the long settle delay"
+    Assert-True ($src.Contains("private const float TypewriterFragmentDebounceSeconds = 0.9f;")) "long fragment settle delay must remain explicit"
+    Assert-True ($src -match '(?s)private static float GetTextSettleDelaySeconds\(string text\)\s*\{\s*if \(LooksLikeTypewriterFragment\(text\)\)\s*\{\s*return TypewriterFragmentDebounceSeconds;') "fragment suspects must use the named long settle delay"
     Assert-False ($src.Contains("ContainsCjk(text) || LooksLikeTypewriterFragment(text) || ShouldSkipText(text)")) "debounce queue entry must not hard-reject fragments"
     Assert-False ($src.Contains("if (LooksLikeTypewriterFragment(item2.Text))")) "debounce flush must not hard-reject settled fragments"
     Assert-False ($src -match '(?s)private bool TryGetLocalTranslation\(string text, out string translated\).{0,400}?LooksLikeTypewriterFragment') "local cache lookup must not reject fragment-looking final text"
@@ -513,6 +564,31 @@ It "Unity long-running component state is bounded" {
     Assert-True ($src.Contains("_pendingApplyKeys.Clear()")) "pending apply key set must be rebuilt/cleared with queue pruning"
 }
 
+It "Unity renderer state has scene and generation reclamation" {
+    Assert-True ($src -match '(?s)private void ResetSceneScopedState\(bool clearPendingComponentWork\).*?_deepScannedObjects\.Clear\(\);.*?_deepPrefetchSeen\.Clear\(\);.*?_deepPrefetchQueue\.Clear\(\);') "Mono scene reset must release deep-scan and prefetch generation state"
+    Assert-True ($src -match '(?s)private void ResetSceneScopedState\(bool clearPendingComponentWork\).*?lock \(HistoryComponentCache\).*?HistoryComponentCache\.Clear\(\);') "Mono scene reset must release cached scene component IDs"
+    Assert-True ($src.Contains("_deepScannedObjects.Count > MaxTrackedComponentStates")) "Mono long-running pruning must bound deep-scanned object IDs"
+
+    Assert-True ($tmpFallbackSrc.Contains("SweepStaleState()")) "IL2CPP TMP installer must periodically sweep destroyed Unity objects"
+    Assert-True ($tmpFallbackSrc -match '(?s)public static void Apply\(\).*?SweepStaleState\(\);') "IL2CPP stale-state sweep must be wired into the slow Apply path"
+    Assert-True ($tmpFallbackSrc.Contains("PatchedFontAssets.IntersectWith(")) "IL2CPP patched font IDs must be mark/swept"
+    Assert-True ($tmpFallbackSrc.Contains("DirtiedTexts.IntersectWith(")) "IL2CPP TMP text IDs must be mark/swept"
+    Assert-True ($tmpFallbackSrc.Contains("PatchedUguiTexts.IntersectWith(")) "IL2CPP UGUI text IDs must be mark/swept"
+    Assert-True ($tmpFallbackSrc.Contains("LastTmpTextById.Remove(")) "IL2CPP last-text cache must remove destroyed text IDs"
+    Assert-True ($tmpFallbackSrc -match '(?s)private static void SweepStaleState\(\).*?foreach \(int sourceId in StaleInteractiveSourceIds\).*?DestroyInteractiveOverlay\(sourceId\);.*?InteractiveOriginalTextBySourceId\.Remove\(sourceId\);.*?InteractiveOriginalColorBySourceId\.Remove\(sourceId\);') "IL2CPP stale interactive overlays must release strong Unity object references and source metadata"
+}
+
+It "Unity background work and diagnostics avoid unmanaged thread and IO churn" {
+    Assert-True ($src -match '(?s)private static Task<T> RunBackground<T>\(Func<T> work\).*?ThreadPool\.QueueUserWorkItem') "background HTTP/cache work must reuse the managed thread pool"
+    Assert-False ($src -match '(?s)private static Task<T> RunBackground<T>\(Func<T> work\).*?new Thread') "each request must not create a dedicated OS thread"
+    Assert-True ($src -match '(?s)private void Awake\(\).*?if \(_debugMode\.Value\)\s*\{.*?DST_Diag') "continuous diagnostic files must be opt-in"
+    Assert-False ($src -match '(?s)private void Awake\(\).*?if \(!_debugMode\.Value\)\s*\{.*?return;') "optional diagnostics must not early-return from Awake"
+    Assert-True ($src.Contains("_diagnosticsStop.WaitOne")) "diagnostic thread must have a plugin-lifetime stop signal"
+    Assert-True ($src -match '(?s)private void OnDestroy\(\).*?_diagnosticsStop\?\.Set\(\);') "plugin teardown must stop diagnostic work"
+    Assert-False ($src -match '(?s)private void FlushDebouncedTextRequests\(\).*?_debouncedTextRequests\.ToList\(\)') "main-thread debounce pump must not clone the dictionary every tick"
+    Assert-True ($src -match '(?s)private static string RawHttpRequest.*?memoryStream\.GetBuffer\(\).*?memoryStream\.Length') "raw HTTP response decoding must avoid a full ToArray copy"
+}
+
 It "Unity batch dispatch keeps multiple batches in flight" {
     Assert-True ($src.Contains("MaxConcurrentBatchFlushes")) "batch flush concurrency constant must exist"
     Assert-True ($src.Contains("DrainPendingBatchQueueAsync")) "flush must drain via concurrent workers"
@@ -553,13 +629,13 @@ It "Fire-and-forget scheduler flags cannot wedge on exceptions" {
     # _batchFlushScheduled / _cachePersistScheduled gate their own reschedule:
     # if the owning task dies without clearing the flag or restarting, the
     # translation pipeline or cache persistence silently stops for the session.
-    Assert-True ($src -match '(?s)finally\s*\{\s*/\* Liveness guarantee.{0,1500}?_ = FlushPendingBatchRequestsAsync\(faulted \? BatchFlushFaultRestartDelayMs : 0\);') "flush restart must run inside finally so catch-path exceptions cannot skip it"
+    Assert-True ($src -match '(?s)finally\s*\{.{0,1500}?_ = FlushPendingBatchRequestsAsync\(faulted \? BatchFlushFaultRestartDelayMs : 0\);') "flush restart must run inside finally so catch-path exceptions cannot skip it"
     Assert-True ($src -match '(?s)catch \(Exception ex\)\s*\{\s*faulted = true;') "flush failures must mark the cycle as faulted"
     Assert-True ($src.Contains("private const int BatchFlushFaultRestartDelayMs")) "faulted flush restarts must be rate-limited, not a hot loop"
     Assert-True ($src -match '(?s)\[BATCH\] Invoking callbacks for \{requests\.Count\} requests, \{groupResults\.Count\} results"\);\s*InvokePendingRequestCallbacks\(requests, groupResults, requestFailed\);\s*\}\s*catch') "group callback dispatch must not throw past the worker chain"
     Assert-True ($src -match '(?s)private async Task PersistLocalCacheAsync\(\)\s*\{\s*try\s*\{\s*while \(true\)') "cache persist loop must be wrapped in a top-level try"
     Assert-True ($src.Contains("[CACHE] Persist cycle failed: ")) "a bad snapshot/write must only cost one persist cycle, not the loop"
-    Assert-True ($src -match '(?s)catch \(Exception ex2\)\s*\{\s*/\* Liveness guarantee.{0,500}?_cachePersistScheduled = false;') "fatal persist loop errors must release the scheduled flag for reschedule"
+    Assert-True ($src -match '(?s)catch \(Exception ex2\)\s*\{.{0,500}?_cachePersistScheduled = false;') "fatal persist loop errors must release the scheduled flag for reschedule"
 }
 
 It "Unity async pass-through misses stay retryable while repeated rejected translations are bounded" {

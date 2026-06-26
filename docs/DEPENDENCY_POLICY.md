@@ -26,7 +26,7 @@ external inputs installed by the user with `scripts/install_runtime_payloads.ps1
 
 Program packages may include this project's own compiled launcher, server, and
 plugin binaries. These first-party binaries may be embedded inside the launcher
-so users can update by replacing `ds翻译器.exe`. Third-party
+so users can update by replacing `ds游戏翻译器.exe`. Third-party
 BepInEx/XUnity/Newtonsoft payloads should normally be downloaded on the user's
 machine by `scripts/install_runtime_payloads.ps1`.
 

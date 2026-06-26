@@ -15,6 +15,19 @@ using UnityEngine;
 
 namespace DeepSeekTMPFontFallback;
 
+/*
+ * Unity IL2CPP 渲染兼容 payload，不负责翻译请求或共享缓存。
+ *
+ * 真实入口与调用链：
+ *   BepInEx IL2CPP -> TmpFontFallbackPlugin.Load()
+ *   -> 挂载 TmpFontFallbackBehaviour
+ *   -> Start/Update 周期调用 TmpFontFallbackInstaller.Apply()
+ *   -> 给 TMP/UGUI 字体资产附加中文 fallback，并刷新已加载文本。
+ *
+ * LateUpdate 的快速扫描只在 TMP setter Harmony 补丁未安装时兜底。
+ * 所有 Unity 对象、反射缓存和集合都只在 Unity 主线程访问，因此本文件
+ * 不加锁；不得从后台线程直接调用 Installer。
+ */
 [BepInPlugin("com.deepseek.game-translator.tmp-font-fallback", "DeepSeek TMP Font Fallback", "1.2.8")]
 public sealed class TmpFontFallbackPlugin : BasePlugin
 {
@@ -30,10 +43,8 @@ public sealed class TmpFontFallbackPlugin : BasePlugin
 
 public sealed class TmpFontFallbackBehaviour : MonoBehaviour
 {
-    // Poll fast during the first ~30s while the game is still wiring up TMP,
-    // then keep a slow steady cadence forever so font assets and texts that
-    // are loaded later (scene/addressable streaming) still get the Chinese
-    // fallback. Stopping early left late content rendering as tofu boxes.
+    // 启动前约 30 秒快速轮询，之后永久降到慢速轮询。不能在预热结束后停止：
+    // 场景切换和 Addressables 会继续加载新的字体资产与文本，否则后加载内容会变方框。
     private const float WarmupInterval = 1.0f;
     private const float SteadyInterval = 5.0f;
     private const float BackoffInterval = 30.0f;
@@ -74,8 +85,7 @@ public sealed class TmpFontFallbackBehaviour : MonoBehaviour
         }
         catch
         {
-            // The slower Apply path logs persistent errors; this path is only a
-            // frame-level safety net for text that bypasses the setter patch.
+            // 慢速 Apply 路径会记录持续失败；这里仅是绕过 setter 补丁时的逐帧安全网。
         }
     }
 
@@ -158,6 +168,11 @@ internal static class TmpFontFallbackInstaller
 
     private const string CjkWarmupText = "\u4e2d\u6587\u6c49\u5316\u7ffb\u8bd1\u6e38\u620f\u8bbe\u7f6e\u5f00\u59cb\u7ee7\u7eed\u8fd4\u56de\u786e\u8ba4\u53d6\u6d88\u4fdd\u5b58\u52a0\u8f7d\u83dc\u5355\u5bf9\u8bdd";
 
+    /*
+     * 以下状态的所有权属于本 Installer，生命周期覆盖整个游戏进程。
+     * InstanceID 集合用于避免反复修改同一个 Unity 对象；对象引用用于维持
+     * AssetBundle/字体/交互覆盖层存活。调用线程固定为 Unity 主线程。
+     */
     private static readonly HashSet<int> PatchedFontAssets = new();
     private static readonly HashSet<int> DirtiedTexts = new();
     private static readonly HashSet<int> PatchedUguiTexts = new();
@@ -166,6 +181,16 @@ internal static class TmpFontFallbackInstaller
     private static readonly Dictionary<int, string> InteractiveOriginalTextBySourceId = new();
     private static readonly Dictionary<int, Color> InteractiveOriginalColorBySourceId = new();
     private static readonly HashSet<int> InteractiveOverlayTextIds = new();
+    /*
+     * 上述集合保存跨帧状态，但 Unity 场景对象本身是分代出现/销毁的。下面的 scratch
+     * 集合只在慢速 Apply 中复用：定期标记当前活对象，再清扫已销毁对象的 InstanceID
+     * 和覆盖层强引用。快速 LateUpdate 路径不做全量回收，避免把 GC 抖动带进每帧。
+     */
+    private static readonly HashSet<int> LiveFontAssetIds = new();
+    private static readonly HashSet<int> LiveTmpTextIds = new();
+    private static readonly HashSet<int> LiveUguiTextIds = new();
+    private static readonly List<int> StaleStateIds = new();
+    private static readonly HashSet<int> StaleInteractiveSourceIds = new();
     private static Type _tmpSettingsType;
     private static Type _tmpFontAssetType;
     private static Type _tmpTextType;
@@ -186,22 +211,26 @@ internal static class TmpFontFallbackInstaller
     private static int _lastFontCount = -1;
     private static int _lastTextCount = -1;
     private static int _lastUguiTextCount = -1;
+    private static int _stateSweepTick;
     private static Harmony _harmony;
 
     private const string InteractiveOverlayName = "DeepSeekTranslationOverlay";
+    private const int StateSweepInterval = 12;
+    private const int SweepScratchTrimThreshold = 16384;
 
-    // Reflection lookups memoized so the perpetual Apply() poll doesn't
-    // re-resolve the same members every tick. All access is on the Unity main
-    // thread (MonoBehaviour.Update), so no locking is required.
+    // 反射结果做进程级缓存，避免永久轮询每次重新解析；仅主线程访问，无需锁。
     private static MethodInfo _findObjectsOfTypeAll;
     private static readonly Dictionary<Type, object> _il2CppTypeCache = new();
     private static readonly Dictionary<Type, MethodInfo> _instanceIdMethods = new();
 
     public static bool ShouldUseFastNormalizeScan => !_textSetterPatchInstalled;
 
+    /* 慢速主入口：先处理 UGUI，再解析 TMP 类型、安装 setter 补丁、加载 fallback，
+       最后把 fallback 接到已加载字体资产并刷新文本。单步失败会保留后续重试机会。 */
     public static void Apply()
     {
         int uguiTextCount = PatchUguiTexts();
+        SweepStaleState();
         if (uguiTextCount != _lastUguiTextCount)
         {
             _lastUguiTextCount = uguiTextCount;
@@ -255,6 +284,116 @@ internal static class TmpFontFallbackInstaller
             _lastTextCount = textCount;
             TmpFontFallbackPlugin.Logger.LogInfo("TMP Chinese fallback active. Patched font assets: " + fontCount + "; refreshed texts: " + textCount + ".");
         }
+    }
+
+    private static void SweepStaleState()
+    {
+        if (++_stateSweepTick < StateSweepInterval)
+        {
+            return;
+        }
+        _stateSweepTick = 0;
+
+        LiveFontAssetIds.Clear();
+        LiveTmpTextIds.Clear();
+        LiveUguiTextIds.Clear();
+        StaleStateIds.Clear();
+        StaleInteractiveSourceIds.Clear();
+
+        /*
+         * 这是渲染器私有状态的 mark/sweep，不触碰服务端翻译缓存、字体 AssetBundle
+         * 或 fallback 资产。后两者是进程代资源，必须存活到游戏退出。
+         */
+        try
+        {
+            if (_tmpFontAssetType != null)
+            {
+                foreach (object fontAsset in FindUnityObjects(_tmpFontAssetType))
+                {
+                    LiveFontAssetIds.Add(InstanceId(fontAsset));
+                }
+                PatchedFontAssets.IntersectWith(LiveFontAssetIds);
+            }
+
+            if (_tmpTextType != null)
+            {
+                foreach (object text in FindUnityObjects(_tmpTextType))
+                {
+                    LiveTmpTextIds.Add(InstanceId(text));
+                }
+                DirtiedTexts.IntersectWith(LiveTmpTextIds);
+                InteractiveOverlayTextIds.IntersectWith(LiveTmpTextIds);
+
+                foreach (int id in LastTmpTextById.Keys)
+                {
+                    if (!LiveTmpTextIds.Contains(id))
+                    {
+                        StaleStateIds.Add(id);
+                    }
+                }
+                foreach (int id in StaleStateIds)
+                {
+                    LastTmpTextById.Remove(id);
+                }
+                StaleStateIds.Clear();
+
+                CollectStaleInteractiveSources(InteractiveOverlayTextBySourceId.Keys);
+                CollectStaleInteractiveSources(InteractiveOriginalTextBySourceId.Keys);
+                CollectStaleInteractiveSources(InteractiveOriginalColorBySourceId.Keys);
+                foreach (int sourceId in StaleInteractiveSourceIds)
+                {
+                    DestroyInteractiveOverlay(sourceId);
+                    InteractiveOriginalTextBySourceId.Remove(sourceId);
+                    InteractiveOriginalColorBySourceId.Remove(sourceId);
+                }
+            }
+
+            if (_uguiTextType != null)
+            {
+                foreach (object text in FindUnityObjects(_uguiTextType))
+                {
+                    LiveUguiTextIds.Add(InstanceId(text));
+                }
+                PatchedUguiTexts.IntersectWith(LiveUguiTextIds);
+            }
+        }
+        finally
+        {
+            ReleaseSweepScratch();
+        }
+    }
+
+    private static void CollectStaleInteractiveSources(IEnumerable<int> sourceIds)
+    {
+        foreach (int sourceId in sourceIds)
+        {
+            if (!LiveTmpTextIds.Contains(sourceId))
+            {
+                StaleInteractiveSourceIds.Add(sourceId);
+            }
+        }
+    }
+
+    private static void ReleaseSweepScratch()
+    {
+        bool trimFonts = LiveFontAssetIds.Count > SweepScratchTrimThreshold;
+        bool trimTmpTexts = LiveTmpTextIds.Count > SweepScratchTrimThreshold;
+        bool trimUguiTexts = LiveUguiTextIds.Count > SweepScratchTrimThreshold;
+        bool trimStaleIds = StaleStateIds.Capacity > SweepScratchTrimThreshold;
+        bool trimInteractiveIds = StaleInteractiveSourceIds.Count > SweepScratchTrimThreshold;
+
+        LiveFontAssetIds.Clear();
+        LiveTmpTextIds.Clear();
+        LiveUguiTextIds.Clear();
+        StaleStateIds.Clear();
+        StaleInteractiveSourceIds.Clear();
+
+        /* 极端大场景退出后归还 scratch 的峰值桶数组；普通场景继续复用，减少 Gen0 垃圾。 */
+        if (trimFonts) LiveFontAssetIds.TrimExcess();
+        if (trimTmpTexts) LiveTmpTextIds.TrimExcess();
+        if (trimUguiTexts) LiveUguiTextIds.TrimExcess();
+        if (trimStaleIds) StaleStateIds.TrimExcess();
+        if (trimInteractiveIds) StaleInteractiveSourceIds.TrimExcess();
     }
 
     private static void TryInstallTextSetterPatch()
@@ -342,6 +481,9 @@ internal static class TmpFontFallbackInstaller
 
     private static object LoadFallbackFontAsset()
     {
+        /* 优先使用与 Unity 大版本匹配的预制 TMP AssetBundle；若版本不兼容或
+           文件缺失，再尝试 Windows 系统字体动态构建。失败只影响字体兜底，
+           不会修改翻译内容或共享缓存。 */
         foreach (string assetName in SelectAssetCandidates())
         {
             string path = Path.Combine(Paths.GameRootPath, "BepInEx", "font", assetName);
@@ -1218,7 +1360,9 @@ internal static class TmpFontFallbackInstaller
                     continue;
                 }
 
-                _uguiFont = CreateUnityFont(faceName) ?? CreateUnityFont(path);
+                /* Unity 的动态字体接口接收系统字体族名，不接受字体文件路径。
+                   文件路径创建由上面的 TMP 专用反射链负责。 */
+                _uguiFont = CreateUnityFont(faceName);
                 if (_uguiFont != null)
                 {
                     TmpFontFallbackPlugin.Logger.LogInfo("Loaded UGUI Chinese font: " + faceName);
@@ -1240,20 +1384,16 @@ internal static class TmpFontFallbackInstaller
         return null;
     }
 
-    private static object CreateUnityFont(string nameOrPath)
+    private static object CreateUnityFont(string fontName)
     {
-        if (string.IsNullOrEmpty(nameOrPath))
-        {
-            return null;
-        }
-        if (Path.IsPathRooted(nameOrPath))
+        if (string.IsNullOrEmpty(fontName))
         {
             return null;
         }
 
         try
         {
-            return Font.CreateDynamicFontFromOSFont(nameOrPath, 90);
+            return Font.CreateDynamicFontFromOSFont(fontName, 90);
         }
         catch
         {
@@ -1372,6 +1512,8 @@ internal static class TmpFontFallbackInstaller
 
     private static bool TryProtectInteractiveTmpTranslation(object text, string translated, out string preservedOriginal)
     {
+        /* 某些游戏把 TMP.text 原文同时当作选项/通知逻辑键。直接覆盖会让点击、
+           状态判断或教程流程失效；这类文本保留原组件原文，并用无射线覆盖层显示译文。 */
         preservedOriginal = null;
         if (text == null || string.IsNullOrEmpty(translated) || !ContainsCjk(translated) || IsInteractiveOverlayText(text))
         {
@@ -1579,6 +1721,10 @@ internal static class TmpFontFallbackInstaller
                 existingComponent.gameObject.SetActive(true);
                 return existing;
             }
+
+            /* Unity wrapper 已失效但托管引用仍在；释放旧 ID 后再创建当前场景覆盖层。 */
+            InteractiveOverlayTextIds.Remove(InstanceId(existing));
+            InteractiveOverlayTextBySourceId.Remove(sourceId);
         }
 
         try
@@ -1778,10 +1924,13 @@ internal static class TmpFontFallbackInstaller
     {
         if (InteractiveOverlayTextBySourceId.TryGetValue(sourceId, out object overlay))
         {
+            if (overlay != null)
+            {
+                InteractiveOverlayTextIds.Remove(InstanceId(overlay));
+            }
             Component overlayComponent = overlay as Component;
             if (overlayComponent != null && overlayComponent.gameObject != null)
             {
-                InteractiveOverlayTextIds.Remove(InstanceId(overlayComponent));
                 UnityEngine.Object.Destroy(overlayComponent.gameObject);
             }
             InteractiveOverlayTextBySourceId.Remove(sourceId);
@@ -1822,6 +1971,8 @@ internal static class TmpFontFallbackInstaller
 
     internal static string NormalizeTmpTextForFallback(string text)
     {
+        /* 仅替换常见缺字标点，属于 IL2CPP 显示层降级。不能把结果写回服务端缓存，
+           否则会污染 Ren'Py、RPG Maker 和 Unity Mono 共用的译文。 */
         if (string.IsNullOrEmpty(text))
         {
             return text;
@@ -1943,6 +2094,8 @@ internal static class TmpFontFallbackInstaller
 
     private static IEnumerable<object> FindUnityObjects(Type targetType)
     {
+        /* IL2CPP 各版本暴露的托管签名不完全一致，因此下面的辅助函数构成反射
+           适配层：找不到成员就返回空/false，让上层继续其它兼容路径。 */
         _findObjectsOfTypeAll ??= typeof(Resources).GetMethods(BindingFlags.Static | BindingFlags.Public)
             .FirstOrDefault(m => m.Name == "FindObjectsOfTypeAll" && m.GetParameters().Length == 1);
         MethodInfo method = _findObjectsOfTypeAll;

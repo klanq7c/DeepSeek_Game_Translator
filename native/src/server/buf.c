@@ -26,10 +26,17 @@ void buf_free(Buf *b) {
 /* 预留至少 n 字节可用空间（已含结尾 '\0' 的余量）。容量按 2 倍指数扩张，
    摊还代价 O(1)。need = len + n + 1 中的 +1 为结尾 '\0' 预留。 */
 void buf_grow(Buf *b, size_t n) {
+    if (n > SIZE_MAX - b->len - 1) die("buffer too large");
     size_t need = b->len + n + 1;
     if (need <= b->cap) return;
     if (b->cap == 0) b->cap = 16;
-    while (b->cap < need) b->cap *= 2;
+    while (b->cap < need) {
+        if (b->cap > SIZE_MAX / 2) {
+            b->cap = need;
+            break;
+        }
+        b->cap *= 2;
+    }
     b->data = xrealloc(b->data, b->cap);
 }
 

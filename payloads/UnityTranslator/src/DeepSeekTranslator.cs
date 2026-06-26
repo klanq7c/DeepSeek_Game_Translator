@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -23,9 +22,31 @@ using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 
+/*
+ * Unity Mono / BepInEx 5 与 6 共用的运行时插件。
+ *
+ * 真实入口是 Awake()，完整主链路为：
+ *   Awake -> 加载本地缓存/字体 -> 安装 Harmony hook -> 创建 TranslatorDriver
+ *   -> TMP/UGUI setter、场景扫描或预热发现文本
+ *   -> 本地缓存命中直接排入主线程应用队列
+ *   -> 未命中经批量队列请求本地 C 服务
+ *   -> 后台网络线程只产生字符串结果，Unity 对象写入统一回到 PumpOnce。
+ *
+ * 引擎边界：本文件只随 Unity Mono payload 部署。Ren'Py、RPG Maker 和
+ * Unity IL2CPP 分别使用启动器 hook、XUnity 端点和 IL2CPP TMP fallback，
+ * 不会执行这里的代码。
+ *
+ * 所有权约定：
+ *   - _cache / _glossary / _localCacheKeys 由本插件拥有，访问时锁 _cache；
+ *   - 请求、去抖、待应用和组件状态由 _pendingLock 保护；
+ *   - _serverStateLock 只保护熔断状态；
+ *   - _cachePersistLock 只保护持久化调度标志，不包住磁盘 IO；
+ *   - UnityEngine.Object 只能在 Unity 主线程读取或写入，后台线程不得持有强引用。
+ */
 [BepInPlugin("com.deepseek.translator", "Unity Translator", "3.1.97")]
 public class DeepSeekTranslator : BaseUnityPlugin
 {
+	/* TMP 字体无法覆盖译文时创建的 UGUI 覆盖层状态；WeakReference 避免阻止场景卸载。 */
 	private sealed class TmpOverlayState : MonoBehaviour
 	{
 		public Text overlayText;
@@ -47,6 +68,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public bool registered;
 	}
 
+	/* 后台翻译完成后等待主线程写回组件的不可变工作项。 */
 	private sealed class PendingTranslationApply
 	{
 		public WeakReference ComponentRef;
@@ -62,6 +84,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public bool PreserveRichText;
 	}
 
+	/* 发给服务端前的占位符保护结果；Tokens 保存富文本/变量的还原映射。 */
 	private sealed class ProtectedTextPayload
 	{
 		public string OriginalText;
@@ -71,6 +94,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public Dictionary<string, string> Tokens = new Dictionary<string, string>(StringComparer.Ordinal);
 	}
 
+	/* 相同 domain+原文共用一次远程请求，Callbacks 承载所有等待者。 */
 	private sealed class PendingBatchRequest
 	{
 		public string Key;
@@ -86,6 +110,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public List<Action<string>> Callbacks = new List<Action<string>>();
 	}
 
+	/* typewriter 文本先在主线程去抖，稳定后才允许进入远程队列。 */
 	private sealed class DebouncedTextRequest
 	{
 		public WeakReference ComponentRef;
@@ -103,6 +128,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public float UpdatedAt;
 	}
 
+	/* 场景预热只保存弱引用；异步返回时组件可能已经销毁或切场景。 */
 	private sealed class WarmupCandidate
 	{
 		public WeakReference ComponentRef;
@@ -114,6 +140,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public bool IsTmp;
 	}
 
+	/* 独立且 DontDestroyOnLoad 的主线程泵。插件宿主 Update 不可靠时，
+	   Harmony 的 Time getter 后缀仍会调用同一个 PumpOnce 作为补充入口。 */
 	private sealed class TranslatorDriver : MonoBehaviour
 	{
 		public DeepSeekTranslator Owner;
@@ -166,6 +194,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private ConfigEntry<bool> _serverCachePreloadEnabled;
 
+	/* 网络、缓存和重试策略。常量必须直接用于真实调用点，禁止仅作“说明”。 */
 	private const int HttpTimeoutMs = 30000;
 
 	private const int ServerOfflineBaseBackoffMs = 2500;
@@ -178,6 +207,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int MaxRejectedTranslationRetries = 3;
 
+	/* 共享翻译状态。_localCacheKeys 只记录本游戏实际使用过的键，防止把
+	   可选的全服缓存预载再次完整写入游戏目录。 */
 	private readonly Dictionary<string, string> _glossary = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
 	private readonly Dictionary<string, string> _cache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -214,9 +245,17 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private int _gameScriptWarmupStarted;
 
+	/* 跨线程调度状态。后台任务只能在锁内增删工作项；真正读写 Unity 组件
+	   由 Driver/Canvas/Frame hook 触发的主线程泵完成。 */
 	private readonly object _pendingLock = new object();
 
 	private readonly object _serverStateLock = new object();
+
+	/* 诊断线程仅在 DebugMode 下创建。停止事件属于插件生命周期，OnDestroy 置位后
+	   线程立即退出，避免场景/插件卸载后仍由闭包强引用整个翻译器实例。 */
+	private ManualResetEvent _diagnosticsStop;
+
+	private Thread _diagnosticsThread;
 
 	private readonly HashSet<int> _inProgress = new HashSet<int>();
 
@@ -229,8 +268,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private readonly HashSet<string> _pendingApplyKeys = new HashSet<string>(StringComparer.Ordinal);
 
 	private readonly Dictionary<int, DebouncedTextRequest> _debouncedTextRequests = new Dictionary<int, DebouncedTextRequest>();
-
-	private readonly HashSet<int> _processed = new HashSet<int>();
 
 	private bool _tmpFontFromChineseSource;
 
@@ -372,26 +409,21 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int MaxClientBatchSize = 8;
 
-	/* Matches the local server's API channel pool: up to 4 batches in flight
-	   keep all channels busy instead of one round-trip at a time. */
+	/* 与本地服务 API 通道池对齐：最多 4 个批次并行，避免单次往返串行化。 */
 	private const int MaxConcurrentBatchFlushes = 4;
 
-	/* When a flush cycle dies on an unexpected exception the restart must be
-	   rate-limited, otherwise a deterministic failure becomes a hot loop. */
+	/* flush 异常退出后的重启必须限速，否则确定性错误会变成高频死循环。 */
 	private const int BatchFlushFaultRestartDelayMs = 1000;
 
 	private const int FreshLocalCacheMinEntries = 1200;
 
-	/* A genuinely game-used local cache stays in the low thousands. Anything
-	   this large is a legacy full-server-dump persist; re-marking it local
-	   would make every persist cycle revalidate and rewrite the whole file. */
+	/* 单个游戏真实使用的本地缓存通常只有几千条。超过此值视为旧版整库污染，
+	   不能重新标成本地键，否则每次持久化都会校验并重写整库。 */
 	private const int OversizedLocalCacheEntryLimit = 50000;
 
 	private const long OversizedLocalCacheFileBytes = 8L * 1024L * 1024L;
 
 	private const int MaxFontWarmupCacheEntries = 2048;
-
-	private const float StartupWarmupDelaySeconds = 0.01f;
 
 	private const float SceneWarmupDelaySeconds = 0.05f;
 
@@ -459,32 +491,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private float _lastStatePruneRealtime = -999f;
 
-	private readonly Dictionary<int, Material> _softMaskFontMaterials = new Dictionary<int, Material>();
-
-	private readonly object _softMaskFontMatLock = new object();
-
-	private volatile int _compatMaterialAppliedCount;
-
-	private volatile int _compatMatNullHostMat;
-
-	private volatile int _compatMatNullClone;
-
-	private volatile int _compatMatSetThrew;
-
-	private volatile int _compatMatOurMatNull;
-
-	private static readonly bool DisableDirectSwap = false;
-
-	private volatile int _directSwapBlockedCount;
-
-	private static readonly bool MinimalMode = false;
-
-	private volatile int _minimalSkipFontCount;
-
-	private volatile int _minimalSkipMeshCount;
-
-	private volatile int _minimalSkipOverlayCount;
-
 	private const int FirstWritesToLog = 12;
 
 	private static int _firstWritesLogged;
@@ -497,13 +503,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int MaxUiActivationCacheAppliesPerPass = 128;
 
-	private const int MaxPeriodicCacheAppliesPerPass = 16;
+	private const int MaxPeriodicCacheAppliesPerPass = 32;
 
 	private const int MaxTargetedCacheQueuesPerActivation = 48;
 
 	private const int SceneCacheApplyPasses = 6;
-
-	private const int MaxRemotePendingRequests = 12;
 
 	private const int MaxRemoteLowPriorityPendingRequests = 4;
 
@@ -547,9 +551,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly TimeSpan FreshLocalCacheMaxAge = TimeSpan.FromHours(12.0);
 
-	/* Tag-name groups are deliberately conservative so plain-angle narration
-	   ("< The lobby is packed... >", "<Mark looked at me.>") never matches:
-	   valued tags require an '=', bare tags must be the exact tag word. */
+	/* 标签名刻意保守：带值标签必须有 '='，裸标签必须完整匹配标签词，
+	   从而不把 "< The lobby... >" 或 "<Mark looked at me.>" 当成富文本。 */
 	private static readonly Regex RichTextTagRegex = new Regex("<\\s*/?\\s*(?:b|i|u|s)\\s*>|<\\s*#[0-9A-Fa-f]{3,8}\\s*>|<\\s*(?:color|size|material)\\s*=\\s*[^>]+>|<\\s*/\\s*(?:color|size|material)\\s*>|<\\s*quad\\b[^>]*>|<\\s*br\\s*/?\\s*>|<\\s*(?:mark|sprite|line-height|link|font-weight|font|align|alpha|cspace|indent|line-indent|margin|mspace|pos|rotate|space|style|voffset|width|gradient|page)\\s*(?:=|\\s+[A-Za-z-]+\\s*=)[^>]*>|<\\s*(?:nobr|noparse|allcaps|smallcaps|lowercase|uppercase|strikethrough)\\s*>|<\\s*/\\s*(?:mark|sprite|line-height|link|font-weight|font|align|alpha|cspace|indent|line-indent|margin|mspace|pos|rotate|space|style|voffset|width|gradient|page|nobr|noparse|allcaps|smallcaps|lowercase|uppercase|strikethrough)\\s*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
 	private static readonly Regex EmptyAngleTagRegex = new Regex("<\\s*>", RegexOptions.Compiled);
@@ -560,9 +563,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly Regex BareClosingRichTextRegex = new Regex("(?<!<)(/\\s*(?:color|size|b|i|u|material|quad)\\s*>)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-	/* Single-letter tags (b/i/u) must not be "repaired" here: hex colors
-	   ending in B (e.g. <color=#CFC59B>) would match "B>" and get a spurious
-	   '<' injected, corrupting the valid color tag into <color=#CFC59<B>. */
+	/* 这里不能修复 b/i/u 单字母标签：以 B 结尾的十六进制颜色会误匹配
+	   "B>" 并被插入多余 '<'，破坏原本有效的 color 标签。 */
 	private static readonly Regex BareOpeningRichTextRegex = new Regex("(?<![</])((?:color|size|material|quad)(?:\\s*=\\s*[^>\\s]+)?\\s*>)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
 	private static readonly Regex NestedBrokenRichTextRegex = new Regex("</\\s*<\\s*(color|size|b|i|u|material|quad)\\s*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -573,8 +575,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly Regex LooseColorCloseFragmentRegex = new Regex("(?i)[<:/\\\\-]*\\s*/\\s*c?olor\\s*>?", RegexOptions.Compiled);
 
-	/* Percent sizes (<size=150%>) must be consumed fully, otherwise the
-	   plain-text strip leaves a stray "%>" behind. */
+	/* 百分比字号标签必须整体吞掉，否则纯文本路径会残留 "%>"。 */
 	private static readonly Regex LooseSizeOpenFragmentRegex = new Regex("(?i)[<:/\\\\-]*\\s*size\\s*[-=]+\\s*\\d+\\s*%?\\s*>?", RegexOptions.Compiled);
 
 	private static readonly Regex LooseSizeCloseFragmentRegex = new Regex("(?i)[<:/\\\\-]*\\s*/\\s*size\\s*>?", RegexOptions.Compiled);
@@ -591,10 +592,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly Regex RuntimeResolutionTextRegex = new Regex("\\b(?:\\d{3,5}|#+)x(?:\\d{3,5}|#+)@(?:\\d{1,4}|#+)\\s*Hz(?:\\[[^\\]]+\\])?\\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-	/* Geometric symbols (●, □, ·) are common in stat dots and chip padding
-	   but missing from most packaged CJK atlases; left unreplaced they force
-	   the whole component onto the UGUI overlay fallback, which cannot
-	   render <mark> highlight chips. */
+	/* ●、□、· 常用于属性点和标签填充，但多数打包 CJK 图集缺字；不替换会迫使
+	   整个组件降级到无法渲染 <mark> 的 UGUI 覆盖层。 */
 	private static readonly char[] TmpPunctuationFallbackChars = new char[20]
 	{
 		'\u3001', '\u3002', '\uff0c', '\uff1f', '\uff01', '\uff1a', '\uff1b', '\uff08', '\uff09', '\u3010',
@@ -656,8 +655,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly object _quietMethodCacheLock = new object();
 
-	private int _subMeshRescuedCount;
-
 	private Type _tmpSubMeshTypeCache;
 
 	private Type _tmpSubMeshUITypeCache;
@@ -670,19 +667,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly Dictionary<string, PropertyInfo> _quietPropertyCache = new Dictionary<string, PropertyInfo>();
 
-	private static int _compatMatLoggedFirst;
-
-	private static readonly bool SkipCompatMaterialOverride = true;
-
 	private static int _deepInspectCount;
 
 	private const int DeepInspectMax = 3;
 
+	/* BepInEx 真实入口。初始化顺序很重要：先准备配置/缓存/字体，再安装 hook，
+	   最后启动预热和扫描。任何后台工作都不得在这里同步等待远程 API。 */
 	private void Awake()
 	{
-		//IL_01c8: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01d2: Expected O, but got Unknown
-		//IL_02a0: Unknown result type (might be due to invalid IL or missing references)
 		_instance = this;
 		_lastSceneLoadRealtime = Time.realtimeSinceStartup;
 		_serverUrl = base.Config.Bind("General", "ServerUrl", "http://127.0.0.1:19999", "Translation server URL");
@@ -708,7 +700,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_harmony = new Harmony("com.deepseek.translator");
 		InstallHooks();
 		SceneManager.sceneLoaded += OnSceneLoaded;
-		base.Logger.LogInfo("=== DeepSeek Translator v" + (typeof(DeepSeekTranslator).GetCustomAttribute<BepInPlugin>()?.Version?.ToString() ?? "unknown") + " Ready ===");
+		base.Logger.LogInfo("=== ds游戏翻译器 v" + (typeof(DeepSeekTranslator).GetCustomAttribute<BepInPlugin>()?.Version?.ToString() ?? "unknown") + " Ready ===");
 		Canvas.willRenderCanvases += OnWillRenderCanvases;
 		base.Logger.LogInfo("Registered Canvas.willRenderCanvases callback");
 		if (!IsFontModeNone())
@@ -717,11 +709,24 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		StartStartupWarmup();
 		StartManagedCoroutine(ScanTextComponentsCoroutine());
+		if (_debugMode.Value)
+		{
+			/* 周期诊断会分配字符串并写盘，只能显式启用；正常运行不创建常驻线程。
+			   诊断是可选旁路，不能用 Awake 早退控制，否则未来追加的真实初始化会被跳过。 */
 		string pluginDir = Path.GetDirectoryName(base.Info.Location);
 		DeepSeekTranslator translatorRef = this;
+		string diagnosticFontMode = GetFontMode();
+		string diagnosticPerformanceMode = GetPerformanceMode();
+		string diagnosticServerUrl = _serverUrl?.Value;
+		bool diagnosticHasUsableTmpFont = HasUsableTmpFont();
+		bool diagnosticHasChineseTmpFont = !ReferenceEquals(_chineseTMPFont, null);
+		_diagnosticsStop = new ManualResetEvent(initialState: false);
 		Thread thread = new Thread((ThreadStart)delegate
 		{
-			Thread.Sleep(5000);
+			if (_diagnosticsStop.WaitOne(5000))
+			{
+				return;
+			}
 			try
 			{
 				string path = Path.Combine(pluginDir, "translator_runtime_diag.txt");
@@ -729,29 +734,32 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					$"DiagTime={DateTime.Now}",
 					"Version=3.1.97",
-					"FontMode=" + translatorRef.GetFontMode(),
-					"PerformanceMode=" + translatorRef.GetPerformanceMode(),
+					"FontMode=" + diagnosticFontMode,
+					"PerformanceMode=" + diagnosticPerformanceMode,
 					$"HookCalls={translatorRef._hookCallCount}",
 					$"CanvasRenderCalls={translatorRef._canvasRenderCount}",
 					$"DriverTicks={translatorRef._driverTickCount}",
 					$"FramePumpTicks={translatorRef._framePumpTickCount}",
-					$"CacheSize={translatorRef._cache.Count}",
-					$"GlossarySize={translatorRef._glossary.Count}",
+					$"CacheSize={translatorRef.GetCacheCount()}",
+					$"GlossarySize={translatorRef.GetGlossaryCount()}",
 					$"ProcessedCount={translatorRef.GetTranslatedComponentCount()}",
 					$"UiActivationBursts={translatorRef._uiActivationBurstCount}",
 					$"CacheApplyPasses={translatorRef._cacheApplyPassCount}",
 					$"CacheApplyHits={translatorRef._cacheApplyHitCount}",
 					$"TextEnableHooks={translatorRef._textEnableHookCount}",
 					$"TargetedCacheQueues={translatorRef._targetedCacheQueueCount}",
-					$"InProgressCount={translatorRef._inProgress.Count}",
-					"ServerUrl=" + translatorRef._serverUrl?.Value
+					$"InProgressCount={translatorRef.GetInProgressCount()}",
+					"ServerUrl=" + diagnosticServerUrl
 				};
 				File.WriteAllText(path, string.Join("\n", value));
 			}
 			catch
 			{
 			}
-			Thread.Sleep(10000);
+			if (_diagnosticsStop.WaitOne(10000))
+			{
+				return;
+			}
 			try
 			{
 				string path2 = Path.Combine(pluginDir, "translator_scan_diag.txt");
@@ -763,8 +771,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				string[] value2 = new string[21]
 				{
 					$"ScanDiagTime={DateTime.Now}",
-					"FontMode=" + translatorRef.GetFontMode(),
-					"PerformanceMode=" + translatorRef.GetPerformanceMode(),
+					"FontMode=" + diagnosticFontMode,
+					"PerformanceMode=" + diagnosticPerformanceMode,
 					$"ScanCount={translatorRef._scanCount}",
 					$"CanvasRenderCalls={translatorRef._canvasRenderCount}",
 					$"DriverTicks={translatorRef._driverTickCount}",
@@ -776,8 +784,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					$"FlushSkipped={translatorRef._flushSkipped}",
 					$"PendingQueueSize={count}",
 					$"ProcessedCount={translatorRef.GetTranslatedComponentCount()}",
-					$"InProgressCount={translatorRef._inProgress.Count}",
-					$"CacheSize={translatorRef._cache.Count}",
+					$"InProgressCount={translatorRef.GetInProgressCount()}",
+					$"CacheSize={translatorRef.GetCacheCount()}",
 					$"UiActivationBursts={translatorRef._uiActivationBurstCount}",
 					$"CacheApplyPasses={translatorRef._cacheApplyPassCount}",
 					$"CacheApplyHits={translatorRef._cacheApplyHitCount}",
@@ -789,9 +797,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			catch
 			{
 			}
-			while (true)
+			while (!_diagnosticsStop.WaitOne(5000))
 			{
-				Thread.Sleep(5000);
 				try
 				{
 					string path3 = Path.Combine(pluginDir, "translator_live_diag.txt");
@@ -802,15 +809,15 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						count2 = translatorRef._pendingApplyQueue.Count;
 						count3 = translatorRef._activeTmpOverlays.Count;
 					}
-					string[] value3 = new string[56]
+					string[] value3 = new string[44]
 					{
 						$"LiveDiagTime={DateTime.Now}",
 						"Version=3.1.97",
-						"FontMode=" + translatorRef.GetFontMode(),
-						"PerformanceMode=" + translatorRef.GetPerformanceMode(),
+						"FontMode=" + diagnosticFontMode,
+						"PerformanceMode=" + diagnosticPerformanceMode,
 						$"OverlayDisabled={translatorRef._overlayDisabled}",
-						$"HasUsableTmpFont={translatorRef.HasUsableTmpFont()}",
-						$"ChineseTMPFont={translatorRef._chineseTMPFont != null}",
+						$"HasUsableTmpFont={diagnosticHasUsableTmpFont}",
+						$"ChineseTMPFont={diagnosticHasChineseTmpFont}",
 						$"TmpFontFromPackage={translatorRef._tmpFontFromPackage}",
 						$"TmpFontFromExisting={translatorRef._tmpFontFromExisting}",
 						"TmpFontSource=" + translatorRef._tmpFontSource,
@@ -821,10 +828,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						$"ActiveOverlayCount={count3}",
 						$"OverlayRestored={translatorRef._tmpOverlayRestoredCount}",
 						$"TotalTMPFound={translatorRef._totalTmpFound}",
-						$"CacheSize={translatorRef._cache.Count}",
+						$"CacheSize={translatorRef.GetCacheCount()}",
 						$"PendingQueueSize={count2}",
 						$"ProcessedCount={translatorRef.GetTranslatedComponentCount()}",
-						$"InProgressCount={translatorRef._inProgress.Count}",
+						$"InProgressCount={translatorRef.GetInProgressCount()}",
 						$"CacheApplyHits={translatorRef._cacheApplyHitCount}",
 						$"TextEnableHooks={translatorRef._textEnableHookCount}",
 						$"ScanCount={translatorRef._scanCount}",
@@ -842,18 +849,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						$"AlphaSweepRunCount={translatorRef._alphaSweepRunCount}",
 						$"AlphaSweepHealedCount={translatorRef._alphaSweepHealedCount}",
 						$"CanvasGroupHiddenCount={translatorRef._canvasGroupHiddenCount}",
-						$"CompatMaterialAppliedCount={translatorRef._compatMaterialAppliedCount}",
-						$"CompatMaterialCacheSize={translatorRef.GetSoftMaskFontMaterialCacheSize()}",
-						$"CompatMatNullHostMat={translatorRef._compatMatNullHostMat}",
-						$"CompatMatNullClone={translatorRef._compatMatNullClone}",
-						$"CompatMatSetThrew={translatorRef._compatMatSetThrew}",
-						$"CompatMatOurMatNull={translatorRef._compatMatOurMatNull}",
-						$"DirectSwapBlockedCount={translatorRef._directSwapBlockedCount}",
-						$"DirectSwapDisabled={DisableDirectSwap}",
-						$"MinimalMode={MinimalMode}",
-						$"MinimalSkipFontCount={translatorRef._minimalSkipFontCount}",
-						$"MinimalSkipMeshCount={translatorRef._minimalSkipMeshCount}",
-						$"MinimalSkipOverlayCount={translatorRef._minimalSkipOverlayCount}",
 						$"FirstWritesLogged={Volatile.Read(ref _firstWritesLogged)}",
 						$"FontMaterialFixed={translatorRef._fontMaterialFixed}",
 						$"FontMaterialAlreadyOk={translatorRef._fontMaterialAlreadyOk}",
@@ -870,6 +865,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		});
 		thread.IsBackground = true;
 		thread.Name = "DST_Diag";
+		_diagnosticsThread = thread;
 		thread.Start();
 		try
 		{
@@ -878,12 +874,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		catch
 		{
 		}
+		}
 	}
 
 	private void EnsureDriver()
 	{
-		//IL_0015: Unknown result type (might be due to invalid IL or missing references)
-		//IL_001b: Expected O, but got Unknown
+		/* Driver 与插件宿主解耦并跨场景存活，集中执行所有 Unity 对象操作。
+		   创建失败时协程可退回插件自身，Harmony 帧泵仍提供第二条活跃路径。 */
 		if ((Object)(object)_driver != (Object)null)
 		{
 			return;
@@ -962,7 +959,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return 127;
 		}
-		return 63;
+		return FramePumpGateMask;
 	}
 
 	private float GetFastScanIntervalSeconds()
@@ -975,7 +972,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return 1f;
 		}
-		return 0.5f;
+		return FastScanIntervalSeconds;
 	}
 
 	private float GetSlowScanIntervalSeconds()
@@ -988,7 +985,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return 8f;
 		}
-		return 5f;
+		return SlowScanIntervalSeconds;
 	}
 
 	private float GetFastScanWindowSeconds()
@@ -1001,7 +998,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return 1f;
 		}
-		return 2f;
+		return FastScanWindowSeconds;
 	}
 
 	private int GetMaxPendingApplyPerFlush()
@@ -1014,7 +1011,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return 2;
 		}
-		return 4;
+		return MaxPendingApplyPerFlush;
 	}
 
 	private void DriverUpdate()
@@ -1066,6 +1063,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void PumpOnce(string source)
 	{
+		/* 主线程唯一汇合点：修复覆盖层/透明度、消费缓存命中、处理去抖与
+		   待应用队列，再按性能模式扫描。source 只用于诊断，不改变语义。 */
 		try
 		{
 			RunOverlayValidationTick();
@@ -1089,7 +1088,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		try
 		{
 			Interlocked.Increment(ref _canvasRenderCount);
-			if (_canvasRenderCount <= 3)
+			if (_debugMode.Value && _canvasRenderCount <= 3)
 			{
 				try
 				{
@@ -1157,7 +1156,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_nextPeriodicCacheApplyRealtime = Math.Min(_nextPeriodicCacheApplyRealtime, realtimeSinceStartup);
 		try
 		{
-			ApplyCachedVisibleTextPass(128);
+			ApplyCachedVisibleTextPass(MaxUiActivationCacheAppliesPerPass);
 		}
 		catch (Exception ex)
 		{
@@ -1175,7 +1174,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_nextUiCacheApplyRealtime = realtimeSinceStartup + UiActivationCacheApplyIntervalSeconds;
 		try
 		{
-			ApplyCachedVisibleTextPass(128);
+			ApplyCachedVisibleTextPass(MaxUiActivationCacheAppliesPerPass);
 		}
 		catch (Exception ex)
 		{
@@ -1193,7 +1192,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_nextPeriodicCacheApplyRealtime = realtimeSinceStartup + PeriodicCacheApplyIntervalSeconds;
 		try
 		{
-			ApplyCachedVisibleTextPass(32);
+			ApplyCachedVisibleTextPass(MaxPeriodicCacheAppliesPerPass);
 		}
 		catch (Exception ex)
 		{
@@ -1208,8 +1207,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			float realtimeSinceStartup = Time.realtimeSinceStartup;
 			if (!(realtimeSinceStartup < _nextOverlayValidationRealtime))
 			{
-				_nextOverlayValidationRealtime = realtimeSinceStartup + 0.5f;
-				ValidateActiveTmpOverlays(4);
+				_nextOverlayValidationRealtime = realtimeSinceStartup + OverlayValidationIntervalSeconds;
+				ValidateActiveTmpOverlays(MaxOverlayValidationsPerPump);
 			}
 		}
 	}
@@ -1596,7 +1595,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		float realtimeSinceStartup = Time.realtimeSinceStartup;
 		if (!(realtimeSinceStartup < _nextSceneCacheApplyRealtime))
 		{
-			ApplyCachedVisibleTextPass(256);
+			ApplyCachedVisibleTextPass(MaxSceneCacheAppliesPerPass);
 			FlushPendingTranslations();
 			_sceneCacheApplyPassesRemaining--;
 			_nextSceneCacheApplyRealtime = realtimeSinceStartup + SceneCacheApplyIntervalSeconds;
@@ -1611,7 +1610,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return;
 		}
 		float realtimeSinceStartup = Time.realtimeSinceStartup;
-		if (realtimeSinceStartup < 1f || realtimeSinceStartup - _lastDeepPrefetchRealtime < 2f || Interlocked.CompareExchange(ref _deepPrefetchActive, 1, 0) != 0)
+		if (realtimeSinceStartup < DeepPrefetchInitialDelaySeconds ||
+			realtimeSinceStartup - _lastDeepPrefetchRealtime < DeepPrefetchScanIntervalSeconds ||
+			Interlocked.CompareExchange(ref _deepPrefetchActive, 1, 0) != 0)
 		{
 			return;
 		}
@@ -1623,7 +1624,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_lastDeepPrefetchRealtime = realtimeSinceStartup;
 		try
 		{
-			CollectDeepPrefetchCandidates(260, 80);
+			CollectDeepPrefetchCandidates(DeepPrefetchMaxObjectsPerScan, DeepPrefetchMaxTextsPerScan);
 			_ = ProcessDeepPrefetchQueueAsync();
 		}
 		catch
@@ -2044,28 +2045,38 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private static string HttpPost(string url, string jsonBody, int timeoutMs = 30000)
+	private static string HttpPost(string url, string jsonBody, int timeoutMs = HttpTimeoutMs)
 	{
 		return RawHttpRequest(url, "POST", jsonBody, timeoutMs);
 	}
 
 	private static Task<T> RunBackground<T>(Func<T> work)
 	{
+		/* BepInEx/旧 Unity 的 SynchronizationContext 不可靠，因此不依赖 Task.Run
+		   的上下文行为；但也不能为每次 HTTP/磁盘任务创建一个 OS 线程。工作项进入
+		   CLR 线程池，返回值只能是托管数据，禁止在线程中读取或写入 Unity 对象。 */
 		TaskCompletionSource<T> completion = new TaskCompletionSource<T>();
-		Thread thread = new Thread((ThreadStart)delegate
+		try
 		{
-			try
+			if (!ThreadPool.QueueUserWorkItem(delegate
 			{
-				completion.SetResult(work());
-			}
-			catch (Exception exception)
+				try
+				{
+					completion.SetResult(work());
+				}
+				catch (Exception exception)
+				{
+					completion.SetException(exception);
+				}
+			}))
 			{
-				completion.SetException(exception);
+				completion.SetException(new InvalidOperationException("Unable to queue background work."));
 			}
-		});
-		thread.IsBackground = true;
-		thread.Name = "DST_HTTP";
-		thread.Start();
+		}
+		catch (Exception exception2)
+		{
+			completion.SetException(exception2);
+		}
 		return completion.Task;
 	}
 
@@ -2193,7 +2204,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return stringBuilder.ToString();
 	}
 
-	private static string HttpGet(string url, int timeoutMs = 30000)
+	private static string HttpGet(string url, int timeoutMs = HttpTimeoutMs)
 	{
 		return RawHttpRequest(url, "GET", null, timeoutMs);
 	}
@@ -2233,20 +2244,22 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					{
 						memoryStream.Write(array, 0, count);
 					}
-					return DecodeRawHttpResponse(memoryStream.ToArray());
+					/* 默认 MemoryStream 的底层缓冲可公开；直接按 Length 解码，避免
+					   cache dump 等大响应再由 ToArray 复制一整份。 */
+					return DecodeRawHttpResponse(memoryStream.GetBuffer(), checked((int)memoryStream.Length));
 				}
 			}
 		}
 	}
 
-	private static string DecodeRawHttpResponse(byte[] response)
+	private static string DecodeRawHttpResponse(byte[] response, int responseLength)
 	{
-		if (response == null || response.Length == 0)
+		if (response == null || responseLength <= 0 || responseLength > response.Length)
 		{
 			return null;
 		}
 		int num = -1;
-		for (int i = 0; i + 3 < response.Length; i++)
+		for (int i = 0; i + 3 < responseLength; i++)
 		{
 			if (response[i] == 13 && response[i + 1] == 10 && response[i + 2] == 13 && response[i + 3] == 10)
 			{
@@ -2270,7 +2283,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return null;
 		}
 		int num2 = num + 4;
-		int num3 = response.Length - num2;
+		int num3 = responseLength - num2;
 		foreach (string text in array)
 		{
 			if (text.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase) && int.TryParse(text.Substring("Content-Length:".Length).Trim(), out var result2))
@@ -2307,9 +2320,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		lock (_serverStateLock)
 		{
 			_serverFailureCount = Math.Min(_serverFailureCount + 1, 6);
-			timeSpan = TimeSpan.FromMilliseconds(Math.Min(30000, 2500 << Math.Min(_serverFailureCount - 1, 4)));
+			timeSpan = TimeSpan.FromMilliseconds(Math.Min(
+				ServerOfflineMaxBackoffMs,
+				ServerOfflineBaseBackoffMs << Math.Min(_serverFailureCount - 1, 4)));
 			_serverBackoffUntilUtc = utcNow + timeSpan;
-			if (utcNow - _lastServerFailureLogUtc >= TimeSpan.FromMilliseconds(6000.0))
+			if (utcNow - _lastServerFailureLogUtc >= TimeSpan.FromMilliseconds(ServerFailureLogIntervalMs))
 			{
 				_lastServerFailureLogUtc = utcNow;
 				flag = true;
@@ -2324,8 +2339,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void OnDestroy()
 	{
-		//IL_001e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0028: Expected O, but got Unknown
+		/* 先停止会闭包引用本插件的诊断线程，再同步写最后一次本地快照并解绑入口。 */
+		_diagnosticsStop?.Set();
+		Thread diagnosticsThread = _diagnosticsThread;
+		if (diagnosticsThread != null && diagnosticsThread != Thread.CurrentThread && diagnosticsThread.IsAlive)
+		{
+			diagnosticsThread.Join(250);
+		}
+		_diagnosticsThread = null;
 		FlushLocalCacheToDisk();
 		SceneManager.sceneLoaded -= OnSceneLoaded;
 		Canvas.willRenderCanvases -= OnWillRenderCanvases;
@@ -2597,7 +2618,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		if (ShouldDelayServerCacheSync())
 		{
-			base.Logger.LogInfo($"Server cache sync deferred: local cache ready ({_cache.Count} entries)");
+			base.Logger.LogInfo($"Server cache sync deferred: local cache ready ({GetCacheCount()} entries)");
 			_ = DeferredServerCacheSyncAsync();
 		}
 		else
@@ -2608,7 +2629,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private bool ShouldDelayServerCacheSync()
 	{
-		if (_cache.Count < 1200)
+		if (GetCacheCount() < FreshLocalCacheMinEntries)
 		{
 			return false;
 		}
@@ -2656,6 +2677,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void InstallHooks()
 	{
+		/* Harmony hook 是文本进入管线的第一入口；扫描器只是漏网兜底。
+		   这里只挂 Unity Mono 的 TMP/UGUI/Fungus，不参与 IL2CPP/XUnity。 */
 		Type type = AccessTools.TypeByName("TMPro.TMP_Text");
 		if (type != null)
 		{
@@ -2846,11 +2869,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				_harmony.Patch(methodInfo3, new HarmonyMethod(typeof(DeepSeekTranslator), "FungusMenuPrefix"));
 			}
 		}
-	}
-
-	private static bool TMPSetTextMethodPrefix(object __instance, ref string value)
-	{
-		return TMPSetTextPrefix(__instance, ref value);
 	}
 
 	private void ObserveFirstAsyncQueue(object component, string originalText)
@@ -3084,7 +3102,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		if (!((Object)(object)_instance == (Object)null) && value && !((Object)(object)__instance == (Object)null) && _instance.LooksLikeUiGameObject(__instance))
 		{
-			_instance.QueueCachedTextsInHierarchy(__instance, 48);
+			_instance.QueueCachedTextsInHierarchy(__instance, MaxTargetedCacheQueuesPerActivation);
 			_instance.RequestUiCacheApplyBurst();
 		}
 	}
@@ -3093,7 +3111,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		if (!((Object)(object)_instance == (Object)null) && !((Object)(object)__instance == (Object)null) && _instance.ShouldHandleCanvasGroupVisible(__instance, value))
 		{
-			_instance.QueueCachedTextsInHierarchy(((Component)__instance).gameObject, 48);
+			_instance.QueueCachedTextsInHierarchy(((Component)__instance).gameObject, MaxTargetedCacheQueuesPerActivation);
 		}
 	}
 
@@ -3250,7 +3268,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		try
 		{
-			if (!MinimalMode && !(component is Text) && !string.IsNullOrEmpty(translated))
+			if (!(component is Text) && !string.IsNullOrEmpty(translated))
 			{
 				RescueStrandedAlpha(component);
 			}
@@ -3272,23 +3290,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			translated = ((preserveRichText && ShouldPreserveRichTextForDisplayWithColor(sourceForFormatting, translated)) ? PrepareTranslatedTextForComponent(component, translated, sourceForFormatting) : StripRichTextForPlainText(translated));
 			translated = NormalizeTmpPunctuationForMissingGlyphs(translated);
 			LogFirstWrites(component, type, translated);
-			if (MinimalMode)
-			{
-				Interlocked.Increment(ref _minimalSkipFontCount);
-				Interlocked.Increment(ref _minimalSkipMeshCount);
-				Interlocked.Increment(ref _minimalSkipOverlayCount);
-				propertyInfo?.SetValue(component, translated);
-				RevealTmpText(component, translated);
-			}
-			else
-			{
-				bool tmpFontCoversText = EnsureTMPFontCoversText(component, translated);
-				propertyInfo?.SetValue(component, translated);
-				RevealTmpText(component, translated);
-				ApplyTmpOverlay(component, translated, sourceForFormatting, !tmpFontCoversText);
-				InvokeForceMeshUpdate(component, type);
-			}
-			if (MinimalMode || !PostWriteHasMissingGlyph(component, translated))
+			bool tmpFontCoversText = EnsureTMPFontCoversText(component, translated);
+			propertyInfo?.SetValue(component, translated);
+			RevealTmpText(component, translated);
+			ApplyTmpOverlay(component, translated, sourceForFormatting, !tmpFontCoversText);
+			InvokeForceMeshUpdate(component, type);
+			if (!PostWriteHasMissingGlyph(component, translated))
 			{
 				return;
 			}
@@ -3303,11 +3310,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void RescueStrandedAlpha(object tmpComponent)
 	{
-		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0056: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00eb: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0130: Unknown result type (might be due to invalid IL or missing references)
 		try
 		{
 			Color tmpColor = GetTmpColor(tmpComponent);
@@ -3384,9 +3386,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static float TryReadColorAlpha(object tmpComponent, string propName)
 	{
-		//IL_003d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0042: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0043: Unknown result type (might be due to invalid IL or missing references)
 		try
 		{
 			PropertyInfo propertyInfo = AccessTools.Property(tmpComponent?.GetType(), propName);
@@ -3456,6 +3455,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private string Translate(string text)
 	{
+		/* 同步路径只查内存 glossary/cache，绝不发网络请求。未命中原样返回，
+		   setter hook 随后把文本放入去抖/批量异步管线。 */
 		if (!TryGetLocalTranslation(text, out var translated))
 		{
 			return text;
@@ -3463,11 +3464,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return translated;
 	}
 
-	/* Typewriter-suspect texts are no longer hard-rejected anywhere in the
-	   request pipeline: classification only buys them a longer debounce
-	   settle (GetTextSettleDelaySeconds). A text that stopped changing for
-	   the settle window is final regardless of how its ending looks, so
-	   prose without trailing punctuation still gets translated. */
+	/* 疑似打字机片段不再被管线永久拒绝；分类只延长去抖等待时间。
+	   文本在等待窗内不再变化就视为最终文本，因此无句末标点的完整对白仍可翻译。 */
 	private bool TryGetLocalTranslation(string text, out string translated)
 	{
 		translated = text;
@@ -3703,9 +3701,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private void StoreCachedTranslation(string original, string translated)
 	{
 		translated = SanitizeTranslationArtifacts(translated);
-		/* Requests are only issued for texts that survived the debounce
-		   settle window, so what arrives here is final text and safe to
-		   store, even when its ending pattern-matches a typewriter cut. */
+		/* 能走到这里的文本已经通过去抖稳定窗，可视为最终文本并安全缓存；
+		   即使结尾形态仍像打字机截断，也不能再次永久丢弃。 */
 		if (!IsAcceptableTranslation(original, translated))
 		{
 			return;
@@ -4078,13 +4075,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		if (string.Equals(domain, "ui", StringComparison.OrdinalIgnoreCase))
 		{
-			return 0;
+			return UiClientBatchWindowMs;
 		}
 		if (string.Equals(domain, "system", StringComparison.OrdinalIgnoreCase))
 		{
-			return 1;
+			return SystemClientBatchWindowMs;
 		}
-		return 2;
+		return DefaultClientBatchWindowMs;
 	}
 
 	private static string BuildBatchRequestKey(string text, string domain)
@@ -4120,6 +4117,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void RequestSharedTranslation(string text, string domain, Action<string> callback, bool lowPriority = false)
 	{
+		/* 以 domain+原文合并并发等待者。_batchFlushScheduled 是单一调度令牌：
+		   只有持有它的 flush 任务能消费队列，finally 必须清除或重启。 */
 		if (string.IsNullOrWhiteSpace(text))
 		{
 			callback?.Invoke(text);
@@ -4260,10 +4259,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		finally
 		{
-			/* Liveness guarantee: this is the only task allowed to run while
-			   _batchFlushScheduled is true. Whatever happened above, either
-			   clear the flag or restart the flush; otherwise translation
-			   dispatch stops for the rest of the session. */
+			/* 活性约束：_batchFlushScheduled 为 true 时只允许此任务运行。
+			   无论上方如何退出，都必须清标志或重启，否则本局不再分发翻译。 */
 			bool restart = false;
 			try
 			{
@@ -4296,7 +4293,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		while (true)
 		{
-			List<PendingBatchRequest> list = DequeuePendingBatchRequests(8);
+			List<PendingBatchRequest> list = DequeuePendingBatchRequests(MaxClientBatchSize);
 			if (list.Count == 0)
 			{
 				break;
@@ -4392,9 +4389,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 			}
 		}
-		/* Callback dispatch must not throw past this method: a propagated
-		   exception would fault the whole worker chain and double-invoke
-		   sibling groups through the drain-level failure path. */
+		/* 回调异常不能越过本方法，否则整个 worker 链会失败，drain 级降级路径
+		   还可能让同批其它分组被重复回调。 */
 		try
 		{
 			LogVerbose($"[BATCH] Invoking callbacks for {requests.Count} requests, {groupResults.Count} results");
@@ -4452,13 +4448,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private IEnumerator SceneWarmupCoroutine(int generation)
 	{
-		yield return (object)new WaitForSeconds(0.05f);
+		yield return (object)new WaitForSeconds(SceneWarmupDelaySeconds);
 		if (TryStartSceneWarmupPass(generation))
 		{
-			yield return (object)new WaitForSeconds(0.35f);
+			yield return (object)new WaitForSeconds(SceneWarmupSecondPassDelaySeconds);
 			if (TryStartSceneWarmupPass(generation))
 			{
-				yield return (object)new WaitForSeconds(1f);
+				yield return (object)new WaitForSeconds(SceneWarmupThirdPassDelaySeconds);
 				TryStartSceneWarmupPass(generation);
 			}
 		}
@@ -4503,7 +4499,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						OriginalText = text,
 						IsTmp = true
 					});
-					if (list.Count >= 96)
+					if (list.Count >= MaxSceneWarmupCandidates)
 					{
 						return list;
 					}
@@ -4522,7 +4518,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					OriginalText = val2.text,
 					IsTmp = false
 				});
-				if (list.Count >= 96)
+				if (list.Count >= MaxSceneWarmupCandidates)
 				{
 					break;
 				}
@@ -4726,7 +4722,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return false;
 		}
 		int remotePendingCount = GetRemotePendingCount();
-		if (lowPriority && remotePendingCount >= 4)
+		if (lowPriority && remotePendingCount >= MaxRemoteLowPriorityPendingRequests)
 		{
 			return true;
 		}
@@ -4735,6 +4731,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static ProtectedTextPayload ProtectTextForTranslation(string text)
 	{
+		/* 富文本标签、格式变量和数字先替换为稳定 token；服务端只翻译可见文字，
+		   返回后 RestoreProtectedText 按原值恢复，避免模型改写控制序列。 */
 		ProtectedTextPayload payload = new ProtectedTextPayload
 		{
 			OriginalText = text ?? string.Empty,
@@ -5040,14 +5038,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly Regex TrailingStatLineRegex = new Regex("^[-+]?\\d[\\d.,]*\\s*[A-Za-z%]{0,16}$", RegexOptions.Compiled);
 
-	/* Dialogue boxes often append stat/cost annotations below the prose:
-	   "-200 gold", "+3 reputation", "Base payment 45", or even
-	   "+7 gold from tags Friendly+++ Relaxing++". Those lines are final UI
-	   text, not an unfinished typewriter cut, so sentence completeness must
-	   be judged on the prose above them; otherwise such dialogues are
-	   misclassified as typewriter fragments forever and never translated.
-	   A trailing line counts as a stat line when it is short, carries a
-	   digit, and does not end like a sentence. */
+	/* 对话框常在正文下附加费用/属性行。这些是最终 UI 文本，不是未完成的
+	   打字机截断；判断正文完整性前必须剥离短小、含数字且不像句子的尾行，
+	   否则整段会被长期误判为片段而永不翻译。 */
 	private static bool IsTrailingStatLine(string visibleLine)
 	{
 		if (TrailingStatLineRegex.IsMatch(visibleLine))
@@ -5149,13 +5142,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		if (LooksLikeTypewriterFragment(text))
 		{
-			return 0.9f;
+			return TypewriterFragmentDebounceSeconds;
 		}
 		if (LooksLikeUiText(text))
 		{
-			return 0.08f;
+			return UiTextSettleDebounceSeconds;
 		}
-		return 0.35f;
+		return TextSettleDebounceSeconds;
 	}
 
 	private static string SanitizeRichTextForUnityText(string text)
@@ -5310,10 +5303,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private static string PrepareTranslatedTextForComponent(object component, string text, string originalText = null)
 	{
 		text = RestoreOuterRichTextWrapper(text, originalText);
-		/* UGUI Text only renders a small tag whitelist, so unsupported tags
-		   must be filtered there. TMP supports the full tag set (mark, nobr,
-		   line-height, ...), so filtering would strip real formatting like
-		   <mark> highlight chips. */
+		/* UGUI Text 只支持少量标签，必须过滤不支持的标签；TMP 支持完整标签集，
+		   若复用 UGUI 过滤会误删 <mark> 等真实格式。 */
 		string text2 = ((component is Text) ? SanitizeRichTextForUnityText(text) : SanitizeTranslationArtifacts(text));
 		if (!ContainsRichTextTags(text2))
 		{
@@ -5651,11 +5642,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return false;
 	}
 
-	/* Chinese has no plural morphology, so translations legitimately keep
-	   protected terms in singular form ("Betas" -> "Beta"). Accept stem-level
-	   matches (one word prefixes the other, stem >= 3 chars, suffix <= 2
-	   chars) instead of demanding an exact word hit; otherwise such
-	   translations are rejected as English residue forever. */
+	/* 中文没有英语复数形态，受保护术语可能合法地由复数变单数。允许长度差不超
+	   2 的词干级匹配，避免把这类译文长期误判为英文残留。 */
 	private static bool LatinResidueMatchesSourceWord(string residueWord, string sourceWord)
 	{
 		if (string.Equals(sourceWord, residueWord, StringComparison.OrdinalIgnoreCase))
@@ -5713,6 +5701,30 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	private int GetCacheCount()
+	{
+		lock (_cache)
+		{
+			return _cache.Count;
+		}
+	}
+
+	private int GetGlossaryCount()
+	{
+		lock (_cache)
+		{
+			return _glossary.Count;
+		}
+	}
+
+	private int GetInProgressCount()
+	{
+		lock (_pendingLock)
+		{
+			return _inProgress.Count;
+		}
+	}
+
 	private void MarkProcessed(int instanceId, string rawText)
 	{
 		lock (_pendingLock)
@@ -5738,11 +5750,32 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void ResetSceneScopedState(bool clearPendingComponentWork)
 	{
+		/* 场景对象状态不能跨场景复用。翻译 cache/glossary 是进程级资产，
+		   因此这里仅回收“场景代”的组件 ID、预取队列和渲染器状态，不清共享译文。
+		   大场景退出时顺便收缩深扫描集合，避免 Clear 后仍永久保留峰值桶数组。 */
 		lock (_pendingLock)
 		{
+			bool trimDeepScannedObjects = _deepScannedObjects.Count > MaxTrackedComponentStates;
+			bool trimDeepPrefetchSeen = _deepPrefetchSeen.Count > MaxDeepPrefetchSeen;
+			bool trimDeepPrefetchQueue = _deepPrefetchQueue.Count > MaxDeepPrefetchQueue;
 			_translatedComponents.Clear();
 			_canvasGroupVisibleStates.Clear();
 			_activeTmpOverlays.Clear();
+			_deepScannedObjects.Clear();
+			_deepPrefetchSeen.Clear();
+			_deepPrefetchQueue.Clear();
+			if (trimDeepScannedObjects)
+			{
+				_deepScannedObjects.TrimExcess();
+			}
+			if (trimDeepPrefetchSeen)
+			{
+				_deepPrefetchSeen.TrimExcess();
+			}
+			if (trimDeepPrefetchQueue)
+			{
+				_deepPrefetchQueue.TrimExcess();
+			}
 			if (clearPendingComponentWork)
 			{
 				_debouncedTextRequests.Clear();
@@ -5751,6 +5784,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				_inProgress.Clear();
 				_inProgressSources.Clear();
 			}
+		}
+		lock (HistoryComponentCache)
+		{
+			/* InstanceID 可被新场景复用，跨场景保留不仅占内存，还可能命中旧分类。 */
+			HistoryComponentCache.Clear();
 		}
 		lock (_softMaskRefreshedOnce)
 		{
@@ -5775,6 +5813,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			if (_canvasGroupVisibleStates.Count > MaxTrackedComponentStates)
 			{
 				_canvasGroupVisibleStates.Clear();
+			}
+			if (_deepScannedObjects.Count > MaxTrackedComponentStates)
+			{
+				_deepScannedObjects.Clear();
+				_deepScannedObjects.TrimExcess();
 			}
 			if (_debouncedTextRequests.Count > MaxPendingComponentWork)
 			{
@@ -5993,7 +6036,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				return;
 			}
-			foreach (KeyValuePair<int, DebouncedTextRequest> item in _debouncedTextRequests.ToList())
+			foreach (KeyValuePair<int, DebouncedTextRequest> item in _debouncedTextRequests)
 			{
 				DebouncedTextRequest value = item.Value;
 				if (!(realtimeSinceStartup - value.UpdatedAt < GetTextSettleDelaySeconds(value.Text)))
@@ -6003,11 +6046,17 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						list = new List<DebouncedTextRequest>();
 					}
 					list.Add(value);
-					_debouncedTextRequests.Remove(item.Key);
 					if (list.Count >= MaxDebouncedStartsPerTick)
 					{
 						break;
 					}
+				}
+			}
+			if (list != null)
+			{
+				foreach (DebouncedTextRequest ready in list)
+				{
+					_debouncedTextRequests.Remove(ready.InstanceId);
 				}
 			}
 		}
@@ -6254,6 +6303,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void ApplyFont(object component)
 	{
+		/* 字体处理严格留在 Unity Mono 渲染层：UGUI 直接换 Font，TMP 走
+		   fallback/动态图集/覆盖层链路；不会改写 _cache 中的译文。 */
 		if (!IsUnityObjectAlive(component))
 		{
 			return;
@@ -6663,9 +6714,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					base.Logger.LogInfo("[FONT-APPLY] Attached CJK fallback to " + GetComponentLogPath(tmpComponent));
 				}
 			}
-			// Fallback attachment can still miss full-width punctuation in some
-			// packaged TMP atlases, so leave overlay ownership to the caller's
-			// per-text coverage check instead of clearing it here.
+			// 某些打包 TMP 图集即使挂了 fallback 仍缺全角标点；是否清覆盖层
+			// 必须交给调用方按当前文本逐字检查，不能在这里武断决定。
 		}
 		catch (Exception ex)
 		{
@@ -6818,7 +6868,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						}
 						goto end_IL_00f9;
 						IL_0179:
-						Interlocked.Increment(ref _subMeshRescuedCount);
 						end_IL_00f9:;
 					}
 					catch
@@ -6952,14 +7001,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private int GetSoftMaskFontMaterialCacheSize()
-	{
-		lock (_softMaskFontMatLock)
-		{
-			return _softMaskFontMaterials.Count;
-		}
-	}
-
 	private static Material ReadFontSharedMaterial(object tmpComponent, Type compType)
 	{
 		if (tmpComponent == null)
@@ -6990,42 +7031,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return null;
 	}
 
-	private static bool WriteFontSharedMaterial(object tmpComponent, Type compType, Material material)
-	{
-		if (tmpComponent == null || (Object)(object)material == (Object)null)
-		{
-			return false;
-		}
-		Type type = compType ?? tmpComponent.GetType();
-		string[] array = new string[3] { "fontSharedMaterial", "material", "fontMaterial" };
-		foreach (string name in array)
-		{
-			try
-			{
-				PropertyInfo propertyInfo = AccessTools.Property(type, name);
-				if (propertyInfo == null || !propertyInfo.CanWrite)
-				{
-					continue;
-				}
-				propertyInfo.SetValue(tmpComponent, material);
-				return true;
-			}
-			catch
-			{
-			}
-		}
-		return false;
-	}
-
 	private void LogFirstWrites(object component, Type compType, string translated)
 	{
-		//IL_015e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0163: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0172: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0181: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0190: Unknown result type (might be due to invalid IL or missing references)
-		//IL_019f: Unknown result type (might be due to invalid IL or missing references)
-		if (Volatile.Read(ref _firstWritesLogged) >= 12 || Interlocked.Increment(ref _firstWritesLogged) > 12)
+		if (Volatile.Read(ref _firstWritesLogged) >= FirstWritesToLog ||
+			Interlocked.Increment(ref _firstWritesLogged) > FirstWritesToLog)
 		{
 			return;
 		}
@@ -7075,74 +7084,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		catch
 		{
-		}
-	}
-
-	private void LogCompatMatFirstShot(object tmpComponent, Type compType, Material host)
-	{
-		if (Interlocked.CompareExchange(ref _compatMatLoggedFirst, 1, 0) != 0)
-		{
-			return;
-		}
-		try
-		{
-			string text = (((Object)(object)host != (Object)null) ? ((Object)host).name : "<null>");
-			string text2 = (((Object)(object)host != (Object)null && (Object)(object)host.shader != (Object)null) ? ((Object)host.shader).name : "<no-shader>");
-			object obj;
-			if (_chineseTMPFont == null)
-			{
-				obj = null;
-			}
-			else
-			{
-				object obj2 = AccessTools.Property(_chineseTMPFont.GetType(), "material")?.GetValue(_chineseTMPFont);
-				obj = ((obj2 is Material) ? obj2 : null);
-			}
-			Material val = (Material)obj;
-			string text3 = (((Object)(object)val != (Object)null) ? ((Object)val).name : "<null>");
-			string text4 = (compType ?? tmpComponent?.GetType())?.FullName ?? "<null>";
-			base.Logger.LogWarning("[FONT-MAT-FIRST] compType=" + text4 + " hostMat=" + text + " hostShader=" + text2 + " ourFontMat=" + text3);
-		}
-		catch (Exception ex)
-		{
-			try
-			{
-				base.Logger.LogWarning("[FONT-MAT-FIRST] introspection failed: " + ex.Message);
-			}
-			catch
-			{
-			}
-		}
-	}
-
-	private void ApplySoftMaskCompatMaterialAfterSwap(object tmpComponent, Type compType, Material hostMatBeforeSwap)
-	{
-		if (SkipCompatMaterialOverride)
-		{
-			return;
-		}
-		LogCompatMatFirstShot(tmpComponent, compType, hostMatBeforeSwap);
-		if ((Object)(object)hostMatBeforeSwap == (Object)null)
-		{
-			Interlocked.Increment(ref _compatMatNullHostMat);
-			return;
-		}
-		Material orCreateSoftMaskCompatibleMaterial = GetOrCreateSoftMaskCompatibleMaterial(hostMatBeforeSwap);
-		if ((Object)(object)orCreateSoftMaskCompatibleMaterial == (Object)null)
-		{
-			Interlocked.Increment(ref _compatMatNullClone);
-		}
-		else if (!WriteFontSharedMaterial(tmpComponent, compType, orCreateSoftMaskCompatibleMaterial))
-		{
-			Interlocked.Increment(ref _compatMatSetThrew);
-			if (_debugMode != null && _debugMode.Value)
-			{
-				base.Logger.LogWarning("[FONT-MAT] sharedMaterial apply failed (no writable property)");
-			}
-		}
-		else
-		{
-			Interlocked.Increment(ref _compatMaterialAppliedCount);
 		}
 	}
 
@@ -7230,86 +7171,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return 0;
 	}
 
-	private Material GetOrCreateSoftMaskCompatibleMaterial(Material hostMat)
-	{
-		//IL_0104: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0109: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0121: Expected O, but got Unknown
-		if ((Object)(object)hostMat == (Object)null || _chineseTMPFont == null)
-		{
-			return null;
-		}
-		try
-		{
-			int instanceID = ((Object)hostMat).GetInstanceID();
-			lock (_softMaskFontMatLock)
-			{
-				if (_softMaskFontMaterials.TryGetValue(instanceID, out var value) && (Object)(object)value != (Object)null)
-				{
-					return value;
-				}
-				Type type = _chineseTMPFont.GetType();
-				Texture2D val = TryReadAtlasTexture(_chineseTMPFont);
-				if ((Object)(object)val == (Object)null)
-				{
-					Interlocked.Increment(ref _compatMatOurMatNull);
-					return null;
-				}
-				int num = TryReadIntMember(_chineseTMPFont, type, "atlasWidth", "m_AtlasWidth");
-				int num2 = TryReadIntMember(_chineseTMPFont, type, "atlasHeight", "m_AtlasHeight");
-				int num3 = TryReadIntMember(_chineseTMPFont, type, "atlasPadding", "m_AtlasPadding");
-				if (num <= 0)
-				{
-					num = ((Texture)val).width;
-				}
-				if (num2 <= 0)
-				{
-					num2 = ((Texture)val).height;
-				}
-				float num4 = ((num3 > 0) ? ((float)num3 + 1f) : 5f);
-				Material val2 = new Material(hostMat)
-				{
-					name = ((Object)hostMat).name + "_CJK"
-				};
-				if (val2.HasProperty("_MainTex"))
-				{
-					val2.SetTexture("_MainTex", (Texture)(object)val);
-				}
-				if (val2.HasProperty("_GradientScale"))
-				{
-					val2.SetFloat("_GradientScale", num4);
-				}
-				if (val2.HasProperty("_TextureWidth"))
-				{
-					val2.SetFloat("_TextureWidth", (float)num);
-				}
-				if (val2.HasProperty("_TextureHeight"))
-				{
-					val2.SetFloat("_TextureHeight", (float)num2);
-				}
-				if (val2.HasProperty("_WeightNormal"))
-				{
-					val2.SetFloat("_WeightNormal", 0f);
-				}
-				if (val2.HasProperty("_WeightBold"))
-				{
-					val2.SetFloat("_WeightBold", 0.75f);
-				}
-				_softMaskFontMaterials[instanceID] = val2;
-				if (_debugMode != null && _debugMode.Value)
-				{
-					base.Logger.LogInfo($"[FONT-MAT] cloned host material '{((Object)hostMat).name}' for CJK rendering (cache size={_softMaskFontMaterials.Count})");
-				}
-				return val2;
-			}
-		}
-		catch (Exception ex)
-		{
-			base.Logger.LogWarning("[FONT-MAT] compat clone failed: " + ex.Message);
-			return null;
-		}
-	}
-
 	private bool EnsureTMPFontCoversText(object tmpComponent, string translatedText)
 	{
 		if (!HasUsableTmpFont() || !IsUnityObjectAlive(tmpComponent))
@@ -7382,16 +7243,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				return false;
 			}
-			if (DisableDirectSwap)
-			{
-				Interlocked.Increment(ref _directSwapBlockedCount);
-				return false;
-			}
-			Material hostMatBeforeSwap = ReadFontSharedMaterial(tmpComponent, type);
 			propertyInfo.SetValue(tmpComponent, _chineseTMPFont);
 			Interlocked.Increment(ref _directSwapCount);
 			TryWarmTmpFontAssetVerified(_chineseTMPFont, translatedText, out var missingCount3);
-			ApplySoftMaskCompatMaterialAfterSwap(tmpComponent, type, hostMatBeforeSwap);
 			RefreshSoftMaskHierarchy(tmpComponent);
 			DeepInspectPostSwap(tmpComponent, type, translatedText);
 			if (_debugMode != null && _debugMode.Value)
@@ -7428,12 +7282,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static Color GetTmpColor(object tmpComponent)
 	{
-		//IL_003c: Unknown result type (might be due to invalid IL or missing references)
-		//IL_002d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0032: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0033: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0034: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0042: Unknown result type (might be due to invalid IL or missing references)
 		try
 		{
 			object obj = AccessTools.Property(tmpComponent?.GetType(), "color")?.GetValue(tmpComponent);
@@ -7450,12 +7298,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static void SetTmpColorAlphaMember(object tmpComponent, string memberName, float alpha)
 	{
-		//IL_0034: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0039: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0044: Unknown result type (might be due to invalid IL or missing references)
-		//IL_007b: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0080: Unknown result type (might be due to invalid IL or missing references)
-		//IL_008d: Unknown result type (might be due to invalid IL or missing references)
 		try
 		{
 			Type type = tmpComponent?.GetType();
@@ -7502,7 +7344,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static void SetTmpColor(object tmpComponent, Color color)
 	{
-		//IL_001d: Unknown result type (might be due to invalid IL or missing references)
 		try
 		{
 			AccessTools.Property(tmpComponent?.GetType(), "color")?.SetValue(tmpComponent, color);
@@ -7554,16 +7395,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static TextAnchor GetTmpTextAnchor(object tmpComponent)
 	{
-		//IL_0097: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00a2: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00f3: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00ad: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00b8: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00c4: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00d0: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00eb: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00db: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00e7: Unknown result type (might be due to invalid IL or missing references)
 		try
 		{
 			string text = AccessTools.Property(tmpComponent?.GetType(), "alignment")?.GetValue(tmpComponent)?.ToString() ?? string.Empty;
@@ -7611,12 +7442,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static Vector4 GetTmpMargin(object tmpComponent)
 	{
-		//IL_003e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_002f: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0034: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0035: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0036: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0044: Unknown result type (might be due to invalid IL or missing references)
 		try
 		{
 			object obj = (tmpComponent?.GetType().GetProperty("margin", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))?.GetValue(tmpComponent);
@@ -7653,18 +7478,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static void ApplyTmpOverlayRect(Text overlay, object tmpComponent)
 	{
-		//IL_0023: Unknown result type (might be due to invalid IL or missing references)
-		//IL_002e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0039: Unknown result type (might be due to invalid IL or missing references)
-		//IL_003e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0040: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0046: Unknown result type (might be due to invalid IL or missing references)
-		//IL_004c: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0057: Unknown result type (might be due to invalid IL or missing references)
-		//IL_005e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0065: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0070: Unknown result type (might be due to invalid IL or missing references)
-		//IL_007b: Unknown result type (might be due to invalid IL or missing references)
 		if ((Object)(object)overlay == (Object)null)
 		{
 			return;
@@ -7817,7 +7630,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void RestoreTmpOverlay(object tmpComponent)
 	{
-		//IL_0069: Unknown result type (might be due to invalid IL or missing references)
 		Component val = (Component)((tmpComponent is Component) ? tmpComponent : null);
 		if (val == null)
 		{
@@ -7853,27 +7665,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void ApplyTmpOverlay(object tmpComponent, string translatedText, string sourceText = null, bool force = false)
 	{
-		//IL_0143: Unknown result type (might be due to invalid IL or missing references)
-		//IL_014a: Expected O, but got Unknown
-		//IL_0163: Unknown result type (might be due to invalid IL or missing references)
-		//IL_016e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0179: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0184: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0190: Unknown result type (might be due to invalid IL or missing references)
-		//IL_019a: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0227: Unknown result type (might be due to invalid IL or missing references)
-		//IL_022c: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0247: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0249: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0250: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0237: Unknown result type (might be due to invalid IL or missing references)
-		//IL_02d1: Unknown result type (might be due to invalid IL or missing references)
-		//IL_030d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0307: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0312: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0314: Unknown result type (might be due to invalid IL or missing references)
-		//IL_033e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_035a: Unknown result type (might be due to invalid IL or missing references)
+		/* 覆盖层是最终显示降级：仅当 TMP 字体不能完整覆盖文本时使用。
+		   原 TMP 组件仍保留，恢复时按保存的颜色/透明度还原，避免破坏游戏逻辑。 */
 		if ((!force && !IsTmpOverlayMode() && HasUsableTmpFont()) || (Object)(object)_chineseFont == (Object)null || string.IsNullOrWhiteSpace(translatedText))
 		{
 			RestoreTmpOverlay(tmpComponent);
@@ -7996,7 +7789,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static Color GetTmpOverlayDisplayColor(Color currentColor, TmpOverlayState state)
 	{
-		// Keep the current RGB because games often recolor a reused TMP object per speaker or choice state.
+		// 保留当前 RGB：游戏常按说话人或选项状态复用并重新着色同一 TMP 对象。
 		Color result = currentColor;
 		if (result.a <= 0f && state != null)
 		{
@@ -8117,21 +7910,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void DeepInspectPostSwap(object tmpComponent, Type compType, string translatedText)
 	{
-		//IL_0361: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0366: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0375: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0384: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0393: Unknown result type (might be due to invalid IL or missing references)
-		//IL_03a2: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0158: Unknown result type (might be due to invalid IL or missing references)
-		//IL_015d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0161: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0166: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0175: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0184: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0195: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01a9: Unknown result type (might be due to invalid IL or missing references)
-		if (Volatile.Read(ref _deepInspectCount) >= 3 || Interlocked.Increment(ref _deepInspectCount) > 3)
+		if (Volatile.Read(ref _deepInspectCount) >= DeepInspectMax ||
+			Interlocked.Increment(ref _deepInspectCount) > DeepInspectMax)
 		{
 			return;
 		}
@@ -8290,16 +8070,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void EnsureChineseTMPFontMaterial()
 	{
-		//IL_07cb: Unknown result type (might be due to invalid IL or missing references)
-		//IL_080f: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0814: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0829: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0838: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0847: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0856: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00e7: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00ec: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00f8: Expected O, but got Unknown
 		if (_chineseTMPFont == null)
 		{
 			return;
@@ -9055,10 +8825,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private object CreateTmpFontAssetManually(Type tmpFontAssetType, Font sourceFont)
 	{
-		//IL_02d3: Unknown result type (might be due to invalid IL or missing references)
-		//IL_02da: Expected O, but got Unknown
-		//IL_0388: Unknown result type (might be due to invalid IL or missing references)
-		//IL_038f: Expected O, but got Unknown
 		if (tmpFontAssetType == null || (Object)(object)sourceFont == (Object)null)
 		{
 			return null;
@@ -9400,10 +9166,6 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private Font LoadFontFromFilePath(string path)
 	{
-		//IL_0013: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0019: Expected O, but got Unknown
-		//IL_008f: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0095: Expected O, but got Unknown
 		if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
 		{
 			return null;
@@ -9671,6 +9433,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void LoadGlossary()
 	{
+		/* glossary 是短文本优先映射，可来自内置默认值和游戏目录静态文件；
+		   加载失败只降级为空/部分词表，不影响本地服务和普通缓存。 */
 		_glossary.Clear();
 		foreach (KeyValuePair<string, string> item in new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 		{
@@ -9756,7 +9520,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				LoadGlossaryFile(path3);
 			}
 		}
-		base.Logger.LogInfo($"Glossary loaded: {_glossary.Count} entries");
+		base.Logger.LogInfo($"Glossary loaded: {GetGlossaryCount()} entries");
 	}
 
 	private void LoadGlossaryFile(string path)
@@ -9791,11 +9555,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private async Task BootCacheLoadAsync()
 	{
-		/* The local cache file can hold hundreds of thousands of rows that
-		   each run regex validators on import; doing that inline in Awake
-		   froze startup for seconds. Texts rendered before the cache lands
-		   are healed by the scanner's cache-apply passes, same as entries
-		   arriving from the deferred server sync. */
+		/* 本地缓存可能被旧版本污染成数十万条；导入时每条都要跑正则校验，
+		   因此不能在 Awake 主线程执行。缓存落地前已经显示的文本会由扫描器
+		   后续 cache-apply 补齐，与延迟服务端同步到达的条目处理方式相同。 */
 		try
 		{
 			await RunBackground(delegate
@@ -9854,10 +9616,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				else
 				{
 					JObject val = JObject.Parse(File.ReadAllText(path));
-					/* Local files polluted by legacy full-server-dump persists turn
-					   every persist cycle into a 250k-row revalidation plus a 25 MB
-					   rewrite -- felt as periodic in-game stutter. Skip oversized
-					   files; the file is rebuilt from keys the game actually uses. */
+					/* 旧版整库落盘会让每轮持久化重新校验数十万条并重写几十 MB，
+					   表现为周期性卡顿。超大文件跳过导入，之后仅按游戏实际使用键重建。 */
 					bool oversized = val.Count > OversizedLocalCacheEntryLimit;
 					if (oversized)
 					{
@@ -9870,16 +9630,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 				}
 			}
-			if (File.Exists(Path.Combine(text, "translation_cache.db")))
-			{
-				_ = _cache.Count;
-			}
 		}
 		catch (Exception ex)
 		{
 			base.Logger.LogWarning("Cache load failed: " + ex.Message);
 		}
-		base.Logger.LogInfo($"Cache preloaded: {_cache.Count} entries");
+		base.Logger.LogInfo($"Cache preloaded: {GetCacheCount()} entries");
 	}
 
 	private void TryBackupOversizedLocalCache(string path, int entryCount)
@@ -9903,6 +9659,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private int ImportServerCacheEntries(IEnumerable<KeyValuePair<string, string>> entries, bool logPromotions, string sourceLabel, bool persistAfterImport, bool markImportedAsLocal = false)
 	{
+		/* 只有可接受且非原文回声的结果才进入 _cache。markImportedAsLocal 决定
+		   是否进入本游戏持久化集合；服务端 dump/export 必须保持 memory-only。 */
 		if (entries == null)
 		{
 			return 0;
@@ -9970,6 +9728,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void ScheduleLocalCachePersist()
 	{
+		/* dirty/scheduled 组成单消费者去抖协议。锁只保护两个标志；快照验证和
+		   File.WriteAllText 均在后台线程执行，避免 Unity 主线程卡顿。 */
 		bool flag = false;
 		lock (_cachePersistLock)
 		{
@@ -9992,7 +9752,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			while (true)
 			{
-				await Task.Delay(6000);
+				await Task.Delay(CachePersistDebounceMs);
 				lock (_cachePersistLock)
 				{
 					if (!_cachePersistDirty)
@@ -10002,12 +9762,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 					_cachePersistDirty = false;
 				}
-				/* Snapshot filtering runs regex-heavy validators over every
-				   cached entry; one bad entry must cost a single cycle, not
-				   the persist loop for the rest of the session. The whole
-				   cycle runs off the Unity main thread: awaits resume on the
-				   Unity SynchronizationContext, so doing the snapshot and the
-				   file write inline would hitch frames on every persist. */
+				/* 快照过滤会对每条缓存运行较重的正则。单条异常最多损失本轮，
+				   不能杀死整局持久化循环。整个快照与写盘放到后台线程，避免 await
+				   回到 Unity SynchronizationContext 后在主线程制造卡顿。 */
 				try
 				{
 					await RunBackground(delegate
@@ -10042,9 +9799,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		catch (Exception ex2)
 		{
-			/* Liveness guarantee: _cachePersistScheduled must never stay true
-			   without a live persist loop, or local translations stop being
-			   saved until the game exits. */
+			/* 活性约束：持久化循环已死时 _cachePersistScheduled 不能继续为 true，
+			   否则直到游戏退出都不会再启动保存任务。 */
 			lock (_cachePersistLock)
 			{
 				_cachePersistScheduled = false;
@@ -10173,9 +9929,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		if (ShouldDelayServerCacheSync())
 		{
 			int num = await TryGetServerCacheSizeAsync();
-			if (num > 0 && _cache.Count >= (int)Math.Ceiling((double)num * 1.05))
+			int localCacheCount = GetCacheCount();
+			if (num > 0 && localCacheCount >= (int)Math.Ceiling((double)num * ServerCacheSkipRatio))
 			{
-				base.Logger.LogInfo($"Skipped server cache dump: local cache ({_cache.Count}) already covers server cache ({num})");
+				base.Logger.LogInfo($"Skipped server cache dump: local cache ({localCacheCount}) already covers server cache ({num})");
 				return;
 			}
 		}

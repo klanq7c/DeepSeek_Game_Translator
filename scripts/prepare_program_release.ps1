@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $distRoot = Join-Path $repo "build\dist"
-$DsName = "ds" + [string][char]0x7ffb + [string][char]0x8bd1 + [string][char]0x5668
+$DsName = "ds" + [string][char]0x6e38 + [string][char]0x620f + [string][char]0x7ffb + [string][char]0x8bd1 + [string][char]0x5668
 $UsageName = "README_" + [string][char]0x4f7f + [string][char]0x7528 + [string][char]0x8bf4 + [string][char]0x660e + ".txt"
 $stageName = "${DsName}_$Version"
 $stage = Join-Path $distRoot $stageName

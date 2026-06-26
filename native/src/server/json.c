@@ -15,7 +15,9 @@
 /* 追加字符串指针，按需 2 倍扩容。所有权转移给 List。 */
 void list_push(List *l, char *s) {
     if (l->n == l->cap) {
+        if (l->cap > SIZE_MAX / 2) die("JSON list too large");
         l->cap = l->cap ? l->cap * 2 : 8;
+        if (l->cap > SIZE_MAX / sizeof *l->v) die("JSON list too large");
         l->v = xrealloc(l->v, l->cap * sizeof *l->v);
     }
     l->v[l->n++] = s;
@@ -80,18 +82,33 @@ char *json_str(const char **pp) {
     p++;
     Buf b;
     buf_init(&b);
+    int closed = 0;
+    int invalid = 0;
     while (*p && *p != '"') {
         unsigned char c = (unsigned char)*p++;
+        if (c < 0x20) {
+            invalid = 1;
+            break;
+        }
         if (c == '\\') {
             char e = *p;
-            if (!e) break; /* dangling backslash at end of buffer */
+            if (!e) {
+                invalid = 1;
+                break;
+            }
             p++;
-            if (e == 'n') buf_ch(&b, '\n');
+            if (e == '"' || e == '\\' || e == '/') buf_ch(&b, e);
+            else if (e == 'b') buf_ch(&b, '\b');
+            else if (e == 'f') buf_ch(&b, '\f');
+            else if (e == 'n') buf_ch(&b, '\n');
             else if (e == 'r') buf_ch(&b, '\r');
             else if (e == 't') buf_ch(&b, '\t');
             else if (e == 'u') {
                 unsigned cp = 0;
-                if (!u4(p, &cp)) break;
+                if (!u4(p, &cp)) {
+                    invalid = 1;
+                    break;
+                }
                 p += 4;
                 if (cp >= 0xd800 && cp <= 0xdbff) {
                     /* 高代理：尝试合并紧跟的低代理组成完整码点 */
@@ -106,12 +123,26 @@ char *json_str(const char **pp) {
                     /* 孤立低代理，替换为替换字符 */
                     cp = 0xfffd;
                 }
+                if (cp == 0) {
+                    invalid = 1; /* C 字符串不能安全承载内嵌 NUL。 */
+                    break;
+                }
                 putcp(&b, cp);
-            } else buf_ch(&b, e);
+            } else {
+                invalid = 1;
+                break;
+            }
         } else buf_ch(&b, (char)c);
     }
-    if (*p == '"') p++;
+    if (*p == '"') {
+        p++;
+        closed = 1;
+    }
     *pp = p;
+    if (!closed || invalid) {
+        buf_free(&b);
+        return NULL;
+    }
     return b.data;
 }
 
@@ -153,15 +184,30 @@ List json_array(const char *json, const char *key) {
         return l;
     }
     if (*p++ != '[') return l;
+    p = json_skipws(p);
+    if (*p == ']') return l;
     for (;;) {
         p = json_skipws(p);
-        if (*p == ']') break;
-        if (*p != '"') break;
+        if (*p != '"') {
+            list_free(&l);
+            return l;
+        }
         char *s = json_str(&p);
-        if (!s) break;
+        if (!s) {
+            list_free(&l);
+            return l;
+        }
         list_push(&l, s);
         p = json_skipws(p);
-        if (*p == ',') p++;
+        if (*p == ']') return l;
+        if (*p != ',') {
+            list_free(&l);
+            return l;
+        }
+        p = json_skipws(p + 1);
+        if (*p == ']') {
+            list_free(&l);
+            return l;
+        }
     }
-    return l;
 }

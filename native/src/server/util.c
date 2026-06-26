@@ -33,6 +33,15 @@ void *xmalloc(size_t n) {
     return p;
 }
 
+/* calloc，统一处理乘法溢出和 OOM。返回内存始终可 free 且已经清零。 */
+void *xcalloc(size_t count, size_t size) {
+    if (!count || !size) return xmalloc(1);
+    if (count > SIZE_MAX / size) die("allocation too large");
+    void *p = calloc(count, size);
+    if (!p) die("oom");
+    return p;
+}
+
 /* realloc，OOM 即终止。同样对 n==0 做归一化。 */
 void *xrealloc(void *p, size_t n) {
     void *r = realloc(p, n ? n : 1);
@@ -42,6 +51,7 @@ void *xrealloc(void *p, size_t n) {
 
 /* 复制 s 的前 n 字节并补 '\0'，调用者负责 free。 */
 char *xstrndup(const char *s, size_t n) {
+    if (n == SIZE_MAX) die("string too large");
     char *p = xmalloc(n + 1);
     memcpy(p, s, n);
     p[n] = 0;

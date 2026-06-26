@@ -68,6 +68,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             append_log(L"选择游戏目录后点击 ⚡ 开始汉化。");
         }
+        refresh_server_status();
         layout(hwnd);
         return 0;
     }
@@ -241,7 +242,7 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE prev, PWSTR cmd, int show) {
 
     int initW = MulDiv(1200, primary_dpi, 96);
     int initH = MulDiv(780,  primary_dpi, 96);
-    g_main = CreateWindowW(wc.lpszClassName, L"DeepSeek Game Translator", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    g_main = CreateWindowW(wc.lpszClassName, L"ds游戏翻译器", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT, initW, initH, NULL, NULL, h, NULL);
     ShowWindow(g_main, show);
     UpdateWindow(g_main);

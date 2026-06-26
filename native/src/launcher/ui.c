@@ -363,7 +363,7 @@ static UiLayout compute_layout(HWND hwnd) {
  *
  * 绘制内容：
  *   - 页面底色 + 左侧导航栏渐变 + 分割线
- *   - 导航栏：品牌标识（菱形+DeepSeek Translator）、导航项（运行时汉化）、
+ *   - 导航栏：品牌标识（菱形+ds游戏翻译器）、导航项（运行时汉化）、
  *     功能要点（本地缓存优先/运行时不等待API/标签变量保护）、版本标签
  *   - 主区域：状态药丸（ONLINE/OFFLINE）、选择器卡片、指标卡片（×3）、
  *     日志卡片（含 ACTIVITY LOG 标题和 LIVE 指示灯）、路径输入框边框
@@ -391,7 +391,7 @@ void paint_background(HWND hwnd, HDC dc) {
 
     SetBkMode(dc, TRANSPARENT);
 
-    /* Brand mark: diamond + DeepSeek */
+    /* Brand mark: diamond + product name */
     {
         POINT diamond[4] = {{sc(28), sc(40)}, {sc(38), sc(30)}, {sc(48), sc(40)}, {sc(38), sc(50)}};
         HBRUSH ab = CreateSolidBrush(C_ACCENT);
@@ -402,8 +402,8 @@ void paint_background(HWND hwnd, HDC dc) {
         SelectObject(dc, op);
         DeleteObject(ab);
     }
-    draw_text_x(dc, L"DeepSeek",   sc(60), sc(22), rail - sc(80), sc(28), C_TEXT, g_font_heading, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    draw_text_x(dc, L"Translator", sc(60), sc(48), rail - sc(80), sc(20), C_MUTED, g_font_small,   DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, L"ds\u6E38\u620F", sc(60), sc(22), rail - sc(80), sc(28), C_TEXT, g_font_heading, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, L"\u7FFB\u8BD1\u5668", sc(60), sc(48), rail - sc(80), sc(20), C_MUTED, g_font_small,   DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     /* Section divider */
     HPEN sd = CreatePen(PS_SOLID, 1, C_LINE);
@@ -674,7 +674,7 @@ static DWORD WINAPI warmup_launch_thread(LPVOID p) {
 void start_translation(void) {
     GetWindowTextW(g_path, g_game, MAX_PATH * 4);
     if (!is_dir(g_game)) {
-        MessageBoxW(g_main, L"请先选择游戏目录。", L"DeepSeek Game Translator", MB_ICONWARNING);
+        MessageBoxW(g_main, L"请先选择游戏目录。", L"ds游戏翻译器", MB_ICONWARNING);
         return;
     }
     save_last_game_dir(g_game);
@@ -683,7 +683,11 @@ void start_translation(void) {
     append_log(L"选择目录：%s", g_game);
     append_log(L"识别引擎：%s", engine_name(e));
     set_status(L"正在启动服务并部署...");
-    start_server();
+    if (!start_server()) {
+        append_log(L"\u672C\u5730\u7FFB\u8BD1\u670D\u52A1\u672A\u5C31\u7EEA\uFF0C\u5DF2\u53D6\u6D88\u90E8\u7F72\u548C\u6E38\u620F\u542F\u52A8\u3002");
+        set_status(L"\u72B6\u6001\uFF1A\u670D\u52A1\u5668\u542F\u52A8\u5931\u8D25\uFF0C\u672A\u542F\u52A8\u6E38\u620F");
+        return;
+    }
     int deployed = 0;
     if (e == ENGINE_RENPY) deployed = deploy_renpy(g_game);
     else if (e == ENGINE_RPGM_MV) deployed = deploy_rpgm(g_game);

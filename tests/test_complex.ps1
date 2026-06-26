@@ -327,6 +327,17 @@ try {
         Assert-Eq $r.Status 400 "malformed body"
     }
 
+    It "Unterminated or invalid JSON strings are rejected instead of partially translated" {
+        $r = Send-Json "POST" "/translate" '{"text":"unterminated}'
+        Assert-Eq $r.Status 400 "unterminated string"
+
+        $r = Send-Json "POST" "/translate" '{"text":"bad\qescape"}'
+        Assert-Eq $r.Status 400 "unknown escape"
+
+        $r = Send-Json "POST" "/batch" '{"texts":["valid","unterminated]}'
+        Assert-Eq $r.Status 400 "partial malformed array"
+    }
+
     It "Body text named Content-Length does not affect header parsing" {
         $cli = New-Object System.Net.Sockets.TcpClient
         $cli.SendTimeout = 2000
@@ -414,7 +425,7 @@ try {
     Write-Host ""
     Write-Host "=== 7. Server hygiene after stress ===" -ForegroundColor Cyan
 
-    It "Cache size monotonic — only grew, never shrank during stress" {
+    It "Cache size monotonic - only grew, never shrank during stress" {
         $r = Send-Get "/health"
         if ($r.Json.cache_size -lt 300000) { throw "cache size suspiciously small: $($r.Json.cache_size)" }
     }

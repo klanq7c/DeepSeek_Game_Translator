@@ -224,7 +224,7 @@ static int api_prepare_locked(ApiChannel *ch, ApiConfig *cfg) {
 
     ch->port = uc.nPort;
     ch->flags = uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
-    ch->session = WinHttpOpen(L"DeepSeek Game Translator/3.1",
+    ch->session = WinHttpOpen(L"ds-game-translator/3.1",
                               WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                               WINHTTP_NO_PROXY_NAME,
                               WINHTTP_NO_PROXY_BYPASS, 0);
@@ -309,7 +309,12 @@ static int send_chat_request(ApiConfig *cfg, Buf *body, char **content_out) {
     }
 
     DWORD timeout = (DWORD)cfg->timeout_ms;
-    WinHttpSetTimeouts(req, timeout, timeout, timeout, timeout);
+    if (!WinHttpSetTimeouts(req, timeout, timeout, timeout, timeout)) {
+        WinHttpCloseHandle(req);
+        api_reset_locked(ch);
+        ReleaseSRWLockExclusive(&ch->lock);
+        return 0;
+    }
 
     WCHAR headers[1800];
     _snwprintf(headers, 1800, L"Content-Type: application/json\r\nAuthorization: Bearer %s\r\n", ch->key);

@@ -14,6 +14,14 @@
 #include <string.h>
 #include <winhttp.h>
 
+#define SERVER_READY_TIMEOUT_MS 15000
+#define SERVER_READY_POLL_MS 200
+#define SUPERVISED_RESTART_TIMEOUT_MS 3500
+
+/* 1 when the launcher spawned dst_server.exe itself; 0 when it merely adopted
+   a healthy localhost service that was already running. */
+static int g_server_owned = 0;
+
 /* ----------------------------------------------------------------
  * server_http_alive — 通过 HTTP 请求检查服务器是否响应
  *
@@ -22,7 +30,7 @@
  * ---------------------------------------------------------------- */
 static int server_http_alive(DWORD timeout) {
     int ok = 0;
-    HINTERNET ses = WinHttpOpen(L"DeepSeek Game Translator Launcher/3.1",
+    HINTERNET ses = WinHttpOpen(L"ds-game-translator Launcher/3.1",
                                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                 WINHTTP_NO_PROXY_NAME,
                                 WINHTTP_NO_PROXY_BYPASS, 0);
@@ -56,6 +64,20 @@ static int server_http_alive(DWORD timeout) {
     return ok;
 }
 
+static int wait_for_server_ready(DWORD timeout_ms) {
+    DWORD waited = 0;
+    for (;;) {
+        if (server_http_alive(200)) return 1;
+        if (g_server_pi.hProcess &&
+            WaitForSingleObject(g_server_pi.hProcess, 0) != WAIT_TIMEOUT) {
+            return 0;
+        }
+        if (waited >= timeout_ms) return 0;
+        Sleep(SERVER_READY_POLL_MS);
+        waited += SERVER_READY_POLL_MS;
+    }
+}
+
 /* ----------------------------------------------------------------
  * server_alive — 公开的存活检查
  *
@@ -76,6 +98,7 @@ static void reset_server_handle(void) {
     if (g_server_pi.hThread) CloseHandle(g_server_pi.hThread);
     ZeroMemory(&g_server_pi, sizeof g_server_pi);
     g_server_started = 0;
+    g_server_owned = 0;
 }
 
 /* 更新 UI 中的服务器状态标签（带双缓冲重绘） */
@@ -98,8 +121,35 @@ static void set_btn_label(const WCHAR *text) {
  * 发送 POST /shutdown 请求，让服务器自行清理并退出。
  * 超时设为 500ms，快速失败以避免阻塞 UI。
  * ---------------------------------------------------------------- */
+/* Reconcile launcher UI with a server that may already be running.
+   This does not start a new server; it only adopts an existing healthy
+   localhost service so startup status is truthful. */
+void refresh_server_status(void) {
+    if (g_server_started && server_alive()) {
+        set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
+        set_btn_label(L"\u505C\u6B62\u670D\u52A1\u5668");
+        if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
+        return;
+    }
+
+    if (g_server_started) reset_server_handle();
+
+    if (server_http_alive(200)) {
+        g_server_started = 1;
+        g_server_owned = 0;
+        set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
+        set_btn_label(L"\u505C\u6B62\u670D\u52A1\u5668");
+        append_log(L"\u68C0\u6D4B\u5230\u5DF2\u8FD0\u884C\u7684 C \u670D\u52A1\u7AEF\uFF1A127.0.0.1:19999");
+    } else {
+        set_server_label(L"\u672A\u542F\u52A8");
+        set_btn_label(L"\u542F\u52A8\u670D\u52A1\u5668");
+    }
+
+    if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
+}
+
 static void request_server_shutdown(void) {
-    HINTERNET ses = WinHttpOpen(L"DeepSeek Game Translator Launcher/3.1",
+    HINTERNET ses = WinHttpOpen(L"ds-game-translator Launcher/3.1",
                                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                 WINHTTP_NO_PROXY_NAME,
                                 WINHTTP_NO_PROXY_BYPASS, 0);
@@ -144,6 +194,7 @@ int start_server(void) {
     /* 端口可能被外部进程占用 */
     if (server_http_alive(200)) {
         g_server_started = 1;
+        g_server_owned = 0;
         set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
         set_btn_label(L"\u505C\u6B62\u670D\u52A1\u5668");
         append_log(L"\u68C0\u6D4B\u5230\u5DF2\u8FD0\u884C\u7684 C \u670D\u52A1\u7AEF\uFF1A127.0.0.1:19999");
@@ -178,10 +229,28 @@ int start_server(void) {
         return 0;
     }
     g_server_started = 1;
-    set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
+    g_server_owned = 1;
+    set_server_label(L"\u6B63\u5728\u542F\u52A8 \u00B7 19999");
     set_btn_label(L"\u505C\u6B62\u670D\u52A1\u5668");
-    append_log(L"C \u670D\u52A1\u7AEF\u5DF2\u542F\u52A8\uFF1A127.0.0.1:19999");
-    Sleep(600);
+    append_log(L"C \u670D\u52A1\u7AEF\u5DF2\u542F\u52A8\uFF0C\u6B63\u5728\u7B49\u5F85 /health\uFF1A127.0.0.1:19999");
+    if (!wait_for_server_ready(SERVER_READY_TIMEOUT_MS)) {
+        append_log(L"C \u670D\u52A1\u7AEF\u542F\u52A8\u540E\u672A\u901A\u8FC7\u5065\u5EB7\u68C0\u67E5\uFF0C\u5DF2\u505C\u6B62\u542F\u52A8\u6D41\u7A0B\u3002");
+        if (g_server_pi.hProcess &&
+            WaitForSingleObject(g_server_pi.hProcess, 0) == WAIT_TIMEOUT) {
+            request_server_shutdown();
+            if (WaitForSingleObject(g_server_pi.hProcess, 1000) == WAIT_TIMEOUT) {
+                TerminateProcess(g_server_pi.hProcess, 1);
+                WaitForSingleObject(g_server_pi.hProcess, 500);
+            }
+        }
+        reset_server_handle();
+        set_server_label(L"\u672A\u542F\u52A8");
+        set_btn_label(L"\u542F\u52A8\u670D\u52A1\u5668");
+        if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
+        return 0;
+    }
+    set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
+    append_log(L"C \u670D\u52A1\u7AEF\u5065\u5EB7\u68C0\u67E5\u901A\u8FC7\uFF1A127.0.0.1:19999");
     if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
     return 1;
 }
@@ -193,6 +262,7 @@ int start_server(void) {
  * 超时则 TerminateProcess 强制终止。最后重置所有状态和 UI。
  * ---------------------------------------------------------------- */
 void stop_server(void) {
+    int owned = g_server_owned;
     if (!g_server_started && !server_http_alive(200)) {
         set_server_label(L"\u672A\u542F\u52A8");
         set_btn_label(L"\u542F\u52A8\u670D\u52A1\u5668");
@@ -209,6 +279,15 @@ void stop_server(void) {
         }
     }
     reset_server_handle();
+    if (!owned && wait_for_server_ready(SUPERVISED_RESTART_TIMEOUT_MS)) {
+        g_server_started = 1;
+        g_server_owned = 0;
+        set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
+        set_btn_label(L"\u505C\u6B62\u670D\u52A1\u5668");
+        append_log(L"C \u670D\u52A1\u7AEF\u7531\u5916\u90E8\u8FDB\u7A0B\u4FDD\u6301\u6216\u91CD\u542F\uFF0C\u5DF2\u7EE7\u7EED\u663E\u793A\u4E3A\u8FD0\u884C\u4E2D\u3002");
+        if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
+        return;
+    }
     set_server_label(L"\u5DF2\u505C\u6B62");
     set_btn_label(L"\u542F\u52A8\u670D\u52A1\u5668");
     append_log(L"C \u670D\u52A1\u7AEF\u5DF2\u505C\u6B62\u3002");
@@ -223,7 +302,11 @@ void stop_server(void) {
 void toggle_server(void) {
     if (g_server_started && server_alive()) {
         stop_server();
-        set_status(L"\u670D\u52A1\u5668\u5DF2\u505C\u6B62");
+        if (g_server_started && server_alive()) {
+            set_status(L"\u72B6\u6001\uFF1A\u670D\u52A1\u5668\u4ECD\u7531\u5916\u90E8\u8FDB\u7A0B\u8FD0\u884C");
+        } else {
+            set_status(L"\u670D\u52A1\u5668\u5DF2\u505C\u6B62");
+        }
         return;
     }
     set_status(L"\u6B63\u5728\u542F\u52A8\u670D\u52A1\u5668...");

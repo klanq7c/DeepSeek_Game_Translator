@@ -8,6 +8,21 @@ using XUnity.AutoTranslator.Plugin.Core.Web;
 
 namespace DeepSeekTranslate;
 
+/*
+ * Unity IL2CPP / XUnity 专用翻译端点。
+ *
+ * 真实调用链：
+ *   XUnity -> Initialize -> OnCreateRequest -> 本地 C 服务 /translate 或 /batch
+ *          -> OnExtractTranslation -> XUnity 把结果写回游戏文本。
+ *
+ * 本类不是 Unity Mono 插件入口，也不会被 Ren'Py / RPG Maker 使用。
+ * 它只适配 XUnity 的 HttpEndpoint 接口；翻译缓存、远程 API 队列和持久化
+ * 仍全部归本地 C 服务所有。服务返回 source=miss/queued 时必须 Fail，让
+ * XUnity 保留原文并按自身策略重试，不能把原文误记成成功译文。
+ *
+ * 标点替换属于 IL2CPP/TMP 渲染兼容层，只改交给 XUnity 的显示结果，
+ * 不回写共享翻译缓存。
+ */
 public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
 {
     private string _baseUrl = "http://127.0.0.1:19999";
@@ -20,6 +35,8 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
     public override int MaxConcurrency => _maxConcurrency;
     public override int MaxTranslationsPerRequest => _maxBatch;
 
+    /* XUnity 在加载端点时调用一次。配置写入 XUnity 自己的 ini；
+       钳制上限是为了与本地服务批量大小和通道池容量保持可控。 */
     public override void Initialize(IInitializationContext context)
     {
         _baseUrl = TrimSlash(context.GetOrCreateSetting("DeepSeek", "Url", _baseUrl));
@@ -38,6 +55,8 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
             texts = new[] { context.UntranslatedText ?? string.Empty };
         }
 
+        /* 单条和批量必须走与 C 服务公开契约一致的两个路由。请求创建阶段
+           不等待远程模型；是否命中缓存由本地服务立即回答。 */
         bool batch = texts.Length > 1;
         string url = _baseUrl + (batch ? "/batch" : "/translate");
         string payload = BuildPayload(texts, !batch);
@@ -81,6 +100,8 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
             return;
         }
 
+        /* 新版服务优先返回与输入同序的 results；translations 映射是为旧版
+           服务保留的兼容读取路径，两者都必须完整覆盖原始批次。 */
         string[] results = ReadStringArrayProperty(data, "results");
         if (results == null || results.Length != original.Length)
         {
@@ -166,6 +187,8 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
             return text;
         }
 
+        /* 只处理常见缺字标点。正文、富文本标签和缓存键保持原样，
+           避免把某个 TMP 字体的限制扩散到共享翻译记忆。 */
         bool containsCjk = ContainsCjk(text);
         if (!containsCjk && !ContainsAlwaysSafePunctuation(text))
         {
@@ -321,6 +344,11 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         sb.Append('"');
     }
 
+    /*
+     * 以下是面向本地服务固定响应结构的最小 JSON 读取器。
+     * 该 payload 只引用 XUnity Core，故不额外携带 Newtonsoft.Json。
+     * 解析失败统一返回 null，由 OnExtractTranslation 走 Fail 降级。
+     */
     private static string ReadStringProperty(string json, string name)
     {
         int value = FindPropertyValue(json, name, 0);

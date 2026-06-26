@@ -9,8 +9,38 @@
 #include <string.h>
 #include <wchar.h>
 
+/*
+ * Win32 的同步 ReadFile/WriteFile 允许成功但只传输部分字节。下面两个助手把
+ * “完整传输”收进文件 IO 模块的实现，调用方只需要处理成功/失败，不再重复
+ * 容易漏掉的偏移和零进展检查。HANDLE 仍由调用方创建和关闭。
+ */
+static int write_handle_all(HANDLE h, const char *buf, DWORD size) {
+    DWORD offset = 0;
+    while (offset < size) {
+        DWORD written = 0;
+        DWORD remaining = size - offset;
+        if (!WriteFile(h, buf + offset, remaining, &written, NULL) || written == 0) return 0;
+        offset += written;
+    }
+    return 1;
+}
+
+/* 完整读取固定长度的数据。ReadFile 允许短读，因此不能把单次成功
+   当成整个文件已经读完；buf 由调用方分配并保证至少有 size 字节。 */
+static int read_handle_all(HANDLE h, char *buf, DWORD size) {
+    DWORD offset = 0;
+    while (offset < size) {
+        DWORD read = 0;
+        DWORD remaining = size - offset;
+        if (!ReadFile(h, buf + offset, remaining, &read, NULL) || read == 0) return 0;
+        offset += read;
+    }
+    return 1;
+}
+
 /* 拼接两个路径段：a 末尾无 '\' 时自动补上。 */
 void path_join(WCHAR *out, size_t cap, const WCHAR *a, const WCHAR *b) {
+    if (!out || cap == 0) return;
     _snwprintf(out, cap, L"%s%s%s", a,
                (a[0] && a[wcslen(a) - 1] != L'\\') ? L"\\" : L"", b);
     out[cap - 1] = 0;
@@ -49,6 +79,7 @@ int ensure_dir(const WCHAR *path) {
 
 /* 以 CREATE_ALWAYS 写 UTF-8 文本，返回是否写入完整。 */
 int write_text_file_utf8(const WCHAR *path, const char *bytes) {
+    if (!path || !bytes) return 0;
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     size_t len = strlen(bytes);
@@ -56,15 +87,17 @@ int write_text_file_utf8(const WCHAR *path, const char *bytes) {
         CloseHandle(h);
         return 0;
     }
-    DWORD written = 0;
-    int ok = WriteFile(h, bytes, (DWORD)len, &written, NULL);
+    int ok = write_handle_all(h, bytes, (DWORD)len);
     CloseHandle(h);
-    return ok && written == (DWORD)len;
+    return ok;
 }
 
 /* 读取文件全部内容到新分配缓冲。返回 1=成功，*out 和 *size 由调用方负责。
    限制文件大小 < 4GB 且 != UINT32_MAX，超出则拒绝。 */
 int read_file_bytes(const WCHAR *path, char **out, DWORD *size) {
+    if (!path || !out || !size) return 0;
+    *out = NULL;
+    *size = 0;
     HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     LARGE_INTEGER li;
@@ -75,24 +108,23 @@ int read_file_bytes(const WCHAR *path, char **out, DWORD *size) {
     DWORD sz = (DWORD)li.QuadPart;
     char *buf = (char *)malloc(sz + 1);
     if (!buf) { CloseHandle(h); return 0; }
-    DWORD rd = 0;
-    int ok = ReadFile(h, buf, sz, &rd, NULL);
+    int ok = read_handle_all(h, buf, sz);
     CloseHandle(h);
     if (!ok) { free(buf); return 0; }
-    buf[rd] = 0;  /* 方便当 C 字符串用 */
+    buf[sz] = 0;  /* 方便当 C 字符串用 */
     *out = buf;
-    *size = rd;
+    *size = sz;
     return 1;
 }
 
 /* 写入原始字节到文件，CREATE_ALWAYS 覆盖。 */
 int write_file_bytes(const WCHAR *path, const char *buf, DWORD size) {
+    if (!path || (!buf && size != 0)) return 0;
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    DWORD wr = 0;
-    int ok = WriteFile(h, buf, size, &wr, NULL);
+    int ok = write_handle_all(h, buf, size);
     CloseHandle(h);
-    return ok && wr == size;
+    return ok;
 }
 
 /* 复制单个文件。自动确保目标父目录已存在。FALSE = 覆盖已有。 */
@@ -238,8 +270,10 @@ void dpi_set_for_window(HWND hwnd) {
     }
     if (dpi <= 0) {
         HDC dc = GetDC(hwnd);
-        dpi = GetDeviceCaps(dc, LOGPIXELSY);
-        ReleaseDC(hwnd, dc);
+        if (dc) {
+            dpi = GetDeviceCaps(dc, LOGPIXELSY);
+            ReleaseDC(hwnd, dc);
+        }
     }
     if (dpi <= 0) dpi = 96;
     g_scale_dpi = dpi;

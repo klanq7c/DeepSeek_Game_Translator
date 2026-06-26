@@ -12,6 +12,10 @@
 /* 检查服务器是否存活（进程存在或 HTTP /health 返回 200） */
 int server_alive(void);
 
+/* Refresh UI state without starting a new server; adopts an already-running
+   localhost translation server if /health is reachable. */
+void refresh_server_status(void);
+
 /* 启动本地 C 服务器子进程；如果已运行则复用 */
 int start_server(void);
 

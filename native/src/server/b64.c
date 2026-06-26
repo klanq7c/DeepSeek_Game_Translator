@@ -24,7 +24,10 @@ char *b64enc(const char *s) {
     static const char tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t n = 0;
     while (s && s[n]) n++;
-    size_t out_n = ((n + 2) / 3) * 4;
+    if (n > SIZE_MAX - 2) die("base64 input too large");
+    size_t groups = (n + 2) / 3;
+    if (groups > (SIZE_MAX - 1) / 4) die("base64 output too large");
+    size_t out_n = groups * 4;
     char *out = xmalloc(out_n + 1);
     size_t j = 0;
     for (size_t i = 0; i < n; i += 3) {

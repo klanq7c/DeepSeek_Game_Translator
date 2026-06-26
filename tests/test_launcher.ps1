@@ -4,7 +4,10 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $bin = Join-Path $root "native\toolchain\w64devkit\bin"
 $probeExe = Join-Path $PSScriptRoot "launcher_probe.exe"
+$warmupProbeExe = Join-Path $PSScriptRoot "warmup_probe.exe"
+$rpgmHookProbe = Join-Path $PSScriptRoot "rpgm_hook_probe.js"
 $fixtures = Join-Path $PSScriptRoot "_launcher_fixtures"
+$productName = "ds" + [string][char]0x6e38 + [string][char]0x620f + [string][char]0x7ffb + [string][char]0x8bd1 + [string][char]0x5668
 
 if (-not (Test-Path (Join-Path $bin "gcc.exe"))) {
     throw "Missing w64devkit gcc at $bin"
@@ -12,7 +15,7 @@ if (-not (Test-Path (Join-Path $bin "gcc.exe"))) {
 
 $env:PATH = "$bin;$env:PATH"
 
-$mainSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\main.c") -Raw
+$mainSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\main.c") -Raw -Encoding UTF8
 if ($mainSrc -match '(?s)case\s+WM_DESTROY:.*stop_server\s*\(') {
     throw "launcher must not stop the translation server when the window closes"
 }
@@ -22,9 +25,22 @@ if ($mainSrc -notmatch 'sync_embedded_payloads\(\)') {
 if ($mainSrc -notmatch '--sync-payloads-and-exit') {
     throw "launcher must keep a headless embedded payload sync mode for release verification"
 }
-$uiSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\ui.c") -Raw
+if (-not $mainSrc.Contains($productName)) {
+    throw "launcher window title must use the ds游戏翻译器 product name"
+}
+$uiSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\ui.c") -Raw -Encoding UTF8
 if ($uiSrc -notmatch 'OutputDebugStringW\(line\)' -or $uiSrc -notmatch '!g_log \|\| !IsWindow\(g_log\)') {
     throw "launcher logging must be safe before UI controls exist"
+}
+if (-not $uiSrc.Contains($productName)) {
+    throw "launcher UI/dialog branding must use the ds游戏翻译器 product name"
+}
+$fsutilSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\fsutil.c") -Raw
+if ($fsutilSrc -notmatch 'static int read_handle_all' -or $fsutilSrc -notmatch 'static int write_handle_all') {
+    throw "launcher file IO must centralize complete ReadFile/WriteFile loops"
+}
+if ($fsutilSrc -notmatch '\*out = NULL;\s*\*size = 0;') {
+    throw "launcher file reads must clear output ownership before attempting IO"
 }
 $serverProcSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\server_proc.c") -Raw
 if ($serverProcSrc -notmatch 'server_http_alive') {
@@ -33,6 +49,20 @@ if ($serverProcSrc -notmatch 'server_http_alive') {
 if ($serverProcSrc -notmatch 'if\s*\(\s*server_http_alive\(200\)\s*\)') {
     throw "start_server must adopt an already-running translation server"
 }
+if ($serverProcSrc -notmatch 'void\s+refresh_server_status\s*\(' -or
+    $serverProcSrc -notmatch '(?s)refresh_server_status.*?server_http_alive\(200\).*?g_server_started\s*=\s*1') {
+    throw "launcher startup must reconcile UI state with an already-running translation server"
+}
+if ($serverProcSrc -notmatch 'wait_for_server_ready' -or
+    $serverProcSrc -notmatch '(?s)CreateProcessW.*?wait_for_server_ready\(.*?reset_server_handle\(\).*?return\s+0') {
+    throw "launcher must not report a newly spawned server as running until /health is reachable"
+}
+if ($mainSrc -notmatch '(?s)case\s+WM_CREATE:.*refresh_server_status\(\).*layout\(hwnd\);') {
+    throw "launcher must refresh server status during startup before first layout"
+}
+if ($uiSrc -notmatch '(?s)if\s*\(!start_server\(\)\)\s*\{.{0,500}?return;') {
+    throw "launcher must stop translation launch when the local server cannot start"
+}
 $engineSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\engine.c") -Raw
 if ($engineSrc -notmatch 'has_file_pattern\(p,\s*L"\*\.rpy"\)') {
     throw "Ren'Py detection must recognize source-only .rpy games, not only compiled .rpyc/.rpa packages"
@@ -40,6 +70,14 @@ if ($engineSrc -notmatch 'has_file_pattern\(p,\s*L"\*\.rpy"\)') {
 $warmupSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\warmup.c") -Raw
 if ($warmupSrc -notmatch 'scan_renpy_script_dir') {
     throw "Ren'Py warmup must scan script files for prefetch candidates"
+}
+if ($warmupSrc -notmatch 'const char \*fq = renpy_first_quote\(line\);' -or
+    $warmupSrc -notmatch 'char \*text = renpy_string_at\(&cursor\);' -or
+    $warmupSrc -notmatch 'collect_renpy_string\(text, prefetch\);') {
+    throw "Ren'Py warmup must parse single/double quoted strings with escapes and apply its script-specific filter"
+}
+if ($warmupSrc -match 'const char \*fq = strchr\(line,\s*''"''\);') {
+    throw "Ren'Py warmup must not regress to the old double-quote-only scanner"
 }
 if ($warmupSrc -notmatch 'ENGINE_RENPY\)\s+warmup_renpy') {
     throw "Ren'Py warmup must be wired into warmup_translations"
@@ -53,11 +91,23 @@ if ($warmupSrc -notmatch 'RENPY_WARMUP_MAX_ITEMS 30000') {
 if ($warmupSrc -notmatch 'UNITY_WARMUP_MAX_ITEMS 8000') {
     throw "Unity warmup must have its own larger cap so VN text can be prefetched before display"
 }
+if ($warmupSrc -notmatch 'RPGM_WARMUP_MAX_ITEMS 40000') {
+    throw "RPG Maker warmup must not stop after the first 1200 texts in large games"
+}
 if ($warmupSrc -notmatch 'prefetch\.max_items = RENPY_WARMUP_MAX_ITEMS;') {
     throw "Ren'Py warmup list must raise its item cap"
 }
 if ($warmupSrc -notmatch 'prefetch\.max_items = UNITY_WARMUP_MAX_ITEMS;') {
     throw "Unity warmup list must raise its item cap without changing RPGM defaults"
+}
+if ($warmupSrc -notmatch 'prefetch\.max_items = RPGM_WARMUP_MAX_ITEMS;') {
+    throw "RPG Maker warmup list must use its engine-specific item cap"
+}
+if ($warmupSrc -notmatch 'should_warm_rpgm_text') {
+    throw "RPG Maker warmup must preserve valid engine control sequences instead of rejecting every backslash"
+}
+if ($warmupSrc -notmatch 'scan_rpgm_external_texts\(dir,\s*&prefetch\);') {
+    throw "RPG Maker warmup must include plugin-owned external text files such as quest/Quests.txt"
 }
 if ($warmupSrc -notmatch 'static int local_http_post\(LocalHttp \*h') {
     throw "warmup must reuse one localhost connection across batches"
@@ -267,8 +317,11 @@ if ($selfUpdateSrc -match 'Newtonsoft\.Json' -or $selfUpdateSrc -match 'BepInExR
     throw "embedded payload sync must not bundle third-party runtime payloads"
 }
 $programReleaseSrc = Get-Content -LiteralPath (Join-Path $root "scripts\prepare_program_release.ps1") -Raw
-if ($programReleaseSrc -notmatch 'singleExePath' -or $programReleaseSrc -notmatch 'Copy-ReleaseFile "DeepSeekTranslator\.exe" "\$DsName\.exe"') {
-    throw "program release script must produce a standalone ds translator exe asset"
+if ($programReleaseSrc -notmatch 'singleExePath' -or
+    $programReleaseSrc -notmatch 'Copy-ReleaseFile "DeepSeekTranslator\.exe" "\$DsName\.exe"' -or
+    $programReleaseSrc -notmatch '0x6e38' -or
+    $programReleaseSrc -notmatch '0x620f') {
+    throw "program release script must produce a standalone ds游戏翻译器 exe asset"
 }
 if ($programReleaseSrc -notmatch '\(\^\|/\)native/' -or $programReleaseSrc -notmatch '\(\^\|/\)payloads/' -or $programReleaseSrc -notmatch 'Newtonsoft\\\.Json') {
     throw "program release script must reject sidecar runtime payloads and third-party binaries"
@@ -333,7 +386,20 @@ try {
 
     & $probeExe $root $fixtures
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    gcc -std=c17 -O2 -D_CRT_SECURE_NO_WARNINGS `
+        -I"$root\native\src\launcher" `
+        "$PSScriptRoot\warmup_probe.c" `
+        -lwinhttp -o "$warmupProbeExe"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    & $warmupProbeExe
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    & node $rpgmHookProbe (Join-Path $fixtures "rpgm\www\js\hook_rpgm_mv.js")
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
     Remove-Item -LiteralPath $probeExe -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $warmupProbeExe -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $fixtures -Recurse -Force -ErrorAction SilentlyContinue
 }

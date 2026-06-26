@@ -9,6 +9,11 @@ $ErrorActionPreference = "Stop"
 $script:Pass = 0
 $script:Fail = 0
 $script:Errors = @()
+$httpSourcePath = Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\http.c"
+$httpSource = Get-Content -LiteralPath $httpSourcePath -Raw
+$utilSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\util.c") -Raw
+$bufSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\buf.c") -Raw
+$jsonSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\json.c") -Raw
 
 function It([string]$name, [scriptblock]$body) {
     try {
@@ -57,6 +62,15 @@ try {
         Assert-Eq $r.Json.status "ok" "status field"
         if ($r.Json.cache_size -lt 0) { throw "cache_size negative" }
         if ($r.Json.runtime_cache_only -ne $false) { throw "runtime_cache_only flag" }
+        $healthFields = $r.Json.PSObject.Properties.Name
+        if ($healthFields -notcontains "request_buffer_pool_cached") { throw "request buffer pool cached count missing" }
+        if ($healthFields -notcontains "request_buffer_pool_limit") { throw "request buffer pool limit missing" }
+        if ($healthFields -notcontains "request_buffer_pool_hits") { throw "request buffer pool hit count missing" }
+        if ($healthFields -notcontains "request_buffer_pool_misses") { throw "request buffer pool miss count missing" }
+        if ($r.Json.request_buffer_pool_limit -le 0 -or $r.Json.request_buffer_pool_limit -gt 64) { throw "request buffer pool limit outside bounded range" }
+        if ($r.Json.request_buffer_pool_cached -lt 0 -or $r.Json.request_buffer_pool_cached -gt $r.Json.request_buffer_pool_limit) { throw "request buffer pool cached count outside bounded range" }
+        if ($r.Json.request_buffer_pool_hits -lt 0) { throw "request buffer pool hits negative" }
+        if ($r.Json.request_buffer_pool_misses -lt 0) { throw "request buffer pool misses negative" }
     }
 
     It "GET /capabilities returns batch+cache_only" {
@@ -65,6 +79,42 @@ try {
         Assert-Eq $r.Json.supports.batch $true "batch"
         Assert-Eq $r.Json.supports.cache_only $true "cache_only"
         Assert-Eq $r.Json.supports.xunity_batch_endpoint $true "xunity_batch_endpoint"
+    }
+
+    It "Request buffer pool retains only fixed initial blocks" {
+        if ($httpSource -notmatch 'if \(capacity != HTTP_RECV_INITIAL\)\s*\{\s*free\(buffer\);\s*return;') {
+            throw "expanded request buffers must bypass the pool"
+        }
+        if ($httpSource -notmatch 'request_buffer_release\(req, cap\);') {
+            throw "connection cleanup must return the buffer with its actual capacity"
+        }
+        if ($httpSource -notmatch '#define HTTP_REQUEST_BUFFER_POOL_LIMIT\s+\d+') {
+            throw "request buffer pool must have a compile-time hard cap"
+        }
+    }
+
+    It "C allocation and parser helpers guard overflow and malformed ownership" {
+        if ($utilSource -notmatch 'void \*xcalloc\(size_t count, size_t size\)') {
+            throw "server allocations need one checked calloc helper"
+        }
+        if ($bufSource -notmatch 'SIZE_MAX - b->len - 1') {
+            throw "dynamic buffer growth must reject size_t addition overflow"
+        }
+        if ($jsonSource -notmatch 'list_free\(&l\);\s*return l;') {
+            throw "malformed arrays must release partial elements"
+        }
+        if ($jsonSource -notmatch 'if \(!closed \|\| invalid\)') {
+            throw "JSON strings must require a closing quote and valid escapes"
+        }
+    }
+
+    It "Socket timeouts are mandatory for connection worker lifetime" {
+        if ($httpSource -notmatch 'if \(setsockopt\(s, SOL_SOCKET, SO_RCVTIMEO') {
+            throw "receive timeout failure must terminate the connection"
+        }
+        if ($httpSource -notmatch 'setsockopt\(s, SOL_SOCKET, SO_SNDTIMEO') {
+            throw "send timeout failure must terminate the connection"
+        }
     }
 
     Write-Host ""
@@ -278,6 +328,14 @@ try {
         $jobs | Remove-Job
         $ok = ($results | Where-Object { $_ -eq 200 }).Count
         if ($ok -ne 50) { throw "only $ok / 50 succeeded" }
+    }
+
+    It "Request buffer pool reuses blocks without exceeding its generation cap" {
+        $r = Send-Json "/health"
+        if ($r.Json.request_buffer_pool_hits -le 0) { throw "request buffer pool never recorded a reuse hit" }
+        if ($r.Json.request_buffer_pool_misses -le 0) { throw "request buffer pool never recorded an allocation miss" }
+        if ($r.Json.request_buffer_pool_cached -le 0) { throw "request buffer pool retained no reusable initial blocks" }
+        if ($r.Json.request_buffer_pool_cached -gt $r.Json.request_buffer_pool_limit) { throw "request buffer pool exceeded its hard cap" }
     }
 
     Write-Host ""

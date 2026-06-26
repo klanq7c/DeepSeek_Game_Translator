@@ -5,7 +5,7 @@ repository. Read it before making changes.
 
 ## Project Goal
 
-DeepSeek Game Translator is intended to become a general-purpose game
+ds游戏翻译器 is intended to become a general-purpose game
 translation tool for:
 
 - Ren'Py games

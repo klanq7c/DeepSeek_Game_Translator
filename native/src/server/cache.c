@@ -43,9 +43,9 @@ static int cache_insert_locked(Cache *c, char *k, char *v) {
 static void cache_rehash_locked(Cache *c) {
     CacheEntry *old = c->e;
     size_t oldcap = c->cap;
+    if (c->cap > SIZE_MAX / 2) die("cache too large");
     c->cap *= 2;
-    c->e = calloc(c->cap, sizeof *c->e);
-    if (!c->e) die("oom");
+    c->e = xcalloc(c->cap, sizeof *c->e);
     c->len = 0;
     for (size_t i = 0; i < oldcap; i++) {
         if (old[i].used) (void)cache_insert_locked(c, old[i].k, old[i].v);
@@ -57,8 +57,7 @@ static void cache_rehash_locked(Cache *c) {
 void cache_init(Cache *c, const char *path) {
     c->cap = 1 << 15;
     c->len = 0;
-    c->e = calloc(c->cap, sizeof *c->e);
-    if (!c->e) die("oom");
+    c->e = xcalloc(c->cap, sizeof *c->e);
     InitializeSRWLock(&c->lock);
     InitializeSRWLock(&c->io_lock);
     c->persist_f = NULL;

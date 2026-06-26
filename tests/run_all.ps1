@@ -31,6 +31,7 @@ Run-Suite "API channel pool concurrency (test_concurrency.ps1)" "test_concurrenc
 Run-Suite "Unity text rules (test_unity_text_rules.ps1)" "test_unity_text_rules.ps1" | Out-Null
 Run-Suite "Launcher detection / deploy routing (test_launcher.ps1)" "test_launcher.ps1" | Out-Null
 if (-not $SkipEndurance) {
+    Run-Suite "Generational idle-memory waves (test_memory_generations.ps1)" "test_memory_generations.ps1" | Out-Null
     Run-Suite ("Endurance (" + $EnduranceSec + "s sustained load)") "test_endurance.ps1" @("-DurationSec", $EnduranceSec) | Out-Null
 }
 

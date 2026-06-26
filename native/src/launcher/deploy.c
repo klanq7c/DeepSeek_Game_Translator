@@ -237,6 +237,7 @@ static const char RENPY_HOOK[] =
  *   3. 注入 CJK @font-face（ds_font.ttf/ttc），确保中文能正确渲染
  *   4. 覆盖 Window_Base.standardFontFace 和 Game_System.mainFontFace，
  *      将 CJK 字体设为首选
+ *   5. 统一插件外部 CRLF 文本的缓存键，并为重复 miss 设置短冷却
  * ---------------------------------------------------------------- */
 static const char RPGM_HOOK[] =
 "(function(){\n"
@@ -244,6 +245,8 @@ static const char RPGM_HOOK[] =
 "  var URL='http://127.0.0.1:19999/translate';\n"
 "  var CJK_FONT='DeepSeekCJK';\n"
 "  var cache=Object.create(null);\n"
+"  var retryAfter=Object.create(null);\n"
+"  var MISS_RETRY_MS=1000;\n"
 "  function installCjkFont(){\n"
 "    try{var st=document.createElement('style'); st.type='text/css'; st.textContent=\"@font-face{font-family:'DeepSeekCJK';src:url('fonts/ds_font.ttf') format('truetype'),url('fonts/ds_font.ttc') format('truetype');font-weight:normal;font-style:normal;} body,canvas{font-family:'DeepSeekCJK',sans-serif;}\"; (document.head||document.documentElement).appendChild(st); if(document.fonts&&document.fonts.load){document.fonts.load('16px '+CJK_FONT);}}\n"
 "    catch(e){}\n"
@@ -255,11 +258,13 @@ static const char RPGM_HOOK[] =
 "  installCjkFont();\n"
 "  function hasCjk(s){return /[\\u4e00-\\u9fff]/.test(String(s||''));}\n"
 "  function tr(s){\n"
-"    s=String(s==null?'':s); if(!s||hasCjk(s)) return s; if(cache[s]) return cache[s];\n"
-"    try{var x=new XMLHttpRequest(); x.open('POST',URL,false); x.setRequestHeader('Content-Type','application/json'); x.send(JSON.stringify({text:s,cache_only:true})); if(x.status===200){var r=JSON.parse(x.responseText); var v=r.translated_text||r.translation||s; if(r.source==='cache'||(v&&v!==s&&r.source!=='miss'&&r.source!=='queued')){cache[s]=v; return v;}}}\n"
+"    s=String(s==null?'':s); if(!s||hasCjk(s)) return s; var key=s.replace(/\\r+$/,''); if(!key) return s; if(cache[key]) return cache[key]; var now=Date.now(); if(retryAfter[key]&&retryAfter[key]>now) return s;\n"
+"    try{var x=new XMLHttpRequest(); x.open('POST',URL,false); x.setRequestHeader('Content-Type','application/json'); x.send(JSON.stringify({text:key,cache_only:true})); if(x.status===200){var r=JSON.parse(x.responseText); var v=r.translated_text||r.translation||key; if(r.source==='cache'||(v&&v!==key&&r.source!=='miss'&&r.source!=='queued')){cache[key]=v; delete retryAfter[key]; return v;}}}\n"
 "    catch(e){}\n"
+"    retryAfter[key]=now+MISS_RETRY_MS;\n"
 "    return s;\n"
 "  }\n"
+"  if(window.Window_Message&&Window_Message.prototype.startMessage&&!Window_Message.prototype._dsStartMessage){var oldMsg=Window_Message.prototype.startMessage; Window_Message.prototype._dsStartMessage=oldMsg; Window_Message.prototype.startMessage=function(){var gm=window.$gameMessage; var original=gm&&gm._texts; if(!original||!Array.isArray(original)||!original.length){return oldMsg.apply(this,arguments);} var translated=new Array(original.length); for(var i=0;i<original.length;i++){translated[i]=tr(original[i]);} gm._texts=translated; try{return oldMsg.apply(this,arguments);} finally{gm._texts=original;}};}\n"
 "  if(window.Window_Base&&Window_Base.prototype.drawTextEx){var old=Window_Base.prototype.drawTextEx; Window_Base.prototype.drawTextEx=function(text,x,y,w){return old.call(this,tr(text),x,y,w);};}\n"
 "  if(window.Window_Base&&Window_Base.prototype.drawText){var old2=Window_Base.prototype.drawText; Window_Base.prototype.drawText=function(text,x,y,w,a){return old2.call(this,tr(text),x,y,w,a);};}\n"
 "})();\n";
@@ -697,6 +702,7 @@ static int unity_has_bepinex6_mono(const WCHAR *dir) {
     return exists_path(p);
 }
 
+/* payload 缺失时只记录可复制执行的修复命令，不在部署路径中自动联网下载。 */
 static void log_payload_install_command(const WCHAR *flag) {
     append_log(L"Install runtime payloads with:");
     append_log(L"  powershell -ExecutionPolicy Bypass -File scripts\\install_runtime_payloads.ps1 %s", flag);
