@@ -7,6 +7,7 @@
 
 #include "api_config.h"
 #include "fsutil.h"
+#include "resource.h"
 #include "ui.h"
 
 #include <string.h>
@@ -101,14 +102,19 @@ static LRESULT CALLBACK api_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 void show_api_config(void) {
     static int registered = 0;
     if (!registered) {
-        WNDCLASSW wc;
+        WNDCLASSEXW wc;
         ZeroMemory(&wc, sizeof wc);
+        wc.cbSize = sizeof wc;
         wc.lpfnWndProc = api_wndproc;
         wc.hInstance = g_inst;
+        wc.hIcon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                    GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+        wc.hIconSm = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                      GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         wc.lpszClassName = L"DSTApiConfigDialog";
-        RegisterClassW(&wc);
+        RegisterClassExW(&wc);
         registered = 1;
     }
     ApiDialog d;

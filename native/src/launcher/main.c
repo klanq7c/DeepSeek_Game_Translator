@@ -6,6 +6,7 @@
 #include "api_config.h"
 #include "fsutil.h"
 #include "godot_patch.h"
+#include "resource.h"
 #include "server_proc.h"
 #include "self_update.h"
 #include "ui.h"
@@ -269,14 +270,19 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE prev, PWSTR cmd, int show) {
         if (primary_dpi <= 0) primary_dpi = 96;
     }
 
-    WNDCLASSW wc;
+    WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof wc);
+    wc.cbSize = sizeof wc;
     wc.lpfnWndProc = wndproc;
     wc.hInstance = h;
+    wc.hIcon = (HICON)LoadImageW(h, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+    wc.hIconSm = (HICON)LoadImageW(h, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                  GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = NULL;
     wc.lpszClassName = L"DSTNativeLauncher";
-    RegisterClassW(&wc);
+    RegisterClassExW(&wc);
 
     int initW = MulDiv(1200, primary_dpi, 96);
     int initH = MulDiv(780,  primary_dpi, 96);
