@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -23,30 +24,19 @@ using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 
 /*
- * Unity Mono / BepInEx 5 与 6 共用的运行时插件。
- *
- * 真实入口是 Awake()，完整主链路为：
+ * Unity Mono / BepInEx 5 ...6 共用的运行时插件... *
+ * 真实入口...Awake()，完整主链路为：
  *   Awake -> 加载本地缓存/字体 -> 安装 Harmony hook -> 创建 TranslatorDriver
  *   -> TMP/UGUI setter、场景扫描或预热发现文本
- *   -> 本地缓存命中直接排入主线程应用队列
- *   -> 未命中经批量队列请求本地 C 服务
- *   -> 后台网络线程只产生字符串结果，Unity 对象写入统一回到 PumpOnce。
- *
- * 引擎边界：本文件只随 Unity Mono payload 部署。Ren'Py、RPG Maker 和
- * Unity IL2CPP 分别使用启动器 hook、XUnity 端点和 IL2CPP TMP fallback，
- * 不会执行这里的代码。
- *
- * 所有权约定：
- *   - _cache / _glossary / _localCacheKeys 由本插件拥有，访问时锁 _cache；
- *   - 请求、去抖、待应用和组件状态由 _pendingLock 保护；
- *   - _serverStateLock 只保护熔断状态；
- *   - _cachePersistLock 只保护持久化调度标志，不包住磁盘 IO；
- *   - UnityEngine.Object 只能在 Unity 主线程读取或写入，后台线程不得持有强引用。
- */
-[BepInPlugin("com.deepseek.translator", "Unity Translator", "3.1.97")]
+ *   -> 本地缓存命中在主线程立即写回，未命中再进入异步应用管... *   -> 未命中经批量队列请求本地 C 服务
+ *   -> 后台网络线程只产生字符串结果，Unity 对象写入统一回到 PumpOnce... *
+ * 引擎边界：本文件只随 Unity Mono payload 部署。Ren'Py、RPG Maker ... * Unity IL2CPP 分别使用启动...hook、XUnity 端点...IL2CPP TMP fallback... * 不会执行这里的代码... *
+ * 所有权约定... *   - _cache / _glossary / _localCacheKeys 由本插件拥有，访问时..._cache... *   - 请求、去抖、待应用和组件状态由 _pendingLock 保护... *   - _serverStateLock 只保护熔断状态；
+ *   - _cachePersistLock 只保护持久化调度标志，不包住磁盘 IO... *   - UnityEngine.Object 只能...Unity 主线程读取或写入，后台线程不得持有强引用... */
+[BepInPlugin("com.deepseek.translator", "Unity Translator", "3.1.111")]
 public class DeepSeekTranslator : BaseUnityPlugin
 {
-	/* TMP 字体无法覆盖译文时创建的 UGUI 覆盖层状态；WeakReference 避免阻止场景卸载。 */
+	/* TMP 字体无法覆盖译文时创建的 UGUI 覆盖层状态；WeakReference 避免阻止场景卸载...*/
 	private sealed class TmpOverlayState : MonoBehaviour
 	{
 		public Text overlayText;
@@ -68,7 +58,16 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public bool registered;
 	}
 
-	/* 后台翻译完成后等待主线程写回组件的不可变工作项。 */
+	private sealed class UguiShortLabelLayoutState
+	{
+		public HorizontalWrapMode OriginalMode;
+
+		public string AppliedText;
+	}
+
+	private static readonly ConditionalWeakTable<Text, UguiShortLabelLayoutState> _uguiShortLabelLayouts = new ConditionalWeakTable<Text, UguiShortLabelLayoutState>();
+
+	/* 后台翻译完成后等待主线程写回组件的不可变工作项...*/
 	private sealed class PendingTranslationApply
 	{
 		public WeakReference ComponentRef;
@@ -84,7 +83,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public bool PreserveRichText;
 	}
 
-	/* 发给服务端前的占位符保护结果；Tokens 保存富文本/变量的还原映射。 */
+	/* 发给服务端前的占位符保护结果；Tokens 保存富文...变量的还原映射...*/
 	private sealed class ProtectedTextPayload
 	{
 		public string OriginalText;
@@ -94,7 +93,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public Dictionary<string, string> Tokens = new Dictionary<string, string>(StringComparer.Ordinal);
 	}
 
-	/* 相同 domain+原文共用一次远程请求，Callbacks 承载所有等待者。 */
+	/* 相同 domain+原文共用一次远程请求，Callbacks 承载所有等待者...*/
 	private sealed class PendingBatchRequest
 	{
 		public string Key;
@@ -110,7 +109,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public List<Action<string>> Callbacks = new List<Action<string>>();
 	}
 
-	/* typewriter 文本先在主线程去抖，稳定后才允许进入远程队列。 */
+	/* typewriter 文本先在主线程去抖，稳定后才允许进入远程队列...*/
 	private sealed class DebouncedTextRequest
 	{
 		public WeakReference ComponentRef;
@@ -128,7 +127,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public float UpdatedAt;
 	}
 
-	/* 场景预热只保存弱引用；异步返回时组件可能已经销毁或切场景。 */
+	/* 场景预热只保存弱引用；异步返回时组件可能已经销毁或切场景...*/
 	private sealed class WarmupCandidate
 	{
 		public WeakReference ComponentRef;
@@ -140,8 +139,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public bool IsTmp;
 	}
 
-	/* 独立且 DontDestroyOnLoad 的主线程泵。插件宿主 Update 不可靠时，
-	   Harmony 的 Time getter 后缀仍会调用同一个 PumpOnce 作为补充入口。 */
+	/* 独立...DontDestroyOnLoad 的主线程泵。插件宿...Update 不可靠时...	   Harmony ...Time getter 后缀仍会调用同一...PumpOnce 作为补充入口...*/
 	private sealed class TranslatorDriver : MonoBehaviour
 	{
 		public DeepSeekTranslator Owner;
@@ -172,7 +170,45 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	public const string PluginGuid = "com.deepseek.translator";
 
+	private const string PluginRuntimeVersion = "3.1.111";
+
 	private static DeepSeekTranslator _instance;
+
+	private static readonly object _caughtExceptionLogLock = new object();
+
+	private static readonly Dictionary<string, int> _caughtExceptionCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+
+	/* Compatibility exception boundary policy:
+	   1. It prevents one version-specific Unity/TMP reflection failure from disabling unrelated renderers.
+	   2. It cannot be fixed in the shared server because the failing member exists only in the loaded game engine.
+	   3. It preserves the existing local fallback but never hides the failure: counts and exception details are logged.
+	   4. BepInEx receives the method, exception type/message, occurrence count, and first full stack trace. */
+	private static void ReportCaughtException(Exception exception, string context = null, [System.Runtime.CompilerServices.CallerMemberName] string operation = null)
+	{
+		Exception root = (exception is TargetInvocationException && exception.InnerException != null) ? exception.InnerException : exception;
+		string key = (operation ?? "unknown") + "|" + root.GetType().FullName;
+		int count;
+		lock (_caughtExceptionLogLock)
+		{
+			_caughtExceptionCounts.TryGetValue(key, out count);
+			count++;
+			_caughtExceptionCounts[key] = count;
+		}
+		bool shouldLog = count <= 3 || (count & (count - 1)) == 0;
+		if (shouldLog)
+		{
+			string detail = count == 1 ? root.ToString() : root.GetType().FullName + ": " + root.Message;
+			string message = "[EXCEPTION-BOUNDARY] operation=" + (operation ?? "unknown") + " occurrence=" + count + (string.IsNullOrWhiteSpace(context) ? string.Empty : " context=" + context) + " error=" + detail;
+			if (_instance != null)
+			{
+				_instance.Logger.LogWarning(message);
+			}
+			else
+			{
+				System.Diagnostics.Trace.TraceWarning(message);
+			}
+		}
+	}
 
 	private TranslatorDriver _driver;
 
@@ -194,7 +230,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private ConfigEntry<bool> _serverCachePreloadEnabled;
 
-	/* 网络、缓存和重试策略。常量必须直接用于真实调用点，禁止仅作“说明”。 */
+	/* 网络、缓存和重试策略。常量必须直接用于真实调用点，禁止仅作“说明”...*/
 	private const int HttpTimeoutMs = 30000;
 
 	private const int ServerOfflineBaseBackoffMs = 2500;
@@ -203,17 +239,20 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int ServerFailureLogIntervalMs = 6000;
 
-	private const int TranslationRetryCooldownSeconds = 8;
+	private const int TransientTranslationRetryCooldownSeconds = 1;
+
+	private const int RejectedTranslationRetryCooldownSeconds = 8;
 
 	private const int MaxRejectedTranslationRetries = 3;
 
-	/* 共享翻译状态。_localCacheKeys 只记录本游戏实际使用过的键，防止把
-	   可选的全服缓存预载再次完整写入游戏目录。 */
+	/* 共享翻译状态。_localCacheKeys 只记录本游戏实际使用过的键，防止...	   可选的全服缓存预载再次完整写入游戏目录...*/
 	private readonly Dictionary<string, string> _glossary = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
 	private readonly Dictionary<string, string> _cache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
 	private readonly HashSet<string> _localCacheKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+	private volatile bool _firstFrameLocalCachePrimed;
 
 	private readonly Dictionary<string, string> _mixedRepairOriginals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -243,16 +282,19 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private readonly Queue<string> _deepPrefetchQueue = new Queue<string>();
 
+	private readonly HashSet<string> _imguiPending = new HashSet<string>(StringComparer.Ordinal);
+
+	private readonly Dictionary<string, float> _imguiSettleStartedAt = new Dictionary<string, float>(StringComparer.Ordinal);
+
 	private int _gameScriptWarmupStarted;
 
 	/* 跨线程调度状态。后台任务只能在锁内增删工作项；真正读写 Unity 组件
-	   由 Driver/Canvas/Frame hook 触发的主线程泵完成。 */
+	   ...Driver/Canvas/Frame hook 触发的主线程泵完成...*/
 	private readonly object _pendingLock = new object();
 
 	private readonly object _serverStateLock = new object();
 
-	/* 诊断线程仅在 DebugMode 下创建。停止事件属于插件生命周期，OnDestroy 置位后
-	   线程立即退出，避免场景/插件卸载后仍由闭包强引用整个翻译器实例。 */
+	/* 诊断线程仅在 DebugMode 下创建。停止事件属于插件生命周期，OnDestroy 置位...	   线程立即退出，避免场景/插件卸载后仍由闭包强引用整个翻译器实例...*/
 	private ManualResetEvent _diagnosticsStop;
 
 	private Thread _diagnosticsThread;
@@ -282,6 +324,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private float _lastSceneLoadRealtime;
 
 	private readonly object _cachePersistLock = new object();
+
+	private readonly object _cacheFileWriteLock = new object();
+
+	private volatile bool _shuttingDown;
 
 	private bool _cachePersistScheduled;
 
@@ -363,6 +409,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private volatile int _targetedCacheQueueCount;
 
+	private volatile int _uguiShortLabelOverflowCount;
+
+	private volatile int _imguiShortLabelWidthCount;
+
 	private volatile int _fontApplyFailures;
 
 	private volatile int _fontApplyAttached;
@@ -407,21 +457,25 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int DefaultClientBatchWindowMs = 2;
 
-	private const int MaxClientBatchSize = 8;
+	private const int MaxClientBatchSize = 16;
 
-	/* 与本地服务 API 通道池对齐：最多 4 个批次并行，避免单次往返串行化。 */
+	/* 与本地服...API 通道池对齐：最...4 个批次并行，避免单次往返串行化...*/
 	private const int MaxConcurrentBatchFlushes = 4;
 
-	/* flush 异常退出后的重启必须限速，否则确定性错误会变成高频死循环。 */
+	/* flush 异常退出后的重启必须限速，否则确定性错误会变成高频死循环...*/
 	private const int BatchFlushFaultRestartDelayMs = 1000;
 
 	private const int FreshLocalCacheMinEntries = 1200;
 
 	/* 单个游戏真实使用的本地缓存通常只有几千条。超过此值视为旧版整库污染，
-	   不能重新标成本地键，否则每次持久化都会校验并重写整库。 */
+	   不能重新标成本地键，否则每次持久化都会校验并重写整库...*/
 	private const int OversizedLocalCacheEntryLimit = 50000;
 
 	private const long OversizedLocalCacheFileBytes = 8L * 1024L * 1024L;
+
+	private const int FirstFrameLocalCacheEntryLimit = 2048;
+
+	private const long FirstFrameLocalCacheFileBytes = 256L * 1024L;
 
 	private const int MaxFontWarmupCacheEntries = 2048;
 
@@ -461,17 +515,17 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int FramePumpGateMask = 63;
 
-	private const float TextSettleDebounceSeconds = 0.35f;
+	private const float TextSettleDebounceSeconds = 0.2f;
 
-	private const float TypewriterFragmentDebounceSeconds = 0.9f;
+	private const float TypewriterFragmentDebounceSeconds = 0.6f;
 
-	private const float UiTextSettleDebounceSeconds = 0.08f;
+	private const float UiTextSettleDebounceSeconds = 0.03f;
 
-	private const int MaxDebouncedStartsPerTick = 10;
+	private const int MaxDebouncedStartsPerTick = 24;
 
 	private const int MaxSceneWarmupCandidates = 96;
 
-	private const int MaxPendingApplyPerFlush = 4;
+	private const int MaxPendingApplyPerFlush = 12;
 
 	private const int MaxSceneCacheAppliesPerPass = 256;
 
@@ -517,6 +571,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int MaxPendingComponentWork = 512;
 
+	private const int MaxImGuiPending = 512;
+
 	private const int MaxMixedRepairMemoized = 512;
 
 	private const int MaxDeepPrefetchSeen = 4096;
@@ -552,7 +608,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private static readonly TimeSpan FreshLocalCacheMaxAge = TimeSpan.FromHours(12.0);
 
 	/* 标签名刻意保守：带值标签必须有 '='，裸标签必须完整匹配标签词，
-	   从而不把 "< The lobby... >" 或 "<Mark looked at me.>" 当成富文本。 */
+	   从而不..."< The lobby... >" ..."<Mark looked at me.>" 当成富文本...*/
 	private static readonly Regex RichTextTagRegex = new Regex("<\\s*/?\\s*(?:b|i|u|s)\\s*>|<\\s*#[0-9A-Fa-f]{3,8}\\s*>|<\\s*(?:color|size|material)\\s*=\\s*[^>]+>|<\\s*/\\s*(?:color|size|material)\\s*>|<\\s*quad\\b[^>]*>|<\\s*br\\s*/?\\s*>|<\\s*(?:mark|sprite|line-height|link|font-weight|font|align|alpha|cspace|indent|line-indent|margin|mspace|pos|rotate|space|style|voffset|width|gradient|page)\\s*(?:=|\\s+[A-Za-z-]+\\s*=)[^>]*>|<\\s*(?:nobr|noparse|allcaps|smallcaps|lowercase|uppercase|strikethrough)\\s*>|<\\s*/\\s*(?:mark|sprite|line-height|link|font-weight|font|align|alpha|cspace|indent|line-indent|margin|mspace|pos|rotate|space|style|voffset|width|gradient|page|nobr|noparse|allcaps|smallcaps|lowercase|uppercase|strikethrough)\\s*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
 	private static readonly Regex EmptyAngleTagRegex = new Regex("<\\s*>", RegexOptions.Compiled);
@@ -563,8 +619,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly Regex BareClosingRichTextRegex = new Regex("(?<!<)(/\\s*(?:color|size|b|i|u|material|quad)\\s*>)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-	/* 这里不能修复 b/i/u 单字母标签：以 B 结尾的十六进制颜色会误匹配
-	   "B>" 并被插入多余 '<'，破坏原本有效的 color 标签。 */
+	/* 这里不能修复 b/i/u 单字母标签：...B 结尾的十六进制颜色会误匹...	   "B>" 并被插入多余 '<'，破坏原本有效的 color 标签...*/
 	private static readonly Regex BareOpeningRichTextRegex = new Regex("(?<![</])((?:color|size|material|quad)(?:\\s*=\\s*[^>\\s]+)?\\s*>)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
 	private static readonly Regex NestedBrokenRichTextRegex = new Regex("</\\s*<\\s*(color|size|b|i|u|material|quad)\\s*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -575,7 +630,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly Regex LooseColorCloseFragmentRegex = new Regex("(?i)[<:/\\\\-]*\\s*/\\s*c?olor\\s*>?", RegexOptions.Compiled);
 
-	/* 百分比字号标签必须整体吞掉，否则纯文本路径会残留 "%>"。 */
+	/* 百分比字号标签必须整体吞掉，否则纯文本路径会残留 "%>"...*/
 	private static readonly Regex LooseSizeOpenFragmentRegex = new Regex("(?i)[<:/\\\\-]*\\s*size\\s*[-=]+\\s*\\d+\\s*%?\\s*>?", RegexOptions.Compiled);
 
 	private static readonly Regex LooseSizeCloseFragmentRegex = new Regex("(?i)[<:/\\\\-]*\\s*/\\s*size\\s*>?", RegexOptions.Compiled);
@@ -592,8 +647,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly Regex RuntimeResolutionTextRegex = new Regex("\\b(?:\\d{3,5}|#+)x(?:\\d{3,5}|#+)@(?:\\d{1,4}|#+)\\s*Hz(?:\\[[^\\]]+\\])?\\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-	/* ●、□、· 常用于属性点和标签填充，但多数打包 CJK 图集缺字；不替换会迫使
-	   整个组件降级到无法渲染 <mark> 的 UGUI 覆盖层。 */
+	private static readonly Regex InventoryQuantityLineRegex = new Regex("^\\s*(?<name>[^\\r\\n<>$][^\\r\\n]*?\\S)\\s+x\\s*(?<count>\\d+)\\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+	private static readonly Regex InventoryMoneyLineRegex = new Regex("^\\s*[$￥¥]\\s*\\d[\\d,]*(?:\\.\\d+)?\\s*$", RegexOptions.Compiled);
+
+	private static readonly Regex ColoredRichTextSpanRegex = new Regex("<\\s*color\\s*=\\s*[^>]+>(?<text>.*?)<\\s*/\\s*color\\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
+
+	/* ●、□、...常用于属性点和标签填充，但多数打...CJK 图集缺字；不替换会迫...	   整个组件降级到无法渲...<mark> ...UGUI 覆盖层...*/
 	private static readonly char[] TmpPunctuationFallbackChars = new char[20]
 	{
 		'\u3001', '\u3002', '\uff0c', '\uff1f', '\uff01', '\uff1a', '\uff1b', '\uff08', '\uff09', '\u3010',
@@ -671,10 +731,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int DeepInspectMax = 3;
 
-	/* BepInEx 真实入口。初始化顺序很重要：先准备配置/缓存/字体，再安装 hook，
-	   最后启动预热和扫描。任何后台工作都不得在这里同步等待远程 API。 */
+	/* BepInEx 真实入口。初始化顺序很重要：先准备配...缓存/字体，再安装 hook...	   最后启动预热和扫描。任何后台工作都不得在这里同步等待远...API...*/
 	private void Awake()
 	{
+		_shuttingDown = false;
 		_instance = this;
 		_lastSceneLoadRealtime = Time.realtimeSinceStartup;
 		_serverUrl = base.Config.Bind("General", "ServerUrl", "http://127.0.0.1:19999", "Translation server URL");
@@ -687,6 +747,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_serverCachePreloadEnabled = base.Config.Bind("General", "ServerCachePreload", defaultValue: false, "Full server cache preload. Disabled by default to avoid importing hundreds of thousands of translations into the game process.");
 		ConfigureHttpFastPath();
 		LoadGlossary();
+		PrimeSmallLocalCacheForFirstFrame();
 		_ = BootCacheLoadAsync();
 		if (IsFontModeNone())
 		{
@@ -711,8 +772,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		StartManagedCoroutine(ScanTextComponentsCoroutine());
 		if (_debugMode.Value)
 		{
-			/* 周期诊断会分配字符串并写盘，只能显式启用；正常运行不创建常驻线程。
-			   诊断是可选旁路，不能用 Awake 早退控制，否则未来追加的真实初始化会被跳过。 */
+			/* 周期诊断会分配字符串并写盘，只能显式启用；正常运行不创建常驻线程...			   诊断是可选旁路，不能...Awake 早退控制，否则未来追加的真实初始化会被跳过...*/
 		string pluginDir = Path.GetDirectoryName(base.Info.Location);
 		DeepSeekTranslator translatorRef = this;
 		string diagnosticFontMode = GetFontMode();
@@ -733,7 +793,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				string[] value = new string[18]
 				{
 					$"DiagTime={DateTime.Now}",
-					"Version=3.1.97",
+					"Version=" + PluginRuntimeVersion,
 					"FontMode=" + diagnosticFontMode,
 					"PerformanceMode=" + diagnosticPerformanceMode,
 					$"HookCalls={translatorRef._hookCallCount}",
@@ -753,8 +813,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				};
 				File.WriteAllText(path, string.Join("\n", value));
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			if (_diagnosticsStop.WaitOne(10000))
 			{
@@ -794,8 +855,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				};
 				File.WriteAllText(path2, string.Join("\n", value2));
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			while (!_diagnosticsStop.WaitOne(5000))
 			{
@@ -809,10 +871,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						count2 = translatorRef._pendingApplyQueue.Count;
 						count3 = translatorRef._activeTmpOverlays.Count;
 					}
-					string[] value3 = new string[44]
+					string[] value3 = new string[]
 					{
 						$"LiveDiagTime={DateTime.Now}",
-						"Version=3.1.97",
+						"Version=" + PluginRuntimeVersion,
 						"FontMode=" + diagnosticFontMode,
 						"PerformanceMode=" + diagnosticPerformanceMode,
 						$"OverlayDisabled={translatorRef._overlayDisabled}",
@@ -844,6 +906,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						$"DirectSwapCount={translatorRef._directSwapCount}",
 						$"HostAtlasWarmedCount={translatorRef._hostAtlasWarmedCount}",
 						$"SoftMaskRefreshCount={translatorRef._softMaskRefreshCount}",
+						$"UguiShortLabelOverflow={translatorRef._uguiShortLabelOverflowCount}",
+						$"ImGuiShortLabelWidth={translatorRef._imguiShortLabelWidthCount}",
 						$"ImmediateSceneApplyCount={translatorRef._immediateSceneApplyCount}",
 						$"ImmediateSceneHits={translatorRef._immediateSceneHits}",
 						$"AlphaSweepRunCount={translatorRef._alphaSweepRunCount}",
@@ -858,8 +922,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					};
 					File.WriteAllText(path3, string.Join("\n", value3));
 				}
-				catch
+				catch (Exception reportedException)
 				{
+					ReportCaughtException(reportedException);
 				}
 			}
 		});
@@ -869,18 +934,18 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		thread.Start();
 		try
 		{
-			File.WriteAllText(Path.Combine(pluginDir, "translator_diag.txt"), $"AwakeTime={DateTime.Now}\nVersion=3.1.97\nEnabled={((Behaviour)this).enabled}\nGameObjectActive={((Component)this).gameObject.activeSelf}\nHideFlags={((Object)((Component)this).gameObject).hideFlags}\nCanvasCallback=registered\n");
+			File.WriteAllText(Path.Combine(pluginDir, "translator_diag.txt"), $"AwakeTime={DateTime.Now}\nVersion={PluginRuntimeVersion}\nEnabled={((Behaviour)this).enabled}\nGameObjectActive={((Component)this).gameObject.activeSelf}\nHideFlags={((Object)((Component)this).gameObject).hideFlags}\nCanvasCallback=registered\n");
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		}
 	}
 
 	private void EnsureDriver()
 	{
-		/* Driver 与插件宿主解耦并跨场景存活，集中执行所有 Unity 对象操作。
-		   创建失败时协程可退回插件自身，Harmony 帧泵仍提供第二条活跃路径。 */
+		/* Driver 与插件宿主解耦并跨场景存活，集中执行所...Unity 对象操作...		   创建失败时协程可退回插件自身，Harmony 帧泵仍提供第二条活跃路径...*/
 		if ((Object)(object)_driver != (Object)null)
 		{
 			return;
@@ -1005,13 +1070,26 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		if (IsHighPerformance())
 		{
-			return 8;
+			return 24;
 		}
 		if (IsEcoPerformance())
 		{
-			return 2;
+			return 4;
 		}
 		return MaxPendingApplyPerFlush;
+	}
+
+	private int GetMaxDebouncedStartsPerTick()
+	{
+		if (IsHighPerformance())
+		{
+			return 48;
+		}
+		if (IsEcoPerformance())
+		{
+			return 8;
+		}
+		return MaxDebouncedStartsPerTick;
 	}
 
 	private void DriverUpdate()
@@ -1027,8 +1105,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				File.WriteAllText(Path.Combine(Path.GetDirectoryName(base.Info.Location), "translator_driver_error.txt"), $"Driver update error at {DateTime.Now}: {ex}\nInner: {ex.InnerException}");
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 	}
@@ -1053,7 +1132,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		catch (Exception ex)
 		{
-			LogVerbose("Frame pump failed: " + ex.Message);
+			ReportCaughtException(ex, "source=FRAME");
 		}
 		finally
 		{
@@ -1063,8 +1142,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void PumpOnce(string source)
 	{
-		/* 主线程唯一汇合点：修复覆盖层/透明度、消费缓存命中、处理去抖与
-		   待应用队列，再按性能模式扫描。source 只用于诊断，不改变语义。 */
+		/* 主线程唯一汇合点：修复覆盖...透明度、消费缓存命中、处理去抖与
+		   待应用队列，再按性能模式扫描。source 只用于诊断，不改变语义...*/
 		try
 		{
 			RunOverlayValidationTick();
@@ -1078,8 +1157,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			float num = ((Mathf.Max(0f, Time.realtimeSinceStartup - _lastSceneLoadRealtime) <= GetFastScanWindowSeconds()) ? GetFastScanIntervalSeconds() : GetSlowScanIntervalSeconds());
 			RunScannerTick(Math.Max(10, (int)(num * 1000f)), source);
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -1094,8 +1174,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					File.AppendAllText(Path.Combine(Path.GetDirectoryName(base.Info.Location), "translator_canvas_fired.txt"), $"Canvas callback #{_canvasRenderCount} at {DateTime.Now}\n");
 				}
-				catch
+				catch (Exception reportedException)
 				{
+					ReportCaughtException(reportedException);
 				}
 			}
 			float realtimeSinceStartup = Time.realtimeSinceStartup;
@@ -1116,8 +1197,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				File.WriteAllText(Path.Combine(Path.GetDirectoryName(base.Info.Location), "translator_canvas_error.txt"), $"Canvas callback error at {DateTime.Now}: {ex}\nInner: {ex.InnerException}");
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 	}
@@ -1138,7 +1220,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		catch (Exception ex)
 		{
-			LogVerbose("ScanOnce error from " + source + ": " + ex.Message);
+			ReportCaughtException(ex, "source=" + source);
 		}
 	}
 
@@ -1160,7 +1242,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		catch (Exception ex)
 		{
-			LogVerbose("UI cache apply (immediate) error: " + ex.Message);
+			ReportCaughtException(ex, "phase=immediate");
 		}
 	}
 
@@ -1178,7 +1260,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		catch (Exception ex)
 		{
-			LogVerbose("UI cache apply error: " + ex.Message);
+			ReportCaughtException(ex, "phase=activation");
 		}
 	}
 
@@ -1196,7 +1278,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		catch (Exception ex)
 		{
-			LogVerbose("Periodic cache apply error: " + ex.Message);
+			ReportCaughtException(ex, "phase=periodic");
 		}
 	}
 
@@ -1213,17 +1295,17 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private void QueueCachedComponentTextIfAvailable(object component, bool isTmp, bool allowRemoteFallback)
+	private bool QueueCachedComponentTextIfAvailable(object component, bool isTmp, bool allowRemoteFallback)
 	{
 		if (!IsUnityObjectAlive(component))
 		{
-			return;
+			return false;
 		}
 		try
 		{
 			if (isTmp && !CanHandleTmp())
 			{
-				return;
+				return false;
 			}
 			EnsureScannerInitialized("TEXT_ENABLE");
 			string currentComponentText = GetCurrentComponentText(component, isTmp);
@@ -1252,22 +1334,57 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						}
 					}
 					Interlocked.Increment(ref _targetedCacheQueueCount);
+					return true;
 				}
 				else if (!ContainsCjk(currentComponentText) && TryGetLocalTranslation(currentComponentText, out var translated))
 				{
-					QueueTranslationApply(component, componentInstanceId, currentComponentText, translated, isTmp);
-					Interlocked.Increment(ref _targetedCacheQueueCount);
+					bool applied = ApplyCachedComponentTranslationNow(component, componentInstanceId, currentComponentText, translated, isTmp);
+					if (applied)
+					{
+						Interlocked.Increment(ref _targetedCacheQueueCount);
+					}
+					return applied;
 				}
 				else if (!ContainsCjk(currentComponentText) && allowRemoteFallback && !WasProcessed(componentInstanceId, currentComponentText) && !IsInProgress(componentInstanceId, currentComponentText) && !ShouldSkipText(currentComponentText) && !IsTranslationRetryCoolingDown(currentComponentText))
 				{
 					QueueDebouncedTextRequest(component, componentInstanceId, currentComponentText, isTmp);
+					Interlocked.Increment(ref _targetedCacheQueueCount);
+					return true;
 				}
 			}
 		}
-		catch (Exception ex)
+		catch (Exception reportedException)
 		{
-			LogVerbose("Targeted cache queue failed: " + ex.Message);
+			ReportCaughtException(reportedException);
 		}
+		return false;
+	}
+
+	private bool ApplyCachedComponentTranslationNow(object component, int componentInstanceId, string originalText, string translatedText, bool isTmp)
+	{
+		if (!IsUnityObjectAlive(component) || !IsAcceptableTranslation(originalText, translatedText))
+		{
+			return false;
+		}
+		if (isTmp)
+		{
+			if (!CanHandleTmp())
+			{
+				return false;
+			}
+			ApplyTMProTranslation(component, componentInstanceId, originalText, translatedText, _textPropCache, _fontPropCache, _forceMeshMethodCache);
+			return true;
+		}
+		Text val = component as Text;
+		if ((Object)(object)val == (Object)null)
+		{
+			return false;
+		}
+		ApplyFont(val);
+		val.text = PrepareTranslatedTextForUGUIText(val, translatedText, originalText);
+		MarkProcessed(componentInstanceId, originalText);
+		TryMarkAppliedCacheKeyForPersist(originalText, translatedText);
+		return true;
 	}
 
 	private bool LooksLikeUiGameObject(GameObject gameObject)
@@ -1280,8 +1397,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return (Object)(object)gameObject.GetComponent<RectTransform>() != (Object)null || (Object)(object)gameObject.GetComponent<Canvas>() != (Object)null || (Object)(object)gameObject.GetComponent<CanvasGroup>() != (Object)null;
 		}
-		catch
+		catch (Exception ex)
 		{
+			ReportCaughtException(ex);
 			return false;
 		}
 	}
@@ -1298,7 +1416,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private void QueueCachedTextsInHierarchy(GameObject root, int maxQueue)
+	private void QueueCachedTextsInHierarchy(GameObject root, int maxQueue, bool allowRemoteFallback = false)
 	{
 		if ((Object)(object)root == (Object)null || maxQueue <= 0)
 		{
@@ -1319,9 +1437,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 					if (!((Object)(object)val == (Object)null) && IsComponentActive(val))
 					{
-						int targetedCacheQueueCount = _targetedCacheQueueCount;
-						QueueCachedComponentTextIfAvailable(val, isTmp: true, allowRemoteFallback: false);
-						if (_targetedCacheQueueCount != targetedCacheQueueCount)
+						if (QueueCachedComponentTextIfAvailable(val, isTmp: true, allowRemoteFallback))
 						{
 							num++;
 						}
@@ -1337,18 +1453,16 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 				if (!((Object)(object)val2 == (Object)null) && IsComponentActive(val2))
 				{
-					int targetedCacheQueueCount2 = _targetedCacheQueueCount;
-					QueueCachedComponentTextIfAvailable(val2, isTmp: false, allowRemoteFallback: false);
-					if (_targetedCacheQueueCount != targetedCacheQueueCount2)
+					if (QueueCachedComponentTextIfAvailable(val2, isTmp: false, allowRemoteFallback))
 					{
 						num++;
 					}
 				}
 			}
 		}
-		catch (Exception ex)
+		catch (Exception reportedException)
 		{
-			LogVerbose("Targeted UI tree queue failed: " + ex.Message);
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -1379,16 +1493,18 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				RefreshTmpSubMeshMaterials();
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		try
 		{
 			PruneLongRunningStateIfNeeded();
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		int num = 0;
 		int num2 = 0;
@@ -1576,8 +1692,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				Interlocked.Add(ref _alphaSweepHealedCount, num);
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -1627,8 +1744,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			CollectDeepPrefetchCandidates(DeepPrefetchMaxObjectsPerScan, DeepPrefetchMaxTextsPerScan);
 			_ = ProcessDeepPrefetchQueueAsync();
 		}
-		catch
+		catch (Exception ex)
 		{
+			ReportCaughtException(ex);
 			Interlocked.Exchange(ref _deepPrefetchActive, 0);
 		}
 	}
@@ -1797,8 +1915,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					continue;
 				}
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 	}
@@ -2039,9 +2158,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			ServicePointManager.Expect100Continue = false;
 			ServicePointManager.UseNagleAlgorithm = false;
 		}
-		catch (Exception ex)
+		catch (Exception reportedException)
 		{
-			LogVerbose("ConfigureHttpFastPath failed: " + ex.Message);
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -2052,9 +2171,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static Task<T> RunBackground<T>(Func<T> work)
 	{
-		/* BepInEx/旧 Unity 的 SynchronizationContext 不可靠，因此不依赖 Task.Run
-		   的上下文行为；但也不能为每次 HTTP/磁盘任务创建一个 OS 线程。工作项进入
-		   CLR 线程池，返回值只能是托管数据，禁止在线程中读取或写入 Unity 对象。 */
+		/* BepInEx/...Unity ...SynchronizationContext 不可靠，因此不依...Task.Run
+		   的上下文行为；但也不能为每次 HTTP/磁盘任务创建一...OS 线程。工作项进入
+		   CLR 线程池，返回值只能是托管数据，禁止在线程中读取或写入 Unity 对象...*/
 		TaskCompletionSource<T> completion = new TaskCompletionSource<T>();
 		try
 		{
@@ -2244,8 +2363,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					{
 						memoryStream.Write(array, 0, count);
 					}
-					/* 默认 MemoryStream 的底层缓冲可公开；直接按 Length 解码，避免
-					   cache dump 等大响应再由 ToArray 复制一整份。 */
+					/* 默认 MemoryStream 的底层缓冲可公开；直接按 Length 解码，避...					   cache dump 等大响应再由 ToArray 复制一整份...*/
 					return DecodeRawHttpResponse(memoryStream.GetBuffer(), checked((int)memoryStream.Length));
 				}
 			}
@@ -2339,7 +2457,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void OnDestroy()
 	{
-		/* 先停止会闭包引用本插件的诊断线程，再同步写最后一次本地快照并解绑入口。 */
+		/* 先停止会闭包引用本插件的诊断线程，再同步写最后一次本地快照并解绑入口...*/
+		_shuttingDown = true;
+		if (ReferenceEquals(_instance, this))
+		{
+			_instance = null;
+		}
 		_diagnosticsStop?.Set();
 		Thread diagnosticsThread = _diagnosticsThread;
 		if (diagnosticsThread != null && diagnosticsThread != Thread.CurrentThread && diagnosticsThread.IsAlive)
@@ -2386,7 +2509,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void Update()
 	{
-		DriverUpdate();
+		/* 独立 driver 是正常泵；宿...Update 仅在 driver 丢失或被禁用时兜底...*/
+		if ((Object)(object)_driver == (Object)null || !((Behaviour)_driver).isActiveAndEnabled)
+		{
+			DriverUpdate();
+		}
 	}
 
 	private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
@@ -2398,8 +2525,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			RefreshTmpSubMeshMaterials();
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		try
 		{
@@ -2483,8 +2611,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				JToken token = JToken.Parse(File.ReadAllText(path, Encoding.UTF8));
 				ExtractGameScriptStrings(token, output, maxTexts);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		return output.Distinct(StringComparer.Ordinal).Take(maxTexts).ToList();
@@ -2503,8 +2632,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			roots.AddRange(Directory.GetDirectories(root, "*_Data", SearchOption.TopDirectoryOnly));
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		foreach (string candidateRoot in roots)
 		{
@@ -2529,8 +2659,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					files = Directory.GetFiles(candidateRoot, pattern, SearchOption.AllDirectories);
 				}
-				catch
+				catch (Exception reportedException)
 				{
+					ReportCaughtException(reportedException);
 				}
 				foreach (string path in files)
 				{
@@ -2602,9 +2733,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			StartManagedCoroutine(SceneWarmupCoroutine(result));
 		}
-		catch (Exception ex)
+		catch (Exception reportedException)
 		{
-			LogVerbose("[WARMUP] Scene warmup start failed: " + ex.Message);
+			ReportCaughtException(reportedException);
 		}
 		return result;
 	}
@@ -2642,8 +2773,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			return DateTime.UtcNow - File.GetLastWriteTimeUtc(localCacheFilePath) <= FreshLocalCacheMaxAge;
 		}
-		catch
+		catch (Exception ex)
 		{
+			ReportCaughtException(ex);
 			return false;
 		}
 	}
@@ -2677,8 +2809,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void InstallHooks()
 	{
-		/* Harmony hook 是文本进入管线的第一入口；扫描器只是漏网兜底。
-		   这里只挂 Unity Mono 的 TMP/UGUI/Fungus，不参与 IL2CPP/XUnity。 */
+		/* Harmony hook 是文本进入管线的第一入口；扫描器只是漏网兜底...		   这里只挂 Unity Mono ...TMP/UGUI/Fungus，不参与 IL2CPP/XUnity...*/
 		Type type = AccessTools.TypeByName("TMPro.TMP_Text");
 		if (type != null)
 		{
@@ -2741,7 +2872,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		MethodInfo methodInfo4 = AccessTools.PropertySetter(typeof(Text), "text");
 		if (methodInfo4 != null)
 		{
-			_harmony.Patch(methodInfo4, new HarmonyMethod(typeof(DeepSeekTranslator), "UGUITextPrefix"));
+			_harmony.Patch(methodInfo4, new HarmonyMethod(typeof(DeepSeekTranslator), "UGUITextPrefix"), new HarmonyMethod(typeof(DeepSeekTranslator), "UGUITextPostfix"));
 			base.Logger.LogInfo("Hooked Text.set_text");
 		}
 		MethodInfo methodInfo5 = AccessTools.PropertySetter(typeof(Text), "font");
@@ -2776,6 +2907,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			base.Logger.LogWarning("CanvasGroup.alpha hook skipped: " + ex4.Message);
 		}
+		InstallImGuiHooks();
 		InstallFungusHooks();
 		InstallFramePumpHooks();
 		base.Logger.LogInfo("All hooks installed");
@@ -2804,6 +2936,25 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		catch (Exception ex)
 		{
 			base.Logger.LogWarning(tmpType.FullName + ".OnEnable hook skipped: " + ex.Message);
+		}
+	}
+
+	private void InstallImGuiHooks()
+	{
+		try
+		{
+			MethodInfo methodInfo = AccessTools.Method(typeof(GUI), "Label", new Type[3] { typeof(Rect), typeof(string), typeof(GUIStyle) });
+			if (methodInfo == null)
+			{
+				base.Logger.LogWarning("GUI.Label(Rect,String,GUIStyle) hook skipped: overload not found");
+				return;
+			}
+			_harmony.Patch(methodInfo, new HarmonyMethod(typeof(DeepSeekTranslator), "GUILabelPrefix"));
+			base.Logger.LogInfo("Hooked GUI.Label(Rect,String,GUIStyle)");
+		}
+		catch (Exception ex)
+		{
+			base.Logger.LogWarning("GUI.Label(Rect,String,GUIStyle) hook skipped: " + ex.Message);
 		}
 	}
 
@@ -2897,8 +3048,101 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			string arg = ((originalText.Length > 80) ? (originalText.Substring(0, 80) + "…") : originalText);
 			base.Logger.LogWarning($"[ASYNC-QUEUE #{num}] path={componentLogPath} text='{arg}'");
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
+		}
+	}
+
+	private void QueueImGuiTranslation(string text)
+	{
+		if (string.IsNullOrWhiteSpace(text) || ContainsCjk(text) || ShouldSkipText(text) || IsTranslationRetryCoolingDown(text))
+		{
+			return;
+		}
+		string key = NormalizeRequestText(text);
+		if (LooksLikeTypewriterFragment(text))
+		{
+			float realtimeSinceStartup = Time.realtimeSinceStartup;
+			lock (_pendingLock)
+			{
+				if (_imguiPending.Contains(key))
+				{
+					return;
+				}
+				if (_imguiSettleStartedAt.TryGetValue(key, out var value))
+				{
+					if (realtimeSinceStartup - value < TypewriterFragmentDebounceSeconds)
+					{
+						return;
+					}
+					_imguiSettleStartedAt.Remove(key);
+				}
+				else
+				{
+					if (_imguiSettleStartedAt.Count >= MaxImGuiPending)
+					{
+						string text2 = null;
+						float num = float.MaxValue;
+						foreach (KeyValuePair<string, float> item in _imguiSettleStartedAt)
+						{
+							if (item.Value < num)
+							{
+								num = item.Value;
+								text2 = item.Key;
+							}
+						}
+						if (text2 != null)
+						{
+							_imguiSettleStartedAt.Remove(text2);
+						}
+					}
+					_imguiSettleStartedAt[key] = realtimeSinceStartup;
+					return;
+				}
+			}
+		}
+		else
+		{
+			lock (_pendingLock)
+			{
+				_imguiSettleStartedAt.Remove(key);
+			}
+		}
+		lock (_pendingLock)
+		{
+			if (_imguiPending.Contains(key) || _imguiPending.Count >= MaxImGuiPending)
+			{
+				return;
+			}
+			_imguiPending.Add(key);
+		}
+		ObserveFirstAsyncQueue(null, text);
+		try
+		{
+			RequestSharedTranslation(text, GetRequestDomain(text), delegate
+			{
+				lock (_pendingLock)
+				{
+					_imguiPending.Remove(key);
+				}
+			});
+		}
+		catch (Exception ex)
+		{
+			lock (_pendingLock)
+			{
+				_imguiPending.Remove(key);
+			}
+			base.Logger.LogWarning("IMGUI translation queue failed for '" + PreviewForLog(text) + "': " + ex.Message);
+		}
+	}
+
+	private void ApplyImGuiFont(GUIStyle style)
+	{
+		if (style != null && (Object)(object)_chineseFont != (Object)null && (Object)(object)style.font != (Object)(object)_chineseFont)
+		{
+			style.font = _chineseFont;
 		}
 	}
 
@@ -2947,8 +3191,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				string text3 = ((text.Length > 60) ? (text.Substring(0, 60) + "…") : text);
 				_instance.Logger.LogWarning($"[SETTEXT-OBSERVED #{_setTextAnyOverloadCount}] firstArgType={obj.GetType().Name} path={componentLogPath} text='{text3}'");
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		return true;
@@ -3048,12 +3293,17 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return true;
 		}
+		bool flag = ContainsCjk(value);
+		if (!flag)
+		{
+			RestoreUGUIShortLabelLayoutCompatibility(__instance);
+		}
 		if (string.IsNullOrWhiteSpace(value))
 		{
 			return true;
 		}
 		int componentInstanceId = GetComponentInstanceId(__instance);
-		if (ContainsCjk(value))
+		if (flag)
 		{
 			if (_instance.TryRepairMixedTranslatedText(value, out var originalText, out var repaired))
 			{
@@ -3098,11 +3348,97 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return true;
 	}
 
+	private static void UGUITextPostfix(Text __instance)
+	{
+		if ((Object)(object)_instance == (Object)null || (Object)(object)__instance == (Object)null)
+		{
+			return;
+		}
+		FinalizeUGUITextLayoutCompatibility(__instance);
+	}
+
+	private static void GUILabelPrefix(ref Rect position, ref string text, GUIStyle style)
+	{
+		if ((Object)(object)_instance == (Object)null || string.IsNullOrWhiteSpace(text))
+		{
+			return;
+		}
+		if (ContainsCjk(text))
+		{
+			_instance.ApplyImGuiFont(style);
+			return;
+		}
+		string originalText = text;
+		string translated = _instance.Translate(text);
+		if (!string.Equals(translated, originalText, StringComparison.Ordinal))
+		{
+			text = PrepareTranslatedTextForString(translated, originalText);
+			_instance.ApplyImGuiFont(style);
+			PrepareImGuiTranslatedShortLabelLayout(ref position, style, text, originalText);
+			_instance.TryMarkAppliedCacheKeyForPersist(originalText, translated);
+			return;
+		}
+		if (!ShouldSkipText(text) && !_instance.IsTranslationRetryCoolingDown(text))
+		{
+			_instance.QueueImGuiTranslation(text);
+		}
+	}
+
+	private static void PrepareImGuiTranslatedShortLabelLayout(ref Rect position, GUIStyle style, string translatedText, string sourceText)
+	{
+		if (style == null || string.IsNullOrEmpty(translatedText) || string.IsNullOrEmpty(sourceText))
+		{
+			return;
+		}
+		string visibleText = GetVisibleText(translatedText);
+		string sourceVisibleText = GetVisibleText(sourceText);
+		if (ContainsCjk(sourceVisibleText) || !ContainsCjk(visibleText) || visibleText.Length == 0 || visibleText.Length > 4 ||
+			translatedText.IndexOf('\n') >= 0 || translatedText.IndexOf('\r') >= 0 || sourceText.IndexOf('\n') >= 0 || sourceText.IndexOf('\r') >= 0)
+		{
+			return;
+		}
+		try
+		{
+			GUIContent content = new GUIContent(translatedText);
+			style.CalcMinMaxWidth(content, out var minWidth, out var maxWidth);
+			float requiredWidth = Mathf.Ceil(Mathf.Max(style.CalcSize(content).x, Mathf.Max(minWidth, maxWidth)));
+			if (requiredWidth <= position.width + 0.5f)
+			{
+				return;
+			}
+			float originalWidth = position.width;
+			float widthDelta = requiredWidth - originalWidth;
+			switch (style.alignment)
+			{
+			case TextAnchor.UpperCenter:
+			case TextAnchor.MiddleCenter:
+			case TextAnchor.LowerCenter:
+				position.x -= widthDelta * 0.5f;
+				break;
+			case TextAnchor.UpperRight:
+			case TextAnchor.MiddleRight:
+			case TextAnchor.LowerRight:
+				position.x -= widthDelta;
+				break;
+			}
+			position.width = requiredWidth;
+			int count = Interlocked.Increment(ref _instance._imguiShortLabelWidthCount);
+			if (count <= 3 || (count & (count - 1)) == 0)
+			{
+				_instance.Logger.LogInfo($"[IMGUI-LAYOUT] short-label width occurrence={count} originalWidth={originalWidth:0.0} requiredWidth={requiredWidth:0.0} visibleLength={visibleText.Length} sourceLength={sourceVisibleText.Length} alignment={style.alignment}");
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=IMGUI prepare-short-label-layout");
+		}
+	}
+
 	private static void GameObjectSetActivePostfix(GameObject __instance, bool value)
 	{
 		if (!((Object)(object)_instance == (Object)null) && value && !((Object)(object)__instance == (Object)null) && _instance.LooksLikeUiGameObject(__instance))
 		{
-			_instance.QueueCachedTextsInHierarchy(__instance, MaxTargetedCacheQueuesPerActivation);
+			_instance.QueueCachedTextsInHierarchy(__instance, MaxTargetedCacheQueuesPerActivation, allowRemoteFallback: true);
 			_instance.RequestUiCacheApplyBurst();
 		}
 	}
@@ -3111,7 +3447,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		if (!((Object)(object)_instance == (Object)null) && !((Object)(object)__instance == (Object)null) && _instance.ShouldHandleCanvasGroupVisible(__instance, value))
 		{
-			_instance.QueueCachedTextsInHierarchy(((Component)__instance).gameObject, MaxTargetedCacheQueuesPerActivation);
+			_instance.QueueCachedTextsInHierarchy(((Component)__instance).gameObject, MaxTargetedCacheQueuesPerActivation, allowRemoteFallback: true);
 		}
 	}
 
@@ -3229,10 +3565,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		catch (Exception ex)
 		{
-			if (_debugMode.Value)
-			{
-				LogVerbose("[Fungus] Resolve story component failed: " + ex.Message);
-			}
+			ReportCaughtException(ex, "adapter=Fungus");
 		}
 		return null;
 	}
@@ -3347,8 +3680,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				base.Logger.LogInfo($"[ALPHA-RESCUE] color.a={tmpColor.a:0.00} faceA={num:0.00} outlineA={num2:0.00} canvasA={num3:0.00} on {GetComponentLogPath(tmpComponent)}");
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -3378,8 +3712,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				val2 = val2.parent;
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return false;
 	}
@@ -3398,8 +3733,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return val.a;
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return float.NaN;
 	}
@@ -3447,16 +3783,16 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return false;
 	}
 
 	private string Translate(string text)
 	{
-		/* 同步路径只查内存 glossary/cache，绝不发网络请求。未命中原样返回，
-		   setter hook 随后把文本放入去抖/批量异步管线。 */
+		/* 同步路径只查内存 glossary/cache，绝不发网络请求。未命中原样返回...		   setter hook 随后把文本放入去...批量异步管线...*/
 		if (!TryGetLocalTranslation(text, out var translated))
 		{
 			return text;
@@ -3464,8 +3800,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return translated;
 	}
 
-	/* 疑似打字机片段不再被管线永久拒绝；分类只延长去抖等待时间。
-	   文本在等待窗内不再变化就视为最终文本，因此无句末标点的完整对白仍可翻译。 */
+	/* 疑似打字机片段不再被管线永久拒绝；分类只延长去抖等待时间...	   文本在等待窗内不再变化就视为最终文本，因此无句末标点的完整对白仍可翻译...*/
 	private bool TryGetLocalTranslation(string text, out string translated)
 	{
 		translated = text;
@@ -3516,8 +3851,243 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					return true;
 				}
 			}
+			if (TryTranslateQuantityListFromLocalTerms(text, out var quantityListTranslation))
+			{
+				translated = quantityListTranslation;
+				return true;
+			}
 		}
 		return false;
+	}
+
+	private bool TryTranslateQuantityListFromLocalTerms(string text, out string translated)
+	{
+		translated = null;
+		if (string.IsNullOrWhiteSpace(text) || ContainsCjk(text))
+		{
+			return false;
+		}
+		string normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+		string[] lines = normalized.Split('\n');
+		if (lines.Length < 2)
+		{
+			return false;
+		}
+		bool sawQuantityLine = false;
+		StringBuilder stringBuilder = new StringBuilder(normalized.Length + 16);
+		for (int i = 0; i < lines.Length; i++)
+		{
+			string line = lines[i];
+			if (i > 0)
+			{
+				stringBuilder.Append('\n');
+			}
+			if (string.IsNullOrWhiteSpace(line))
+			{
+				continue;
+			}
+			if (!sawQuantityLine && InventoryMoneyLineRegex.IsMatch(line))
+			{
+				stringBuilder.Append(line.Trim());
+				continue;
+			}
+			Match match = InventoryQuantityLineRegex.Match(line);
+			if (!match.Success)
+			{
+				return false;
+			}
+			string itemName = match.Groups["name"].Value.Trim();
+			if (!TryTranslateInventoryTerm(itemName, out var translatedName))
+			{
+				return false;
+			}
+			sawQuantityLine = true;
+			stringBuilder.Append(translatedName);
+			stringBuilder.Append(" x ");
+			stringBuilder.Append(match.Groups["count"].Value);
+		}
+		if (!sawQuantityLine)
+		{
+			return false;
+		}
+		string candidate = stringBuilder.ToString();
+		if (!IsAcceptableTranslation(text, candidate))
+		{
+			return false;
+		}
+		translated = candidate;
+		return true;
+	}
+
+	private bool TryTranslateInventoryTerm(string term, out string translated)
+	{
+		translated = null;
+		foreach (string candidate in GetInventoryTermCandidates(term))
+		{
+			if (TryGetDirectLocalTermTranslation(candidate, out translated))
+			{
+				return true;
+			}
+			if (TryInferTermTranslationFromCachedQuantityLists(candidate, out translated))
+			{
+				return true;
+			}
+			if (TryInferTermTranslationFromRichTextSpans(candidate, out translated))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private bool TryGetDirectLocalTermTranslation(string term, out string translated)
+	{
+		translated = null;
+		if (string.IsNullOrWhiteSpace(term))
+		{
+			return false;
+		}
+		string normalized = NormalizeRequestText(term);
+		if (_glossary.TryGetValue(term, out var glossaryValue) || _glossary.TryGetValue(normalized, out glossaryValue) || _cache.TryGetValue(term, out glossaryValue) || _cache.TryGetValue(normalized, out glossaryValue))
+		{
+			glossaryValue = SanitizeTranslationArtifacts(glossaryValue);
+			string visible = GetVisibleText(glossaryValue);
+			if (ContainsCjk(visible) && !LooksLikeMixedTranslationResidue(glossaryValue))
+			{
+				translated = visible;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private bool TryInferTermTranslationFromCachedQuantityLists(string term, out string translated)
+	{
+		translated = null;
+		string normalizedTerm = NormalizeInventoryTerm(term);
+		if (string.IsNullOrWhiteSpace(normalizedTerm))
+		{
+			return false;
+		}
+		foreach (KeyValuePair<string, string> pair in _cache)
+		{
+			string[] sourceLines = pair.Key.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+			string[] translatedLines = pair.Value.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+			int count = Math.Min(sourceLines.Length, translatedLines.Length);
+			for (int i = 0; i < count; i++)
+			{
+				Match source = InventoryQuantityLineRegex.Match(sourceLines[i]);
+				if (!source.Success || !string.Equals(NormalizeInventoryTerm(source.Groups["name"].Value), normalizedTerm, StringComparison.OrdinalIgnoreCase))
+				{
+					continue;
+				}
+				Match target = InventoryQuantityLineRegex.Match(translatedLines[i]);
+				if (!target.Success)
+				{
+					continue;
+				}
+				string candidate = GetVisibleText(target.Groups["name"].Value);
+				if (ContainsCjk(candidate))
+				{
+					translated = candidate;
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private bool TryInferTermTranslationFromRichTextSpans(string term, out string translated)
+	{
+		translated = null;
+		string normalizedTerm = NormalizeInventoryTerm(term);
+		if (string.IsNullOrWhiteSpace(normalizedTerm))
+		{
+			return false;
+		}
+		foreach (KeyValuePair<string, string> pair in _cache)
+		{
+			MatchCollection sourceSpans = ColoredRichTextSpanRegex.Matches(pair.Key);
+			if (sourceSpans.Count == 0)
+			{
+				continue;
+			}
+			MatchCollection targetSpans = ColoredRichTextSpanRegex.Matches(pair.Value);
+			int count = Math.Min(sourceSpans.Count, targetSpans.Count);
+			for (int i = 0; i < count; i++)
+			{
+				string sourceText = StripLeadingInventoryCount(GetVisibleText(sourceSpans[i].Groups["text"].Value));
+				if (!string.Equals(NormalizeInventoryTerm(sourceText), normalizedTerm, StringComparison.OrdinalIgnoreCase))
+				{
+					continue;
+				}
+				string candidate = GetVisibleText(targetSpans[i].Groups["text"].Value);
+				if (ContainsCjk(candidate))
+				{
+					translated = candidate;
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private static IEnumerable<string> GetInventoryTermCandidates(string term)
+	{
+		string normalized = NormalizeRequestText(term);
+		if (string.IsNullOrWhiteSpace(normalized))
+		{
+			yield break;
+		}
+		yield return normalized;
+		string singular = SingularizeInventoryTerm(normalized);
+		if (!string.Equals(singular, normalized, StringComparison.OrdinalIgnoreCase))
+		{
+			yield return singular;
+		}
+	}
+
+	private static string SingularizeInventoryTerm(string term)
+	{
+		if (string.IsNullOrWhiteSpace(term))
+		{
+			return term;
+		}
+		if (term.EndsWith("ies", StringComparison.OrdinalIgnoreCase) && term.Length > 4)
+		{
+			return term.Substring(0, term.Length - 3) + "y";
+		}
+		if (term.EndsWith("es", StringComparison.OrdinalIgnoreCase) && term.Length > 3)
+		{
+			string stem = term.Substring(0, term.Length - 2);
+			if (stem.EndsWith("ch", StringComparison.OrdinalIgnoreCase) || stem.EndsWith("sh", StringComparison.OrdinalIgnoreCase) || stem.EndsWith("x", StringComparison.OrdinalIgnoreCase) || stem.EndsWith("s", StringComparison.OrdinalIgnoreCase))
+			{
+				return stem;
+			}
+		}
+		if (term.EndsWith("s", StringComparison.OrdinalIgnoreCase) && !term.EndsWith("ss", StringComparison.OrdinalIgnoreCase) && term.Length > 3)
+		{
+			return term.Substring(0, term.Length - 1);
+		}
+		return term;
+	}
+
+	private static string StripLeadingInventoryCount(string text)
+	{
+		if (string.IsNullOrWhiteSpace(text))
+		{
+			return text;
+		}
+		return Regex.Replace(text.Trim(), "^\\d+\\s+", string.Empty);
+	}
+
+	private static string NormalizeInventoryTerm(string term)
+	{
+		if (string.IsNullOrWhiteSpace(term))
+		{
+			return string.Empty;
+		}
+		return SingularizeInventoryTerm(StripLeadingInventoryCount(NormalizeRequestText(term))).ToLowerInvariant();
 	}
 
 	private bool TryRepairMixedTranslatedText(string mixedText, out string originalText, out string translated)
@@ -3701,8 +4271,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private void StoreCachedTranslation(string original, string translated)
 	{
 		translated = SanitizeTranslationArtifacts(translated);
-		/* 能走到这里的文本已经通过去抖稳定窗，可视为最终文本并安全缓存；
-		   即使结尾形态仍像打字机截断，也不能再次永久丢弃。 */
+		/* 能走到这里的文本已经通过去抖稳定窗，可视为最终文本并安全缓存...		   即使结尾形态仍像打字机截断，也不能再次永久丢弃...*/
 		if (!IsAcceptableTranslation(original, translated))
 		{
 			return;
@@ -3828,7 +4397,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return;
 		}
-		DateTime retryAfter = DateTime.UtcNow.AddSeconds(TranslationRetryCooldownSeconds);
+		DateTime retryAfter = DateTime.UtcNow.AddSeconds(RejectedTranslationRetryCooldownSeconds);
 		string text2 = NormalizeRequestText(text);
 		int attempts;
 		bool abandoned;
@@ -3865,7 +4434,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return;
 		}
-		DateTime retryAfter = DateTime.UtcNow.AddSeconds(TranslationRetryCooldownSeconds);
+		DateTime retryAfter = DateTime.UtcNow.AddSeconds(TransientTranslationRetryCooldownSeconds);
 		lock (_translationRetryCooldownLock)
 		{
 			_translationRetryCooldowns[text] = retryAfter;
@@ -4010,8 +4579,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 							return true;
 						}
 					}
-					catch
+					catch (Exception reportedException)
 					{
+						ReportCaughtException(reportedException);
 					}
 					if (DateTime.UtcNow >= deadline)
 					{
@@ -4021,8 +4591,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			});
 		}
-		catch
+		catch (Exception ex)
 		{
+			ReportCaughtException(ex);
 			return false;
 		}
 	}
@@ -4107,8 +4678,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					{
 						LogVerbose("[BATCH] Callback failed for '" + PreviewForLog(request.OriginalText) + "': " + ex.Message);
 					}
-					catch
+					catch (Exception reportedException)
 					{
+						ReportCaughtException(reportedException);
 					}
 				}
 			}
@@ -4117,11 +4689,15 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void RequestSharedTranslation(string text, string domain, Action<string> callback, bool lowPriority = false)
 	{
-		/* 以 domain+原文合并并发等待者。_batchFlushScheduled 是单一调度令牌：
-		   只有持有它的 flush 任务能消费队列，finally 必须清除或重启。 */
+		/* ...domain+原文合并并发等待者。_batchFlushScheduled 是单一调度令牌...		   只有持有它的 flush 任务能消费队列，finally 必须清除或重启...*/
 		if (string.IsNullOrWhiteSpace(text))
 		{
 			callback?.Invoke(text);
+			return;
+		}
+		if (_shuttingDown)
+		{
+			callback?.Invoke(null);
 			return;
 		}
 		if (TryGetLocalTranslation(text, out var translated))
@@ -4253,14 +4829,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				NoteServerRequestFailed(ex);
 				LogVerbose("[BATCH] Flush failed: " + ex.Message);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		finally
 		{
-			/* 活性约束：_batchFlushScheduled 为 true 时只允许此任务运行。
-			   无论上方如何退出，都必须清标志或重启，否则本局不再分发翻译。 */
+			/* 活性约束：_batchFlushScheduled ...true 时只允许此任务运行...			   无论上方如何退出，都必须清标志或重启，否则本局不再分发翻译...*/
 			bool restart = false;
 			try
 			{
@@ -4277,8 +4853,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 				}
 			}
-			catch
+			catch (Exception ex)
 			{
+				ReportCaughtException(ex);
 				faulted = true;
 				restart = true;
 			}
@@ -4309,15 +4886,17 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					NoteServerRequestFailed(ex);
 					LogVerbose("[BATCH] Worker failed: " + ex.Message);
 				}
-				catch
+				catch (Exception reportedException)
 				{
+					ReportCaughtException(reportedException);
 				}
 				try
 				{
 					InvokePendingRequestCallbacks(list, new Dictionary<string, string>(StringComparer.Ordinal), requestFailed: true);
 				}
-				catch
+				catch (Exception reportedException)
 				{
+					ReportCaughtException(reportedException);
 				}
 			}
 		}
@@ -4385,12 +4964,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				NoteServerRequestFailed(ex);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
-		/* 回调异常不能越过本方法，否则整个 worker 链会失败，drain 级降级路径
-		   还可能让同批其它分组被重复回调。 */
+		/* 回调异常不能越过本方法，否则整个 worker 链会失败，drain 级降级路...		   还可能让同批其它分组被重复回调...*/
 		try
 		{
 			LogVerbose($"[BATCH] Invoking callbacks for {requests.Count} requests, {groupResults.Count} results");
@@ -4402,8 +4981,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				LogVerbose("[BATCH] Callback dispatch failed: " + ex2.Message);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 	}
@@ -4416,6 +4996,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			ClearInProgress(instanceId, originalText);
 			return;
 		}
+		WeakReference componentRef = new WeakReference(component);
 		RequestSharedTranslation(originalText, GetRequestDomain(originalText), delegate(string result)
 		{
 			try
@@ -4430,7 +5011,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 					else
 					{
-						QueueTranslationApply(component, instanceId, originalText, result, isTmp, preserveRichText);
+						object target = componentRef.Target;
+						if (!_shuttingDown && target != null)
+						{
+							QueueTranslationApply(target, instanceId, originalText, result, isTmp, preserveRichText);
+						}
 					}
 				}
 				else
@@ -4688,8 +5273,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					flag = num2 >= 10;
 				}
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		lock (HistoryComponentCache)
@@ -4732,7 +5318,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private static ProtectedTextPayload ProtectTextForTranslation(string text)
 	{
 		/* 富文本标签、格式变量和数字先替换为稳定 token；服务端只翻译可见文字，
-		   返回后 RestoreProtectedText 按原值恢复，避免模型改写控制序列。 */
+		   返回...RestoreProtectedText 按原值恢复，避免模型改写控制序列...*/
 		ProtectedTextPayload payload = new ProtectedTextPayload
 		{
 			OriginalText = text ?? string.Empty,
@@ -4775,6 +5361,94 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private static string RestoreOuterRichTextWrapper(string text, ProtectedTextPayload payload)
 	{
 		return RestoreOuterRichTextWrapper(text, payload?.OriginalText);
+	}
+
+	private static string RestoreLeadingTextDecoration(string translated, string originalText)
+	{
+		if (string.IsNullOrWhiteSpace(translated) || string.IsNullOrWhiteSpace(originalText))
+		{
+			return translated;
+		}
+		if (!TryGetLeadingTextDecoration(originalText, out var decoration, out _))
+		{
+			return translated;
+		}
+		int contentStart;
+		if (!TryGetLeadingTextDecoration(translated, out _, out contentStart))
+		{
+			contentStart = 0;
+			while (contentStart < translated.Length && IsHorizontalWhitespace(translated[contentStart]))
+			{
+				contentStart++;
+			}
+			int markerStart = contentStart;
+			while (contentStart < translated.Length && IsLeadingTextDecorationMarker(translated[contentStart]))
+			{
+				contentStart++;
+			}
+			if (contentStart == markerStart)
+			{
+				contentStart = 0;
+			}
+			else
+			{
+				while (contentStart < translated.Length && IsHorizontalWhitespace(translated[contentStart]))
+				{
+					contentStart++;
+				}
+			}
+		}
+		if (contentStart >= translated.Length || string.IsNullOrWhiteSpace(translated.Substring(contentStart)))
+		{
+			return translated;
+		}
+		return decoration + translated.Substring(contentStart);
+	}
+
+	private static bool TryGetLeadingTextDecoration(string text, out string decoration, out int contentStart)
+	{
+		decoration = null;
+		contentStart = 0;
+		if (string.IsNullOrEmpty(text))
+		{
+			return false;
+		}
+		int index = 0;
+		while (index < text.Length && IsHorizontalWhitespace(text[index]))
+		{
+			index++;
+		}
+		int markerStart = index;
+		while (index < text.Length && IsLeadingTextDecorationMarker(text[index]))
+		{
+			index++;
+		}
+		if (index == markerStart)
+		{
+			return false;
+		}
+		int separatorStart = index;
+		while (index < text.Length && IsHorizontalWhitespace(text[index]))
+		{
+			index++;
+		}
+		if (index == separatorStart || index >= text.Length)
+		{
+			return false;
+		}
+		decoration = text.Substring(0, index);
+		contentStart = index;
+		return true;
+	}
+
+	private static bool IsHorizontalWhitespace(char c)
+	{
+		return c == ' ' || c == '\t';
+	}
+
+	private static bool IsLeadingTextDecorationMarker(char c)
+	{
+		return c == '-' || c == '\u2013' || c == '\u2014' || c == '\u2022' || c == '\u2023' || c == '\u25aa' || c == '\u25cf' || c == '\u25a0' || c == '\u25a1' || c == '*' || c == '>' || c == '+' || c == '\u00b7';
 	}
 
 	private static string RestoreOuterRichTextWrapper(string text, string originalText)
@@ -4920,10 +5594,76 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return text2;
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return text;
+	}
+
+	private static readonly string[] TranslationPromptEchoPrefixes = new string[10]
+	{
+		"\u7ffb\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587",
+		"\u7ffb\u8bd1\u4e3a\u7b80\u4f53\u4e2d\u6587",
+		"\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587",
+		"\u7b80\u4f53\u4e2d\u6587\u7ffb\u8bd1",
+		"\u7b80\u4f53\u4e2d\u6587\u8bd1\u6587",
+		"Simplified Chinese translation",
+		"Translation to Simplified Chinese",
+		"Translate to Simplified Chinese",
+		"Translated into Simplified Chinese",
+		"Translate this exact game text to Simplified Chinese. Return only the translation."
+	};
+
+	private static string StripTranslationPromptEchoPrefix(string text)
+	{
+		if (string.IsNullOrWhiteSpace(text))
+		{
+			return text;
+		}
+		string candidate = text.TrimStart();
+		bool changed = false;
+		for (int pass = 0; pass < 3; pass++)
+		{
+			bool stripped = false;
+			foreach (string prefix in TranslationPromptEchoPrefixes)
+			{
+				if (!candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+				{
+					continue;
+				}
+				int index = prefix.Length;
+				while (index < candidate.Length && (candidate[index] == ' ' || candidate[index] == '\t'))
+				{
+					index++;
+				}
+				if (index < candidate.Length && (candidate[index] == ':' || candidate[index] == '\uff1a'))
+				{
+					index++;
+				}
+				else if (index >= candidate.Length || (candidate[index] != '\r' && candidate[index] != '\n'))
+				{
+					continue;
+				}
+				while (index < candidate.Length && char.IsWhiteSpace(candidate[index]))
+				{
+					index++;
+				}
+				if (index >= candidate.Length)
+				{
+					continue;
+				}
+				candidate = candidate.Substring(index).TrimEnd();
+				changed = true;
+				stripped = true;
+				break;
+			}
+			if (!stripped)
+			{
+				break;
+			}
+		}
+		return changed ? candidate : text;
 	}
 
 	private static string SanitizeTranslationArtifacts(string text)
@@ -4933,6 +5673,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return text;
 		}
 		text = RepairUtf8DecodedAsGbk(text);
+		text = StripTranslationPromptEchoPrefix(text);
 		text = NestedBrokenRichTextRegex.Replace(text, "</$1>");
 		text = BrokenOpeningRichTextDashRegex.Replace(text, "<$1=");
 		text = BareClosingRichTextRegex.Replace(text, "<$1");
@@ -5033,14 +5774,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return true;
 		}
-		return c == '.' || c == '!' || c == '?' || c == '~' || c == '>' || c == ')' || c == ']' || c == '"' || c == '\'' || c == ':' || c == ';' || c == '。' || c == '！' || c == '？' || c == '）' || c == '】' || c == '”' || c == '’' || c == '：' || c == '；' || c == '…';
+		return c == '.' || c == '!' || c == '?' || c == '~' || c == '>' || c == ')' || c == ']' || c == '"' || c == '\'' || c == ':' || c == ';' || c == '’' || c == '”' || c == '。' || c == '】' || c == '！' || c == '）' || c == '：' || c == '；' || c == '？';
 	}
 
 	private static readonly Regex TrailingStatLineRegex = new Regex("^[-+]?\\d[\\d.,]*\\s*[A-Za-z%]{0,16}$", RegexOptions.Compiled);
 
-	/* 对话框常在正文下附加费用/属性行。这些是最终 UI 文本，不是未完成的
-	   打字机截断；判断正文完整性前必须剥离短小、含数字且不像句子的尾行，
-	   否则整段会被长期误判为片段而永不翻译。 */
+	/* 对话框常在正文下附加费用/属性行。这些是最...UI 文本，不是未完成...	   打字机截断；判断正文完整性前必须剥离短小、含数字且不像句子的尾行...	   否则整段会被长期误判为片段而永不翻译...*/
 	private static bool IsTrailingStatLine(string visibleLine)
 	{
 		if (TrailingStatLineRegex.IsMatch(visibleLine))
@@ -5255,9 +5994,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return true;
 		}
-		string unusedOpeningTag;
-		string unusedClosingTag;
-		if (TryGetOuterRichTextWrapper(originalText, out unusedOpeningTag, out unusedClosingTag))
+		if (TryGetOuterRichTextWrapper(originalText, out _, out _))
 		{
 			return true;
 		}
@@ -5293,8 +6030,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				result = true;
 			}
 		}
-		catch
+		catch (Exception ex)
 		{
+			ReportCaughtException(ex);
 			return result;
 		}
 		return result;
@@ -5302,9 +6040,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static string PrepareTranslatedTextForComponent(object component, string text, string originalText = null)
 	{
+		text = RestoreLeadingTextDecoration(text, originalText);
 		text = RestoreOuterRichTextWrapper(text, originalText);
 		/* UGUI Text 只支持少量标签，必须过滤不支持的标签；TMP 支持完整标签集，
-		   若复用 UGUI 过滤会误删 <mark> 等真实格式。 */
+		   若复...UGUI 过滤会误...<mark> 等真实格式...*/
 		string text2 = ((component is Text) ? SanitizeRichTextForUnityText(text) : SanitizeTranslationArtifacts(text));
 		if (!ContainsRichTextTags(text2))
 		{
@@ -5324,11 +6063,329 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return translated;
 		}
 		string sourceText = originalText ?? translated;
+		string prepared;
 		if (preserveRichText && ShouldPreserveRichTextForDisplayWithColor(sourceText, translated))
 		{
-			return PrepareTranslatedTextForComponent(component, translated, sourceText);
+			prepared = PrepareTranslatedTextForComponent(component, translated, sourceText);
 		}
-		return StripRichTextForPlainText(translated);
+		else
+		{
+			prepared = StripRichTextForPlainText(translated);
+		}
+		prepared = RestoreOuterLineBreaks(prepared, sourceText);
+		PrepareUGUITranslatedShortLabelLayout(component, prepared, sourceText);
+		return ApplyUGUITextLayoutCompatibility(component, prepared);
+	}
+
+	private static string RestoreOuterLineBreaks(string text, string originalText)
+	{
+		if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(originalText))
+		{
+			return text;
+		}
+		string leading = ExtractLeadingLineBreaks(originalText);
+		string trailing = ExtractTrailingLineBreaks(originalText);
+		if (leading.Length > 0 && !StartsWithLineBreak(text))
+		{
+			text = leading + text;
+		}
+		if (trailing.Length > 0 && !EndsWithLineBreak(text))
+		{
+			text += trailing;
+		}
+		return text;
+	}
+
+	private static string ExtractLeadingLineBreaks(string text)
+	{
+		if (string.IsNullOrEmpty(text))
+		{
+			return string.Empty;
+		}
+		StringBuilder stringBuilder = null;
+		for (int i = 0; i < text.Length; i++)
+		{
+			char c = text[i];
+			if (c != '\r' && c != '\n')
+			{
+				break;
+			}
+			if (stringBuilder == null)
+			{
+				stringBuilder = new StringBuilder();
+			}
+			stringBuilder.Append('\n');
+			if (c == '\r' && i + 1 < text.Length && text[i + 1] == '\n')
+			{
+				i++;
+			}
+		}
+		return stringBuilder?.ToString() ?? string.Empty;
+	}
+
+	private static string ExtractTrailingLineBreaks(string text)
+	{
+		if (string.IsNullOrEmpty(text))
+		{
+			return string.Empty;
+		}
+		int count = 0;
+		for (int i = text.Length - 1; i >= 0; i--)
+		{
+			char c = text[i];
+			if (c != '\r' && c != '\n')
+			{
+				break;
+			}
+			count++;
+			if (c == '\n' && i > 0 && text[i - 1] == '\r')
+			{
+				i--;
+			}
+		}
+		return count <= 0 ? string.Empty : new string('\n', count);
+	}
+
+	private static bool StartsWithLineBreak(string text)
+	{
+		return !string.IsNullOrEmpty(text) && (text[0] == '\r' || text[0] == '\n');
+	}
+
+	private static bool EndsWithLineBreak(string text)
+	{
+		return !string.IsNullOrEmpty(text) && (text[text.Length - 1] == '\r' || text[text.Length - 1] == '\n');
+	}
+
+	private static string ApplyUGUITextLayoutCompatibility(Text component, string text)
+	{
+		if ((Object)(object)component == (Object)null || string.IsNullOrEmpty(text) || !ContainsCjk(text))
+		{
+			return text;
+		}
+		try
+		{
+			string visibleText = GetVisibleText(text);
+			RectTransform rectTransform = ((Graphic)component).rectTransform;
+			Rect rect = ((Object)(object)rectTransform == (Object)null) ? default(Rect) : rectTransform.rect;
+			if (rect.width > 24f && visibleText.Length > 4)
+			{
+				component.horizontalOverflow = HorizontalWrapMode.Wrap;
+				text = WrapTranslatedCjkForUGUI(text, rect.width, Math.Max(1, component.fontSize));
+			}
+			((Graphic)component).SetAllDirty();
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex);
+			return text;
+		}
+		return text;
+	}
+
+	private static void RestoreUGUIShortLabelLayoutCompatibility(Text component, string keepAppliedText = null)
+	{
+		if ((Object)(object)component == (Object)null || !_uguiShortLabelLayouts.TryGetValue(component, out var state))
+		{
+			return;
+		}
+		if (!string.IsNullOrEmpty(keepAppliedText) && string.Equals(state.AppliedText, keepAppliedText, StringComparison.Ordinal))
+		{
+			return;
+		}
+		_uguiShortLabelLayouts.Remove(component);
+		try
+		{
+			component.horizontalOverflow = state.OriginalMode;
+			((Graphic)component).SetAllDirty();
+			RectTransform rectTransform = ((Graphic)component).rectTransform;
+			if ((Object)(object)rectTransform != (Object)null)
+			{
+				LayoutRebuilder.MarkLayoutForRebuild(rectTransform);
+				RectTransform parentRect = ((Transform)rectTransform).parent as RectTransform;
+				if ((Object)(object)parentRect != (Object)null)
+				{
+					LayoutRebuilder.MarkLayoutForRebuild(parentRect);
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UGUI restore-short-label-layout path=" + GetComponentLogPath(component));
+		}
+	}
+
+	private static void PrepareUGUITranslatedShortLabelLayout(Text component, string translatedText, string sourceText)
+	{
+		if ((Object)(object)component == (Object)null || string.IsNullOrEmpty(translatedText) || string.IsNullOrEmpty(sourceText))
+		{
+			return;
+		}
+		string visibleText = GetVisibleText(translatedText);
+		string sourceVisibleText = GetVisibleText(sourceText);
+		if (_uguiShortLabelLayouts.TryGetValue(component, out var existingState) &&
+			string.Equals(existingState.AppliedText, translatedText, StringComparison.Ordinal) &&
+			component.horizontalOverflow == HorizontalWrapMode.Overflow)
+		{
+			return;
+		}
+		if (ContainsCjk(sourceVisibleText))
+		{
+			RestoreUGUIShortLabelLayoutCompatibility(component, translatedText);
+			return;
+		}
+		RestoreUGUIShortLabelLayoutCompatibility(component);
+		if (!ContainsCjk(visibleText) || visibleText.Length == 0 || visibleText.Length > 4 || sourceVisibleText.Length == 0 || sourceVisibleText.Length > 12 ||
+			translatedText.IndexOf('\n') >= 0 || translatedText.IndexOf('\r') >= 0 || sourceText.IndexOf('\n') >= 0 || sourceText.IndexOf('\r') >= 0)
+		{
+			return;
+		}
+		try
+		{
+			RectTransform rectTransform = ((Graphic)component).rectTransform;
+			if ((Object)(object)rectTransform == (Object)null || component.horizontalOverflow != HorizontalWrapMode.Wrap)
+			{
+				return;
+			}
+			RectTransform parentRect = ((Transform)rectTransform).parent as RectTransform;
+			LayoutElement layoutElement = ((Component)component).GetComponent<LayoutElement>();
+			bool parentOwnsWidth = (Object)(object)parentRect != (Object)null &&
+				((Object)(object)((Component)parentRect).GetComponent<ContentSizeFitter>() != (Object)null ||
+				 (Object)(object)((Component)parentRect).GetComponent<HorizontalOrVerticalLayoutGroup>() != (Object)null);
+			if ((Object)(object)layoutElement == (Object)null || !parentOwnsWidth)
+			{
+				return;
+			}
+
+			_uguiShortLabelLayouts.Remove(component);
+			_uguiShortLabelLayouts.Add(component, new UguiShortLabelLayoutState
+			{
+				OriginalMode = component.horizontalOverflow,
+				AppliedText = translatedText
+			});
+			component.horizontalOverflow = HorizontalWrapMode.Overflow;
+			((Graphic)component).SetAllDirty();
+			LayoutRebuilder.MarkLayoutForRebuild(rectTransform);
+			LayoutRebuilder.MarkLayoutForRebuild(parentRect);
+			int count = Interlocked.Increment(ref _instance._uguiShortLabelOverflowCount);
+			if (count <= 3 || (count & (count - 1)) == 0)
+			{
+				Rect rect = rectTransform.rect;
+				_instance.Logger.LogInfo($"[UGUI-LAYOUT] short-label overflow occurrence={count} phase=prepare path={GetComponentLogPath(component)} rectWidth={rect.width:0.0} rectHeight={rect.height:0.0} sourceLength={sourceVisibleText.Length} visibleLength={visibleText.Length}");
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UGUI prepare-short-label-layout path=" + GetComponentLogPath(component));
+		}
+	}
+
+	private static void FinalizeUGUITextLayoutCompatibility(Text component)
+	{
+		if ((Object)(object)component == (Object)null || !_uguiShortLabelLayouts.TryGetValue(component, out var state))
+		{
+			return;
+		}
+		if (!string.Equals(component.text, state.AppliedText, StringComparison.Ordinal))
+		{
+			RestoreUGUIShortLabelLayoutCompatibility(component);
+			return;
+		}
+		try
+		{
+			RectTransform rectTransform = ((Graphic)component).rectTransform;
+			if ((Object)(object)rectTransform == (Object)null)
+			{
+				return;
+			}
+			LayoutRebuilder.MarkLayoutForRebuild(rectTransform);
+			RectTransform parentRect = ((Transform)rectTransform).parent as RectTransform;
+			if ((Object)(object)parentRect != (Object)null)
+			{
+				LayoutRebuilder.MarkLayoutForRebuild(parentRect);
+			}
+
+			component.horizontalOverflow = HorizontalWrapMode.Overflow;
+			((Graphic)component).SetAllDirty();
+			LayoutRebuilder.MarkLayoutForRebuild(rectTransform);
+			if ((Object)(object)parentRect != (Object)null)
+			{
+				LayoutRebuilder.MarkLayoutForRebuild(parentRect);
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UGUI short-label-layout path=" + GetComponentLogPath(component));
+		}
+	}
+
+	private static string WrapTranslatedCjkForUGUI(string text, float rectWidth, int fontSize)
+	{
+		if (string.IsNullOrEmpty(text) || rectWidth <= 24f || fontSize <= 0)
+		{
+			return text;
+		}
+		int maxUnits = Math.Max(12, Math.Min(96, (int)Math.Floor(rectWidth / Math.Max(8f, (float)fontSize * 0.92f) * 2f)));
+		if (GetVisibleText(text).Length <= maxUnits / 2)
+		{
+			return text;
+		}
+		StringBuilder stringBuilder = new StringBuilder(text.Length + 8);
+		int lineUnits = 0;
+		for (int i = 0; i < text.Length; i++)
+		{
+			char c = text[i];
+			if (c == '<')
+			{
+				int tagEnd = text.IndexOf('>', i + 1);
+				if (tagEnd > i)
+				{
+					stringBuilder.Append(text, i, tagEnd - i + 1);
+					i = tagEnd;
+					continue;
+				}
+			}
+			if (c == '\r' || c == '\n')
+			{
+				stringBuilder.Append('\n');
+				if (c == '\r' && i + 1 < text.Length && text[i + 1] == '\n')
+				{
+					i++;
+				}
+				lineUnits = 0;
+				continue;
+			}
+			int charUnits = GetUGUIWrapCharUnits(c);
+			if (lineUnits > 0 && charUnits > 0 && lineUnits + charUnits > maxUnits && !IsPoorLineStartPunctuation(c))
+			{
+				stringBuilder.Append('\n');
+				lineUnits = 0;
+				if (char.IsWhiteSpace(c))
+				{
+					continue;
+				}
+			}
+			stringBuilder.Append(c);
+			lineUnits += charUnits;
+		}
+		return stringBuilder.ToString();
+	}
+
+	private static int GetUGUIWrapCharUnits(char c)
+	{
+		if (char.IsControl(c))
+		{
+			return 0;
+		}
+		if (c <= '\u007f')
+		{
+			return char.IsWhiteSpace(c) ? 1 : 1;
+		}
+		return 2;
+	}
+
+	private static bool IsPoorLineStartPunctuation(char c)
+	{
+		return c == '。' || c == '，' || c == '、' || c == '；' || c == '：' || c == '！' || c == '？' || c == ')' || c == '）' || c == ']' || c == '】' || c == '”' || c == '’' || c == '…';
 	}
 
 	private static string PrepareTranslatedTextForString(string translated, string originalText = null)
@@ -5337,6 +6394,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return translated;
 		}
+		translated = RestoreLeadingTextDecoration(translated, originalText);
 		return SanitizeRichTextForUnityText(RestoreOuterRichTextWrapper(translated, originalText));
 	}
 
@@ -5643,7 +6701,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	}
 
 	/* 中文没有英语复数形态，受保护术语可能合法地由复数变单数。允许长度差不超
-	   2 的词干级匹配，避免把这类译文长期误判为英文残留。 */
+	   2 的词干级匹配，避免把这类译文长期误判为英文残留...*/
 	private static bool LatinResidueMatchesSourceWord(string residueWord, string sourceWord)
 	{
 		if (string.Equals(sourceWord, residueWord, StringComparison.OrdinalIgnoreCase))
@@ -5750,9 +6808,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void ResetSceneScopedState(bool clearPendingComponentWork)
 	{
-		/* 场景对象状态不能跨场景复用。翻译 cache/glossary 是进程级资产，
-		   因此这里仅回收“场景代”的组件 ID、预取队列和渲染器状态，不清共享译文。
-		   大场景退出时顺便收缩深扫描集合，避免 Clear 后仍永久保留峰值桶数组。 */
+		/* 场景对象状态不能跨场景复用。翻...cache/glossary 是进程级资产...		   因此这里仅回收“场景代”的组件 ID、预取队列和渲染器状态，不清共享译文...		   大场景退出时顺便收缩深扫描集合，避免 Clear 后仍永久保留峰值桶数组...*/
 		lock (_pendingLock)
 		{
 			bool trimDeepScannedObjects = _deepScannedObjects.Count > MaxTrackedComponentStates;
@@ -5787,7 +6843,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		lock (HistoryComponentCache)
 		{
-			/* InstanceID 可被新场景复用，跨场景保留不仅占内存，还可能命中旧分类。 */
+			/* InstanceID 可被新场景复用，跨场景保留不仅占内存，还可能命中旧分类...*/
 			HistoryComponentCache.Clear();
 		}
 		lock (_softMaskRefreshedOnce)
@@ -6020,8 +7076,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			return (component?.GetType().GetProperty("text", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))?.GetValue(component) as string;
 		}
-		catch
+		catch (Exception ex)
 		{
+			ReportCaughtException(ex);
 			return null;
 		}
 	}
@@ -6046,7 +7103,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						list = new List<DebouncedTextRequest>();
 					}
 					list.Add(value);
-					if (list.Count >= MaxDebouncedStartsPerTick)
+					if (list.Count >= GetMaxDebouncedStartsPerTick())
 					{
 						break;
 					}
@@ -6243,8 +7300,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			SetTmpIntProperty(type, target, "maxVisibleWords", num);
 			SetTmpIntProperty(type, target, "maxVisibleLines", num);
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -6262,8 +7320,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -6296,15 +7355,15 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				AccessTools.Method(compType, "ForceMeshUpdate", Type.EmptyTypes)?.Invoke(target, null);
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
 	private void ApplyFont(object component)
 	{
-		/* 字体处理严格留在 Unity Mono 渲染层：UGUI 直接换 Font，TMP 走
-		   fallback/动态图集/覆盖层链路；不会改写 _cache 中的译文。 */
+		/* 字体处理严格留在 Unity Mono 渲染层：UGUI 直接...Font，TMP ...		   fallback/动态图...覆盖层链路；不会改写 _cache 中的译文...*/
 		if (!IsUnityObjectAlive(component))
 		{
 			return;
@@ -6353,8 +7412,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					return result2;
 				}
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		return null;
@@ -6388,8 +7448,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		try
 		{
@@ -6407,8 +7468,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return false;
 	}
@@ -6441,8 +7503,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			Interlocked.Add(ref _instance._glyphAtlasMissCount, list.Count);
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		StringBuilder stringBuilder = null;
 		lock (_atlasMissLogLock)
@@ -6469,8 +7532,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				_instance.Logger.LogWarning("[FONT-WARM] glyphs missing from CJK atlas (will use overlay fallback): " + stringBuilder);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		return false;
@@ -6625,8 +7689,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return list;
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return list;
 	}
@@ -6714,8 +7779,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					base.Logger.LogInfo("[FONT-APPLY] Attached CJK fallback to " + GetComponentLogPath(tmpComponent));
 				}
 			}
-			// 某些打包 TMP 图集即使挂了 fallback 仍缺全角标点；是否清覆盖层
-			// 必须交给调用方按当前文本逐字检查，不能在这里武断决定。
+			// Some packed TMP atlases still miss punctuation after a fallback is attached.
+			// The caller validates glyph coverage against the current text.
 		}
 		catch (Exception ex)
 		{
@@ -6753,8 +7818,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			return obj.ToString().IndexOf("Dynamic", StringComparison.OrdinalIgnoreCase) >= 0;
 		}
-		catch
+		catch (Exception ex)
 		{
+			ReportCaughtException(ex);
 			return false;
 		}
 	}
@@ -6794,8 +7860,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				BindingFlags bindingAttr = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
 				methodInfo = ((paramTypes != null) ? t.GetMethod(name, bindingAttr, null, paramTypes, null) : t.GetMethod(name, bindingAttr));
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			_quietMethodCache[key] = methodInfo;
 			return methodInfo;
@@ -6836,8 +7903,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					array2 = Resources.FindObjectsOfTypeAll(type);
 				}
-				catch
+				catch (Exception ex)
 				{
+					ReportCaughtException(ex, "type=" + type.FullName);
 					continue;
 				}
 				PropertyInfo propertyQuiet = GetPropertyQuiet(type, "sharedMaterial");
@@ -6870,8 +7938,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						IL_0179:
 						end_IL_00f9:;
 					}
-					catch
+					catch (Exception reportedException)
 					{
+						ReportCaughtException(reportedException);
 					}
 				}
 			}
@@ -6905,8 +7974,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					type = type.BaseType;
 				}
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			_quietFieldCache[key] = fieldInfo;
 			return fieldInfo;
@@ -6936,8 +8006,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					type = type.BaseType;
 				}
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			_quietPropertyCache[key] = propertyInfo;
 			return propertyInfo;
@@ -6961,43 +8032,49 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				methodQuiet?.Invoke(val, null);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			try
 			{
 				methodQuiet2?.Invoke(val, null);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			try
 			{
 				methodQuiet3?.Invoke(val, null);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			FieldInfo fieldQuiet = GetFieldQuiet(type, "m_havePropertiesChanged");
 			try
 			{
 				fieldQuiet?.SetValue(val, true);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			FieldInfo fieldQuiet2 = GetFieldQuiet(type, "m_haveLayoutChanged");
 			try
 			{
 				fieldQuiet2?.SetValue(val, true);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			Interlocked.Increment(ref _softMaskRefreshCount);
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -7024,8 +8101,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 				}
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		return null;
@@ -7077,13 +8155,15 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				Color tmpColor = GetTmpColor(component);
 				text3 = $"({tmpColor.r:0.00},{tmpColor.g:0.00},{tmpColor.b:0.00},{tmpColor.a:0.00})";
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			base.Logger.LogWarning($"[FIRST-WRITE #{_firstWritesLogged}] path={componentLogPath} active={text2} color={text3} crAlpha={text4} cg={text5} translated='{text}'");
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -7103,8 +8183,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return val;
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		try
 		{
@@ -7115,8 +8196,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return val2;
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		try
 		{
@@ -7125,8 +8207,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return array[0];
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return null;
 	}
@@ -7150,8 +8233,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		try
 		{
@@ -7165,8 +8249,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return 0;
 	}
@@ -7274,8 +8359,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			return component?.GetType().FullName ?? "<null>";
 		}
-		catch
+		catch (Exception ex)
 		{
+			ReportCaughtException(ex);
 			return "<unreachable>";
 		}
 	}
@@ -7290,8 +8376,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return (Color)obj;
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return Color.white;
 	}
@@ -7315,8 +8402,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				fieldInfo.SetValue(tmpComponent, val2);
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -7337,8 +8425,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -7348,8 +8437,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			AccessTools.Property(tmpComponent?.GetType(), "color")?.SetValue(tmpComponent, color);
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -7371,8 +8461,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return Mathf.Max(12, num3);
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return 24;
 	}
@@ -7387,8 +8478,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return (bool)obj;
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return true;
 	}
@@ -7434,8 +8526,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			return (TextAnchor)8;
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return (TextAnchor)4;
 	}
@@ -7450,8 +8543,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return (Vector4)obj;
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return Vector4.zero;
 	}
@@ -7470,8 +8564,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return Mathf.Max(0.6f, (float)((num2 <= 0.0) ? 1.0 : num2));
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return 1f;
 	}
@@ -7512,8 +8607,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 	}
 
@@ -7665,8 +8761,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void ApplyTmpOverlay(object tmpComponent, string translatedText, string sourceText = null, bool force = false)
 	{
-		/* 覆盖层是最终显示降级：仅当 TMP 字体不能完整覆盖文本时使用。
-		   原 TMP 组件仍保留，恢复时按保存的颜色/透明度还原，避免破坏游戏逻辑。 */
+		/* 覆盖层是最终显示降级：仅当 TMP 字体不能完整覆盖文本时使用...		   ...TMP 组件仍保留，恢复时按保存的颜...透明度还原，避免破坏游戏逻辑...*/
 		if ((!force && !IsTmpOverlayMode() && HasUsableTmpFont()) || (Object)(object)_chineseFont == (Object)null || string.IsNullOrWhiteSpace(translatedText))
 		{
 			RestoreTmpOverlay(tmpComponent);
@@ -7688,7 +8783,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			if (!_cjkFontWarningLogged)
 			{
 				_cjkFontWarningLogged = true;
-				base.Logger.LogWarning("[v3.1.47] CJK TMP font unavailable and overlay disabled. Text set directly on TMP components — may render as squares if font lacks CJK glyphs.");
+				base.Logger.LogWarning("[v3.1.47] CJK TMP font unavailable and overlay disabled. Text set directly on TMP components - may render as squares if font lacks CJK glyphs.");
 			}
 			return;
 		}
@@ -7789,7 +8884,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static Color GetTmpOverlayDisplayColor(Color currentColor, TmpOverlayState state)
 	{
-		// 保留当前 RGB：游戏常按说话人或选项状态复用并重新着色同一 TMP 对象。
+		// Preserve the live RGB because games often recolor reused TMP components.
 		Color result = currentColor;
 		if (result.a <= 0f && state != null)
 		{
@@ -7935,6 +9030,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			catch (Exception ex)
 			{
+				ReportCaughtException(ex, "member=material");
 				text = "<read threw: " + ex.Message + ">";
 			}
 			string text3 = "<n/a>";
@@ -7963,6 +9059,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			catch (Exception ex2)
 			{
+				ReportCaughtException(ex2, "member=font/material");
 				text3 = "<read threw: " + ex2.Message + ">";
 			}
 			string text6 = "<n/a>";
@@ -7990,6 +9087,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			catch (Exception ex3)
 			{
+				ReportCaughtException(ex3, "member=textInfo");
 				text6 = "<textInfo threw: " + ex3.Message + ">";
 			}
 			string text7 = "<n/a>";
@@ -7998,16 +9096,18 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				Color tmpColor = GetTmpColor(tmpComponent);
 				text7 = $"({tmpColor.r:0.00},{tmpColor.g:0.00},{tmpColor.b:0.00},{tmpColor.a:0.00})";
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			string text8 = "<n/a>";
 			try
 			{
 				text8 = ((!(AccessTools.Property(compType, "text")?.GetValue(tmpComponent) is string text9)) ? "<null>" : ((text9.Length > 30) ? (text9.Substring(0, 30) + "…") : text9));
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			base.Logger.LogWarning($"[POST-SWAP-DEEP #{_deepInspectCount}] path={componentLogPath} active={text4} text='{text8}' color={text7} rect={text3} cr={text5} mat={text} textInfo={text6}");
 		}
@@ -8017,8 +9117,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				base.Logger.LogWarning("[POST-SWAP-DEEP] threw: " + ex4.Message);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 	}
@@ -8056,8 +9157,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						num += count;
 					}
 				}
-				catch
+				catch (Exception reportedException)
 				{
+					ReportCaughtException(reportedException);
 				}
 			}
 			base.Logger.LogWarning($"[FONT-MAT-FIX] cleared {num} entries from MaterialReferenceManager caches");
@@ -8087,14 +9189,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			if ((Object)(object)val == (Object)null)
 			{
 				Interlocked.Increment(ref _fontMaterialFixFailed);
-				base.Logger.LogWarning("[FONT-MAT-FIX] no atlas texture found on runtime font asset — cannot construct material");
+				base.Logger.LogWarning("[FONT-MAT-FIX] no atlas texture found on runtime font asset - cannot construct material");
 				return;
 			}
 			Shader val2 = Shader.Find("TextMeshPro/Distance Field") ?? Shader.Find("TMPro/Distance Field") ?? Shader.Find("TextMeshPro/Mobile/Distance Field") ?? Shader.Find("TMPro/Mobile/Distance Field");
 			if ((Object)(object)val2 == (Object)null)
 			{
 				Interlocked.Increment(ref _fontMaterialFixFailed);
-				base.Logger.LogWarning("[FONT-MAT-FIX] TextMeshPro/Distance Field shader not present in scene — cannot construct material");
+				base.Logger.LogWarning("[FONT-MAT-FIX] TextMeshPro/Distance Field shader not present in scene - cannot construct material");
 				return;
 			}
 			Material val3 = new Material(val2)
@@ -8148,8 +9250,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					fields = type2.GetFields(bindingAttr);
 				}
-				catch
+				catch (Exception ex)
 				{
+					ReportCaughtException(ex, "type=" + type2.FullName);
 					continue;
 				}
 				FieldInfo[] array = fields;
@@ -8164,8 +9267,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 							flag = true;
 							list2.Add(type2.Name + "." + fieldInfo.Name);
 						}
-						catch
+						catch (Exception reportedException)
 						{
+							ReportCaughtException(reportedException);
 						}
 					}
 				}
@@ -8190,14 +9294,16 @@ public class DeepSeekTranslator : BaseUnityPlugin
 							flag = true;
 							list2.Add("prop:" + propertyInfo.Name);
 						}
-						catch
+						catch (Exception reportedException)
 						{
+							ReportCaughtException(reportedException);
 						}
 					}
 				}
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 			List<string> list4 = new List<string>();
 			for (Type type3 = type; type3 != null && type3 != typeof(object); type3 = type3.BaseType)
@@ -8207,8 +9313,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					fields2 = type3.GetFields(bindingAttr);
 				}
-				catch
+				catch (Exception ex)
 				{
+					ReportCaughtException(ex, "type=" + type3.FullName);
 					continue;
 				}
 				FieldInfo[] array = fields2;
@@ -8273,8 +9380,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						num5 = list7.Count;
 					}
 				}
-				catch
+				catch (Exception reportedException)
 				{
+					ReportCaughtException(reportedException);
 				}
 				try
 				{
@@ -8283,8 +9391,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						num6 = list8.Count;
 					}
 				}
-				catch
+				catch (Exception reportedException)
 				{
+					ReportCaughtException(reportedException);
 				}
 				bool flag4 = false;
 				bool flag5 = false;
@@ -8297,8 +9406,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						flag5 = (bool)methodInfo.Invoke(_chineseTMPFont, new object[1] { 25991 });
 					}
 				}
-				catch
+				catch (Exception reportedException)
 				{
+					ReportCaughtException(reportedException);
 				}
 				base.Logger.LogWarning($"[FONT-DEEP] glyphTable={num5} charTable={num6} hasChar(中)={flag4} hasChar(文)={flag5} atlas={((Texture)val).width}x{((Texture)val).height} format={val.format} isReadable={((Texture)val).isReadable}");
 				try
@@ -8312,7 +9422,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 					else
 					{
-						base.Logger.LogWarning("[FONT-DEEP] atlas not readable from CPU — cannot sample pixels");
+						base.Logger.LogWarning("[FONT-DEEP] atlas not readable from CPU - cannot sample pixels");
 					}
 				}
 				catch (Exception ex2)
@@ -8365,8 +9475,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				list.Add(val2.name);
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		try
 		{
@@ -8388,8 +9499,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		string text3 = string.Join("|", list.Where((string t) => !string.IsNullOrWhiteSpace(t)));
 		bool flag = false;
@@ -8430,8 +9542,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		try
 		{
@@ -8441,8 +9554,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return true;
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return false;
 	}
@@ -8656,8 +9770,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		catch
+		catch (Exception reportedException)
 		{
+			ReportCaughtException(reportedException);
 		}
 		return false;
 	}
@@ -9081,8 +10196,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					return item;
 				}
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		return null;
@@ -9267,8 +10383,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 				}
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		string[] array2 = new string[6] { _fontName.Value, "Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "SimSun", "Arial" };
@@ -9289,8 +10406,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					return;
 				}
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 		base.Logger.LogWarning("No Chinese font found!");
@@ -9434,7 +10552,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private void LoadGlossary()
 	{
 		/* glossary 是短文本优先映射，可来自内置默认值和游戏目录静态文件；
-		   加载失败只降级为空/部分词表，不影响本地服务和普通缓存。 */
+		   加载失败只降级为...部分词表，不影响本地服务和普通缓存...*/
 		_glossary.Clear();
 		foreach (KeyValuePair<string, string> item in new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 		{
@@ -9553,18 +10671,48 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private async Task BootCacheLoadAsync()
+	private void PrimeSmallLocalCacheForFirstFrame()
 	{
-		/* 本地缓存可能被旧版本污染成数十万条；导入时每条都要跑正则校验，
-		   因此不能在 Awake 主线程执行。缓存落地前已经显示的文本会由扫描器
-		   后续 cache-apply 补齐，与延迟服务端同步到达的条目处理方式相同。 */
+		/* A small per-game cache is cheap enough to validate before hooks are installed.
+		   This keeps known text out of the first rendered frame; large or polluted caches
+		   retain the background path below so startup cannot stall on a full dump. */
 		try
 		{
-			await RunBackground(delegate
+			string path = GetLocalCacheFilePath();
+			if (!File.Exists(path) || new FileInfo(path).Length > FirstFrameLocalCacheFileBytes)
 			{
-				LoadServerCache();
-				return true;
-			});
+				return;
+			}
+			JObject val = JObject.Parse(File.ReadAllText(path));
+			if (val.Count > FirstFrameLocalCacheEntryLimit)
+			{
+				return;
+			}
+			ImportServerCacheEntries(from prop in val.Properties()
+				select new KeyValuePair<string, string>(prop.Name, ((object)prop.Value)?.ToString()), logPromotions: false, "first-frame local cache", persistAfterImport: false, markImportedAsLocal: true);
+			_firstFrameLocalCachePrimed = true;
+			base.Logger.LogInfo($"First-frame cache ready: {GetCacheCount()} entries");
+		}
+		catch (Exception reportedException)
+		{
+			ReportCaughtException(reportedException);
+		}
+	}
+
+	private async Task BootCacheLoadAsync()
+	{
+		/* 大缓存可能被旧版本污染成数十万条；导入时每条都要跑正则校验，
+		   因此仍然留在后台。小缓存已在安装 hook 前完成有界预装...*/
+		try
+		{
+			if (!_firstFrameLocalCachePrimed)
+			{
+				await RunBackground(delegate
+				{
+					LoadServerCache();
+					return true;
+				});
+			}
 		}
 		catch (Exception ex)
 		{
@@ -9572,9 +10720,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				base.Logger.LogWarning("Boot cache load failed: " + ex.Message);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
+		}
+		if (_shuttingDown)
+		{
+			return;
 		}
 		try
 		{
@@ -9586,18 +10739,20 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				base.Logger.LogWarning("Server cache sync start failed: " + ex2.Message);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 	}
 
 	private void LoadServerCache()
 	{
-		lock (_cache)
+		/* Hooks are already active while this background import runs. Merge the
+		   disk snapshot so a faster live response cannot be erased by startup IO. */
+		if (_shuttingDown)
 		{
-			_cache.Clear();
-			_localCacheKeys.Clear();
+			return;
 		}
 		string text = Path.Combine(ResolveGameRoot(), "TranslationCache");
 		if (!Directory.Exists(text))
@@ -9616,8 +10771,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				else
 				{
 					JObject val = JObject.Parse(File.ReadAllText(path));
-					/* 旧版整库落盘会让每轮持久化重新校验数十万条并重写几十 MB，
-					   表现为周期性卡顿。超大文件跳过导入，之后仅按游戏实际使用键重建。 */
+					/* 旧版整库落盘会让每轮持久化重新校验数十万条并重写几十 MB...					   表现为周期性卡顿。超大文件跳过导入，之后仅按游戏实际使用键重建...*/
 					bool oversized = val.Count > OversizedLocalCacheEntryLimit;
 					if (oversized)
 					{
@@ -9626,7 +10780,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					else
 					{
 						ImportServerCacheEntries(from prop in val.Properties()
-							select new KeyValuePair<string, string>(prop.Name, ((object)prop.Value)?.ToString()), logPromotions: false, "local cache file", persistAfterImport: false, markImportedAsLocal: true);
+							select new KeyValuePair<string, string>(prop.Name, ((object)prop.Value)?.ToString()), logPromotions: false, "local cache file", persistAfterImport: false, markImportedAsLocal: true, preserveExisting: true);
 					}
 				}
 			}
@@ -9657,11 +10811,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private int ImportServerCacheEntries(IEnumerable<KeyValuePair<string, string>> entries, bool logPromotions, string sourceLabel, bool persistAfterImport, bool markImportedAsLocal = false)
+	private int ImportServerCacheEntries(IEnumerable<KeyValuePair<string, string>> entries, bool logPromotions, string sourceLabel, bool persistAfterImport, bool markImportedAsLocal = false, bool preserveExisting = false)
 	{
-		/* 只有可接受且非原文回声的结果才进入 _cache。markImportedAsLocal 决定
-		   是否进入本游戏持久化集合；服务端 dump/export 必须保持 memory-only。 */
-		if (entries == null)
+		/* 只有可接受且非原文回声的结果才进..._cache。markImportedAsLocal 决定
+		   是否进入本游戏持久化集合；服务端 dump/export 必须保持 memory-only...*/
+		if (entries == null || _shuttingDown)
 		{
 			return 0;
 		}
@@ -9670,6 +10824,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		int num3 = 0;
 		foreach (KeyValuePair<string, string> entry in entries)
 		{
+			if (_shuttingDown)
+			{
+				break;
+			}
 			string key = entry.Key;
 			string text = SanitizeTranslationArtifacts(entry.Value);
 			if (!string.Equals(text, entry.Value, StringComparison.Ordinal))
@@ -9689,6 +10847,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			bool flag = ShouldPromoteToGlossary(key);
 			lock (_cache)
 			{
+				if (preserveExisting && (_cache.ContainsKey(key) || (!string.Equals(text2, key, StringComparison.Ordinal) && _cache.ContainsKey(text2))))
+				{
+					if (markImportedAsLocal)
+					{
+						MarkLocalCacheKeyLocked(key);
+					}
+					continue;
+				}
 				_cache[key] = text;
 				if (!string.Equals(text2, key, StringComparison.Ordinal))
 				{
@@ -9728,11 +10894,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void ScheduleLocalCachePersist()
 	{
-		/* dirty/scheduled 组成单消费者去抖协议。锁只保护两个标志；快照验证和
-		   File.WriteAllText 均在后台线程执行，避免 Unity 主线程卡顿。 */
+		/* dirty/scheduled 组成单消费者去抖协议。锁只保护两个标志；快照验证...		   File.WriteAllText 均在后台线程执行，避...Unity 主线程卡顿...*/
 		bool flag = false;
 		lock (_cachePersistLock)
 		{
+			if (_shuttingDown)
+			{
+				return;
+			}
 			_cachePersistDirty = true;
 			if (!_cachePersistScheduled)
 			{
@@ -9753,6 +10922,15 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			while (true)
 			{
 				await Task.Delay(CachePersistDebounceMs);
+				if (_shuttingDown)
+				{
+					lock (_cachePersistLock)
+					{
+						_cachePersistDirty = false;
+						_cachePersistScheduled = false;
+					}
+					break;
+				}
 				lock (_cachePersistLock)
 				{
 					if (!_cachePersistDirty)
@@ -9763,18 +10941,25 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					_cachePersistDirty = false;
 				}
 				/* 快照过滤会对每条缓存运行较重的正则。单条异常最多损失本轮，
-				   不能杀死整局持久化循环。整个快照与写盘放到后台线程，避免 await
-				   回到 Unity SynchronizationContext 后在主线程制造卡顿。 */
+				   不能杀死整局持久化循环。整个快照与写盘放到后台线程，避...await
+				   回到 Unity SynchronizationContext 后在主线程制造卡顿...*/
 				try
 				{
 					await RunBackground(delegate
 					{
-						Dictionary<string, string> dictionary = SnapshotLocalCacheForPersist();
-						if (dictionary.Count > 0)
+						lock (_cacheFileWriteLock)
 						{
-							WriteLocalCacheSnapshot(dictionary);
+							if (_shuttingDown)
+							{
+								return 0;
+							}
+							Dictionary<string, string> dictionary = SnapshotLocalCacheForPersist();
+							if (dictionary.Count > 0)
+							{
+								WriteLocalCacheSnapshot(dictionary);
+							}
+							return dictionary.Count;
 						}
-						return dictionary.Count;
 					});
 				}
 				catch (Exception ex)
@@ -9783,8 +10968,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					{
 						LogVerbose("[CACHE] Persist cycle failed: " + ex.Message);
 					}
-					catch
+					catch (Exception reportedException)
 					{
+						ReportCaughtException(reportedException);
 					}
 				}
 				lock (_cachePersistLock)
@@ -9799,8 +10985,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		catch (Exception ex2)
 		{
-			/* 活性约束：持久化循环已死时 _cachePersistScheduled 不能继续为 true，
-			   否则直到游戏退出都不会再启动保存任务。 */
+			/* 活性约束：持久化循环已死时 _cachePersistScheduled 不能继续...true...			   否则直到游戏退出都不会再启动保存任务...*/
 			lock (_cachePersistLock)
 			{
 				_cachePersistScheduled = false;
@@ -9809,8 +10994,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				LogVerbose("[CACHE] Persist loop stopped: " + ex2.Message);
 			}
-			catch
+			catch (Exception reportedException)
 			{
+				ReportCaughtException(reportedException);
 			}
 		}
 	}
@@ -9864,10 +11050,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			_cachePersistDirty = false;
 			_cachePersistScheduled = false;
 		}
-		Dictionary<string, string> dictionary = SnapshotLocalCacheForPersist();
-		if (dictionary.Count > 0)
+		lock (_cacheFileWriteLock)
 		{
-			WriteLocalCacheSnapshot(dictionary);
+			Dictionary<string, string> dictionary = SnapshotLocalCacheForPersist();
+			if (dictionary.Count > 0)
+			{
+				WriteLocalCacheSnapshot(dictionary);
+			}
 		}
 	}
 
@@ -9917,8 +11106,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			JToken obj = JObject.Parse(text)["cache_size"];
 			return (obj != null) ? Extensions.Value<int>((IEnumerable<JToken>)obj) : 0;
 		}
-		catch
+		catch (Exception ex)
 		{
+			ReportCaughtException(ex);
 			return 0;
 		}
 	}
@@ -9947,6 +11137,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			catch (Exception ex)
 			{
+				ReportCaughtException(ex, "server-cache-load-attempt=" + (attempt + 1));
 				lastError = ex;
 			}
 			await Task.Delay(600 * (attempt + 1));

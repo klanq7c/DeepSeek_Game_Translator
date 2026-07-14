@@ -41,7 +41,8 @@ function Send-Raw {
         [string]$Method, [string]$Path, [byte[]]$BodyBytes,
         [int]$BodyLengthOverride = -1,
         [string]$ExtraHeaders = "",
-        [int]$TimeoutMs = 5000
+        [int]$TimeoutMs = 5000,
+        [switch]$ShutdownSend
     )
     $cli = New-Object System.Net.Sockets.TcpClient
     $cli.SendTimeout = $TimeoutMs
@@ -54,6 +55,9 @@ function Send-Raw {
     $st.Write($hdrBytes, 0, $hdrBytes.Length)
     if ($BodyBytes.Length -gt 0) { $st.Write($BodyBytes, 0, $BodyBytes.Length) }
     $st.Flush()
+    if ($ShutdownSend) {
+        $cli.Client.Shutdown([System.Net.Sockets.SocketShutdown]::Send)
+    }
     $ms = New-Object System.IO.MemoryStream
     $buf = New-Object byte[] 8192
     try {
@@ -336,6 +340,47 @@ try {
 
         $r = Send-Json "POST" "/batch" '{"texts":["valid","unterminated]}'
         Assert-Eq $r.Status 400 "partial malformed array"
+    }
+
+    It "Incomplete declared request bodies are rejected" {
+        $body = [System.Text.Encoding]::UTF8.GetBytes('{"text":"incomplete-body"}')
+        $r = Send-Raw -Method "POST" -Path "/translate" -BodyBytes $body `
+            -BodyLengthOverride ($body.Length + 20) -ShutdownSend
+        Assert-Eq $r.Status 400 "truncated body must not be routed"
+    }
+
+    It "Duplicate Content-Length headers are rejected" {
+        $body = [System.Text.Encoding]::UTF8.GetBytes('{"text":"duplicate-length"}')
+        $r = Send-Raw -Method "POST" -Path "/translate" -BodyBytes $body `
+            -ExtraHeaders "Content-Length: $($body.Length)`r`n"
+        Assert-Eq $r.Status 400 "duplicate content length"
+    }
+
+    It "Bytes beyond Content-Length are not parsed as the current request" {
+        $declaredBody = '{}'
+        $extraBody = '{"text":"smuggled-value"}'
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($declaredBody + $extraBody)
+        $r = Send-Raw -Method "POST" -Path "/translate" -BodyBytes $bytes `
+            -BodyLengthOverride ([System.Text.Encoding]::UTF8.GetByteCount($declaredBody))
+        Assert-Eq $r.Status 400 "extra bytes must be ignored"
+    }
+
+    It "Nested JSON fields cannot shadow top-level request fields" {
+        $r = Send-Json "POST" "/translate" '{"meta":{"text":"nested-value"},"text":"top-level-value"}'
+        Assert-Eq $r.Status 200 "translate status"
+        Assert-Eq $r.Json.translation "top-level-value" "top-level text"
+
+        $prefix = "top_level_$(Get-Random)_"
+        $nestedKey = $prefix + "nested"
+        $topKey = $prefix + "top"
+        $body = '{"meta":{"entries":[{"key":"' + $nestedKey + '","value":"BAD"}]},' +
+            '"entries":[{"key":"' + $topKey + '","value":"GOOD"}]}'
+        $r = Send-Json "POST" "/cache/import" $body
+        Assert-Eq $r.Json.imported 1 "one top-level entry imported"
+
+        $r = Send-Json "POST" "/cache/lookup" ('{"texts":["' + $nestedKey + '","' + $topKey + '"]}')
+        Assert-Eq $r.Json.hit_count 1 "only top-level entry is cached"
+        Assert-Eq $r.Json.hits.$topKey "GOOD" "top-level entry value"
     }
 
     It "Body text named Content-Length does not affect header parsing" {

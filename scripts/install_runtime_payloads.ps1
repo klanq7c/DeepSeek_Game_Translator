@@ -3,6 +3,7 @@ param(
     [switch]$UnityMono6,
     [switch]$UnityIL2CPP,
     [switch]$Newtonsoft,
+    [switch]$TmpFonts,
     [switch]$All,
     [switch]$Force
 )
@@ -17,11 +18,24 @@ if (-not $PSScriptRoot) {
 
 $Root = Split-Path -Parent $ScriptRoot
 $DownloadCache = Join-Path $Root ".downloads\runtime-payloads"
+$TmpFontBundleNames = @(
+    "arialuni_sdf-u55to2017",
+    "arialuni_sdf_u2018",
+    "arialuni_sdf_u2019",
+    "arialuni_sdf_u2021",
+    "arialuni_sdf_u2022",
+    "arialuni_sdf_u6000"
+)
 
 if ($All) {
     $UnityMono5 = $true
     $UnityMono6 = $true
     $UnityIL2CPP = $true
+    $TmpFonts = $true
+}
+
+if ($UnityMono5 -or $UnityMono6 -or $UnityIL2CPP) {
+    $TmpFonts = $true
 }
 
 if ($UnityMono5 -or $UnityMono6) {
@@ -34,11 +48,12 @@ function Show-Usage {
     Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -UnityMono5"
     Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -UnityMono6"
     Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -UnityIL2CPP"
+    Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -TmpFonts"
     Write-Host ""
     Write-Host "Options can be combined. Add -Force to redownload and replace runtime payloads."
 }
 
-if (-not ($UnityMono5 -or $UnityMono6 -or $UnityIL2CPP -or $Newtonsoft)) {
+if (-not ($UnityMono5 -or $UnityMono6 -or $UnityIL2CPP -or $Newtonsoft -or $TmpFonts)) {
     Show-Usage
     exit 0
 }
@@ -96,6 +111,37 @@ function Expand-PayloadZip([string]$ZipPath, [string]$Destination, [switch]$Clea
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $Destination -Force
 }
 
+function Expand-WithExternalArchiveTool([string]$ArchivePath, [string]$Destination) {
+    Assert-UnderRoot $Destination
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+
+    $tar = Get-Command tar.exe -ErrorAction SilentlyContinue
+    if (-not $tar) {
+        $tar = Get-Command tar -ErrorAction SilentlyContinue
+    }
+    if ($tar) {
+        & $tar.Source -xf $ArchivePath -C $Destination
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+        Write-Warning "tar could not extract $ArchivePath; trying 7-Zip if available."
+    }
+
+    $sevenZip = $null
+    foreach ($candidate in @("7z.exe", "7za.exe", "7zr.exe")) {
+        $sevenZip = Get-Command $candidate -ErrorAction SilentlyContinue
+        if ($sevenZip) { break }
+    }
+    if ($sevenZip) {
+        & $sevenZip.Source x "-o$Destination" "-y" $ArchivePath
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+    }
+
+    throw "Could not extract $ArchivePath. Install Windows tar/libarchive or 7-Zip, then rerun this script."
+}
+
 function Install-BepInEx5Mono {
     $zip = Get-DownloadFile `
         "BepInEx_win_x64_5.4.23.5.zip" `
@@ -141,6 +187,59 @@ function Install-XUnityIL2CPP {
     Write-Host "Installed: Unity IL2CPP / BepInEx 6 + XUnity payload"
 }
 
+function Test-TmpFontAssetBundlesInstalled {
+    $fontDst = Join-Path $Root "payloads\UnityIL2CPP\TMPFontAssetBundles\BepInEx\font"
+    foreach ($name in $TmpFontBundleNames) {
+        if (-not (Test-Path -LiteralPath (Join-Path $fontDst $name))) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Install-TmpFontAssetBundles {
+    if ((Test-TmpFontAssetBundlesInstalled) -and -not $Force) {
+        Write-Host "Using existing TMP font asset bundles"
+        return
+    }
+
+    $archive = Get-DownloadFile `
+        "TMP_Font_AssetBundles_2025-12-08.7z" `
+        "https://github.com/bbepis/XUnity.AutoTranslator/releases/download/v5.5.0/TMP_Font_AssetBundles_2025-12-08.7z" `
+        "889e963fb9dbd4b64927e0adf5d9060e1d0fb9d6bceb0c407d0597643e2b54ec"
+
+    $tmp = Join-Path $DownloadCache ("tmpfonts_" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    Assert-UnderRoot $tmp
+
+    try {
+        Expand-WithExternalArchiveTool $archive $tmp
+
+        foreach ($name in $TmpFontBundleNames) {
+            if (-not (Test-Path -LiteralPath (Join-Path $tmp $name))) {
+                throw "TMP font asset bundle archive is missing $name."
+            }
+        }
+
+        $bundleRoot = Join-Path $Root "payloads\UnityIL2CPP\TMPFontAssetBundles"
+        $fontDst = Join-Path $bundleRoot "BepInEx\font"
+        Assert-UnderRoot $bundleRoot
+        Assert-UnderRoot $fontDst
+
+        if (Test-Path -LiteralPath $bundleRoot) {
+            Remove-Item -LiteralPath $bundleRoot -Recurse -Force
+        }
+        New-Item -ItemType Directory -Force -Path $fontDst | Out-Null
+
+        foreach ($name in $TmpFontBundleNames) {
+            Copy-Item -LiteralPath (Join-Path $tmp $name) -Destination (Join-Path $fontDst $name) -Force
+        }
+        Write-Host "Installed: XUnity TMP font asset bundles"
+    } finally {
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-NewtonsoftJson {
     $url = "https://www.nuget.org/api/v2/package/Newtonsoft.Json/13.0.4"
     $pkg = Get-DownloadFile "Newtonsoft.Json.13.0.4.nupkg" $url
@@ -179,6 +278,7 @@ They are not part of the DS Translator source release.
 
 - BepInEx: https://github.com/BepInEx/BepInEx and https://builds.bepinex.dev/projects/bepinex_be
 - XUnity.AutoTranslator: https://github.com/bbepis/XUnity.AutoTranslator
+- XUnity TMP font asset bundles: https://github.com/bbepis/XUnity.AutoTranslator/releases/tag/v5.5.0
 - Newtonsoft.Json: https://github.com/JamesNK/Newtonsoft.Json
 
 Do not commit downloaded payloads, Unity/game assemblies, user caches, logs, fonts, or real config files.
@@ -188,6 +288,7 @@ Do not commit downloaded payloads, Unity/game assemblies, user caches, logs, fon
 if ($UnityMono5) { Install-BepInEx5Mono }
 if ($UnityMono6) { Install-BepInEx6Mono }
 if ($UnityIL2CPP) { Install-XUnityIL2CPP }
+if ($TmpFonts) { Install-TmpFontAssetBundles }
 if ($Newtonsoft) { Install-NewtonsoftJson }
 
 Write-DownloadedNotice

@@ -25,6 +25,12 @@ function Assert-False($value, $msg) {
     if ($value) { throw $msg }
 }
 
+function Get-NumericConstant([string]$source, [string]$name) {
+    $match = [regex]::Match($source, "private const (?:int|float|long) " + [regex]::Escape($name) + " = ([0-9.]+)")
+    if (-not $match.Success) { throw "Could not find numeric constant $name" }
+    return [double]::Parse($match.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Normalize-RequestText([string]$text) {
     if ([string]::IsNullOrWhiteSpace($text)) { return "" }
     return (($text.Trim() -split '\s+') -join ' ')
@@ -35,7 +41,10 @@ $srcPath = Join-Path $repo "payloads\UnityTranslator\src\DeepSeekTranslator.cs"
 $src = Get-Content -LiteralPath $srcPath -Raw
 $il2cppEndpointPath = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src\DeepSeekTranslateEndpoint.cs"
 $tmpFallbackPath = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\src\TmpFontFallbackPlugin.cs"
+$serverSrcPath = Join-Path $repo "native\src\server\api.c"
+$il2cppEndpointSrc = Get-Content -LiteralPath $il2cppEndpointPath -Raw
 $tmpFallbackSrc = Get-Content -LiteralPath $tmpFallbackPath -Raw
+$serverSrc = Get-Content -LiteralPath $serverSrcPath -Raw
 $unityCoreSourcePaths = @($srcPath, $il2cppEndpointPath, $tmpFallbackPath)
 $unusedPrototypePath = Join-Path $repo "payloads\UnityTranslator\src\UnityTranslator"
 
@@ -268,6 +277,47 @@ It "Unity rich-text tags are still protected" {
     Assert-True ($tmpVisible -eq "Warning") "TMP color shorthand visible text mismatch: '$tmpVisible'"
 }
 
+It "Unity IMGUI labels use the generic async translation path" {
+    foreach ($sample in @("What?", "Hi honey.", "- Car keys added to the inventory")) {
+        Assert-False (Looks-LikeRuntimeStatusText $sample) "IMGUI story text was classified as runtime telemetry: $sample"
+        Assert-False (Looks-LikeTypewriterFragment $sample) "complete IMGUI story text was classified as a fragment: $sample"
+    }
+
+    Assert-True ($src.Contains('AccessTools.Method(typeof(GUI), "Label", new Type[3] { typeof(Rect), typeof(string), typeof(GUIStyle) })')) "Unity Mono must hook the managed GUI.Label string overload used by IMGUI games"
+    Assert-True ($src.Contains('new HarmonyMethod(typeof(DeepSeekTranslator), "GUILabelPrefix")')) "GUI.Label must route through the IMGUI translation prefix"
+    Assert-True ($src.Contains("private static void GUILabelPrefix(ref Rect position, ref string text, GUIStyle style)")) "IMGUI prefix must be strongly typed to the rendered rect, string, and style"
+    $objective = "- Get something to eat"
+    Assert-True (Looks-LikeTypewriterFragment $objective) "the regression fixture must exercise the fragment-looking objective path"
+    Assert-False ($src.Contains("!LooksLikeTypewriterFragment(text) && !_instance.IsTranslationRetryCoolingDown(text)")) "IMGUI must not permanently drop stable labels that only look like typewriter fragments"
+    Assert-True ($src -match '(?s)private void QueueImGuiTranslation\(string text\).*?LooksLikeTypewriterFragment\(text\).*?TypewriterFragmentDebounceSeconds') "IMGUI fragment suspects must settle before entering the async queue"
+    Assert-True ($src.Contains("QueueImGuiTranslation(text)")) "uncached IMGUI text must enter the shared async batch queue"
+    Assert-True ($src.Contains("RequestSharedTranslation(text, GetRequestDomain(text)")) "IMGUI requests must reuse the existing deduplicated batch pipeline"
+    Assert-True ($src.Contains("_imguiPending.Count >= MaxImGuiPending")) "IMGUI per-frame requests must remain bounded"
+    Assert-True ($src.Contains("ApplyImGuiFont(style)")) "translated IMGUI labels must receive a CJK-capable font"
+    Assert-True ($src.Contains("PrepareImGuiTranslatedShortLabelLayout(ref position, style, text, originalText)")) "translated IMGUI labels must resize the live draw rect where source and translation are both known"
+    Assert-True ($src.Contains("style.CalcMinMaxWidth")) "IMGUI short labels must use the active style and CJK font to measure required width"
+    Assert-True ($src.Contains("TextAnchor.MiddleCenter")) "center-aligned IMGUI labels must preserve their horizontal anchor when widened"
+    Assert-True ($src.Contains("TextAnchor.MiddleRight")) "right-aligned IMGUI labels must preserve their right edge when widened"
+    Assert-True ($src.Contains("[IMGUI-LAYOUT] short-label width")) "IMGUI label rect expansion must emit rate-limited renderer diagnostics"
+    Assert-True ($src.Contains("ImGuiShortLabelWidth=")) "IMGUI label expansion count must remain visible in live diagnostics"
+    Assert-False ($src.Contains("string[] value3 = new string[45]")) "live diagnostics must not require a manually synchronized array length"
+    Assert-False ($src.Contains("AC.MenuLabel")) "Unity IMGUI support must not hard-code Adventure Creator"
+    Assert-False ($src.Contains("TheNightDriver")) "Unity IMGUI support must not hard-code one game"
+    Assert-True ($src.Contains('"Unity Translator", "3.1.111"')) "Unity Mono plugin version must include the current IMGUI renderer fixes"
+}
+
+It "Unity renderers restore leading decorations dropped by translation" {
+    # Translation providers may treat a leading list marker as prompt syntax
+    # and omit it. The renderer must rebuild that display-only decoration from
+    # the source without rewriting shared translation memory.
+    Assert-True ($src.Contains("private static string RestoreLeadingTextDecoration(string translated, string originalText)")) "Unity needs a renderer-local leading-decoration restorer"
+    Assert-True ($src.Contains("private static bool TryGetLeadingTextDecoration(string text, out string decoration, out int contentStart)")) "leading decoration parsing must expose the exact source prefix"
+    Assert-True ($src.Contains("private static bool IsLeadingTextDecorationMarker(char c)")) "decoration recognition must use an explicit marker allow-list"
+    Assert-True ($src -match '(?s)private static string PrepareTranslatedTextForString\(string translated, string originalText = null\).*?RestoreLeadingTextDecoration\(translated, originalText\)') "IMGUI/Fungus string rendering must restore dropped leading decorations"
+    Assert-True ($src -match '(?s)private static string PrepareTranslatedTextForComponent\(object component, string text, string originalText = null\).*?RestoreLeadingTextDecoration\(text, originalText\)') "TMP/UGUI rendering must keep the adjacent decoration behavior"
+    Assert-True ($src.Contains('"Unity Translator", "3.1.111"')) "Unity Mono plugin version must include the current renderer and latency fixes"
+}
+
 It "Unity skips runtime status text before queueing translation" {
     Assert-True (Looks-LikeRuntimeStatusText "RAM: 31964 MB") "RAM telemetry should not be translated"
     Assert-True (Looks-LikeRuntimeStatusText "VR: Not active") "VR telemetry should not be translated"
@@ -280,6 +330,7 @@ It "Unity skips runtime status text before queueing translation" {
 
     Assert-False (Looks-LikeRuntimeStatusText "Crystal Transit Hub") "location titles should remain translatable"
     Assert-False (Looks-LikeRuntimeStatusText "The trainee is calm, focused, and ready to start the next exercise") "dialogue should remain translatable"
+    Assert-False (Looks-LikeRuntimeStatusText "The cannon is ready to fire! Now I can use a match to shoot the boss if it is visible.") "quest hint prose should remain translatable"
     Assert-False (Looks-LikeRuntimeStatusText "Load Game") "ordinary menu labels should remain translatable"
 
     Assert-True ($src.Contains("LooksLikeRuntimeStatusText(visibleText)")) "ShouldSkipText must call the runtime-status classifier"
@@ -303,6 +354,7 @@ It "Typewriter fragments are rejected before translation/cache" {
     Assert-False (Looks-LikeTypewriterFragment ("Alright{0} from this point, the task belongs to us." -f $ellipsis)) "complete ellipsis sentence should not be rejected"
     Assert-False (Looks-LikeTypewriterFragment "Ready or not, I just want to find the archive. There must already be a team practicing.") "complete sentence should not be rejected"
     Assert-False (Looks-LikeTypewriterFragment ("It Feels strange... like we{0}re stepping into another world." -f ([string][char]0x2019))) "complete dialogue line with ellipsis should not be rejected"
+    Assert-False (Looks-LikeTypewriterFragment "The cannon is ready to fire! Now I can use a match to shoot the boss if it is visible.") "complete rich UI quest hint should not be treated as a typewriter fragment"
     Assert-False (Looks-LikeTypewriterFragment "Mira") "short character name should not be rejected"
 }
 
@@ -398,6 +450,44 @@ It "Unity scene warmup actively requests visible UI misses" {
     Assert-False ($src.Contains("ProcessDeepPrefetchQueueCoroutine")) "deep-prefetch should use the active async tick path only"
 }
 
+It "Unity activation scans can queue newly visible uncached UI text" {
+    Assert-True ($src.Contains("private bool QueueCachedComponentTextIfAvailable")) "targeted visible text scan must report whether it queued or applied work"
+    Assert-True ($src.Contains("QueueCachedTextsInHierarchy(GameObject root, int maxQueue, bool allowRemoteFallback = false)")) "UI tree scans must have an explicit remote fallback gate"
+    Assert-True ($src.Contains("QueueDebouncedTextRequest(component, componentInstanceId, currentComponentText, isTmp);")) "visible uncached UI text must be able to enter the debounced remote queue"
+    Assert-True ($src.Contains("Interlocked.Increment(ref _targetedCacheQueueCount);") -and $src.Contains("return true;")) "remote fallback must count against targeted activation work limits"
+    Assert-True ($src.Contains("QueueCachedTextsInHierarchy(__instance, MaxTargetedCacheQueuesPerActivation, allowRemoteFallback: true);")) "GameObject activation must allow remote fallback for visible uncached UI text"
+    Assert-True ($src.Contains("QueueCachedTextsInHierarchy(((Component)__instance).gameObject, MaxTargetedCacheQueuesPerActivation, allowRemoteFallback: true);")) "CanvasGroup visibility must allow remote fallback for visible uncached UI text"
+}
+
+It "Unity cached activation text is applied before the first visible frame" {
+    Assert-True ($src.Contains("ApplyCachedComponentTranslationNow")) "activation paths need a direct main-thread apply helper for local cache hits"
+    Assert-True ($src -match '(?s)private bool QueueCachedComponentTextIfAvailable.*?TryGetLocalTranslation\(currentComponentText, out var translated\).*?ApplyCachedComponentTranslationNow\(component, componentInstanceId, currentComponentText, translated, isTmp\)') "OnEnable/SetActive cache hits must be written immediately instead of waiting in the apply queue"
+    Assert-False ($src -match '(?s)private bool QueueCachedComponentTextIfAvailable.*?TryGetLocalTranslation\(currentComponentText, out var translated\)\)\s*\{\s*QueueTranslationApply') "known translations must not expose source text while waiting for a later flush"
+    Assert-True ($src -match '(?s)private static void TMPTextOnEnablePostfix.*?QueueCachedComponentTextIfAvailable') "TMP OnEnable must keep using the first-frame cache path"
+    Assert-True ($src -match '(?s)private static void CanvasGroupAlphaPostfix.*?QueueCachedTextsInHierarchy') "CanvasGroup visibility changes must keep using the first-frame cache path"
+}
+
+It "Unity primes bounded local caches before hooks can render source text" {
+    Assert-True ($src.Contains("FirstFrameLocalCacheFileBytes")) "first-frame cache loading must have a strict file-size bound"
+    Assert-True ($src.Contains("FirstFrameLocalCacheEntryLimit")) "first-frame cache loading must have a strict entry-count bound"
+    Assert-True ($src -match '(?s)LoadGlossary\(\);\s*PrimeSmallLocalCacheForFirstFrame\(\);\s*_ = BootCacheLoadAsync\(\);') "small local caches must be ready before Unity text hooks are installed"
+    Assert-True ($src -match '(?s)private void PrimeSmallLocalCacheForFirstFrame\(\).*?FileInfo\(path\)\.Length > FirstFrameLocalCacheFileBytes.*?val.Count > FirstFrameLocalCacheEntryLimit.*?ImportServerCacheEntries') "first-frame priming must reject large files before importing entries"
+    Assert-True ($src -match '(?s)private async Task BootCacheLoadAsync\(\).*?if \(!_firstFrameLocalCachePrimed\).*?await RunBackground') "large caches must retain the background import path"
+}
+
+It "Unity first-translation latency stays within the interactive budget" {
+    Assert-True ((Get-NumericConstant $src "UiTextSettleDebounceSeconds") -le 0.04) "stable UI text should begin translation within 40ms"
+    Assert-True ((Get-NumericConstant $src "TextSettleDebounceSeconds") -le 0.22) "stable dialogue should begin translation within 220ms"
+    Assert-True ((Get-NumericConstant $src "TypewriterFragmentDebounceSeconds") -le 0.65) "completed typewriter text should not wait more than 650ms"
+    Assert-True ((Get-NumericConstant $src "MaxClientBatchSize") -ge 16) "Unity client batches should match the local server's 16-item batch capacity"
+    Assert-True ((Get-NumericConstant $src "MaxDebouncedStartsPerTick") -ge 20) "normal mode should start enough ready translations per frame"
+    Assert-True ((Get-NumericConstant $src "MaxPendingApplyPerFlush") -ge 12) "normal mode should write back a scene-sized response without a long frame tail"
+    Assert-True ($src.Contains("GetMaxDebouncedStartsPerTick")) "translation start throughput must remain performance-mode aware"
+    Assert-True ($src -match '(?s)private int GetMaxDebouncedStartsPerTick\(\).*?IsHighPerformance\(\).*?return 48;.*?IsEcoPerformance\(\).*?return 8;.*?return MaxDebouncedStartsPerTick;') "high/eco modes need explicit translation-start budgets"
+    Assert-True ($src -match '(?s)private int GetMaxPendingApplyPerFlush\(\).*?IsHighPerformance\(\).*?return 24;.*?IsEcoPerformance\(\).*?return 4;.*?return MaxPendingApplyPerFlush;') "high/eco modes need explicit translation-writeback budgets"
+    Assert-True ($src.Contains("list.Count >= GetMaxDebouncedStartsPerTick()")) "debounced work must consume the performance-aware start budget"
+}
+
 It "Unity plugin source does not compile unused modular prototype code" {
     Assert-False (Test-Path -LiteralPath $unusedPrototypePath) "unused UnityTranslator prototype tree must not be present in the SDK-style project"
     Assert-False ($src.Contains("TranslatorEngine")) "real plugin entry must not depend on the removed prototype engine"
@@ -470,7 +560,8 @@ It "Unity source treats typewriter suspects as settle-delayed, not hard-rejected
     # Classification only buys a longer debounce settle; final-but-odd-looking
     # prose (e.g. no trailing punctuation) must still translate.
     Assert-True ($src.Contains("GetTextSettleDelaySeconds(value.Text)")) "debounce must wait by text type"
-    Assert-True ($src.Contains("private const float TypewriterFragmentDebounceSeconds = 0.9f;")) "long fragment settle delay must remain explicit"
+    Assert-True ((Get-NumericConstant $src "TypewriterFragmentDebounceSeconds") -ge 0.5) "fragment settle delay must remain long enough to reject mid-typewriter pauses"
+    Assert-True ((Get-NumericConstant $src "TypewriterFragmentDebounceSeconds") -gt (Get-NumericConstant $src "TextSettleDebounceSeconds")) "fragment suspects must wait longer than stable dialogue"
     Assert-True ($src -match '(?s)private static float GetTextSettleDelaySeconds\(string text\)\s*\{\s*if \(LooksLikeTypewriterFragment\(text\)\)\s*\{\s*return TypewriterFragmentDebounceSeconds;') "fragment suspects must use the named long settle delay"
     Assert-False ($src.Contains("ContainsCjk(text) || LooksLikeTypewriterFragment(text) || ShouldSkipText(text)")) "debounce queue entry must not hard-reject fragments"
     Assert-False ($src.Contains("if (LooksLikeTypewriterFragment(item2.Text))")) "debounce flush must not hard-reject settled fragments"
@@ -507,6 +598,15 @@ It "Sanitize repairs must not corrupt valid tags" {
     Assert-True ($looseSize.Replace("<size=42>text", "") -eq "text") "plain size tags must still strip"
 }
 
+It "Unity strips model prompt echoes before accepting or persisting translations" {
+    Assert-True ($src.Contains("StripTranslationPromptEchoPrefix")) "Unity Mono must have a prompt-echo sanitizer"
+    Assert-True ($src -match '(?s)private static string SanitizeTranslationArtifacts\(string text\).*?StripTranslationPromptEchoPrefix\(text\)') "all Mono cache and response imports must pass through prompt-echo cleanup"
+    Assert-True ($src.Contains('\u7ffb\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587')) "Mono cleanup must cover the real Chinese prompt echo"
+    Assert-True ($il2cppEndpointSrc.Contains("StripTranslationPromptEchoPrefix")) "XUnity must defensively clean prompt echoes from compatible servers and old caches"
+    Assert-True ($il2cppEndpointSrc -match '(?s)private string PrepareDisplayTranslation\(string value\).*?StripTranslationPromptEchoPrefix\(value\)') "single XUnity results must be cleaned before display"
+    Assert-True ($il2cppEndpointSrc -match '(?s)private string\[\] PrepareDisplayTranslations\(string\[\] values\).*?StripTranslationPromptEchoPrefix\(values\[i\]\)') "batch XUnity results must be cleaned before display"
+}
+
 It "TMP overlay has a visible-render guard" {
     Assert-True ($src.Contains("GetComponentInParent<Canvas>()")) "overlay must not hide TMP when it cannot render on a Canvas"
     Assert-True ($src.Contains("SetParent(val6, false)")) "overlay should be parented beside the TMP component for UI draw order"
@@ -524,6 +624,41 @@ It "TMP overlay and rich-text restore preserve original colors" {
     Assert-True ($src.Contains("value = PrepareTranslatedTextForUGUIText(__instance, text, rawText);")) "UGUI sync translation must keep source color wrappers"
     Assert-True ($src.Contains("val.text = PrepareTranslatedTextForUGUIText(val, translated, originalText ?? translated, preserveRichText);")) "UGUI async/cached translation must keep source color wrappers"
     Assert-True ($src.Contains("PrepareTranslatedTextForComponent(component, translated, sourceForFormatting)")) "TMP formatting must use the original source text when restoring wrappers"
+}
+
+It "UGUI translated CJK keeps source line padding and wraps without resizing menu labels" {
+    Assert-True ($src.Contains("RestoreOuterLineBreaks(prepared, sourceText)")) "UGUI translation must preserve leading/trailing source line breaks"
+    Assert-True ($src.Contains("ApplyUGUITextLayoutCompatibility(component, prepared)")) "UGUI translation must pass through renderer-local layout compatibility"
+    Assert-True ($src.Contains("WrapTranslatedCjkForUGUI")) "UGUI translation needs a local CJK wrapping helper"
+    Assert-True ($src.Contains("component.horizontalOverflow = HorizontalWrapMode.Wrap")) "UGUI CJK text should wrap instead of overflowing into nearby UI"
+    Assert-False ($src.Contains("component.resizeTextForBestFit = true")) "UGUI translation must not enable best-fit because it can enlarge translated main-menu labels"
+    Assert-False ($src.Contains("component.resizeTextMaxSize")) "UGUI translation must not mutate max font size for existing menu/button layouts"
+    Assert-False ($serverSrc.Contains("WrapTranslatedCjkForUGUI")) "UGUI wrapping must stay out of the shared server/cache layer"
+}
+
+It "UGUI translated short labels bypass stale preferred-width layout caches" {
+    Assert-True ($src.Contains('"UGUITextPostfix"')) "UGUI text writes need a post-set layout compatibility pass"
+    Assert-True ($src.Contains("FinalizeUGUITextLayoutCompatibility(__instance)")) "UGUI post-set hook must finalize the live layout"
+    Assert-True ($src.Contains("PrepareUGUITranslatedShortLabelLayout(component, prepared, sourceText)")) "short translated labels must be classified where both source and translation are known"
+    Assert-True ($src.Contains("RestoreUGUIShortLabelLayoutCompatibility")) "temporary short-label overflow must be restored before later source text is rendered"
+    Assert-True ($src.Contains("ConditionalWeakTable<Text, UguiShortLabelLayoutState>")) "short-label renderer state must not retain destroyed scene Text components"
+    Assert-True ($src.Contains("GetComponent<LayoutElement>()")) "short-label overflow must require explicit layout ownership"
+    Assert-True ($src.Contains("GetComponent<ContentSizeFitter>()")) "content-sized labels must be recognized"
+    Assert-True ($src.Contains("GetComponent<HorizontalOrVerticalLayoutGroup>()")) "layout-group-owned labels must be recognized"
+    Assert-False ($src.Contains("preferredWidth <= rectWidth + 0.5f")) "post-set preferredWidth can still describe the old English label and must not gate the repair"
+    Assert-True ($src.Contains("component.horizontalOverflow = HorizontalWrapMode.Overflow")) "clipped short labels must remain on one visible line"
+    Assert-True ($src.Contains("LayoutRebuilder.MarkLayoutForRebuild(parentRect)")) "the owning layout must be asked to recompute its width"
+    Assert-True ($src.Contains("[UGUI-LAYOUT] short-label overflow")) "layout fallback activation must be diagnosed"
+    Assert-False ($serverSrc.Contains("FinalizeUGUITextLayoutCompatibility")) "UGUI layout repair must stay out of the shared server/cache layer"
+}
+
+It "Unity inventory quantity lists can be rebuilt from local item term translations" {
+    Assert-True ($src.Contains("InventoryQuantityLineRegex")) "Unity Mono must recognize item quantity lines like 'fongo fruits x 3'"
+    Assert-True ($src.Contains("TryTranslateQuantityListFromLocalTerms")) "Unity Mono must rebuild changing inventory lists locally"
+    Assert-True ($src.Contains("TryInferTermTranslationFromCachedQuantityLists")) "Unity Mono must learn item names from previous inventory list cache hits"
+    Assert-True ($src.Contains("TryInferTermTranslationFromRichTextSpans")) "Unity Mono must learn item names from highlighted rich-text item mentions"
+    Assert-True ($src.Contains("SingularizeInventoryTerm")) "plural item counts should fall back to singular cached terms"
+    Assert-False ($serverSrc.Contains("InventoryQuantityLineRegex")) "inventory-list rendering repair must stay out of the shared server/cache layer"
 }
 
 It "TMP translation releases typewriter visibility limits" {
@@ -587,6 +722,21 @@ It "Unity background work and diagnostics avoid unmanaged thread and IO churn" {
     Assert-True ($src -match '(?s)private void OnDestroy\(\).*?_diagnosticsStop\?\.Set\(\);') "plugin teardown must stop diagnostic work"
     Assert-False ($src -match '(?s)private void FlushDebouncedTextRequests\(\).*?_debouncedTextRequests\.ToList\(\)') "main-thread debounce pump must not clone the dictionary every tick"
     Assert-True ($src -match '(?s)private static string RawHttpRequest.*?memoryStream\.GetBuffer\(\).*?memoryStream\.Length') "raw HTTP response decoding must avoid a full ToArray copy"
+    Assert-False ($src.Contains('Version=3.1.97')) "diagnostic output must not report a stale plugin version"
+}
+
+It "Unity exception boundaries never swallow failures silently" {
+    $emptyCatch = 'catch(?:\s*\([^\)]*\))?\s*\{\s*\}'
+    Assert-False ([regex]::IsMatch($src, $emptyCatch, [System.Text.RegularExpressions.RegexOptions]::Singleline)) "Unity Mono must not contain empty catch blocks"
+    Assert-False ([regex]::IsMatch($tmpFallbackSrc, $emptyCatch, [System.Text.RegularExpressions.RegexOptions]::Singleline)) "IL2CPP TMP fallback must not contain empty catch blocks"
+    Assert-True ($src.Contains("ReportCaughtException")) "Unity Mono compatibility fallbacks must report method and exception diagnostics"
+    Assert-True ($tmpFallbackSrc.Contains("ReportCaughtException")) "IL2CPP TMP compatibility fallbacks must report method and exception diagnostics"
+}
+
+It "Unity Mono runtime has one active pump with a host fallback" {
+    Assert-True ($src -match '(?s)private sealed class TranslatorDriver.*?private void Update\(\)\s*\{\s*Owner\?\.DriverUpdate\(\);') "the dedicated driver must remain the normal main-thread pump"
+    Assert-True ($src -match '(?s)private void Update\(\).*?if \(\(Object\)\(object\)_driver == \(Object\)null \|\| !\(\(Behaviour\)_driver\)\.isActiveAndEnabled\)\s*\{\s*DriverUpdate\(\);') "the plugin host Update must only pump when the dedicated driver is unavailable"
+    Assert-False ($src -match '(?s)private void Update\(\)\s*\{\s*DriverUpdate\(\);\s*\}') "the plugin host and dedicated driver must not both run PumpOnce every frame"
 }
 
 It "Unity batch dispatch keeps multiple batches in flight" {
@@ -607,8 +757,22 @@ It "Unity boot cache import runs off the main thread" {
     Assert-True ($src.Contains("_ = BootCacheLoadAsync();")) "Awake must fire the boot cache load asynchronously"
     Assert-False ($src -match '(?s)LoadGlossary\(\);\s*LoadServerCache\(\);') "Awake must not import the local cache inline"
     Assert-True ($src -match '(?s)private async Task BootCacheLoadAsync\(\).{0,2000}?StartServerCacheSync\(\);') "server sync decision must wait for the local cache count"
-    Assert-True ($src -match '(?s)lock \(_cache\)\s*\{\s*_cache\.Clear\(\);\s*_localCacheKeys\.Clear\(\);') "cache reset must hold the lock now that the importer is concurrent"
+    Assert-False ($src -match '(?s)private void LoadServerCache\(\).*?_cache\.Clear\(\);') "background boot import must not erase translations accepted after hooks start"
+    Assert-False ($src -match '(?s)private void LoadServerCache\(\).*?_localCacheKeys\.Clear\(\);') "background boot import must not erase live per-game persistence keys"
+    Assert-True ($src -match '(?s)private void LoadServerCache\(\).*?markImportedAsLocal: true, preserveExisting: true') "background local-cache import must preserve a newer live translation for the same key"
+    Assert-True ($src -match '(?s)private int ImportServerCacheEntries\(.*?bool preserveExisting = false\).*?preserveExisting.*?_cache\.ContainsKey') "cache import must implement the live-entry preservation contract under the cache lock"
     Assert-True ($src -match '(?s)private bool TryGetLocalTranslation\(string text, out string translated\).*?lock \(_cache\)\s*\{\s*if \(_glossary\.TryGetValue\(text, out var value\)\)') "glossary fast path must lock against the background importer"
+}
+
+It "Unity Mono teardown does not retain scene objects or race the final cache write" {
+    $scheduleAsyncApply = [regex]::Match($src, '(?s)private void ScheduleAsyncApply\(.*?(?=\s*private IEnumerator SceneWarmupCoroutine)').Value
+    Assert-True ($src.Contains("private volatile bool _shuttingDown;")) "fire-and-forget work needs a plugin teardown gate"
+    Assert-True ($src -match '(?s)private void OnDestroy\(\).*?_shuttingDown = true;.*?ReferenceEquals\(_instance, this\).*?_instance = null;') "teardown must stop new work and release the static plugin reference"
+    Assert-True ($scheduleAsyncApply -match '(?s)WeakReference componentRef = new WeakReference\(component\);.*?RequestSharedTranslation') "remote callbacks must hold scene components weakly"
+    Assert-False ($scheduleAsyncApply.Contains("QueueTranslationApply(component,")) "remote callbacks must not capture a strong scene component reference"
+    Assert-True ($src.Contains("private readonly object _cacheFileWriteLock = new object();")) "cache writes need a dedicated ordering lock"
+    Assert-True ($src -match '(?s)private async Task PersistLocalCacheAsync\(\).*?lock \(_cacheFileWriteLock\).*?_shuttingDown') "background persistence must serialize with and yield to final teardown persistence"
+    Assert-True ($src -match '(?s)private void FlushLocalCacheToDisk\(\).*?lock \(_cacheFileWriteLock\)') "the final cache snapshot must share the persistence ordering lock"
 }
 
 It "Oversized local caches heal instead of stuttering every persist" {
@@ -622,7 +786,7 @@ It "Oversized local caches heal instead of stuttering every persist" {
     Assert-True ($src.Contains("TryBackupOversizedLocalCache(path, val.Count);")) "polluted local caches must be backed up before the file shrinks"
     Assert-True ($src.Contains('".bak-oversized"')) "backup must use a recognizable suffix"
     Assert-True ($src.Contains('File.WriteAllText(path, "{}", Encoding.UTF8);')) "active oversized cache must be reset so next launch does not parse it again"
-    Assert-True ($src -match '(?s)await RunBackground\(delegate\s*\{\s*Dictionary<string, string> dictionary = SnapshotLocalCacheForPersist\(\);.{0,300}?WriteLocalCacheSnapshot\(dictionary\);') "persist snapshot and file write must run off the Unity main thread"
+    Assert-True ($src -match '(?s)await RunBackground\(delegate\s*\{.{0,300}?Dictionary<string, string> dictionary = SnapshotLocalCacheForPersist\(\);.{0,300}?WriteLocalCacheSnapshot\(dictionary\);') "persist snapshot and file write must run off the Unity main thread"
 }
 
 It "Fire-and-forget scheduler flags cannot wedge on exceptions" {
@@ -640,7 +804,10 @@ It "Fire-and-forget scheduler flags cannot wedge on exceptions" {
 
 It "Unity async pass-through misses stay retryable while repeated rejected translations are bounded" {
     Assert-True ($src.Contains(") ? value : null);")) "batch callbacks must not echo the original on cache/API miss"
-    Assert-True ($src.Contains("TranslationRetryCooldownSeconds")) "temporary failures should use a bounded retry cooldown"
+    Assert-True ($src.Contains("TransientTranslationRetryCooldownSeconds")) "temporary failures should use their own short retry cooldown"
+    Assert-True ($src.Contains("RejectedTranslationRetryCooldownSeconds")) "quality-rejected translations should keep a separate bounded cooldown"
+    Assert-True ((Get-NumericConstant $src "TransientTranslationRetryCooldownSeconds") -le 2) "transient pass-through misses must retry quickly"
+    Assert-True ((Get-NumericConstant $src "RejectedTranslationRetryCooldownSeconds") -ge 5) "quality rejection retries must remain rate-limited"
     Assert-True ($src.Contains("MaxRejectedTranslationRetries")) "rejected translations need a finite retry budget"
     Assert-True ($src.Contains("MarkRejectedTranslationRetry(pendingBatchRequest.OriginalText, text2);")) "rejected batch responses should count toward the retry budget"
     Assert-True ($src.Contains("_translationRetryAbandoned.Contains(key)")) "abandoned rejected translations must block future remote retries"
@@ -651,6 +818,37 @@ It "Unity async pass-through misses stay retryable while repeated rejected trans
     Assert-False ($src.Contains("MarkKnownUntranslatable(pendingBatchRequest.OriginalText);")) "rejected batch responses must not permanently poison retryability"
     Assert-False ($src.Contains("MarkKnownUntranslatable(originalText);")) "async pass-through responses must not permanently poison retryability"
     Assert-True ($src.Contains("pass-through result left retryable")) "async original echoes should be documented as retryable"
+}
+
+It "XUnity accepts only resolved server sources and never blocks on live API work" {
+    Assert-True ($il2cppEndpointSrc.Contains('\"cache_only\":true')) "XUnity requests must use cache-only mode so remote API latency stays off the game request path"
+    Assert-True ($il2cppEndpointSrc.Contains("IsResolvedSource")) "XUnity endpoint must use an allow-list for successful server sources"
+    Assert-True ($il2cppEndpointSrc.Contains('string.Equals(source, "cache"')) "cache responses must remain accepted"
+    Assert-True ($il2cppEndpointSrc.Contains('string.Equals(source, "api"')) "resolved live responses from compatible servers may remain accepted"
+    Assert-True ($il2cppEndpointSrc.Contains('string.Equals(source, "api_batch"')) "resolved batch responses from compatible servers may remain accepted"
+    Assert-True ($il2cppEndpointSrc -match '(?s)private static bool HasOnlyResolvedSources.*?if \(sources == null \|\| sources.Length != expectedLength\) return false;') "missing or mismatched batch source metadata must fail closed"
+    Assert-True ($il2cppEndpointSrc.Contains("string.Equals(one, original[0], StringComparison.Ordinal)")) "single original echoes must fail instead of entering XUnity's successful cache path"
+    Assert-True ($il2cppEndpointSrc.Contains("string.Equals(results[i], original[i], StringComparison.Ordinal)")) "batch original echoes must fail instead of entering XUnity's successful cache path"
+    Assert-False ($il2cppEndpointSrc -match 'IsUnresolvedSource|HasUnresolvedSource') "deny-list source checks must not return because pass and unknown states would be accepted"
+}
+
+It "Unity IL2CPP endpoint rejects whitespace-only server URLs" {
+    Assert-True ($il2cppEndpointSrc -match '(?s)private static string TrimSlash\(string value\).*?string trimmed = value\?\.Trim\(\);.*?string\.IsNullOrEmpty\(trimmed\).*?127\.0\.0\.1:19999') "whitespace-only XUnity URLs must fall back to the local server"
+}
+
+It "IL2CPP TMP fallback revalidates mutable font tables without hot full scans" {
+    Assert-True ((Get-NumericConstant $tmpFallbackSrc "SteadyNormalizeInterval") -ge 2.0) "setter-backed IL2CPP fallback should not enumerate every TMP text twice per second"
+    Assert-True ($tmpFallbackSrc -match 'PatchLoadedFontAssets\(out bool fontTablesChanged\)') "font fallback repair must report table topology changes"
+    Assert-False ($tmpFallbackSrc -match 'id == InstanceId\(_fallbackAsset\) \|\| PatchedFontAssets\.Contains\(id\)') "previously patched font IDs must still be checked after games rebuild their fallback tables"
+    Assert-True ($tmpFallbackSrc -match 'AddToListProperty\([^\r\n]+out bool added\)') "font-list repair must distinguish existing entries from newly restored entries"
+    Assert-True ($tmpFallbackSrc -match '(?s)if \(settingsChanged \|\| fontTablesChanged\).*?DirtiedTexts\.Clear\(\);') "restored fallback topology must force loaded TMP text meshes to rebuild"
+}
+
+It "IL2CPP TMP fallback retries assets that become available after startup" {
+    Assert-True ($tmpFallbackSrc.Contains("FallbackLoadRetryInterval")) "TMP fallback retries must be rate-limited"
+    Assert-True ($tmpFallbackSrc.Contains("_nextFallbackLoadAttemptUtc")) "TMP fallback must remember the next retry time instead of permanently giving up"
+    Assert-True ($tmpFallbackSrc -match '(?s)if \(_fallbackAsset == null\).*?DateTime now = DateTime.UtcNow;.*?if \(now < _nextFallbackLoadAttemptUtc\).*?LoadFallbackFontAsset') "TMP fallback Apply must retry after the bounded delay"
+    Assert-False ($tmpFallbackSrc -match '(?s)if \(_fallbackAsset == null\).*?if \(_reportedFailure\)\s*\{\s*return;') "the first missing asset must not permanently disable fallback loading"
 }
 
 
@@ -704,4 +902,3 @@ if ($script:Fail -gt 0) {
     exit 1
 }
 exit 0
-

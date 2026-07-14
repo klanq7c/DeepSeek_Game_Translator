@@ -169,13 +169,71 @@ char *json_get_str(const char *json, const char *key) {
     return p ? json_str(&p) : NULL;
 }
 
-/* 取 key 对应的字符串数组。兼容两种形态：
-   - 直接是一个字符串（包装成单元素列表）；
-   - 标准数组 ["a","b",...]。
-   解析中途遇到非法结构即停止，返回已收集到的部分。 */
-List json_array(const char *json, const char *key) {
+/* Locate a direct member of the root object. Request bodies use this stricter
+   lookup so an unrelated nested object cannot shadow the public API fields. */
+const char *json_top_key(const char *json, const char *key) {
+    const char *p = json_skipws(json);
+    if (*p != '{') return NULL;
+    p++;
+
+    int object_depth = 1;
+    int array_depth = 0;
+    int expect_key = 1;
+    while (*p) {
+        if (object_depth == 1 && array_depth == 0 && expect_key) {
+            p = json_skipws(p);
+            if (*p == '}') return NULL;
+            if (*p != '"') return NULL;
+
+            const char *after = p;
+            char *name = json_str(&after);
+            if (!name) return NULL;
+            after = json_skipws(after);
+            if (*after != ':') {
+                free(name);
+                return NULL;
+            }
+            const char *value = json_skipws(after + 1);
+            int match = strcmp(name, key) == 0;
+            free(name);
+            if (match) return value;
+
+            p = value;
+            expect_key = 0;
+            continue;
+        }
+
+        if (*p == '"') {
+            char *ignored = json_str(&p);
+            if (!ignored) return NULL;
+            free(ignored);
+            continue;
+        }
+        if (*p == '{') {
+            object_depth++;
+        } else if (*p == '}') {
+            if (object_depth <= 1) return NULL;
+            object_depth--;
+        } else if (*p == '[') {
+            array_depth++;
+        } else if (*p == ']') {
+            if (array_depth <= 0) return NULL;
+            array_depth--;
+        } else if (*p == ',' && object_depth == 1 && array_depth == 0) {
+            expect_key = 1;
+        }
+        p++;
+    }
+    return NULL;
+}
+
+char *json_top_get_str(const char *json, const char *key) {
+    const char *p = json_top_key(json, key);
+    return p ? json_str(&p) : NULL;
+}
+
+static List json_array_value(const char *p) {
     List l = {0};
-    const char *p = json_key(json, key);
     if (!p) return l;
     p = json_skipws(p);
     if (*p == '"') {
@@ -210,4 +268,18 @@ List json_array(const char *json, const char *key) {
             return l;
         }
     }
+}
+
+/* 取 key 对应的字符串数组。兼容两种形态：
+   - 直接是一个字符串（包装成单元素列表）；
+   - 标准数组 ["a","b",...]。
+   解析中途遇到非法结构即停止，返回已收集到的部分。 */
+List json_array(const char *json, const char *key) {
+    const char *p = json_key(json, key);
+    return json_array_value(p);
+}
+
+List json_top_array(const char *json, const char *key) {
+    const char *p = json_top_key(json, key);
+    return json_array_value(p);
 }

@@ -39,6 +39,7 @@ New-Item -ItemType Directory -Path $stage | Out-Null
 $includeFiles = @(
     ".gitignore",
     "AGENTS.md",
+    "CONTEXT.md",
     "CONTRIBUTING.md",
     "LICENSE",
     "README.md",

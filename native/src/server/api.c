@@ -185,6 +185,51 @@ typedef struct {
 /* 通道池，下标 0..API_CONCURRENCY_MAX-1。零初始化使 lock == SRWLOCK_INIT。
    实际使用数量由 cfg->concurrency 决定，多余通道闲置。 */
 static ApiChannel g_channels[API_CONCURRENCY_MAX];
+typedef enum {
+    API_DIAG_ENDPOINT_ENCODING,
+    API_DIAG_KEY_ENCODING,
+    API_DIAG_CRACK_URL,
+    API_DIAG_OPEN_SESSION,
+    API_DIAG_CONNECT,
+    API_DIAG_OPEN_REQUEST,
+    API_DIAG_SET_TIMEOUTS,
+    API_DIAG_SEND,
+    API_DIAG_RECEIVE,
+    API_DIAG_QUERY_STATUS,
+    API_DIAG_HTTP_STATUS,
+    API_DIAG_QUERY_BODY,
+    API_DIAG_READ_BODY,
+    API_DIAG_BODY_TOO_LARGE,
+    API_DIAG_EMPTY_BODY,
+    API_DIAG_MISSING_CONTENT,
+    API_DIAG_EMPTY_CONTENT,
+    API_DIAG_BATCH_SHAPE,
+    API_DIAG_COUNT
+} ApiDiag;
+
+static volatile LONG g_api_diag_counts[API_DIAG_COUNT];
+
+/* Remote transport/provider fallbacks cannot be repaired above this client:
+   the endpoint and response are external. They never turn a failure into a
+   cache hit; every fallback is rate-limited here with its exact stage and no
+   request text or API key, so the original fault remains diagnosable. */
+static void api_diag(ApiDiag reason, DWORD winhttp_error, DWORD status, const char *detail) {
+    static const char *names[API_DIAG_COUNT] = {
+        "endpoint-encoding", "key-encoding", "crack-url", "open-session",
+        "connect", "open-request", "set-timeouts", "send", "receive",
+        "query-status", "http-status", "query-body", "read-body",
+        "body-too-large", "empty-body", "missing-content", "empty-content",
+        "batch-shape"
+    };
+    LONG count = InterlockedIncrement(&g_api_diag_counts[reason]);
+    if (count <= 3 || (count & (count - 1)) == 0) {
+        fprintf(stderr,
+                "[api] %s failed #%ld (winhttp=%lu, status=%lu%s%s)\n",
+                names[reason], count, winhttp_error, status,
+                detail ? ", detail=" : "", detail ? detail : "");
+        fflush(stderr);
+    }
+}
 static volatile LONG g_rr;    /* 轮询计数器，Interlocked 递增保证线程安全 */
 
 /* 持锁：关闭并清空通道的句柄与就绪标志，用于配置变更或传输失败后重建。 */
@@ -206,8 +251,14 @@ static int api_prepare_locked(ApiChannel *ch, ApiConfig *cfg) {
     api_reset_locked(ch);
 
     WCHAR url[2048];
-    if (!utf8_to_wide(cfg->endpoint, url, 2048)) return 0;
-    if (!utf8_to_wide(cfg->key, ch->key, 1400)) return 0;
+    if (!utf8_to_wide(cfg->endpoint, url, 2048)) {
+        api_diag(API_DIAG_ENDPOINT_ENCODING, GetLastError(), 0, NULL);
+        return 0;
+    }
+    if (!utf8_to_wide(cfg->key, ch->key, 1400)) {
+        api_diag(API_DIAG_KEY_ENCODING, GetLastError(), 0, NULL);
+        return 0;
+    }
 
     URL_COMPONENTSW uc;
     memset(&uc, 0, sizeof uc);
@@ -216,7 +267,10 @@ static int api_prepare_locked(ApiChannel *ch, ApiConfig *cfg) {
     uc.dwHostNameLength = 512;
     uc.lpszUrlPath = ch->path;
     uc.dwUrlPathLength = 2048;
-    if (!WinHttpCrackUrl(url, 0, 0, &uc)) return 0;
+    if (!WinHttpCrackUrl(url, 0, 0, &uc)) {
+        api_diag(API_DIAG_CRACK_URL, GetLastError(), 0, NULL);
+        return 0;
+    }
     if (uc.dwHostNameLength < 512) ch->host[uc.dwHostNameLength] = 0;
     else ch->host[511] = 0;
     if (uc.dwUrlPathLength < 2048) ch->path[uc.dwUrlPathLength] = 0;
@@ -228,10 +282,14 @@ static int api_prepare_locked(ApiChannel *ch, ApiConfig *cfg) {
                               WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                               WINHTTP_NO_PROXY_NAME,
                               WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ch->session) return 0;
+    if (!ch->session) {
+        api_diag(API_DIAG_OPEN_SESSION, GetLastError(), 0, NULL);
+        return 0;
+    }
 
     ch->connect = WinHttpConnect(ch->session, ch->host, ch->port, 0);
     if (!ch->connect) {
+        api_diag(API_DIAG_CONNECT, GetLastError(), 0, NULL);
         api_reset_locked(ch);
         return 0;
     }
@@ -265,23 +323,32 @@ static int read_response(HINTERNET req, char **out) {
     buf_init(&b);
     for (;;) {
         DWORD avail = 0;
-        if (!WinHttpQueryDataAvailable(req, &avail)) break;
+        if (!WinHttpQueryDataAvailable(req, &avail)) {
+            api_diag(API_DIAG_QUERY_BODY, GetLastError(), 0, NULL);
+            buf_free(&b);
+            return 0;
+        }
         if (!avail) break;
         char *tmp = (char *)xmalloc(avail + 1);
         DWORD rd = 0;
         if (!WinHttpReadData(req, tmp, avail, &rd)) {
+            api_diag(API_DIAG_READ_BODY, GetLastError(), 0, NULL);
             free(tmp);
-            break;
+            buf_free(&b);
+            return 0;
         }
         tmp[rd] = 0;
-        if (b.len + rd > 2 * 1024 * 1024) {
+        if ((size_t)rd > 2 * 1024 * 1024 - b.len) {
+            api_diag(API_DIAG_BODY_TOO_LARGE, 0, 0, "limit=2097152");
             free(tmp);
-            break;
+            buf_free(&b);
+            return 0;
         }
         buf_addn(&b, tmp, rd);
         free(tmp);
     }
     if (!b.len) {
+        api_diag(API_DIAG_EMPTY_BODY, 0, 0, NULL);
         buf_free(&b);
         return 0;
     }
@@ -303,6 +370,7 @@ static int send_chat_request(ApiConfig *cfg, Buf *body, char **content_out) {
     HINTERNET req = WinHttpOpenRequest(ch->connect, L"POST", ch->path, NULL, WINHTTP_NO_REFERER,
                                        WINHTTP_DEFAULT_ACCEPT_TYPES, ch->flags);
     if (!req) {
+        api_diag(API_DIAG_OPEN_REQUEST, GetLastError(), 0, NULL);
         api_reset_locked(ch);
         ReleaseSRWLockExclusive(&ch->lock);
         return 0;
@@ -310,6 +378,7 @@ static int send_chat_request(ApiConfig *cfg, Buf *body, char **content_out) {
 
     DWORD timeout = (DWORD)cfg->timeout_ms;
     if (!WinHttpSetTimeouts(req, timeout, timeout, timeout, timeout)) {
+        api_diag(API_DIAG_SET_TIMEOUTS, GetLastError(), 0, NULL);
         WinHttpCloseHandle(req);
         api_reset_locked(ch);
         ReleaseSRWLockExclusive(&ch->lock);
@@ -322,25 +391,43 @@ static int send_chat_request(ApiConfig *cfg, Buf *body, char **content_out) {
 
     int ok = 0;
     int transport_ok = 0;
-    if (WinHttpSendRequest(req, headers, (DWORD)-1, body->data, (DWORD)body->len, (DWORD)body->len, 0) &&
-        WinHttpReceiveResponse(req, NULL)) {
+    if (!WinHttpSendRequest(req, headers, (DWORD)-1, body->data,
+                            (DWORD)body->len, (DWORD)body->len, 0)) {
+        api_diag(API_DIAG_SEND, GetLastError(), 0, NULL);
+    } else if (!WinHttpReceiveResponse(req, NULL)) {
+        api_diag(API_DIAG_RECEIVE, GetLastError(), 0, NULL);
+    } else {
         transport_ok = 1;
         DWORD status = 0, sz = sizeof status;
-        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
-        char *raw = NULL;
-        if (status >= 200 && status < 300 && read_response(req, &raw)) {
-            char *content = json_get_str(raw, "content");
-            if (content) {
-                normalize_translation(content);
-                if (*content) {
-                    *content_out = content;
-                    content = NULL;
-                    ok = 1;
+        if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
+                                 WINHTTP_NO_HEADER_INDEX)) {
+            api_diag(API_DIAG_QUERY_STATUS, GetLastError(), 0, NULL);
+            transport_ok = 0;
+        } else if (status < 200 || status >= 300) {
+            api_diag(API_DIAG_HTTP_STATUS, 0, status, NULL);
+        } else {
+            char *raw = NULL;
+            if (!read_response(req, &raw)) {
+                transport_ok = 0;
+            } else {
+                char *content = json_get_str(raw, "content");
+                if (!content) {
+                    api_diag(API_DIAG_MISSING_CONTENT, 0, status, NULL);
+                } else {
+                    normalize_translation(content);
+                    normalize_translation_result(content);
+                    if (*content) {
+                        *content_out = content;
+                        content = NULL;
+                        ok = 1;
+                    } else {
+                        api_diag(API_DIAG_EMPTY_CONTENT, 0, status, NULL);
+                    }
+                    free(content);
                 }
-                free(content);
+                free(raw);
             }
-            free(raw);
         }
     }
 
@@ -370,6 +457,7 @@ static int parse_json_string_array(const char *json, List *out) {
             return 0;
         }
         normalize_translation(s);
+        normalize_translation_result(s);
         list_push(out, s);
         p = json_skipws(p);
         if (*p == ',') {
@@ -424,6 +512,9 @@ int api_translate_batch(ApiConfig *cfg, char **texts, size_t count, char ***out)
     ok = parse_json_string_array(content, &parsed);
     free(content);
     if (!ok || parsed.n != count) {
+        char detail[96];
+        snprintf(detail, sizeof detail, "expected=%zu, parsed=%zu", count, parsed.n);
+        api_diag(API_DIAG_BATCH_SHAPE, 0, 0, detail);
         list_free(&parsed);
         return 0;
     }

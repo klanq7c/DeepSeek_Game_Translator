@@ -63,6 +63,81 @@ char *xstrdup(const char *s) {
     return xstrndup(s ? s : "", strlen(s ? s : ""));
 }
 
+static void trim_translation_result(char *s) {
+    char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    size_t n = strlen(s);
+    while (n && isspace((unsigned char)s[n - 1])) s[--n] = 0;
+}
+
+static int translation_prefix_equal(const char *text, const char *prefix) {
+    while (*prefix) {
+        unsigned char a = (unsigned char)*text++;
+        unsigned char b = (unsigned char)*prefix++;
+        if (!a) return 0;
+        if (a < 0x80 && b < 0x80) {
+            if (tolower(a) != tolower(b)) return 0;
+        } else if (a != b) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Require a real separator and non-empty remainder so ordinary translations
+   that merely start with a similar phrase are left untouched. */
+static const char *translation_after_prompt_prefix(const char *text, const char *prefix) {
+    if (!translation_prefix_equal(text, prefix)) return NULL;
+    const char *p = text + strlen(prefix);
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == ':') {
+        p++;
+    } else if ((unsigned char)p[0] == 0xef &&
+               (unsigned char)p[1] == 0xbc &&
+               (unsigned char)p[2] == 0x9a) {
+        p += 3; /* U+FF1A FULLWIDTH COLON */
+    } else if (*p != '\r' && *p != '\n') {
+        return NULL;
+    }
+    while (*p && isspace((unsigned char)*p)) p++;
+    return *p ? p : NULL;
+}
+
+static int strip_translation_prompt_echo(char *s) {
+    static const char *const prefixes[] = {
+        u8"\u7ffb\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587",
+        u8"\u7ffb\u8bd1\u4e3a\u7b80\u4f53\u4e2d\u6587",
+        u8"\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587",
+        u8"\u7b80\u4f53\u4e2d\u6587\u7ffb\u8bd1",
+        u8"\u7b80\u4f53\u4e2d\u6587\u8bd1\u6587",
+        "Simplified Chinese translation",
+        "Translation to Simplified Chinese",
+        "Translate to Simplified Chinese",
+        "Translated into Simplified Chinese",
+        "Translate this exact game text to Simplified Chinese. Return only the translation."
+    };
+    char *candidate = s;
+    while (*candidate && isspace((unsigned char)*candidate)) candidate++;
+    for (size_t i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++) {
+        const char *rest = translation_after_prompt_prefix(candidate, prefixes[i]);
+        if (!rest) continue;
+        memmove(s, rest, strlen(rest) + 1);
+        trim_translation_result(s);
+        return 1;
+    }
+    return 0;
+}
+
+/* Shared by live API responses and every cache ingress. Normal values remain
+   byte-for-byte unchanged; disk-loaded prompt echoes heal only in memory. */
+void normalize_translation_result(char *s) {
+    if (!s || !*s) return;
+    for (int pass = 0; pass < 3 && *s; pass++) {
+        if (!strip_translation_prompt_echo(s)) break;
+    }
+}
+
 /* 不区分大小写比较是否相等；两个串都到尾且相等时返回 1。 */
 int ieq(const char *a, const char *b) {
     while (*a && *b) {

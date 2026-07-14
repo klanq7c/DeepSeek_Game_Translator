@@ -5,9 +5,11 @@
 #include "globals.h"
 #include "api_config.h"
 #include "fsutil.h"
+#include "godot_patch.h"
 #include "server_proc.h"
 #include "self_update.h"
 #include "ui.h"
+#include "warmup.h"
 
 #include <commctrl.h>
 #include <objbase.h>
@@ -204,12 +206,48 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 /* wWinMain：程序入口
  * 初始化 DPI 感知 → 获取可执行文件路径 → 初始化 COM/公共控件 →
  * 注册窗口类 → 创建主窗口 → 进入消息循环 */
+/* Hidden helper mode used by the launcher to refresh large Godot patch packs
+   after the game has already started. */
+static int run_godot_patch_worker_from_cmd(PWSTR cmd) {
+    int argc = 0;
+    LPWSTR *argv = CommandLineToArgvW(cmd ? cmd : L"", &argc);
+    if (!argv) return -1;
+
+    int handled = 0;
+    int code = 0;
+    for (int i = 0; i < argc; i++) {
+        if (wcscmp(argv[i], L"--godot-patch-worker") != 0) continue;
+        handled = 1;
+        if (i + 1 >= argc || !argv[i + 1][0]) {
+            code = 2;
+            break;
+        }
+
+        if (!start_server()) {
+            code = 3;
+            break;
+        }
+
+        warmup_translations(argv[i + 1], ENGINE_GODOT);
+        WCHAR out[MAX_PATH * 4];
+        if (!godot_prepare_patch_pack(argv[i + 1], out, MAX_PATH * 4)) {
+            code = 4;
+        }
+        break;
+    }
+
+    LocalFree(argv);
+    return handled ? code : -1;
+}
+
 int WINAPI wWinMain(HINSTANCE h, HINSTANCE prev, PWSTR cmd, int show) {
     (void)prev;
     g_inst = h;
     GetModuleFileNameW(NULL, g_root, MAX_PATH * 4);
     WCHAR *slash = wcsrchr(g_root, L'\\');
     if (slash) *slash = 0;
+    int worker_code = run_godot_patch_worker_from_cmd(cmd);
+    if (worker_code >= 0) return worker_code;
     if (cmd && wcsstr(cmd, L"--sync-payloads-and-exit")) {
         sync_embedded_payloads();
         return 0;

@@ -9,6 +9,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Normalize wrappers and echoed translation instructions in-place. */
+void normalize_translation_result(char *s);
+
 /* 打印错误信息后终止进程。两种声明用于兼容 MSVC 与 C11 的 noreturn 写法。 */
 #ifdef _MSC_VER
 __declspec(noreturn) void die(const char *m);

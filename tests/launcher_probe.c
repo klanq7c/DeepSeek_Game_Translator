@@ -36,9 +36,13 @@ int wmain(int argc, WCHAR **argv) {
     wcsncpy(g_root, argv[1], MAX_PATH * 4 - 1);
     g_root[MAX_PATH * 4 - 1] = 0;
 
-    WCHAR renpy[MAX_PATH * 4], rpgm[MAX_PATH * 4], unity_mono[MAX_PATH * 4], unity6_mono[MAX_PATH * 4], unity_il2cpp[MAX_PATH * 4], unity_custom[MAX_PATH * 4];
+    WCHAR renpy[MAX_PATH * 4], rpgm[MAX_PATH * 4], rpgm_fail[MAX_PATH * 4], godot[MAX_PATH * 4], godot_embedded[MAX_PATH * 4], exe_select[MAX_PATH * 4], unity_mono[MAX_PATH * 4], unity6_mono[MAX_PATH * 4], unity_il2cpp[MAX_PATH * 4], unity_custom[MAX_PATH * 4];
     join(renpy, argv[2], L"renpy");
     join(rpgm, argv[2], L"rpgm");
+    join(rpgm_fail, argv[2], L"rpgm_fail");
+    join(godot, argv[2], L"godot");
+    join(godot_embedded, argv[2], L"godot_embedded");
+    join(exe_select, argv[2], L"exe_select");
     join(unity_mono, argv[2], L"unity_mono");
     join(unity6_mono, argv[2], L"unity6_mono");
     join(unity_il2cpp, argv[2], L"unity_il2cpp");
@@ -46,9 +50,21 @@ int wmain(int argc, WCHAR **argv) {
 
     if (expect_engine(renpy, ENGINE_RENPY, L"renpy")) return 1;
     if (expect_engine(rpgm, ENGINE_RPGM_MV, L"rpgm")) return 1;
+    if (expect_engine(godot, ENGINE_GODOT, L"godot")) return 1;
+    if (expect_engine(godot_embedded, ENGINE_GODOT, L"godot_embedded")) return 1;
     if (expect_engine(unity_mono, ENGINE_UNITY, L"unity_mono")) return 1;
     if (expect_engine(unity6_mono, ENGINE_UNITY, L"unity6_mono")) return 1;
     if (expect_engine(unity_il2cpp, ENGINE_UNITY_IL2CPP, L"unity_il2cpp")) return 1;
+
+    WCHAR selected_exe[MAX_PATH * 4];
+    if (!find_exe(exe_select, selected_exe, MAX_PATH * 4) ||
+        _wcsicmp(wcsrchr(selected_exe, L'\\') + 1, L"RealGame.exe")) {
+        return fail(L"find_exe should prefer the executable with the matching Unity _Data directory");
+    }
+    if (!find_exe(godot_embedded, selected_exe, MAX_PATH * 4) ||
+        _wcsicmp(wcsrchr(selected_exe, L'\\') + 1, L"EmbeddedGodot.exe")) {
+        return fail(L"find_exe should prefer the executable that owns an embedded Godot pack");
+    }
 
     if (!deploy_renpy(renpy)) return fail(L"renpy deploy should write the say hook");
     WCHAR renpy_hook[MAX_PATH * 4], renpy_font_ttc[MAX_PATH * 4], renpy_font_ttf[MAX_PATH * 4];
@@ -69,6 +85,11 @@ int wmain(int argc, WCHAR **argv) {
     if (!exists_path(rpgm_font_ttc) && !exists_path(rpgm_font_ttf)) {
         return fail(L"rpgm CJK font missing after deploy");
     }
+    if (deploy_rpgm(rpgm_fail)) {
+        return fail(L"rpgm deploy must fail when index.html cannot be read or updated");
+    }
+
+    if (!deploy_godot(godot)) return fail(L"godot deploy should enable resource warmup mode");
 
     if (!deploy_unity(unity_mono)) return fail(L"unity_mono deploy should copy the bundled plugin");
     WCHAR mono_dll[MAX_PATH * 4], mono_json[MAX_PATH * 4], mono_font[MAX_PATH * 4];

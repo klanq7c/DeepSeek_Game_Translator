@@ -106,9 +106,26 @@ model=fake-model
 key=fake-key
 timeout_ms=3000
 "@
+$seededKey = "__api_guard_disk_prompt_echo_$(Get-Random)"
+$seededExpected = ('"\u78c1\u76d8\u65e7\u8bd1\u6587"' | ConvertFrom-Json)
+$seededPrefix = ('"\u7ffb\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587\uff1a"' | ConvertFrom-Json)
+$seededKey64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($seededKey))
+$seededValue64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($seededPrefix + $seededExpected))
+[System.IO.File]::WriteAllText($cache, $seededKey64 + "`t" + $seededValue64 + "`n", [System.Text.Encoding]::ASCII)
 
 $fakeApi = Start-Job -ArgumentList $FakeApiPort,$callsFile,$readyFile,$stopFile -ScriptBlock {
     param([int]$Port, [string]$CallsFile, [string]$ReadyFile, [string]$StopFile)
+
+    function Convert-FakeOutput([string]$text) {
+        if ($text.StartsWith("__api_guard_prompt_echo_cn_", [System.StringComparison]::Ordinal)) {
+            return ('"\u7ffb\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587\uff1a\u6d4b\u8bd5\u8bd1\u6587"' | ConvertFrom-Json)
+        }
+        if ($text.StartsWith("__api_guard_prompt_echo_en_", [System.StringComparison]::Ordinal)) {
+            $second = ('"\u7b2c\u4e8c\u6761\u8bd1\u6587"' | ConvertFrom-Json)
+            return "Simplified Chinese translation: $second"
+        }
+        return $text
+    }
 
     function Read-HttpRequestBody($stream) {
         $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::ASCII, $false, 4096, $true)
@@ -152,11 +169,12 @@ $fakeApi = Start-Job -ArgumentList $FakeApiPort,$callsFile,$readyFile,$stopFile 
             $trimmed = $content.Trim()
             if ($trimmed.StartsWith("[")) {
                 $items = $trimmed | ConvertFrom-Json
-                return ($items | ConvertTo-Json -Compress)
+                $translated = @($items | ForEach-Object { Convert-FakeOutput ([string]$_) })
+                return (ConvertTo-Json -InputObject $translated -Compress)
             }
             $parts = $content -split "`n", 2
-            if ($parts.Count -gt 1) { return $parts[1] }
-            return $content
+            if ($parts.Count -gt 1) { return Convert-FakeOutput $parts[1] }
+            return Convert-FakeOutput $content
         } catch {
             return "original"
         }
@@ -195,6 +213,15 @@ try {
     Write-Host ""
     Write-Host "=== API original echo guard ===" -ForegroundColor Cyan
 
+    It "disk cache prompt echoes are healed in memory without rewriting the file" {
+        $body = '{"texts":["' + $seededKey + '"]}'
+        $lookup = Send-Json "/cache/lookup" "POST" $body
+        Assert-Eq $lookup.Json.hit_count 1 "seeded disk translation should remain a hit"
+        Assert-Eq $lookup.Json.hits.$seededKey $seededExpected "disk-loaded cache should expose only the clean translation"
+        $diskLine = [System.IO.File]::ReadAllText($cache, [System.Text.Encoding]::ASCII)
+        Assert-Eq $diskLine ($seededKey64 + "`t" + $seededValue64 + "`n") "startup healing must not rewrite user translation memory"
+    }
+
     It "POST /batch treats original echo responses as misses" {
         $a = "__api_guard_batch_a_$(Get-Random)"
         $b = "__api_guard_batch_b_$(Get-Random)"
@@ -223,6 +250,55 @@ try {
 
         $lookup = Send-Json "/cache/lookup" "POST" $body
         Assert-Eq $lookup.Json.miss_count 2 "prefetch original echoes must not be cached"
+    }
+
+    It "cache imports clean prompt echoes before any engine reads them" {
+        $key = "__api_guard_imported_prompt_echo_$(Get-Random)"
+        $expected = ('"\u65e7\u7f13\u5b58\u8bd1\u6587"' | ConvertFrom-Json)
+        $importBody = '{"entries":[{"key":"' + $key + '","value":"\u7ffb\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587\uff1a\u65e7\u7f13\u5b58\u8bd1\u6587"}]}'
+        $import = Send-Json "/cache/import" "POST" $importBody
+        Assert-Eq $import.Status 200 "import status"
+        Assert-Eq $import.Json.imported 1 "imported count"
+
+        $lookupBody = '{"texts":["' + $key + '"]}'
+        $lookup = Send-Json "/cache/lookup" "POST" $lookupBody
+        Assert-Eq $lookup.Json.hit_count 1 "imported translation should remain a hit"
+        Assert-Eq $lookup.Json.hits.$key $expected "shared cache reads must expose only the clean translation"
+    }
+
+    It "cache prompt cleanup preserves normal outer whitespace and line breaks" {
+        $key = "__api_guard_preserve_whitespace_$(Get-Random)"
+        $expected = ('" \n\u4fdd\u7559\u8fb9\u754c\n "' | ConvertFrom-Json)
+        $importBody = '{"entries":[{"key":"' + $key + '","value":" \n\u4fdd\u7559\u8fb9\u754c\n "}]}'
+        $import = Send-Json "/cache/import" "POST" $importBody
+        Assert-Eq $import.Status 200 "import status"
+        Assert-Eq $import.Json.imported 1 "imported count"
+
+        $lookupBody = '{"texts":["' + $key + '"]}'
+        $lookup = Send-Json "/cache/lookup" "POST" $lookupBody
+        Assert-Eq $lookup.Json.hits.$key $expected "normal cache values must not be globally trimmed"
+    }
+
+    It "POST /prefetch strips model prompt echoes before caching translations" {
+        $a = "__api_guard_prompt_echo_cn_$(Get-Random)"
+        $b = "__api_guard_prompt_echo_en_$(Get-Random)"
+        $body = '{"texts":["' + $a + '","' + $b + '"]}'
+        $before = Get-ApiCallCount $callsFile
+        $prefetch = Send-Json "/prefetch" "POST" $body
+        Assert-Eq $prefetch.Status 200 "prefetch status"
+        Wait-ApiCalls $callsFile ($before + 1)
+
+        $lookup = $null
+        for ($i = 0; $i -lt 30; $i++) {
+            $lookup = Send-Json "/cache/lookup" "POST" $body
+            if ($lookup.Json.hit_count -eq 2) { break }
+            Start-Sleep -Milliseconds 100
+        }
+        Assert-Eq $lookup.Json.hit_count 2 "cleaned translations should be cached"
+        $expectedA = ('"\u6d4b\u8bd5\u8bd1\u6587"' | ConvertFrom-Json)
+        $expectedB = ('"\u7b2c\u4e8c\u6761\u8bd1\u6587"' | ConvertFrom-Json)
+        Assert-Eq $lookup.Json.hits.$a $expectedA "Chinese prompt echo must be stripped"
+        Assert-Eq $lookup.Json.hits.$b $expectedB "English prompt echo must be stripped"
     }
 } finally {
     try { if ($server -and -not $server.HasExited) { Send-Json "/shutdown" "POST" "{}" 2 | Out-Null } } catch { }

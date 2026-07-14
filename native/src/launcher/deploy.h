@@ -8,6 +8,7 @@
  *   - RPG Maker MV/MZ：注入 JS 脚本 + CJK 字体 + 修改 index.html
  *   - Unity Mono：部署 BepInEx 插件 + 依赖 DLL
  *   - Unity IL2CPP：部署 BepInEx be.755 + XUnity AutoTranslator + 字体回退
+ *   - Godot：启用 PCK/资源文本预热和外置 patch pack，不改写原游戏包
  * ================================================================ */
 
 #include "globals.h"
@@ -23,6 +24,9 @@ int deploy_unity(const WCHAR *dir);
 
 /* 部署 Unity IL2CPP 翻译插件（BepInEx be.755 + XUnity AutoTranslator + TMP 字体回退） */
 int deploy_unity_il2cpp(const WCHAR *dir);
+
+/* Godot 使用资源扫描 + 缓存预热 + 外置 patch pack，不改写原始 pck */
+int deploy_godot(const WCHAR *dir);
 
 /* 在 payloads 目录中查找 UnityTranslator.dll 模板文件，成功返回 1 并写入 out */
 int find_unity_template(WCHAR *out, size_t cap);

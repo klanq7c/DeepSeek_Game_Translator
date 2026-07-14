@@ -14,6 +14,7 @@ $httpSource = Get-Content -LiteralPath $httpSourcePath -Raw
 $utilSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\util.c") -Raw
 $bufSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\buf.c") -Raw
 $jsonSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\json.c") -Raw
+$apiSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\api.c") -Raw
 
 function It([string]$name, [scriptblock]$body) {
     try {
@@ -114,6 +115,21 @@ try {
         }
         if ($httpSource -notmatch 'setsockopt\(s, SOL_SOCKET, SO_SNDTIMEO') {
             throw "send timeout failure must terminate the connection"
+        }
+    }
+
+    It "Remote API failures remain diagnostic and partial bodies are rejected" {
+        if ($apiSource -notmatch 'static\s+void\s+api_diag\s*\(' -or
+            $apiSource -notmatch 'InterlockedIncrement\(&g_api_diag_counts\[reason\]\)') {
+            throw "remote API failures need a thread-safe rate-limited diagnostic boundary"
+        }
+        if ($apiSource -notmatch '(?s)!WinHttpQueryDataAvailable.*?api_diag\(API_DIAG_QUERY_BODY.*?buf_free\(&b\);\s*return\s+0;' -or
+            $apiSource -notmatch '(?s)!WinHttpReadData.*?api_diag\(API_DIAG_READ_BODY.*?buf_free\(&b\);\s*return\s+0;') {
+            throw "partial provider responses must be discarded at the transport failure"
+        }
+        if ($apiSource -notmatch 'API_DIAG_BATCH_SHAPE' -or
+            $apiSource -notmatch 'API_DIAG_HTTP_STATUS') {
+            throw "provider HTTP and batch-shape failures need distinct diagnostics"
         }
     }
 
@@ -251,7 +267,7 @@ try {
         if ($resp -notmatch "Access-Control-Allow-Origin") { throw "CORS header missing" }
     }
 
-    It "Huge Content-Length is capped, no crash" {
+    It "Huge Content-Length is rejected without crashing" {
         $cli = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $Port)
         $st = $cli.GetStream()
         $body = '{"text":"x"}'
@@ -266,7 +282,7 @@ try {
         try { $n = $st.Read($buf, 0, $buf.Length) } catch { }
         $cli.Close()
         $resp = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
-        if ($resp -notmatch "^HTTP/1\.1") { throw "no HTTP response" }
+        if ($resp -notmatch "^HTTP/1\.1 413 ") { throw "expected 413 response, got: $resp" }
     }
 
     It "CJK round-trip via raw socket preserves UTF-8 bytes" {

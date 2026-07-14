@@ -1,8 +1,9 @@
 # Third-Party Notices
 
 This repository publishes only original source code, tests, scripts, and
-documentation. Third-party runtime payloads are downloaded by the user with
-`scripts/install_runtime_payloads.ps1` after unpacking the program package.
+documentation. Third-party runtime payloads and TMP font asset bundles are
+downloaded by the user with `scripts/install_runtime_payloads.ps1` after
+unpacking the program package.
 
 ## Source releases
 
@@ -23,6 +24,8 @@ redistribution manifest and license texts.
   Unity installations: proprietary game or Unity runtime files.
 - BepInEx and XUnity runtime folders in source releases. Users can install
   them with `scripts/install_runtime_payloads.ps1`.
+- XUnity TMP font asset bundles in source releases. Users can install them
+  with `scripts/install_runtime_payloads.ps1`.
 - Noto or other CJK font files: publish only when the exact font file and
   license are included and reviewed for the release.
 - w64devkit and other compiler/toolchain binaries: obtain from upstream.
@@ -36,6 +39,7 @@ redistribution manifest and license texts.
 - HarmonyX: https://github.com/BepInEx/HarmonyX
 - Harmony: https://github.com/pardeike/Harmony
 - XUnity.AutoTranslator: https://github.com/bbepis/XUnity.AutoTranslator
+- XUnity TMP font asset bundles: https://github.com/bbepis/XUnity.AutoTranslator/releases/tag/v5.5.0
 - Newtonsoft.Json: https://github.com/JamesNK/Newtonsoft.Json
 - Noto CJK fonts: https://github.com/googlefonts/noto-cjk
 - w64devkit: https://github.com/skeeto/w64devkit

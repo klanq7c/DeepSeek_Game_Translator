@@ -1,22 +1,46 @@
 @echo off
 setlocal EnableDelayedExpansion
 set "ROOT=%~dp0"
-set "BIN=%ROOT%native\toolchain\w64devkit\bin"
-if not exist "%BIN%\gcc.exe" (
-    echo Missing w64devkit gcc at %BIN%.
-    exit /b 1
+set "APP_VERSION=dev"
+if exist "%ROOT%VERSION" (
+    set /p APP_VERSION=<"%ROOT%VERSION"
 )
-set "PATH=%BIN%;%PATH%"
-
-set "XUT=%ROOT%payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src\DeepSeekXUnityTranslator.csproj"
-if exist "%XUT%" (
-    where dotnet >nul 2>nul
+set "BIN=%ROOT%native\toolchain\w64devkit\bin"
+if exist "%BIN%\gcc.exe" (
+    set "PATH=%BIN%;%PATH%"
+) else (
+    where gcc >nul 2>nul
     if errorlevel 1 (
-        echo Missing dotnet SDK needed to build DeepSeek XUnity translator endpoint.
+        echo Missing gcc. Install w64devkit and add its bin directory to PATH, or place it at %BIN%.
         exit /b 1
     )
-    dotnet build "%XUT%" -c Release --nologo
-    if errorlevel 1 exit /b 1
+    where windres >nul 2>nul
+    if errorlevel 1 (
+        echo Missing windres. Install w64devkit and add its bin directory to PATH, or place it at %BIN%.
+        exit /b 1
+    )
+)
+
+set "XUT=%ROOT%payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src\DeepSeekXUnityTranslator.csproj"
+set "XUT_CORE=%ROOT%payloads\UnityIL2CPP\XUnityAutoTranslator\BepInEx\plugins\XUnity.AutoTranslator\XUnity.AutoTranslator.Plugin.Core.dll"
+if exist "%XUT%" (
+    if exist "%XUT_CORE%" (
+        where dotnet >nul 2>nul
+        if errorlevel 1 (
+            echo Missing dotnet SDK needed to build DeepSeek XUnity translator endpoint.
+            exit /b 1
+        )
+        dotnet build "%XUT%" -c Release --nologo
+        if errorlevel 1 exit /b 1
+    ) else (
+        echo Skipping DeepSeek XUnity endpoint source build: XUnity.AutoTranslator runtime was not found.
+        if exist "%ROOT%payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll" (
+            echo Existing payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll will be used.
+        ) else (
+            echo Missing DeepSeek XUnity endpoint payload. Run scripts\install_runtime_payloads.ps1 -UnityIL2CPP first, or use the program release that embeds this first-party DLL.
+            exit /b 1
+        )
+    )
 )
 
 set "TMPF=%ROOT%payloads\UnityIL2CPP\DeepSeekTMPFontFallback\src\DeepSeekTMPFontFallback.csproj"
@@ -65,7 +89,12 @@ if exist "%TMPF%" (
         echo Built DeepSeek TMP font fallback plugin for IL2CPP.
     ) else (
         echo Skipping DeepSeek TMP font fallback source build: IL2CPP_INTEROP_DIR is not set and UnityInteropRefs was not found.
-        echo Existing payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll will be used.
+        if exist "%ROOT%payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll" (
+            echo Existing payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll will be used.
+        ) else (
+            echo Missing DeepSeek TMP font fallback payload. Set IL2CPP_INTEROP_DIR to a generated IL2CPP interop reference folder, or use the program release that embeds this first-party DLL.
+            exit /b 1
+        )
     )
 )
 
@@ -116,7 +145,14 @@ if exist "%UT%" (
         echo Built UnityTranslator Mono payloads for BepInEx 5 and BepInEx 6.
     ) else (
         echo Skipping UnityTranslator Mono source build: UNITY_MANAGED_DIR is not set and UnityManagedRefs was not found.
-        echo Existing payloads\UnityTranslator\UnityTranslator.dll and UnityTranslator.BepInEx6.dll will be used.
+        set "UT_PAYLOAD_READY=0"
+        if exist "%ROOT%payloads\UnityTranslator\UnityTranslator.dll" if exist "%ROOT%payloads\UnityTranslator\UnityTranslator.BepInEx6.dll" set "UT_PAYLOAD_READY=1"
+        if "!UT_PAYLOAD_READY!"=="1" (
+            echo Existing payloads\UnityTranslator\UnityTranslator.dll and UnityTranslator.BepInEx6.dll will be used.
+        ) else (
+            echo Missing UnityTranslator Mono payloads. Set UNITY_MANAGED_DIR to a Unity Managed folder so both BepInEx 5 and 6 plugin DLLs can be built, or use the program release that embeds these first-party DLLs.
+            exit /b 1
+        )
     )
 )
 
@@ -131,7 +167,7 @@ if exist "%UT_JSON%" (
 set "SVR=%ROOT%native\src\server"
 set "SVR_SRC=%SVR%\main.c %SVR%\util.c %SVR%\buf.c %SVR%\b64.c %SVR%\json.c %SVR%\cache.c %SVR%\api.c %SVR%\http.c"
 
-gcc -std=c17 -O2 -D_CRT_SECURE_NO_WARNINGS -DWIN32_LEAN_AND_MEAN -I"%SVR%" %SVR_SRC% -lws2_32 -lwinhttp -o "%ROOT%native\dst_server.exe"
+gcc -std=c17 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS -DWIN32_LEAN_AND_MEAN -I"%SVR%" %SVR_SRC% -lws2_32 -lwinhttp -o "%ROOT%native\dst_server.exe"
 if errorlevel 1 exit /b 1
 
 set "RES_RC=%ROOT%build\launcher_payloads.rc"
@@ -157,9 +193,15 @@ windres "%RES_RC%" -O coff -o "%RES_OBJ%"
 if errorlevel 1 exit /b 1
 
 set "LCH=%ROOT%native\src\launcher"
-set "LCH_SRC=%LCH%\main.c %LCH%\globals.c %LCH%\fsutil.c %LCH%\engine.c %LCH%\deploy.c %LCH%\server_proc.c %LCH%\api_config.c %LCH%\warmup.c %LCH%\ui.c %LCH%\self_update.c"
+set "LCH_SRC=%LCH%\main.c %LCH%\globals.c %LCH%\fsutil.c %LCH%\engine.c %LCH%\deploy.c %LCH%\server_proc.c %LCH%\api_config.c %LCH%\warmup.c %LCH%\godot_warmup.c %LCH%\godot_patch.c %LCH%\ui.c %LCH%\self_update.c"
+set "LAUNCHER_TMP=%ROOT%build\launcher_build.exe"
 
-gcc -std=c17 -O2 -municode -mwindows -D_CRT_SECURE_NO_WARNINGS -I"%LCH%" %LCH_SRC% "%RES_OBJ%" -lcomctl32 -lshell32 -lole32 -lmsimg32 -lwinhttp -o "%ROOT%DeepSeekTranslator.exe"
+rem Build to an ASCII temp path first; gcc/binutils handle the final binary
+rem bytes there, then PowerShell moves it to the Chinese product filename.
+gcc -std=c17 -O2 -Wall -Wextra -Werror -municode -mwindows -D_CRT_SECURE_NO_WARNINGS -DDS_TRANSLATOR_VERSION=\"%APP_VERSION%\" -I"%LCH%" %LCH_SRC% "%RES_OBJ%" -lcomctl32 -lshell32 -lole32 -lmsimg32 -lwinhttp -o "%LAUNCHER_TMP%"
+if errorlevel 1 exit /b 1
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $ds='ds'+[string][char]0x6e38+[string][char]0x620f+[string][char]0x7ffb+[string][char]0x8bd1+[string][char]0x5668; $dest = Join-Path $env:ROOT ($ds + '.exe'); if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force }; Move-Item -LiteralPath $env:LAUNCHER_TMP -Destination $dest -Force; $legacy = Join-Path $env:ROOT 'DeepSeekTranslator.exe'; if (Test-Path -LiteralPath $legacy) { Remove-Item -LiteralPath $legacy -Force }"
 if errorlevel 1 exit /b 1
 
 echo Built native server and launcher.
