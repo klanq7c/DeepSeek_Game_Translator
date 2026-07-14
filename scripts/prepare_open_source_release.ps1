@@ -55,6 +55,7 @@ $includeFiles = @(
 )
 
 $includeDirs = @(
+    "assets",
     "native\src",
     "payloads\UnityTranslator\src",
     "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src",
@@ -76,6 +77,8 @@ $excludedExtensions = @(
     ".dll", ".exe", ".pdb", ".mdb", ".otf", ".ttf", ".ttc", ".woff", ".woff2",
     ".zip", ".7z", ".rar", ".tsv", ".log"
 )
+
+$binaryAssetExtensions = @(".ico", ".png")
 
 function Is-SafeSourceFile([System.IO.FileInfo]$file) {
     $relative = $file.FullName.Substring($repo.Length).TrimStart("\", "/")
@@ -148,6 +151,9 @@ $scanPatterns = @(
 )
 
 foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) {
+    if ($binaryAssetExtensions -contains $file.Extension.ToLowerInvariant()) {
+        continue
+    }
     $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
     foreach ($pattern in $scanPatterns) {
         if ($text -match $pattern) {
