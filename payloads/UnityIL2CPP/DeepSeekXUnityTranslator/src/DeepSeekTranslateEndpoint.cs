@@ -83,20 +83,26 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         if (original.Length <= 1)
         {
             string source = ReadStringProperty(data, "source");
-            if (IsUnresolvedSource(source))
+            if (!IsResolvedSource(source))
             {
                 context.Fail("DeepSeek local server has no resolved translation yet.");
                 return;
             }
 
             string one = ReadStringProperty(data, "translated_text") ?? ReadStringProperty(data, "translation");
+            one = PrepareDisplayTranslation(one);
             if (string.IsNullOrEmpty(one))
             {
                 context.Fail("DeepSeek local server returned no translation.");
                 return;
             }
+            if (string.Equals(one, original[0], StringComparison.Ordinal))
+            {
+                context.Fail("DeepSeek local server returned the untranslated source text.");
+                return;
+            }
 
-            context.Complete(PrepareDisplayTranslation(one));
+            context.Complete(one);
             return;
         }
 
@@ -114,28 +120,89 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         }
 
         string[] sources = ReadStringArrayProperty(data, "sources");
-        if (HasUnresolvedSource(sources, original.Length))
+        if (!HasOnlyResolvedSources(sources, original.Length))
         {
             context.Fail("DeepSeek local server has unresolved batch translations.");
             return;
         }
+        results = PrepareDisplayTranslations(results);
+        for (int i = 0; i < results.Length; i++)
+        {
+            if (string.IsNullOrEmpty(results[i]) || string.Equals(results[i], original[i], StringComparison.Ordinal))
+            {
+                context.Fail("DeepSeek local server returned an unresolved batch item.");
+                return;
+            }
+        }
 
-        context.Complete(PrepareDisplayTranslations(results));
+        context.Complete(results);
     }
 
     private string[] PrepareDisplayTranslations(string[] values)
     {
-        if (!_displaySafePunctuation || values == null) return values;
+        if (values == null) return values;
         for (int i = 0; i < values.Length; i++)
         {
-            values[i] = NormalizeForTmpDisplay(values[i]);
+            values[i] = StripTranslationPromptEchoPrefix(values[i]);
+            if (_displaySafePunctuation)
+            {
+                values[i] = NormalizeForTmpDisplay(values[i]);
+            }
         }
         return values;
     }
 
     private string PrepareDisplayTranslation(string value)
     {
+        value = StripTranslationPromptEchoPrefix(value);
         return _displaySafePunctuation ? NormalizeForTmpDisplay(value) : value;
+    }
+
+    private static readonly string[] TranslationPromptEchoPrefixes =
+    {
+        "\u7ffb\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587",
+        "\u7ffb\u8bd1\u4e3a\u7b80\u4f53\u4e2d\u6587",
+        "\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587",
+        "\u7b80\u4f53\u4e2d\u6587\u7ffb\u8bd1",
+        "\u7b80\u4f53\u4e2d\u6587\u8bd1\u6587",
+        "Simplified Chinese translation",
+        "Translation to Simplified Chinese",
+        "Translate to Simplified Chinese",
+        "Translated into Simplified Chinese",
+        "Translate this exact game text to Simplified Chinese. Return only the translation."
+    };
+
+    private static string StripTranslationPromptEchoPrefix(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return text;
+        string candidate = text.TrimStart();
+        bool changed = false;
+        for (int pass = 0; pass < 3; pass++)
+        {
+            bool stripped = false;
+            foreach (string prefix in TranslationPromptEchoPrefixes)
+            {
+                if (!candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                int index = prefix.Length;
+                while (index < candidate.Length && (candidate[index] == ' ' || candidate[index] == '\t')) index++;
+                if (index < candidate.Length && (candidate[index] == ':' || candidate[index] == '\uff1a'))
+                {
+                    index++;
+                }
+                else if (index >= candidate.Length || (candidate[index] != '\r' && candidate[index] != '\n'))
+                {
+                    continue;
+                }
+                while (index < candidate.Length && char.IsWhiteSpace(candidate[index])) index++;
+                if (index >= candidate.Length) continue;
+                candidate = candidate.Substring(index).TrimEnd();
+                changed = true;
+                stripped = true;
+                break;
+            }
+            if (!stripped) break;
+        }
+        return changed ? candidate : text;
     }
 
     private static string BuildPayload(string[] texts, bool single)
@@ -145,7 +212,7 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         {
             sb.Append("{\"text\":");
             AppendJsonString(sb, texts[0]);
-            sb.Append('}');
+            sb.Append(",\"cache_only\":true}");
         }
         else
         {
@@ -155,15 +222,17 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
                 if (i != 0) sb.Append(',');
                 AppendJsonString(sb, texts[i]);
             }
-            sb.Append("]}");
+            sb.Append("],\"cache_only\":true}");
         }
         return sb.ToString();
     }
 
     private static string TrimSlash(string value)
     {
-        if (string.IsNullOrEmpty(value)) return "http://127.0.0.1:19999";
-        return value.Trim().TrimEnd('/');
+        string trimmed = value?.Trim();
+        if (string.IsNullOrEmpty(trimmed)) return "http://127.0.0.1:19999";
+        trimmed = trimmed.TrimEnd('/');
+        return string.IsNullOrEmpty(trimmed) ? "http://127.0.0.1:19999" : trimmed;
     }
 
     private static int Clamp(int value, int min, int max)
@@ -297,20 +366,21 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         }
     }
 
-    private static bool IsUnresolvedSource(string source)
+    private static bool IsResolvedSource(string source)
     {
-        return string.Equals(source, "miss", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(source, "queued", StringComparison.OrdinalIgnoreCase);
+        return string.Equals(source, "cache", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(source, "api", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(source, "api_batch", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool HasUnresolvedSource(string[] sources, int expectedLength)
+    private static bool HasOnlyResolvedSources(string[] sources, int expectedLength)
     {
         if (sources == null || sources.Length != expectedLength) return false;
         for (int i = 0; i < sources.Length; i++)
         {
-            if (IsUnresolvedSource(sources[i])) return true;
+            if (!IsResolvedSource(sources[i])) return false;
         }
-        return false;
+        return true;
     }
 
     private static void AppendJsonString(StringBuilder sb, string value)

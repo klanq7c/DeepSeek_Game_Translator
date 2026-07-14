@@ -36,13 +36,13 @@ void http_set_ctx(HttpCtx *ctx) { g_ctx = ctx; }
 /* Sized for whole-script Ren'Py warmups (30k lines): jobs are ~150 bytes, so
    the worst case stays around 10 MB while the queue drains through the API. */
 #define ASYNC_QUEUE_LIMIT 65536              /* 异步队列上限，防失控占满内存 */
-#define ASYNC_BATCH_MAX 16                   /* 单批最多合并的文本数 */
-#define ASYNC_BATCH_CHAR_BUDGET 3200         /* 单批字符预算，控制单次 API 请求体量 */
+#define ASYNC_BATCH_MAX 48                   /* 单批最多合并的文本数 */
+#define ASYNC_BATCH_CHAR_BUDGET 9600         /* 单批字符预算，控制单次 API 请求体量 */
 #define ASYNC_BATCH_COALESCE_MS 25           /* 合批等待窗口：攒够一批或超时即发 */
 #define ASYNC_FOREGROUND_YIELD_MS 25         /* 后台等待前台清空的轮询间隔 */
 #define ASYNC_KNOWN_BUCKETS 8192             /* 去重哈希桶数（须为 2 的幂） */
-#define LIVE_BATCH_MAX 16
-#define LIVE_BATCH_CHAR_BUDGET 3200
+#define LIVE_BATCH_MAX 48
+#define LIVE_BATCH_CHAR_BUDGET 9600
 #define LIVE_BATCH_COALESCE_MS 35
 #define HTTP_REQUEST_BUFFER_POOL_LIMIT 32    /* 仅缓存固定 64 KiB 初始块，常驻上限约 2 MiB */
 
@@ -298,24 +298,41 @@ static int mem_ieq(const char *a, const char *b, size_t n) {
 /* 在请求头区域中查找指定头名的值起点（跳过冒号后空白）。
    headers_end 限定搜索边界（避免越过头部进入 body）。
    返回的指针指向 headers_end 之前，调用方按行尾截断取值。 */
-static char *header_value(char *req, char *headers_end, const char *name) {
-    size_t nl = strlen(name);
+static int parse_content_length(char *req, char *headers_end,
+                                size_t *value_out, int *present_out) {
+    static const char name[] = "Content-Length";
+    const size_t nl = sizeof name - 1;
     char *p = strstr(req, "\r\n");
-    if (!p || p >= headers_end) return NULL;
+    *value_out = 0;
+    *present_out = 0;
+    if (!p || p >= headers_end) return 0;
     p += 2;
     while (p < headers_end) {
         char *line_end = strstr(p, "\r\n");
         if (!line_end || line_end > headers_end) line_end = headers_end;
         char *colon = memchr(p, ':', (size_t)(line_end - p));
         if (colon && (size_t)(colon - p) == nl && mem_ieq(p, name, nl)) {
+            if (*present_out) return 0;
             char *v = colon + 1;
             while (v < line_end && (*v == ' ' || *v == '\t')) v++;
-            return v;
+            if (v == line_end || *v < '0' || *v > '9') return 0;
+
+            size_t value = 0;
+            while (v < line_end && *v >= '0' && *v <= '9') {
+                size_t digit = (size_t)(*v - '0');
+                if (value > (SIZE_MAX - digit) / 10) return 0;
+                value = value * 10 + digit;
+                v++;
+            }
+            while (v < line_end && (*v == ' ' || *v == '\t')) v++;
+            if (v != line_end) return 0;
+            *value_out = value;
+            *present_out = 1;
         }
         if (line_end == headers_end) break;
         p = line_end + 2;
     }
-    return NULL;
+    return 1;
 }
 
 /* 取 JSON 体中某个布尔字段是否为真。先用 strstr 快速短路，避免对大 body
@@ -324,7 +341,7 @@ static int json_bool_true(const char *json, const char *key) {
     /* If the key text isn't even a substring of the body, it can't be a key;
        skip json_key's allocating full-body scan (it parses every string). */
     if (!strstr(json, key)) return 0;
-    const char *p = json_key(json, key);
+    const char *p = json_top_key(json, key);
     if (!p) return 0;
     return !strncmp(p, "true", 4) || !strncmp(p, "1", 1);
 }
@@ -1031,7 +1048,7 @@ static const char *json_object_end(const char *p) {
    不落盘——导入的数据由后续新增翻译触发持久化，或保留在内存供本次运行使用）。
    用 json_object_end 逐个对象切片再解析，避免 value 含 '}' 时误切。 */
 static void op_import(Buf *b, const char *json) {
-    const char *p = json_key(json, "entries");
+    const char *p = json_top_key(json, "entries");
     int n = 0;
     if (p && *p == '[') {
         p++;
@@ -1041,8 +1058,8 @@ static void op_import(Buf *b, const char *json) {
             const char *end = json_object_end(obj);
             if (!end) break;
             char *tmp = xstrndup(obj, (size_t)(end - obj));
-            char *k = json_get_str(tmp, "key");
-            char *v = json_get_str(tmp, "value");
+            char *k = json_top_get_str(tmp, "key");
+            char *v = json_top_get_str(tmp, "value");
             if (k && v && *k && *v) {
                 cache_set(g_ctx->cache, k, v);
                 n++;
@@ -1090,31 +1107,62 @@ static void serve_one(SOCKET s) {
     char *req = request_buffer_acquire();
     req[0] = 0;
     size_t n = 0;
+    size_t expected_total = 0;
+    int headers_complete = 0;
+    int request_error = 0;
     int r;
     for (;;) {
         if (n + 1 >= cap) {
-            if (cap >= HTTP_MAX_REQ) break;
+            if (cap >= HTTP_MAX_REQ) {
+                request_error = 413;
+                break;
+            }
             size_t new_cap = cap * 2;
             if (new_cap > HTTP_MAX_REQ) new_cap = HTTP_MAX_REQ;
             req = xrealloc(req, new_cap + 1);
             cap = new_cap;
         }
         r = recv(s, req + n, (int)(cap - n), 0);
-        if (r <= 0) break;
+        if (r <= 0) {
+            if (!headers_complete || n < expected_total) request_error = 400;
+            break;
+        }
         n += (size_t)r;
         req[n] = 0;
         char *he = strstr(req, "\r\n\r\n");
         if (he) {
             size_t hl = (size_t)(he + 4 - req);
-            char *cl = header_value(req, he, "Content-Length");
-            size_t need = 0;
-            if (cl) {
-                unsigned long long parsed = strtoull(cl, NULL, 10);
-                size_t budget = (hl <= HTTP_MAX_REQ) ? (HTTP_MAX_REQ - hl) : 0;
-                need = parsed > budget ? budget : (size_t)parsed;
+            size_t body_length = 0;
+            int has_content_length = 0;
+            if (!parse_content_length(req, he, &body_length, &has_content_length)) {
+                request_error = 400;
+                break;
             }
-            if (n >= hl + need) break;
+            (void)has_content_length;
+            if (hl > HTTP_MAX_REQ || body_length > HTTP_MAX_REQ - hl) {
+                request_error = 413;
+                break;
+            }
+            expected_total = hl + body_length;
+            headers_complete = 1;
+            if (n >= expected_total) {
+                n = expected_total;
+                req[n] = 0;
+                break;
+            }
         }
+    }
+
+    if (!headers_complete && !request_error) request_error = 400;
+    if (request_error) {
+        if (request_error == 413) {
+            resp(s, 413, "Payload Too Large", "{\"error\":\"payload_too_large\"}");
+        } else {
+            resp(s, 400, "Bad Request", "{\"error\":\"incomplete_request\"}");
+        }
+        request_buffer_release(req, cap);
+        closesocket(s);
+        return;
     }
 
     /* 解析请求行（方法 + 路径），拆出查询串，路径统一转小写以简化匹配。 */
@@ -1194,17 +1242,17 @@ static void serve_one(SOCKET s) {
         op_cache_export(&out);
         resp(s, 200, "OK", out.data);
     } else if (ieq(method, "POST") && ieq(path, "/cache/lookup")) {
-        List l = json_array(body, "texts");
+        List l = json_top_array(body, "texts");
         op_lookup(&out, &l);
         list_free(&l);
         resp(s, 200, "OK", out.data);
     } else if (ieq(method, "POST") && (ieq(path, "/translate") || ieq(path, "/batch") || ieq(path, "/"))) {
         /* JSON 批量/单条翻译。兼容 texts 数组与单 text 字段两种入参；
            "/" 别名用于某些钩子的默认端点。cache_only 从 body 读取。 */
-        List l = json_array(body, "texts");
+        List l = json_top_array(body, "texts");
         char *one = NULL;
         if (!l.n) {
-            one = json_get_str(body, "text");
+            one = json_top_get_str(body, "text");
             if (one) list_push(&l, xstrdup(one));
         }
         if (!l.n) {
@@ -1217,10 +1265,10 @@ static void serve_one(SOCKET s) {
         list_free(&l);
     } else if (ieq(method, "POST") && (ieq(path, "/prefetch") || ieq(path, "/warmup"))) {
         /* 异步预热：入参同上，但不等待翻译，立即返回排队数。 */
-        List l = json_array(body, "texts");
+        List l = json_top_array(body, "texts");
         char *one = NULL;
         if (!l.n) {
-            one = json_get_str(body, "text");
+            one = json_top_get_str(body, "text");
             if (one) list_push(&l, xstrdup(one));
         }
         op_prefetch(&out, &l);

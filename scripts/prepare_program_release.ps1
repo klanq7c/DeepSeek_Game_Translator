@@ -43,7 +43,7 @@ function Copy-ReleaseFile([string]$SourceRelative, [string]$DestRelative = $Sour
     Copy-Item -LiteralPath $src -Destination $dst -Force
 }
 
-Copy-ReleaseFile "DeepSeekTranslator.exe" "$DsName.exe"
+Copy-ReleaseFile "$DsName.exe" "$DsName.exe"
 Copy-ReleaseFile "README.md" "README.md"
 Copy-ReleaseFile "LICENSE" "LICENSE"
 Copy-ReleaseFile "THIRD_PARTY_NOTICES.md" "THIRD_PARTY_NOTICES.md"

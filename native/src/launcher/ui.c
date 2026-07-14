@@ -22,6 +22,7 @@
 #include "deploy.h"
 #include "engine.h"
 #include "fsutil.h"
+#include "godot_patch.h"
 #include "server_proc.h"
 #include "warmup.h"
 
@@ -34,6 +35,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+
+#ifndef DS_TRANSLATOR_VERSION
+#define DS_TRANSLATOR_VERSION "dev"
+#endif
+#define DS_WIDEN2(x) L##x
+#define DS_WIDEN(x) DS_WIDEN2(x)
+#define DS_TRANSLATOR_VERSION_W L"v" DS_WIDEN(DS_TRANSLATOR_VERSION)
 
 /* ---- 日志限制 ---- */
 #define LOG_SOFT_LIMIT 900000   /* 日志缓冲区软上限（字节） */
@@ -437,10 +445,10 @@ void paint_background(HWND hwnd, HDC dc) {
     /* Rail footer: version chip + runtime tag */
     int footY = r.bottom - sc(58);
     int footH = sc(26);
-    RECT chip = {sc(20), footY, sc(88), footY + footH};
+    RECT chip = {sc(20), footY, sc(104), footY + footH};
     draw_round(dc, chip, C_CARD_ELEV, C_LINE_BRIGHT, sc(6));
-    draw_text_x(dc, L"v3.1.70", sc(20), footY, sc(68), footH, C_ACCENT, g_font_mono_small, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-    draw_text_x(dc, L"C native runtime", sc(94), footY, rail - sc(102), footH, C_MUTED, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, DS_TRANSLATOR_VERSION_W, sc(20), footY, sc(84), footH, C_ACCENT, g_font_mono_small, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, L"C native runtime", sc(112), footY, rail - sc(120), footH, C_MUTED, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
     /* Main area geometry */
     int x = ui.x;
@@ -628,21 +636,278 @@ void browse_folder(void) {
 }
 
 /* 启动游戏进程：在指定目录中查找可执行文件并用 ShellExecuteW 打开 */
-void launch_game(const WCHAR *dir) {
+static void launch_game_with_params(const WCHAR *dir, const WCHAR *params) {
     WCHAR exe[MAX_PATH * 4];
     if (!find_exe(dir, exe, MAX_PATH * 4)) {
         append_log(L"未找到游戏 exe。");
         return;
     }
     append_log(L"启动游戏：%s", exe);
-    ShellExecuteW(g_main, L"open", exe, NULL, dir, SW_SHOWNORMAL);
+    ShellExecuteW(g_main, L"open", exe, params, dir, SW_SHOWNORMAL);
+}
+
+void launch_game(const WCHAR *dir) {
+    launch_game_with_params(dir, NULL);
+}
+
+/* A release template may omit command-line script support. Parse the generated
+   bridge in a short hidden process before trusting it with the visible launch. */
+static int godot_runtime_sidecar_preflight(const WCHAR *dir, const WCHAR *pack,
+                                           const WCHAR *script, int loose_project) {
+    WCHAR exe[MAX_PATH * 4];
+    if (!dir || !script || !script[0] || !find_exe(dir, exe, MAX_PATH * 4)) return 0;
+
+    WCHAR cmd[MAX_PATH * 12];
+    if (loose_project) {
+        _snwprintf(cmd, MAX_PATH * 12,
+                   L"\"%s\" --path \"%s\" --script \"res://dst_godot_runtime.gd\" --check-only",
+                   exe, dir);
+    } else if (pack && pack[0]) {
+        _snwprintf(cmd, MAX_PATH * 12,
+                   L"\"%s\" --main-pack \"%s\" --script \"%s\" --check-only",
+                   exe, pack, script);
+    } else {
+        _snwprintf(cmd, MAX_PATH * 12, L"\"%s\" --script \"%s\" --check-only", exe, script);
+    }
+    cmd[MAX_PATH * 12 - 1] = 0;
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si);
+    memset(&pi, 0, sizeof pi);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, dir, &si, &pi)) {
+        append_log(L"Godot: runtime sidecar preflight could not start. Windows error: %lu", GetLastError());
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+
+    DWORD waited = WaitForSingleObject(pi.hProcess, 5000);
+    DWORD exit_code = 1;
+    int ok = waited == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &exit_code) && exit_code == 0;
+    if (waited == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 1000);
+        append_log(L"Godot: runtime sidecar preflight timed out.");
+    } else if (!ok) {
+        append_log(L"Godot: runtime sidecar preflight exited with code %lu.", exit_code);
+    }
+    CloseHandle(pi.hProcess);
+    return ok;
+}
+
+static int launch_godot_with_pack(const WCHAR *dir, const WCHAR *pack) {
+    WCHAR exe[MAX_PATH * 4];
+    if (!find_exe(dir, exe, MAX_PATH * 4)) {
+        append_log(L"Game exe not found.");
+        return 0;
+    }
+
+    WCHAR script[MAX_PATH * 4];
+    path_join(script, MAX_PATH * 4, dir, L"dst_godot_runtime.gd");
+    int prepared_runtime_bridge = godot_prepare_runtime_sidecar(dir) && exists_path(script);
+    int has_runtime_bridge = prepared_runtime_bridge &&
+                             godot_runtime_sidecar_preflight(dir, pack, script, 0);
+    if (prepared_runtime_bridge && !has_runtime_bridge) {
+        append_log(L"Godot: runtime sidecar preflight failed; falling back to the static launch path.");
+    }
+
+    WCHAR cmd[MAX_PATH * 12];
+    if (has_runtime_bridge) {
+        _snwprintf(cmd, MAX_PATH * 12,
+                   L"\"%s\" --main-pack \"%s\" --script \"%s\" --language en",
+                   exe, pack, script);
+    } else {
+        _snwprintf(cmd, MAX_PATH * 12, L"\"%s\" --main-pack \"%s\" --language en", exe, pack);
+    }
+    cmd[MAX_PATH * 12 - 1] = 0;
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si);
+    memset(&pi, 0, sizeof pi);
+    si.cb = sizeof si;
+
+    append_log(has_runtime_bridge
+        ? L"Launching Godot export with patch pack and runtime translator: %s"
+        : L"Launching Godot export with static patch pack: %s", exe);
+    if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
+        append_log(L"Godot: failed to launch with patch pack. Windows error: %lu", GetLastError());
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 1;
+}
+
+static int launch_godot_export_with_runtime_sidecar(const WCHAR *dir) {
+    WCHAR exe[MAX_PATH * 4], script[MAX_PATH * 4];
+    if (!find_exe(dir, exe, MAX_PATH * 4)) {
+        append_log(L"Game exe not found.");
+        return 0;
+    }
+    if (!godot_prepare_runtime_sidecar(dir)) return 0;
+    path_join(script, MAX_PATH * 4, dir, L"dst_godot_runtime.gd");
+    if (!exists_path(script) || !godot_runtime_sidecar_preflight(dir, NULL, script, 0)) {
+        append_log(L"Godot: runtime sidecar preflight failed; falling back to the static launch path.");
+        return 0;
+    }
+
+    WCHAR cmd[MAX_PATH * 12];
+    _snwprintf(cmd, MAX_PATH * 12,
+               L"\"%s\" --script \"%s\" --language en", exe, script);
+    cmd[MAX_PATH * 12 - 1] = 0;
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si);
+    memset(&pi, 0, sizeof pi);
+    si.cb = sizeof si;
+
+    append_log(L"Launching Godot export with runtime translator before static patch is ready: %s", exe);
+    if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
+        append_log(L"Godot: failed to launch export runtime sidecar. Windows error: %lu", GetLastError());
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 1;
+}
+
+static int launch_godot_with_runtime_sidecar(const WCHAR *dir) {
+    WCHAR exe[MAX_PATH * 4], script[MAX_PATH * 4];
+    if (!find_exe(dir, exe, MAX_PATH * 4)) {
+        append_log(L"Game exe not found.");
+        return 0;
+    }
+    path_join(script, MAX_PATH * 4, dir, L"dst_godot_runtime.gd");
+    if (!exists_path(script) || !godot_runtime_sidecar_preflight(dir, NULL, script, 1)) {
+        append_log(L"Godot: runtime sidecar preflight failed; falling back to the normal launch path.");
+        return 0;
+    }
+
+    WCHAR cmd[MAX_PATH * 12];
+    _snwprintf(cmd, MAX_PATH * 12,
+               L"\"%s\" --path \"%s\" --script \"res://dst_godot_runtime.gd\" --language en",
+               exe, dir);
+    cmd[MAX_PATH * 12 - 1] = 0;
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si);
+    memset(&pi, 0, sizeof pi);
+    si.cb = sizeof si;
+
+    append_log(L"Launching Godot loose project with runtime translator: %s", exe);
+    if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
+        append_log(L"Godot: failed to launch with runtime sidecar. Windows error: %lu", GetLastError());
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 1;
+}
+
+static void launch_game_for_engine(const WCHAR *dir, Engine engine) {
+    if (engine == ENGINE_GODOT) {
+        if (godot_is_loose_project(dir)) {
+            if (godot_prepare_runtime_sidecar(dir)) {
+                append_log(L"Godot: loose project detected; launching with runtime translation sidecar.");
+                if (launch_godot_with_runtime_sidecar(dir)) return;
+                append_log(L"Godot: runtime-sidecar launch failed; falling back to normal game launch.");
+            } else {
+                append_log(L"Godot: runtime sidecar could not be prepared; falling back to normal game launch.");
+            }
+            launch_game(dir);
+            return;
+        }
+        godot_promote_staged_patch_pack(dir);
+        WCHAR pack[MAX_PATH * 4];
+        path_join(pack, MAX_PATH * 4, dir, L"dst_godot_patch.pck");
+        if (exists_path(pack)) {
+            append_log(L"Godot: launching with external translation patch pack.");
+            if (launch_godot_with_pack(dir, pack)) return;
+            append_log(L"Godot: patch-pack launch failed; falling back to normal game launch.");
+        } else {
+            append_log(L"Godot: no patch pack yet; using the generic runtime translator for this launch.");
+            if (launch_godot_export_with_runtime_sidecar(dir)) return;
+            append_log(L"Godot: export runtime-sidecar launch failed; falling back to normal game launch.");
+        }
+    }
+    launch_game(dir);
 }
 
 /* 预热+启动工作线程参数：传递游戏目录和引擎类型到后台线程 */
+static int start_godot_patch_worker(const WCHAR *dir) {
+    if (!dir || !dir[0]) return 0;
+
+    WCHAR exe[MAX_PATH * 4];
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH * 4)) return 0;
+
+    WCHAR cmd[MAX_PATH * 12];
+    _snwprintf(cmd, MAX_PATH * 12, L"\"%s\" --godot-patch-worker \"%s\"", exe, dir);
+    cmd[MAX_PATH * 12 - 1] = 0;
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si);
+    memset(&pi, 0, sizeof pi);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    DWORD flags = CREATE_NO_WINDOW;
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, flags, NULL,
+                        g_root[0] ? g_root : NULL, &si, &pi)) {
+        append_log(L"Godot: failed to start patch refresh worker. Windows error: %lu", GetLastError());
+        return 0;
+    }
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    append_log(L"Godot: patch refresh worker started.");
+    return 1;
+}
+
 typedef struct {
     WCHAR dir[MAX_PATH * 4];
     Engine engine;
 } WarmupLaunchArgs;
+
+static void run_engine_launch_flow(const WCHAR *dir, Engine engine) {
+    if (engine == ENGINE_RENPY) {
+        /* Ren'Py render callbacks never wait on HTTP; daemon workers handle
+           cache and live lookups, so the game can start while the whole-script
+           prefetch queues behind it. Unity/XUnity keep import-before-launch:
+           their plugins issue live lookups that should hit imported rows. */
+        launch_game_for_engine(dir, engine);
+        set_status(L"已启动 · 正在后台预热剧本...");
+        warmup_translations(dir, engine);
+    } else if (engine == ENGINE_GODOT) {
+        WCHAR patch[MAX_PATH * 4];
+        path_join(patch, MAX_PATH * 4, dir, L"dst_godot_patch.pck");
+        int had_patch = exists_path(patch);
+        if (had_patch) {
+            append_log(L"Godot: existing patch pack found; launching before detached patch refresh.");
+            launch_game_for_engine(dir, engine);
+            set_status(L"Godot: 已启动，正在后台预热缓存...");
+            if (!start_godot_patch_worker(dir))
+                append_log(L"Godot: detached patch refresh did not start; current game continues with the existing pack.");
+        } else {
+            append_log(L"Godot: no patch pack yet; launching first and starting detached patch preparation for the next start.");
+            launch_game_for_engine(dir, engine);
+            set_status(L"Godot: 已启动，正在后台准备翻译补丁...");
+            if (!start_godot_patch_worker(dir))
+                append_log(L"Godot: detached patch preparation did not start; game was already started normally.");
+        }
+    } else {
+        warmup_translations(dir, engine);
+        launch_game_for_engine(dir, engine);
+    }
+    set_status(L"已启动 · 本地缓存 + 实时批量 API");
+}
 
 /* warmup scans up to tens of MB of asset files and does synchronous HTTP, so it
    runs on a worker thread to keep the UI responsive. launch_game uses
@@ -651,19 +916,7 @@ typedef struct {
 static DWORD WINAPI warmup_launch_thread(LPVOID p) {
     WarmupLaunchArgs *a = (WarmupLaunchArgs *)p;
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    if (a->engine == ENGINE_RENPY) {
-        /* The Ren'Py hook only does cache_only lookups and never waits on the
-           live API, so the game can start right away while the whole-script
-           prefetch queues behind it. Unity/XUnity keep import-before-launch:
-           their plugins issue live lookups that should hit imported rows. */
-        launch_game(a->dir);
-        set_status(L"已启动 · 正在后台预热剧本...");
-        warmup_translations(a->dir, a->engine);
-    } else {
-        warmup_translations(a->dir, a->engine);
-        launch_game(a->dir);
-    }
-    set_status(L"已启动 · 本地缓存 + 实时批量 API");
+    run_engine_launch_flow(a->dir, a->engine);
     if (SUCCEEDED(hr)) CoUninitialize();
     free(a);
     return 0;
@@ -693,6 +946,7 @@ void start_translation(void) {
     else if (e == ENGINE_RPGM_MV) deployed = deploy_rpgm(g_game);
     else if (e == ENGINE_UNITY) deployed = deploy_unity(g_game);
     else if (e == ENGINE_UNITY_IL2CPP) deployed = deploy_unity_il2cpp(g_game);
+    else if (e == ENGINE_GODOT) deployed = deploy_godot(g_game);
     else if (e == ENGINE_RPGM_LEGACY) append_log(L"RPGM XP/VX：离线写入器仍待迁移，当前保留本地缓存服务。");
     else append_log(L"未知引擎：只启动服务端和游戏。");
     append_log(deployed ? L"部署完成。" : L"部署跳过或未完成。");
@@ -713,7 +967,5 @@ void start_translation(void) {
         }
         free(args); /* CreateThread failed: fall back to the synchronous path */
     }
-    warmup_translations(g_game, e);
-    launch_game(g_game);
-    set_status(L"已启动 · 本地缓存 + 实时批量 API");
+    run_engine_launch_flow(g_game, e);
 }

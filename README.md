@@ -1,34 +1,42 @@
 # ds游戏翻译器
 
-版本：`0.3.1.7`
+版本：`0.3.2.7`
 
 ds游戏翻译器是一个本地游戏翻译工具，目标是支持：
 
 - Ren'Py 游戏
 - RPG Maker 游戏，包括旧版本和 MV/MZ 风格项目
 - Unity 游戏，包括 Mono/BepInEx、BepInEx 5/6、IL2CPP/XUnity 相关路径
+- Godot 游戏，当前支持导出包/工程识别，并可扫描 `.po`、`.csv`、`.gd`、`.tscn`、`.tres`、`.translation` 和 `.pck` 中的可翻译文本做缓存预热
 
 程序会在本机启动一个 C 语言本地翻译/缓存服务，并由启动器按游戏引擎部署对应 hook 或插件。设计目标是：缓存命中立即返回，缓存未命中时后台请求 API，尽量不让游戏运行时等待远程接口。
 
-> 本项目与 DeepSeek、Unity、BepInEx、XUnity.AutoTranslator、Ren'Py、RPG Maker 或任何游戏厂商均无官方关联。相关名称只用于说明兼容目标。
+> 本项目与 DeepSeek、Unity、BepInEx、XUnity.AutoTranslator、Ren'Py、RPG Maker、Godot 或任何游戏厂商均无官方关联。相关名称只用于说明兼容目标。
 
 ## 下载
 
 最新下载地址：
 
-https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.3.1.7
+https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.3.2.7
 
 推荐下载：
 
-- `ds游戏翻译器_0.3.1.7.exe`：单文件启动器。首次运行会自动释放/更新本项目自有服务端、脚本、示例配置和自有 Unity 插件。
-- `ds游戏翻译器_0.3.1.7.zip`：带说明文档和许可文件的 Windows 程序包，核心仍是 `ds游戏翻译器.exe`。
-- `DeepSeek_Game_Translator_source_0.3.1.7.zip`：源码包，只包含自有源码、测试和文档。
+- `ds游戏翻译器_0.3.2.7.exe`：单文件启动器。首次运行会自动释放/更新本项目自有服务端、脚本、示例配置和自有 Unity 插件。
+- `ds游戏翻译器_0.3.2.7.zip`：带说明文档和许可文件的 Windows 程序包，核心仍是 `ds游戏翻译器.exe`。
+- `DeepSeek_Game_Translator_source_0.3.2.7.zip`：源码包，只包含自有源码、测试和文档。
 
-为了降低侵权和授权风险，下载包不直接内置 BepInEx、XUnity、Unity 官方 DLL、游戏文件、字体包、翻译记忆或 API key。Unity 第三方运行时由用户通过命令行脚本从上游项目下载。
+## 20260715 更新日志
+
+1. 添加了对 Godot 引擎的翻译支持（现在还在优化阶段）。
+2. 解决了 Ren'Py 翻译模块对于多选择项语句的翻译延迟问题。
+3. 解决了 RPG Maker 模块对于长文本翻译的文本框溢出以及文本刷新问题。
+4. 对 Unity 游戏的支持项目进行了优化。
+
+为了降低侵权和授权风险，下载包不直接内置 BepInEx、XUnity、Unity 官方 DLL、游戏文件、TMP 字体包、翻译记忆或 API key。Unity 第三方运行时和 XUnity TMP 字体 AssetBundle 由用户通过命令行脚本从上游项目下载。
 
 ## 使用方式
 
-1. 下载 `ds游戏翻译器_0.3.1.7.exe`，或解压 `ds游戏翻译器_0.3.1.7.zip` 后运行里面的 `ds游戏翻译器.exe`。
+1. 下载 `ds游戏翻译器_0.3.2.7.exe`，或解压 `ds游戏翻译器_0.3.2.7.zip` 后运行里面的 `ds游戏翻译器.exe`。
 2. 首次运行时，启动器会自动生成/更新这些自有组件：
    - `native\dst_server.exe`
    - `scripts\install_runtime_payloads.ps1`
@@ -43,7 +51,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 
 5. 回到启动器，选择游戏目录，然后点击开始翻译。
 
-Ren'Py 和 RPG Maker 路径不需要下载 BepInEx/XUnity。Unity 路径如果缺少 payload，启动器日志会提示对应的安装命令。
+Ren'Py、RPG Maker 和 Godot 路径不需要下载 BepInEx/XUnity。Unity 路径如果缺少 payload，启动器日志会提示对应的安装命令。Godot 当前走资源文本扫描和本地缓存预热模式，会识别 PO/CSV 翻译表、GDScript `tr()`/`TranslationServer.translate()` 文本、常见场景资源文本以及 `.pck/.translation` 里的 UTF-8 文本；不会改写游戏包。
 
 完整用户说明见 `docs/USER_GUIDE.md`。
 
@@ -70,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -U
 
 ## 更新方式
 
-从 `0.3.1.7` 起，启动器会把本项目自有组件嵌入 `ds游戏翻译器.exe`。大多数更新只需要替换 `ds游戏翻译器.exe`，再次启动后它会自动同步：
+从 `0.3.2.7` 起，启动器会把本项目自有组件嵌入 `ds游戏翻译器.exe`。大多数更新只需要替换 `ds游戏翻译器.exe`，再次启动后它会自动同步：
 
 - `native\dst_server.exe`
 - `scripts\install_runtime_payloads.ps1`
@@ -97,7 +105,7 @@ concurrency=4
 
 ## 当前状态
 
-这是 `0.3.1.7` 预览版。主要源码路径：
+这是 `0.3.2.7` 预览版。主要源码路径：
 
 - `native/src/`：本地 C 服务端和 Windows 启动器。
 - `payloads/UnityTranslator/src/`：Unity Mono/BepInEx 插件源码。
@@ -109,9 +117,11 @@ concurrency=4
 
 本地开发需要：
 
-- Windows C 工具链，例如 w64devkit。
+- Windows C 工具链，例如 w64devkit。可以把 `gcc.exe`/`windres.exe` 所在目录加入 `PATH`，也可以放在 `native/toolchain/w64devkit/bin/`。
 - .NET SDK。
-- 构建 Unity 插件时，需要本地 Unity/BepInEx/XUnity 引用 DLL。
+- 如需从 source-only 源码包构建完整 Unity 功能，先运行 `scripts\install_runtime_payloads.ps1 -All` 下载 BepInEx/XUnity/Newtonsoft/TMP 字体包。
+- 构建 Unity Mono 插件时，需要设置 `UNITY_MANAGED_DIR` 指向目标 Unity 版本的 `Managed` DLL 目录；构建 IL2CPP TMP 字体兜底插件时，需要设置 `IL2CPP_INTEROP_DIR` 指向 BepInEx 为目标游戏生成的 interop DLL 目录。
+- 如果只是直接使用 Release 程序包，`ds游戏翻译器.exe` 已嵌入本项目自有服务端和一方 Unity 插件 DLL，不需要自己编译这些源码。
 
 源码仓库不会发布第三方运行时二进制或 Unity/游戏程序集。依赖边界见：
 
@@ -137,7 +147,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_all.ps1 -SkipEndurance
 发布源码包前运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version 0.3.1.7
+powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version 0.3.2.7
 ```
 
 该脚本会生成 source-only 包，并自动检查是否误带：

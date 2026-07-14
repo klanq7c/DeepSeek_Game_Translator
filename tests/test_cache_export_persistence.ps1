@@ -54,6 +54,11 @@ function Wait-Server {
 
 $tmp = Join-Path $env:TEMP ("dst_cache_export_" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tmp | Out-Null
+$root = Split-Path -Parent $PSScriptRoot
+$serverSrc = Join-Path $root "native\src\server"
+$gcc = Join-Path $root "native\toolchain\w64devkit\bin\gcc.exe"
+$probe = Join-Path $tmp "cache_persistence_probe.exe"
+$probeCache = Join-Path $tmp "overwrite-cache.tsv"
 $cache = Join-Path $tmp "cache.tsv"
 $key = "persist_long_key_$(Get-Random)"
 $value = "V" * (70 * 1024)
@@ -69,6 +74,22 @@ try {
 
     Write-Host ""
     Write-Host "=== Cache export and persisted long rows ===" -ForegroundColor Cyan
+
+    It "Overwritten persisted values survive process restart" {
+        $env:PATH = (Split-Path -Parent $gcc) + ";" + $env:PATH
+        & $gcc -std=c17 -O2 -D_CRT_SECURE_NO_WARNINGS -I $serverSrc `
+            (Join-Path $PSScriptRoot "cache_persistence_probe.c") `
+            (Join-Path $serverSrc "cache.c") (Join-Path $serverSrc "b64.c") `
+            (Join-Path $serverSrc "buf.c") (Join-Path $serverSrc "util.c") `
+            -o $probe
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $probe)) {
+            throw "cache persistence probe build failed"
+        }
+        & $probe write $probeCache
+        if ($LASTEXITCODE -ne 0) { throw "cache persistence probe write failed" }
+        & $probe read $probeCache
+        if ($LASTEXITCODE -ne 0) { throw "persisted overwrite was lost after restart" }
+    }
 
     It "Persisted TSV row above 64KB loads intact" {
         $body = @{ text = $key } | ConvertTo-Json -Compress

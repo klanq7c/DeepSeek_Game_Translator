@@ -24,3 +24,6 @@ char *json_str(const char **pp);                        /* 解析 pp 指向的 J
 const char *json_key(const char *json, const char *key);/* 定位到 key 对应值的起始位置（不解码），未命中返回 NULL */
 char *json_get_str(const char *json, const char *key);  /* 取 key 对应的字符串值并解码，未命中返回 NULL */
 List json_array(const char *json, const char *key);     /* 取 key 对应数组里的所有字符串元素 */
+const char *json_top_key(const char *json, const char *key); /* 仅定位根对象的直接字段 */
+char *json_top_get_str(const char *json, const char *key);   /* 仅取根对象的直接字符串字段 */
+List json_top_array(const char *json, const char *key);      /* 仅取根对象的直接字符串数组字段 */

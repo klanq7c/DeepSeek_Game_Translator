@@ -15,18 +15,22 @@
 #include <string.h>
 
 /* 插入/覆盖一个条目，调用者必须已持有 lock。
-   接管 k、v 的所有权（覆盖时释放旧 v 和多余 k）。
-   返回 1=新增条目，0=覆盖已有键。 */
+   接管 k、v 的所有权。返回 0=值未变化，1=新增，2=覆盖为新值。 */
 static int cache_insert_locked(Cache *c, char *k, char *v) {
     uint64_t h = h64(k);
     size_t m = c->cap - 1;
     size_t i = (size_t)h & m;
     while (c->e[i].used) {
         if (c->e[i].h == h && strcmp(c->e[i].k, k) == 0) {
+            if (strcmp(c->e[i].v, v) == 0) {
+                free(k);
+                free(v);
+                return 0;
+            }
             free(c->e[i].v);
             free(k);
             c->e[i].v = v;
-            return 0;
+            return 2;
         }
         i = (i + 1) & m;
     }
@@ -67,36 +71,49 @@ void cache_init(Cache *c, const char *path) {
 /* 仅写内存。空键/空值直接忽略（绝不能把空值当作翻译结果写入）。 */
 void cache_set(Cache *c, const char *k, const char *v) {
     if (!k || !v || !*k || !*v) return;
+    char *clean = xstrdup(v);
+    normalize_translation_result(clean);
+    if (!*clean) {
+        free(clean);
+        return;
+    }
     AcquireSRWLockExclusive(&c->lock);
     if ((c->len + 1) * 10 > c->cap * 7) cache_rehash_locked(c);
-    (void)cache_insert_locked(c, xstrdup(k), xstrdup(v));
+    (void)cache_insert_locked(c, xstrdup(k), clean);
     ReleaseSRWLockExclusive(&c->lock);
 }
 
-/* 写内存 + 仅当是新增条目时追加落盘。
-   70% 负载阈值 (len*10 > cap*7) 触发 rehash，保持探测链短。 */
+/* 写内存，并在新增或值变化时追加落盘。相同值不会重复扩大 TSV。
+   io_lock 串行化持久化写者的更新顺序，但磁盘 IO 不占用表锁。 */
 void cache_set_persist(Cache *c, const char *k, const char *v) {
     if (!k || !v || !*k || !*v) return;
+
+    char *clean = xstrdup(v);
+    normalize_translation_result(clean);
+    if (!*clean) {
+        free(clean);
+        return;
+    }
+    char *ek = b64enc(k);
+    char *ev = b64enc(clean);
+    AcquireSRWLockExclusive(&c->io_lock);
     AcquireSRWLockExclusive(&c->lock);
     if ((c->len + 1) * 10 > c->cap * 7) cache_rehash_locked(c);
-    int is_new = cache_insert_locked(c, xstrdup(k), xstrdup(v));
+    int changed = cache_insert_locked(c, xstrdup(k), clean);
     ReleaseSRWLockExclusive(&c->lock);
-    if (!is_new) return;
 
-    /* Encode and append outside the map lock: during warmup bursts the API
-       workers persist continuously, and disk IO held under `lock` stalled
-       every game-facing lookup (visible as in-game hitches). */
-    char *ek = b64enc(k);
-    char *ev = b64enc(v);
-    AcquireSRWLockExclusive(&c->io_lock);
-    FILE *f = (FILE *)c->persist_f;
-    if (!f) {
-        f = fopen(c->path, "ab");
-        c->persist_f = f;
-    }
-    if (f) {
-        fprintf(f, "%s\t%s\n", ek, ev);
-        fflush(f);
+    if (changed) {
+        /* Appending stays outside the map lock: game-facing cache reads must
+           not wait for disk IO during warmup bursts. */
+        FILE *f = (FILE *)c->persist_f;
+        if (!f) {
+            f = fopen(c->path, "ab");
+            c->persist_f = f;
+        }
+        if (f) {
+            fprintf(f, "%s\t%s\n", ek, ev);
+            fflush(f);
+        }
     }
     ReleaseSRWLockExclusive(&c->io_lock);
     free(ek);
@@ -222,6 +239,7 @@ void cache_load(Cache *c) {
         while (end > tab && (end[-1] == '\n' || end[-1] == '\r')) *--end = 0;
         char *k = b64dec(line, strlen(line));
         char *v = b64dec(tab, strlen(tab));
+        normalize_translation_result(v);
         if (*k && *v) {
             if ((c->len + 1) * 10 > c->cap * 7) cache_rehash_locked(c);
             (void)cache_insert_locked(c, k, v);

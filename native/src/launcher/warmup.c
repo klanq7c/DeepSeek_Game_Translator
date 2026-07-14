@@ -6,8 +6,9 @@
  *   1. 文本采集：扫描各引擎的数据文件，提取需要翻译的字符串
  *      - Ren'Py：解析 .rpy 脚本中的字符串字面量
  *      - RPG Maker MV/MZ：解析 www/data/ 下 JSON 文件中的对话/名称字段
- *      - Unity：扫描 *_Data/ 下 assets 二进制文件中的 ASCII 字符串，
+ *      - Unity：扫描 *_Data/ 下 assets/AssetBundle 二进制文件中的 ASCII 字符串，
  *        以及 XUnity 的 Translation/zh-CN/Text/ 下翻译文件
+ *      - Godot：委托 godot_warmup.c 扫描 .pck 和常见工程资源
  *
  *   2. 文本过滤：通过 should_warm_text 等函数过滤掉 URL、文件名、
  *      已含中文的文本、Unity 内部标识符等不需要翻译的内容
@@ -25,6 +26,7 @@
 
 #include "warmup.h"
 #include "fsutil.h"
+#include "warmup_internal.h"
 #include "ui.h"
 
 #include <stdint.h>
@@ -36,16 +38,16 @@
 #include <winhttp.h>
 
 /* ---- 预热容量与扫描限制 ---- */
-#define WARMUP_MAX_ITEMS 1200              /* 未指定引擎容量时的保守默认值 */
 #define RPGM_WARMUP_MAX_ITEMS 40000        /* 大型 RPG Maker 游戏的数据与插件文本上限 */
 #define UNITY_WARMUP_MAX_ITEMS 8000        /* Unity 资源扫描最大采集条数 */
 /* Ren'Py 脚本全是高质量对话，且服务器会去重并异步排队缺失项，
    因此可以预热整个脚本。1200 条只够覆盖典型 VN 的前几个文件，
    导致大部分台词在首次显示时才翻译（中英文闪烁）。 */
-#define RENPY_WARMUP_MAX_ITEMS 30000       /* Ren'Py 脚本最大采集条数 */
-#define WARMUP_BATCH_ITEMS 256             /* 每批提交到服务器的条数 */
-#define WARMUP_MAX_TEXT_BYTES 1200         /* 单条文本最大字节数 */
+#define RENPY_WARMUP_MAX_ITEMS 100000      /* Ren'Py 脚本最大采集条数 */
+#define WARMUP_BATCH_ITEMS 512             /* 每批提交到服务器的条数 */
 #define UNITY_ASSET_SCAN_MAX_BYTES (64u * 1024u * 1024u)   /* Unity .assets 扫描上限 64MB */
+#define UNITY_BUNDLE_SCAN_MAX_BYTES (256ull * 1024ull * 1024ull) /* 大包只流式扫描前 256MB */
+#define UNITY_BUNDLE_SCAN_CHUNK_BYTES (1024u * 1024u)
 #define RENPY_SCRIPT_SCAN_MAX_BYTES (8u * 1024u * 1024u)   /* 单个 .rpy 扫描上限 8MB */
 #define RENPY_SCAN_MAX_DEPTH 12            /* .rpy 目录递归最大深度 */
 
@@ -59,34 +61,21 @@ typedef struct {
     size_t seen_cap;
 } PairList;
 
-/* 纯文本列表：用于后台预翻译排队 */
-typedef struct {
-    char **items;
-    size_t n;
-    size_t cap;
-    const char **seen; /* 开放寻址去重索引（延迟分配） */
-    size_t seen_cap;
-    size_t max_items; /* 0 表示使用 WARMUP_MAX_ITEMS */
-} TextList;
-
 /* 返回列表的最大条目数上限 */
-static size_t textlist_limit(const TextList *l) {
+size_t textlist_limit(const TextList *l) {
     return l->max_items ? l->max_items : WARMUP_MAX_ITEMS;
 }
 
-static void textlist_add(TextList *l, const char *s);
-static int bb_init(ByteBuf *b, size_t cap);
-
 /* ======================== 通用字符串工具 ======================== */
 
-static int wide_ends_with_i(const WCHAR *s, const WCHAR *suffix) {
+int wide_ends_with_i(const WCHAR *s, const WCHAR *suffix) {
     size_t sl = s ? wcslen(s) : 0;
     size_t tl = suffix ? wcslen(suffix) : 0;
     return sl >= tl && !_wcsicmp(s + sl - tl, suffix);
 }
 
 /* 复制 s 的前 n 个字节到新分配的内存（自动加 NUL 终止） */
-static char *dup_range(const char *s, size_t n) {
+char *dup_range(const char *s, size_t n) {
     char *p = (char *)malloc(n + 1);
     if (!p) return NULL;
     memcpy(p, s, n);
@@ -95,7 +84,7 @@ static char *dup_range(const char *s, size_t n) {
 }
 
 /* 去除字符串首尾的空白字符（空格/制表/回车/换行），原地修改 */
-static char *trim_ascii(char *s) {
+char *trim_ascii(char *s) {
     while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
     size_t n = strlen(s);
     while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n')) s[--n] = 0;
@@ -135,7 +124,7 @@ static int has_cjk_utf8(const char *s) {
  *   - 不含任何字母或非 ASCII 字符（纯数字/符号）
  *   - 已含 CJK 汉字（不需要翻译）
  * ---------------------------------------------------------------- */
-static int should_warm_text(const char *s) {
+int should_warm_text(const char *s) {
     size_t len = strlen(s);
     if (len < 2 || len > WARMUP_MAX_TEXT_BYTES) return 0;
     if (strchr(s, '\\') || strstr(s, "://") || strstr(s, ".png") || strstr(s, ".ogg") || strstr(s, ".m4a")) return 0;
@@ -218,6 +207,82 @@ static int should_warm_rpgm_text(const char *s) {
     return result;
 }
 
+static int rpgm_prefix_code(const char *code, size_t n) {
+    char buf[8];
+    if (!code || n == 0 || n >= sizeof buf) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = code[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        buf[i] = c;
+    }
+    buf[n] = 0;
+    if (!strcmp(buf, "pop")) return 1;
+    if (!strcmp(buf, "n") || !strcmp(buf, "nc") || !strcmp(buf, "nr")) return 1;
+    if (n == 2 && buf[0] == 'n' && buf[1] >= '1' && buf[1] <= '5') return 1;
+    if (!strcmp(buf, "nd") || !strcmp(buf, "ndc") || !strcmp(buf, "ndr")) return 1;
+    if (n == 3 && buf[0] == 'n' && buf[1] == 'd' && buf[2] >= '1' && buf[2] <= '5') return 1;
+    if (!strcmp(buf, "nt") || !strcmp(buf, "ntc") || !strcmp(buf, "ntr")) return 1;
+    if (n == 3 && buf[0] == 'n' && buf[1] == 't' && buf[2] >= '1' && buf[2] <= '5') return 1;
+    return 0;
+}
+
+static char *dup_rpgm_prefixed_body(const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    size_t i = 0;
+    int moved = 0;
+    for (;;) {
+        if (s[i] == '\\') {
+            size_t code = i + 1;
+            size_t end = code;
+            while (end < len &&
+                   ((s[end] >= 'A' && s[end] <= 'Z') ||
+                    (s[end] >= 'a' && s[end] <= 'z'))) {
+                end++;
+            }
+            if (end < len && (s[code] == 'n' || s[code] == 'N') &&
+                s[end] >= '1' && s[end] <= '5') {
+                end++;
+            }
+            if (!rpgm_prefix_code(s + code, end - code)) break;
+            if (end < len && s[end] == '[') {
+                const char *close = strchr(s + end + 1, ']');
+                if (!close || close - (s + end) > 64) break;
+                i = (size_t)(close - s) + 1;
+                moved = 1;
+                continue;
+            }
+            if (end < len && s[end] == '<') {
+                const char *close = strchr(s + end + 1, '>');
+                if (!close || close - (s + end) > 64) break;
+                i = (size_t)(close - s) + 1;
+                moved = 1;
+                continue;
+            }
+            break;
+        }
+        if (s[i] == '<') {
+            const char *close = strchr(s + i + 1, '>');
+            if (!close || close - (s + i) > 64) break;
+            i = (size_t)(close - s) + 1;
+            moved = 1;
+            continue;
+        }
+        break;
+    }
+    if (!moved || i >= len) return NULL;
+    char *body = (char *)malloc(len - i + 1);
+    if (!body) return NULL;
+    memcpy(body, s + i, len - i + 1);
+    char *trimmed = trim_ascii(body);
+    if (trimmed != body) memmove(body, trimmed, strlen(trimmed) + 1);
+    if (!*body) {
+        free(body);
+        return NULL;
+    }
+    return body;
+}
+
 /* 判断字符串是否纯 ASCII（无多字节 UTF-8 序列） */
 static int ascii_only(const char *s) {
     const unsigned char *p = (const unsigned char *)s;
@@ -229,7 +294,7 @@ static int ascii_only(const char *s) {
 }
 
 /* 检查 s 是否包含 chars 中的任一字符 */
-static int contains_any(const char *s, const char *chars) {
+int contains_any(const char *s, const char *chars) {
     for (; s && *s; s++) {
         if (strchr(chars, *s)) return 1;
     }
@@ -237,7 +302,7 @@ static int contains_any(const char *s, const char *chars) {
 }
 
 /* 不区分大小写检查 s 是否以 word 开头，且后面是分隔符或行尾 */
-static int starts_with_word_i(const char *s, const char *word) {
+int starts_with_word_i(const char *s, const char *word) {
     size_t n = strlen(word);
     return !_strnicmp(s, word, n) &&
            (s[n] == 0 || s[n] == ' ' || s[n] == '\t' || s[n] == ':' || s[n] == '(');
@@ -305,7 +370,7 @@ static int should_warm_unity_asset_text(const char *s) {
 /* ======================== ByteBuf 与 JSON 解析辅助 ======================== */
 
 /* 向 ByteBuf 追加单个字符 */
-static void bb_ch(ByteBuf *b, char c) {
+void bb_ch(ByteBuf *b, char c) {
     bb_add(b, &c, 1);
 }
 
@@ -414,6 +479,16 @@ static int rpgm_text_key(const char *key) {
            !strcmp(key, "description") ||
            !strcmp(key, "profile") ||
            !strcmp(key, "displayName") ||
+           !strcmp(key, "header") ||
+           !strcmp(key, "tech_description") ||
+           !strcmp(key, "basic") ||
+           !strcmp(key, "commands") ||
+           !strcmp(key, "params") ||
+           !strcmp(key, "elements") ||
+           !strcmp(key, "equipTypes") ||
+           !strcmp(key, "weaponTypes") ||
+           !strcmp(key, "armorTypes") ||
+           !strcmp(key, "skillTypes") ||
            !strcmp(key, "message1") ||
            !strcmp(key, "message2") ||
            !strcmp(key, "message3") ||
@@ -421,9 +496,9 @@ static int rpgm_text_key(const char *key) {
 }
 
 /* 判断 RPG Maker 事件命令 code 是否含对话/选项文本
- *   101 = Show Choices（选项）
- *   102 = Show Choices
- *   401 = Show Text（对话）
+ *   101 = Show Text（对话起始）
+ *   102 = Show Choices（选项）
+ *   401 = Show Text（对话续行）
  *   405 = Show Scrolling Text（滚动文本）
  */
 static int rpgm_text_command(int code) {
@@ -434,6 +509,11 @@ static int rpgm_text_command(int code) {
 static void collect_string(char *s, TextList *prefetch) {
     char *t = trim_ascii(s);
     if (should_warm_rpgm_text(t)) textlist_add(prefetch, t);
+    char *body = dup_rpgm_prefixed_body(t);
+    if (body) {
+        if (should_warm_rpgm_text(body)) textlist_add(prefetch, body);
+        free(body);
+    }
 }
 
 /* Ren'Py 使用更严格的过滤，避免把脚本标识符和资源名加入预热队列。 */
@@ -472,6 +552,75 @@ static void collect_array_strings(const char **pp, TextList *prefetch) {
     *pp = p;
 }
 
+typedef struct {
+    ByteBuf text;
+    int active;
+    int lines;
+} RpgmMessageBlock;
+
+static void rpgm_message_block_clear(RpgmMessageBlock *block) {
+    if (!block) return;
+    free(block->text.data);
+    memset(block, 0, sizeof *block);
+}
+
+static void rpgm_message_block_flush(RpgmMessageBlock *block, TextList *prefetch) {
+    if (!block || !block->active) return;
+    if (block->lines > 1 && block->text.data) collect_string(block->text.data, prefetch);
+    rpgm_message_block_clear(block);
+}
+
+static int rpgm_message_block_begin(RpgmMessageBlock *block) {
+    rpgm_message_block_clear(block);
+    if (!bb_init(&block->text, 128)) return 0;
+    block->active = 1;
+    return 1;
+}
+
+static void rpgm_message_block_append(RpgmMessageBlock *block, const char *line, TextList *prefetch) {
+    if (!line || !*line) return;
+    if (!block->active && !rpgm_message_block_begin(block)) return;
+    size_t n = strlen(line);
+    size_t extra = n + (block->lines ? 1u : 0u);
+    if (block->text.len + extra > WARMUP_MAX_TEXT_BYTES) {
+        rpgm_message_block_flush(block, prefetch);
+        if (n > WARMUP_MAX_TEXT_BYTES || !rpgm_message_block_begin(block)) return;
+    }
+    if (block->lines) bb_ch(&block->text, '\n');
+    bb_add(&block->text, line, n);
+    block->lines++;
+}
+
+static void collect_rpgm_command_parameters(int code, const char **pp, TextList *prefetch,
+                                            RpgmMessageBlock *block) {
+    const char *p = json_ws(*pp);
+    if (*p != '[') return;
+    int depth = 0;
+    int string_index = 0;
+    do {
+        if (*p == '[') {
+            depth++;
+            p++;
+        } else if (*p == ']') {
+            depth--;
+            p++;
+        } else if (*p == '"') {
+            char *s = json_string_at(&p);
+            if (s) {
+                if (code == 401 && depth == 1 && string_index == 0) {
+                    rpgm_message_block_append(block, s, prefetch);
+                }
+                collect_string(s, prefetch);
+                string_index++;
+                free(s);
+            }
+        } else {
+            p++;
+        }
+    } while (*p && depth > 0);
+    *pp = p;
+}
+
 /* ======================== Ren'Py 脚本解析 ======================== */
 
 /* ----------------------------------------------------------------
@@ -480,7 +629,7 @@ static void collect_array_strings(const char **pp, TextList *prefetch) {
  * 支持 " 和 ' 两种引号，处理 \n \r \t \uXXXX 转义。
  * 跳过三引号字符串（""" 或 '''）——这些通常是文档字符串。
  * ---------------------------------------------------------------- */
-static char *renpy_string_at(const char **pp) {
+char *renpy_string_at(const char **pp) {
     const char *p = *pp;
     char quote = *p;
     if (quote != '"' && quote != '\'') return NULL;
@@ -570,6 +719,28 @@ static int renpy_skip_statement(const char *line, const char *first_quote) {
            *line == '#';
 }
 
+/* A valid Ren'Py dialogue/menu line can contain adjacent string literals.
+   Collect each literal from the same accepted line so warmup keys match all
+   text the renderer may expose, while keeping the existing statement filter. */
+static void collect_renpy_line_strings(const char *line, TextList *prefetch) {
+    if (!line || !prefetch || prefetch->n >= textlist_limit(prefetch)) return;
+    const char *cursor = renpy_first_quote(line);
+    if (!cursor || renpy_skip_statement(line, cursor)) return;
+
+    size_t seen = 0;
+    while (*cursor && seen < 16u && prefetch->n < textlist_limit(prefetch)) {
+        char *text = renpy_string_at(&cursor);
+        if (!text) break;
+        collect_renpy_string(text, prefetch);
+        free(text);
+        seen++;
+
+        const char *next = renpy_first_quote(cursor);
+        if (!next) break;
+        cursor = next;
+    }
+}
+
 /* ----------------------------------------------------------------
  * bb_json — 将字符串 JSON 转义后追加到 ByteBuf
  * 转义 " \ \n \r \t，其他控制字符用 \uXXXX 形式输出
@@ -596,7 +767,7 @@ static void bb_json(ByteBuf *b, const char *s) {
 }
 
 /* 初始化可增长字节缓冲。成功后 data 归 ByteBuf/调用方所有，最终必须 free。 */
-static int bb_init(ByteBuf *b, size_t cap) {
+int bb_init(ByteBuf *b, size_t cap) {
     b->len = 0;
     b->cap = cap ? cap : 64;
     b->data = (char *)malloc(b->cap);
@@ -654,7 +825,7 @@ static void dedup_add(const char ***pslots, size_t *pcap, const char *s, size_t 
 }
 
 /* 复制并接管一条待预热文本；超长、重复或超过引擎容量上限时直接忽略。 */
-static void textlist_add(TextList *l, const char *s) {
+void textlist_add(TextList *l, const char *s) {
     if (!s || !*s || strlen(s) > WARMUP_MAX_TEXT_BYTES) return;
     if (dedup_contains(l->seen, l->seen_cap, s)) return;
     if (l->n >= textlist_limit(l)) return;
@@ -708,7 +879,7 @@ static void pairlist_add(PairList *l, const char *k, const char *v) {
 }
 
 /* 释放 TextList 拥有的文本、指针数组和只借用这些文本地址的去重表。 */
-static void textlist_free(TextList *l) {
+void textlist_free(TextList *l) {
     for (size_t i = 0; i < l->n; i++) free(l->items[i]);
     free(l->items);
     free(l->seen);
@@ -1165,6 +1336,14 @@ static int unity_asset_file_name(const WCHAR *name) {
     return 0;
 }
 
+/* Common AssetBundle extensions used by Unity games and visual-novel tools.
+   They may be much larger than .assets files, so callers must stream them. */
+static int unity_bundle_file_name(const WCHAR *name) {
+    return wide_ends_with_i(name, L".unity3d") ||
+           wide_ends_with_i(name, L".bundle") ||
+           wide_ends_with_i(name, L".assetbundle");
+}
+
 /* 检查 .assets 文件大小是否在扫描上限内（防止扫描超大文件） */
 static int small_enough_to_scan(const WCHAR *path) {
     WIN32_FILE_ATTRIBUTE_DATA d;
@@ -1172,6 +1351,14 @@ static int small_enough_to_scan(const WCHAR *path) {
     if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return 0;
     if (d.nFileSizeHigh) return 0;
     return d.nFileSizeLow <= UNITY_ASSET_SCAN_MAX_BYTES;
+}
+
+int file_size_at_most(const WCHAR *path, DWORD max_bytes) {
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &d)) return 0;
+    if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return 0;
+    if (d.nFileSizeHigh) return 0;
+    return d.nFileSizeLow <= max_bytes;
 }
 
 /* ----------------------------------------------------------------
@@ -1258,6 +1445,199 @@ static void collect_unity_asset_text(char *s, TextList *prefetch) {
     }
 }
 
+static int unity_bundle_text_byte(unsigned char c) {
+    return (c >= 32 && c <= 126) || c == '\t' || c == '\r' || c == '\n';
+}
+
+static int looks_like_unity_bundle_text(const char *text) {
+    size_t len = strlen(text);
+    if (len < 4 || len > 500) return 0;
+
+    size_t letters = 0;
+    size_t lowercase = 0;
+    size_t visible = 0;
+    int has_angle_pair = strchr(text, '<') && strchr(text, '>');
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        unsigned char c = *p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            letters++;
+            if (c >= 'a' && c <= 'z') lowercase++;
+            visible++;
+            continue;
+        }
+        if (c >= '0' && c <= '9') {
+            visible++;
+            continue;
+        }
+        if (c == ' ' || c == '\t') continue;
+        if (strchr(".,?!:;'\"-+&()[]*", c)) {
+            visible++;
+            continue;
+        }
+        if (has_angle_pair && strchr("<>=/#", c)) {
+            visible++;
+            continue;
+        }
+        return 0;
+    }
+    if (letters < 3 || lowercase < 2 || visible == 0 || letters * 2 < visible) return 0;
+
+    const unsigned char *start = (const unsigned char *)text;
+    if (start[0] == '-' && start[1] == ' ') start += 2;
+    while (*start && strchr("\"'([", *start)) start++;
+    if (*start < 'A' || *start > 'Z') return 0;
+
+    for (const unsigned char *p = (const unsigned char *)text; *p;) {
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z'))) {
+            p++;
+            continue;
+        }
+        const unsigned char *word_start = p;
+        size_t word_letters = 0;
+        size_t word_upper = 0;
+        size_t word_lower = 0;
+        while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || *p == '\'') {
+            if (*p >= 'A' && *p <= 'Z') {
+                word_upper++;
+                word_letters++;
+            } else if (*p >= 'a' && *p <= 'z') {
+                word_lower++;
+                word_letters++;
+            }
+            p++;
+        }
+        if (word_letters == 1 && word_start[0] != 'A' && word_start[0] != 'I' && word_start[0] != 'a') return 0;
+        if (word_upper && word_lower &&
+            (!(word_start[0] >= 'A' && word_start[0] <= 'Z') || word_upper != 1)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* AssetBundle custom payloads often surround dialogue with short binary fields
+   instead of Unity's usual u32 string length. Remove only high-confidence
+   serialization residue and feed the result through the existing strict Unity
+   text filter. Shared translation memory remains untouched. */
+static void collect_unity_bundle_segment(char *segment, TextList *prefetch) {
+    char *text = trim_ascii(segment);
+    if (!*text) return;
+
+    for (;;) {
+        if (*text != '[') break;
+        char *close = strchr(text + 1, ']');
+        if (!close || close - text > 96) break;
+        int metadata = 0;
+        for (char *p = text + 1; p < close; p++) {
+            if (*p == ':') {
+                metadata = 1;
+                break;
+            }
+        }
+        if (!metadata) break;
+        text = trim_ascii(close + 1);
+    }
+    if (!*text) return;
+
+    size_t len = strlen(text);
+    size_t boundary = (size_t)-1;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] == '.' || text[i] == '?' || text[i] == '!') boundary = i;
+    }
+    /* A single printable byte directly after sentence punctuation is usually
+       the next serialized field (for example "Hi honey.0" or "What?("). */
+    if (boundary != (size_t)-1 && boundary + 2 == len) {
+        text[boundary + 1] = 0;
+        len = boundary + 1;
+    }
+    /* Bullet/objective text in several bundle serializers is followed by a
+       one-byte field without a delimiter. A trailing backslash is another
+       observed field marker. Restrict this repair to bullet text so legitimate
+       identifiers and ordinary prose are not changed. */
+    if (len > 4 && text[0] == '-' && text[1] == ' ' &&
+        ((text[len - 1] >= '0' && text[len - 1] <= '9') || text[len - 1] == '\\') &&
+        ((text[len - 2] >= 'A' && text[len - 2] <= 'Z') ||
+         (text[len - 2] >= 'a' && text[len - 2] <= 'z'))) {
+        text[--len] = 0;
+    }
+    if (!looks_like_unity_bundle_text(text)) return;
+    collect_unity_asset_text(text, prefetch);
+}
+
+static void collect_unity_bundle_run(char *run, TextList *prefetch) {
+    char *line = run;
+    while (*line && prefetch->n < textlist_limit(prefetch)) {
+        char *end = strpbrk(line, "\r\n");
+        if (end) *end = 0;
+        collect_unity_bundle_segment(line, prefetch);
+        if (!end) break;
+        line = end + 1;
+        while (*line == '\r' || *line == '\n') line++;
+    }
+}
+
+/* Stream large AssetBundle containers with bounded memory. Only printable
+   runs up to the normal warmup text limit are retained; oversized runs are
+   discarded until the next binary delimiter. */
+static void scan_unity_bundle_file(const WCHAR *path, TextList *prefetch) {
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
+        CloseHandle(file);
+        return;
+    }
+    ULONGLONG remaining = (ULONGLONG)size.QuadPart;
+    if (remaining > UNITY_BUNDLE_SCAN_MAX_BYTES) remaining = UNITY_BUNDLE_SCAN_MAX_BYTES;
+
+    unsigned char *chunk = (unsigned char *)malloc(UNITY_BUNDLE_SCAN_CHUNK_BYTES);
+    char *run = (char *)malloc(WARMUP_MAX_TEXT_BYTES + 1u);
+    if (!chunk || !run) {
+        free(chunk);
+        free(run);
+        CloseHandle(file);
+        return;
+    }
+
+    size_t run_len = 0;
+    int overflow = 0;
+    while (remaining && prefetch->n < textlist_limit(prefetch)) {
+        DWORD request = remaining > UNITY_BUNDLE_SCAN_CHUNK_BYTES
+                      ? UNITY_BUNDLE_SCAN_CHUNK_BYTES : (DWORD)remaining;
+        DWORD read = 0;
+        if (!ReadFile(file, chunk, request, &read, NULL) || read == 0) break;
+        remaining -= read;
+        for (DWORD i = 0; i < read; i++) {
+            unsigned char c = chunk[i];
+            if (unity_bundle_text_byte(c)) {
+                if (!overflow && run_len < WARMUP_MAX_TEXT_BYTES) {
+                    run[run_len++] = (char)c;
+                } else {
+                    overflow = 1;
+                }
+                continue;
+            }
+            if (!overflow && run_len >= 2) {
+                run[run_len] = 0;
+                collect_unity_bundle_run(run, prefetch);
+            }
+            run_len = 0;
+            overflow = 0;
+            if (prefetch->n >= textlist_limit(prefetch)) break;
+        }
+    }
+    if (!overflow && run_len >= 2 && prefetch->n < textlist_limit(prefetch)) {
+        run[run_len] = 0;
+        collect_unity_bundle_run(run, prefetch);
+    }
+
+    free(run);
+    free(chunk);
+    CloseHandle(file);
+}
+
 /* ----------------------------------------------------------------
  * scan_unity_asset_file — 扫描 Unity .assets 二进制文件中的字符串
  *
@@ -1299,10 +1679,15 @@ static void scan_unity_data_dir(const WCHAR *data_dir, TextList *prefetch) {
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (!unity_asset_file_name(fd.cFileName)) continue;
         WCHAR p[MAX_PATH * 4];
         path_join(p, MAX_PATH * 4, data_dir, fd.cFileName);
-        scan_unity_asset_file(p, prefetch);
+        if (unity_asset_file_name(fd.cFileName)) {
+            scan_unity_asset_file(p, prefetch);
+        } else if (unity_bundle_file_name(fd.cFileName)) {
+            scan_unity_bundle_file(p, prefetch);
+        } else {
+            continue;
+        }
         if (prefetch->n >= textlist_limit(prefetch)) break;
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -1342,6 +1727,7 @@ static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
     const char *p = buf;
     if (size >= 3 && (unsigned char)p[0] == 0xef && (unsigned char)p[1] == 0xbb && (unsigned char)p[2] == 0xbf) p += 3;
     int last_code = -1;
+    RpgmMessageBlock message_block = {0};
 
     while (*p) {
         p = json_ws(p);
@@ -1362,9 +1748,18 @@ static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
         if (!strcmp(key, "code")) {
             last_code = atoi(v);
         } else if (!strcmp(key, "parameters")) {
-            if (rpgm_text_command(last_code)) collect_array_strings(&v, prefetch);
+            if (last_code == 101) {
+                rpgm_message_block_flush(&message_block, prefetch);
+                rpgm_message_block_begin(&message_block);
+            } else if (last_code != 401) {
+                rpgm_message_block_flush(&message_block, prefetch);
+            }
+            if (rpgm_text_command(last_code)) {
+                collect_rpgm_command_parameters(last_code, &v, prefetch, &message_block);
+            }
             last_code = -1;
         } else if (rpgm_text_key(key)) {
+            rpgm_message_block_flush(&message_block, prefetch);
             if (*v == '"') {
                 char *s = json_string_at(&v);
                 if (s) {
@@ -1379,6 +1774,8 @@ static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
         p = v;
         if (prefetch->n >= textlist_limit(prefetch)) break;
     }
+    rpgm_message_block_flush(&message_block, prefetch);
+    rpgm_message_block_clear(&message_block);
     free(buf);
 }
 
@@ -1415,6 +1812,11 @@ static void collect_rpgm_text_line(char *line, TextList *prefetch) {
         char saved = *end;
         *end = 0;
         collect_string(colon + 1, prefetch);
+        char *suffix = NULL;
+        for (char *dash = strstr(colon + 1, " - "); dash; dash = strstr(dash + 3, " - ")) {
+            suffix = dash + 3;
+        }
+        if (suffix && *suffix) collect_string(suffix, prefetch);
         *end = saved;
         return;
     }
@@ -1592,6 +1994,9 @@ static void scan_renpy_script_dir(const WCHAR *dir, TextList *prefetch, int dept
         if (prefetch->n >= textlist_limit(prefetch)) { FindClose(hf); return; }
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         if (!wide_ends_with_i(fd.cFileName, L".rpy")) continue;
+        /* Launcher-owned hook literals are implementation details, not game text.
+           Scanning them can occupy the remote queue before the first real menu. */
+        if (!_wcsicmp(fd.cFileName, L"iron_deepseek.rpy")) continue;
         /* 跳过超过大小上限的文件 */
         ULARGE_INTEGER fsz = {0};
         fsz.LowPart = fd.nFileSizeLow;
@@ -1605,15 +2010,7 @@ static void scan_renpy_script_dir(const WCHAR *dir, TextList *prefetch, int dept
         while (*line && prefetch->n < textlist_limit(prefetch)) {
             char *nl = strchr(line, '\n');
             if (nl) { *nl = 0; nl++; } else nl = line + strlen(line);
-            const char *fq = renpy_first_quote(line);
-            if (!renpy_skip_statement(line, fq) && fq) {
-                const char *cursor = fq;
-                char *text = renpy_string_at(&cursor);
-                if (text) {
-                    collect_renpy_string(text, prefetch);
-                    free(text);
-                }
-            }
+            collect_renpy_line_strings(line, prefetch);
             line = nl;
         }
         free(buf);
@@ -1646,6 +2043,17 @@ static void warmup_rpgm(const WCHAR *dir) {
     textlist_free(&prefetch);
 }
 
+static void warmup_godot(const WCHAR *dir) {
+    TextList prefetch = {0};
+    prefetch.max_items = GODOT_WARMUP_MAX_ITEMS;
+    /* Godot currently has no generic runtime hook here. We only scan resources
+       and queue cache warmup; .pck/.translation files remain read-only inputs. */
+    warmup_scan_godot_resources(dir, &prefetch);
+    size_t queued = post_prefetch_all(&prefetch);
+    if (queued) append_log(L"Godot preheated translation cache: queued %zu texts.", queued);
+    textlist_free(&prefetch);
+}
+
 /* Ren'Py 预热：递归扫描 game/ 下的 .rpy 脚本并批量提交 */
 static void warmup_renpy(const WCHAR *dir) {
     TextList prefetch = {0};
@@ -1668,4 +2076,5 @@ void warmup_translations(const WCHAR *dir, Engine engine) {
     if (engine == ENGINE_RENPY) warmup_renpy(dir);
     else if (engine == ENGINE_UNITY || engine == ENGINE_UNITY_IL2CPP) warmup_xunity(dir);
     else if (engine == ENGINE_RPGM_MV) warmup_rpgm(dir);
+    else if (engine == ENGINE_GODOT) warmup_godot(dir);
 }

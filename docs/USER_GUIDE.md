@@ -1,17 +1,17 @@
 # ds游戏翻译器使用说明
 
-本文面向直接下载程序的用户。推荐下载 Release 页面里的 `ds游戏翻译器_0.3.1.7.exe`。
+本文面向直接下载程序的用户。推荐下载 Release 页面里的 `ds游戏翻译器_0.3.2.7.exe`。
 
 ## 第一次使用
 
-1. 把 `ds游戏翻译器_0.3.1.7.exe` 放到一个你准备长期使用的目录，例如 `D:\Games\DSTranslator\`。
+1. 把 `ds游戏翻译器_0.3.2.7.exe` 放到一个你准备长期使用的目录，例如 `D:\Games\DSTranslator\`。
 2. 双击运行一次程序。首次运行会自动释放/更新本项目自带组件：
    - `native\dst_server.exe`
    - `scripts\install_runtime_payloads.ps1`
    - `config\api.ini.example`
    - 自有 Unity 插件 DLL
 3. 在启动器中点击“配置 API”，填写自己的 DeepSeek API Key 并保存。
-4. 如果要翻译 Ren'Py 或 RPG Maker 游戏，可以直接选择游戏目录并开始。
+4. 如果要翻译 Ren'Py、RPG Maker 或 Godot 游戏，可以直接选择游戏目录并开始。
 5. 如果要翻译 Unity 游戏，在程序所在目录运行：
 
 ```powershell
@@ -39,7 +39,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -U
 
 ## 更新方式
 
-从 `0.3.1.7` 开始，大多数更新只需要替换 `ds游戏翻译器.exe`。
+从 `0.3.2.7` 开始，大多数更新只需要替换 `ds游戏翻译器.exe`。
 
 启动器每次启动都会检查并同步本项目自有组件，所以替换 exe 后会自动更新：
 
@@ -66,17 +66,17 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 
 ## 常见问题
 
-### 下载的文件名为什么显示成 `ds._0.3.1.7.exe`？
+### 下载的文件名为什么显示成 `ds._0.3.2.7.exe`？
 
 GitHub 会规范化中文资源文件名。Release 页面已经给资产加了中文 label，下载后你可以把文件改名为 `ds游戏翻译器.exe`，功能不受影响。
 
 ### 为什么还要运行插件安装命令？
 
-为了降低授权和侵权风险，程序不会直接打包 BepInEx、XUnity、Newtonsoft.Json、Unity 官方 DLL、游戏文件、字体、翻译记忆或 API Key。Unity 所需第三方运行时由用户通过脚本从上游项目下载。
+为了降低授权和侵权风险，程序不会直接打包 BepInEx、XUnity、Newtonsoft.Json、Unity 官方 DLL、游戏文件、TMP 字体包、翻译记忆或 API Key。Unity 所需第三方运行时和 XUnity TMP 字体 AssetBundle 由用户通过脚本从上游项目下载。
 
 ### Ren'Py 和 RPG Maker 也需要下载插件吗？
 
-不需要。Ren'Py 和 RPG Maker 路径使用启动器自带 hook 和本地服务端。
+不需要。Ren'Py 和 RPG Maker 路径使用启动器自带 hook 和本地服务端。Godot 当前使用导出包/资源文本扫描和本地缓存预热，会识别 PO/CSV 翻译表、GDScript `tr()`/`TranslationServer.translate()` 文本、常见场景资源文本以及 `.pck/.translation` 里的 UTF-8 文本；不需要 BepInEx/XUnity，也不会改写 `.pck`。
 
 ### API Key 放在哪里？
 

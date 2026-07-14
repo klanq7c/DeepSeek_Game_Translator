@@ -4,7 +4,7 @@
  * engine.h — 游戏引擎类型枚举与自动检测声明
  * ----------------------------------------------------------------
  * 提供基于目录特征的引擎识别，支持 Ren'Py、RPG Maker (MV/MZ 与
- * 旧版 XP/VX/VXAce)、Unity (Mono 与 IL2CPP)。
+ * 旧版 XP/VX/VXAce)、Unity (Mono 与 IL2CPP)、Godot。
  * ================================================================ */
 
 #include "globals.h"
@@ -16,7 +16,8 @@ typedef enum {
     ENGINE_RPGM_MV,       /* RPG Maker MV / MZ (www/index.html) */
     ENGINE_UNITY,         /* Unity Mono (BepInEx) */
     ENGINE_UNITY_IL2CPP,  /* Unity IL2CPP (XUnity) */
-    ENGINE_RPGM_LEGACY    /* RPG Maker XP / VX / VXAce (.rxdata / .rvdata) */
+    ENGINE_RPGM_LEGACY,   /* RPG Maker XP / VX / VXAce (.rxdata / .rvdata) */
+    ENGINE_GODOT          /* Godot export/project (.pck / project.godot) */
 } Engine;
 
 /* ---------- 目录探测辅助函数 ---------- */
