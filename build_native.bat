@@ -173,7 +173,12 @@ if errorlevel 1 exit /b 1
 set "RES_RC=%ROOT%build\launcher_payloads.rc"
 set "RES_OBJ=%ROOT%build\launcher_payloads.o"
 if not exist "%ROOT%build" mkdir "%ROOT%build"
-> "%RES_RC%" echo 101 RCDATA "native/dst_server.exe"
+if not exist "%ROOT%assets\app_icon.ico" (
+    echo Missing application icon: assets\app_icon.ico
+    exit /b 1
+)
+> "%RES_RC%" echo 1 ICON "assets/app_icon.ico"
+>> "%RES_RC%" echo 101 RCDATA "native/dst_server.exe"
 >> "%RES_RC%" echo 102 RCDATA "scripts/install_runtime_payloads.ps1"
 >> "%RES_RC%" echo 103 RCDATA "config/api.ini.example"
 >> "%RES_RC%" echo 104 RCDATA "config/launcher.ini.example"

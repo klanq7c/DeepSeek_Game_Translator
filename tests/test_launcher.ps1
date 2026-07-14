@@ -278,6 +278,11 @@ if ($mainSrc -notmatch '--sync-payloads-and-exit') {
 if (-not $mainSrc.Contains($productName)) {
     throw "launcher window title must use the ds娓告垙缈昏瘧鍣?product name"
 }
+if ($mainSrc -notmatch 'IDI_APP_ICON' -or
+    $mainSrc -notmatch 'RegisterClassExW' -or
+    $mainSrc -notmatch 'hIconSm') {
+    throw "launcher must load the bundled application icon for large and small window icons"
+}
 $uiSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\ui.c") -Raw -Encoding UTF8
 if ($uiSrc -notmatch 'OutputDebugStringW\(line\)' -or $uiSrc -notmatch '!g_log \|\| !IsWindow\(g_log\)') {
     throw "launcher logging must be safe before UI controls exist"
@@ -737,6 +742,32 @@ $sourceReleaseSrc = Get-Content -LiteralPath (Join-Path $root "scripts\prepare_o
 $readmeSrc = Get-Content -LiteralPath (Join-Path $root "README.md") -Raw -Encoding UTF8
 $userGuideSrc = Get-Content -LiteralPath (Join-Path $root "docs\USER_GUIDE.md") -Raw -Encoding UTF8
 $openSourceReleaseDoc = Get-Content -LiteralPath (Join-Path $root "OPEN_SOURCE_RELEASE.md") -Raw -Encoding UTF8
+$iconPng = Join-Path $root "assets\app_icon.png"
+$iconIco = Join-Path $root "assets\app_icon.ico"
+if (-not (Test-Path -LiteralPath $iconPng -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $iconIco -PathType Leaf)) {
+    throw "launcher icon PNG and ICO assets must exist"
+}
+$iconBytes = [System.IO.File]::ReadAllBytes($iconIco)
+if ($iconBytes.Length -lt 22 -or
+    [BitConverter]::ToUInt16($iconBytes, 0) -ne 0 -or
+    [BitConverter]::ToUInt16($iconBytes, 2) -ne 1) {
+    throw "assets\app_icon.ico must be a valid Windows icon container"
+}
+$iconCount = [BitConverter]::ToUInt16($iconBytes, 4)
+$iconSizes = @()
+for ($i = 0; $i -lt $iconCount; $i++) {
+    $entryOffset = 6 + (16 * $i)
+    if ($entryOffset + 16 -gt $iconBytes.Length) {
+        throw "assets\app_icon.ico has a truncated directory"
+    }
+    $iconSizes += $(if ($iconBytes[$entryOffset] -eq 0) { 256 } else { [int]$iconBytes[$entryOffset] })
+}
+foreach ($requiredSize in @(16, 32, 48, 256)) {
+    if ($iconSizes -notcontains $requiredSize) {
+        throw "assets\app_icon.ico is missing the ${requiredSize}x${requiredSize} frame"
+    }
+}
 foreach ($doc in @($readmeSrc, $userGuideSrc, $openSourceReleaseDoc)) {
     if (-not $doc.Contains($productVersion)) {
         throw "release documentation must mention the current VERSION value"
@@ -747,6 +778,9 @@ if ($sourceReleaseSrc -notmatch '\\_launcher_fixtures\\') {
 }
 if ($sourceReleaseSrc -notmatch '"CONTEXT\.md"') {
     throw "source release script must include CONTEXT.md because AGENTS.md references it"
+}
+if ($sourceReleaseSrc -notmatch '"assets"') {
+    throw "source release script must include the launcher icon assets"
 }
 if ($buildSrc -notmatch 'APP_VERSION' -or $buildSrc -notmatch 'DS_TRANSLATOR_VERSION') {
     throw "build_native.bat must inject VERSION into the launcher footer at compile time"
@@ -762,6 +796,9 @@ if ($buildSrc -notmatch 'where gcc' -or $buildSrc -notmatch 'where windres') {
 }
 if ($buildSrc -notmatch 'windres' -or $buildSrc -notmatch 'launcher_payloads\.rc' -or $buildSrc -notmatch 'launcher_payloads\.o') {
     throw "build_native.bat must embed first-party payload resources into the launcher"
+}
+if ($buildSrc -notmatch '1 ICON "assets/app_icon\.ico"') {
+    throw "build_native.bat must embed assets\app_icon.ico as the Windows application icon"
 }
 if ($buildSrc -notmatch 'native/dst_server\.exe' -or $buildSrc -notmatch 'scripts/install_runtime_payloads\.ps1' -or $buildSrc -notmatch 'payloads/UnityTranslator/UnityTranslator\.dll') {
     throw "launcher resources must include the server, runtime installer script, and first-party Unity plugin"
