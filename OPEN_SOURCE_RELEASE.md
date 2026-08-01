@@ -21,7 +21,7 @@ publish it directly.
 For the downloadable Windows program package, run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\prepare_program_release.ps1 -Version 0.3.2.7
+powershell -ExecutionPolicy Bypass -File scripts\prepare_program_release.ps1 -Version 0.3.3.8
 ```
 
 The generated program package should contain the launcher and documentation

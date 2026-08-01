@@ -1,10 +1,10 @@
 # ds游戏翻译器使用说明
 
-本文面向直接下载程序的用户。推荐下载 Release 页面里的 `ds游戏翻译器_0.3.2.7.exe`。
+本文面向直接下载程序的用户。推荐下载 Release 页面里的 `ds游戏翻译器_0.3.3.8.exe`。
 
 ## 第一次使用
 
-1. 把 `ds游戏翻译器_0.3.2.7.exe` 放到一个你准备长期使用的目录，例如 `D:\Games\DSTranslator\`。
+1. 把 `ds游戏翻译器_0.3.3.8.exe` 放到一个你准备长期使用的目录，例如 `D:\Games\DSTranslator\`。
 2. 双击运行一次程序。首次运行会自动释放/更新本项目自带组件：
    - `native\dst_server.exe`
    - `scripts\install_runtime_payloads.ps1`
@@ -80,7 +80,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 
 ## 常见问题
 
-### 下载的文件名为什么显示成 `ds._0.3.2.7.exe`？
+### 下载的文件名为什么显示成 `ds._0.3.3.8.exe`？
 
 GitHub 会规范化中文资源文件名。Release 页面已经给资产加了中文 label，下载后你可以把文件改名为 `ds游戏翻译器.exe`，功能不受影响。
 
