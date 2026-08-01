@@ -41,6 +41,7 @@ function Send-Raw {
         [string]$Method, [string]$Path, [byte[]]$BodyBytes,
         [int]$BodyLengthOverride = -1,
         [string]$ExtraHeaders = "",
+        [string]$HttpVersion = "HTTP/1.1",
         [int]$TimeoutMs = 5000,
         [switch]$ShutdownSend
     )
@@ -50,7 +51,7 @@ function Send-Raw {
     $cli.Connect("127.0.0.1", $Port)
     $st = $cli.GetStream()
     $clen = if ($BodyLengthOverride -ge 0) { $BodyLengthOverride } else { $BodyBytes.Length }
-    $hdr = "$Method $Path HTTP/1.1`r`nHost: 127.0.0.1`r`nContent-Type: application/json; charset=utf-8`r`nContent-Length: $clen`r`n${ExtraHeaders}Connection: close`r`n`r`n"
+    $hdr = "$Method $Path $HttpVersion`r`nHost: 127.0.0.1`r`nContent-Type: application/json; charset=utf-8`r`nContent-Length: $clen`r`n${ExtraHeaders}Connection: close`r`n`r`n"
     $hdrBytes = [System.Text.Encoding]::ASCII.GetBytes($hdr)
     $st.Write($hdrBytes, 0, $hdrBytes.Length)
     if ($BodyBytes.Length -gt 0) { $st.Write($BodyBytes, 0, $BodyBytes.Length) }
@@ -356,6 +357,16 @@ try {
         Assert-Eq $r.Status 400 "duplicate content length"
     }
 
+    It "Malformed or unsupported HTTP request lines are rejected" {
+        $r = Send-Raw -Method "GET" -Path "/health" -BodyBytes ([byte[]]@()) `
+            -HttpVersion "garbage"
+        Assert-Eq $r.Status 400 "non-HTTP request-line version"
+
+        $r = Send-Raw -Method "GET" -Path "/health" -BodyBytes ([byte[]]@()) `
+            -HttpVersion "HTTP/1.1 extra"
+        Assert-Eq $r.Status 400 "request line with extra token"
+    }
+
     It "Bytes beyond Content-Length are not parsed as the current request" {
         $declaredBody = '{}'
         $extraBody = '{"text":"smuggled-value"}'
@@ -429,6 +440,34 @@ try {
         }
         $r = Send-Get "/health"
         Assert-Eq $r.Status 200 "still healthy"
+    }
+
+    It "Idle connections cannot create an unbounded number of worker threads" {
+        $health = Send-Get "/health"
+        $limit = [int]$health.Json.connection_limit
+        if ($limit -le 0 -or $limit -gt 256) {
+            throw "server did not publish a sane connection limit"
+        }
+
+        $clients = New-Object "System.Collections.Generic.List[System.Net.Sockets.TcpClient]"
+        try {
+            for ($i = 0; $i -lt ($limit + 32); $i++) {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect("127.0.0.1", $Port)
+                $clients.Add($client)
+            }
+            $p.Refresh()
+            $allowedThreads = $limit + 24
+            if ($p.Threads.Count -gt $allowedThreads) {
+                throw "idle connections created $($p.Threads.Count) threads (limit $limit, allowed process total $allowedThreads)"
+            }
+        } finally {
+            foreach ($client in $clients) { $client.Close() }
+        }
+
+        Start-Sleep -Milliseconds 150
+        $r = Send-Get "/health"
+        Assert-Eq $r.Status 200 "server remains healthy after idle connection pressure"
     }
 
     It "Path with control characters returns 404, not crash" {

@@ -1,14 +1,25 @@
 # Regression tests for launcher engine detection and deploy routing.
+param(
+    [string]$ProbeGamePath = "",
+    [string]$DeployRpgmPath = ""
+)
+
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $bin = Join-Path $root "native\toolchain\w64devkit\bin"
 $probeExe = Join-Path $PSScriptRoot "launcher_probe.exe"
+$restoreProbeExe = Join-Path $PSScriptRoot "restore_probe.exe"
+$godotCliProbeExe = Join-Path $PSScriptRoot "godot_cli_probe.exe"
 $warmupProbeExe = Join-Path $PSScriptRoot "warmup_probe.exe"
 $godotPatchProbeExe = Join-Path $PSScriptRoot "godot_patch_probe.exe"
 $rpgmHookProbe = Join-Path $PSScriptRoot "rpgm_hook_probe.js"
 $renpyHookProbe = Join-Path $PSScriptRoot "renpy_hook_probe.py"
 $fixtures = Join-Path $PSScriptRoot "_launcher_fixtures"
+$reparseOutside = Join-Path $PSScriptRoot "_launcher_reparse_outside"
+$reparseLink = Join-Path $fixtures "reparse_link"
+$restoreReparseRoot = Join-Path $fixtures "restore_reparse"
+$restoreReparseLink = Join-Path $restoreReparseRoot "game"
 $productName = "ds" + [string][char]0x6e38 + [string][char]0x620f + [string][char]0x7ffb + [string][char]0x8bd1 + [string][char]0x5668
 $productExeName = "$productName.exe"
 $productVersion = (Get-Content -LiteralPath (Join-Path $root "VERSION") -Raw -Encoding UTF8).Trim()
@@ -18,6 +29,10 @@ if ($productVersion -notmatch '^\d+\.\d+\.\d+\.\d+$') {
 
 $contextDoc = Get-Content -LiteralPath (Join-Path $root "CONTEXT.md") -Raw -Encoding UTF8
 $maintenanceDoc = Get-Content -LiteralPath (Join-Path $root "docs\MAINTENANCE_MAP.md") -Raw -Encoding UTF8
+$runAllSrc = Get-Content -LiteralPath (Join-Path $root "tests\run_all.ps1") -Raw -Encoding UTF8
+if ($runAllSrc -match 'Get-Process\s+-Name\s+dst_server[^\r\n]*Stop-Process\s+-Force') {
+    throw "the test runner must not force-stop a user-owned translation service by process name"
+}
 foreach ($needle in @(
     "native/src/launcher/engine.c",
     "native/src/launcher/deploy.c",
@@ -28,6 +43,8 @@ foreach ($needle in @(
     "tests/godot_patch_probe.c",
     "tests/warmup_probe.c",
     "tests/launcher_probe.c",
+    "tests/restore_probe.c",
+    "tests/godot_cli_probe.c",
     "payloads/UnityTranslator/src",
     "payloads/UnityIL2CPP",
     "scripts/prepare_open_source_release.ps1",
@@ -89,14 +106,16 @@ if (-not $godotPatchSrc.Contains("GODOT_PCK_V1_HEADER_SIZE 88u") -or
 if (-not $godotPatchSrc.Contains("GODOT_PATCH_ENTRY_TEXT_RESOURCE") -or
     -not $godotPatchSrc.Contains("collect_json_text_patches") -or
     -not $godotPatchSrc.Contains("collect_scene_text_patches") -or
+    -not $godotPatchSrc.Contains("collect_markdown_text_patches") -or
     -not $godotPatchSrc.Contains("godot_display_text_key") -or
     -not $godotPatchSrc.Contains('"name", "editorname"') -or
     -not $godotPatchSrc.Contains('"kin", "traittype"') -or
     -not $godotPatchSrc.Contains("godot_patch_text_resource_path") -or
     -not $godotPatchSrc.Contains('ends_with_i(path, ".tscn")') -or
     -not $godotPatchSrc.Contains('ends_with_i(path, ".tres")') -or
-    -not $godotPatchSrc.Contains('ends_with_i(path, ".json")')) {
-    throw "Godot patching must patch display text and data names in .tscn/.tres/.json resources when no Translation resources exist"
+    -not $godotPatchSrc.Contains('ends_with_i(path, ".json")') -or
+    -not $godotPatchSrc.Contains('ends_with_i(path, ".md")')) {
+    throw "Godot patching must patch display text in .tscn/.tres/.json/Markdown resources when no Translation resources exist"
 }
 $godotTextPathBody = [regex]::Match(
     $godotPatchSrc,
@@ -148,6 +167,8 @@ if (-not $godotPatchSrc.Contains("GODOT_RUNTIME_SCRIPT_NAME") -or
     -not $godotPatchSrc.Contains("DST_MAX_MISS") -or
     -not $godotPatchSrc.Contains("_dst_cache_order") -or
     -not $godotPatchSrc.Contains("_dst_cache_put") -or
+    -not $godotPatchSrc.Contains("_dst_queue_head") -or
+    $godotPatchSrc.Contains("_dst_queue.pop_front()") -or
     -not $godotPatchSrc.Contains("_dst_trim_miss") -or
     -not $godotPatchSrc.Contains("_dst_http_pool") -or
     -not $godotPatchSrc.Contains("_dst_busy") -or
@@ -161,7 +182,7 @@ if (-not $godotPatchSrc.Contains("GODOT_RUNTIME_SCRIPT_NAME") -or
     -not $godotPatchSrc.Contains("C:/Windows/Fonts/simhei.ttf") -or
     -not $godotPatchSrc.Contains("DynamicFontData.new") -or
     -not $godotPatchSrc.Contains('add_font_override(\"font\"') -or
-    -not $godotPatchSrc.Contains("DeleteFileW(final_pack)") -or
+    -not $godotPatchSrc.Contains("delete_file_safe(final_pack)") -or
     -not $godotPatchSrc.Contains("prepared runtime sidecar instead of a --main-pack overlay")) {
     throw "Godot loose projects must use a runtime sidecar instead of a minimal --main-pack overlay that breaks res:// directory enumeration"
 }
@@ -175,8 +196,19 @@ if (-not $godotPatchSrc.Contains("GODOT_RUNTIME_SIDECAR_G3") -or
     -not $godotPatchSrc.Contains("FileAccess.file_exists") -or
     -not $godotPatchSrc.Contains("FontFile.new") -or
     -not $godotPatchSrc.Contains("add_theme_font_override") -or
+    -not $godotPatchSrc.Contains("OS.get_cmdline_user_args()") -or
     -not $godotPatchSrc.Contains("JSON.stringify")) {
     throw "Godot runtime translation must select an engine-compatible Godot 3 or Godot 4 sidecar"
+}
+if (-not $godotPatchSrc.Contains("GODOT_PCK_V3_HEADER_SIZE 112u") -or
+    -not $godotPatchSrc.Contains("info->directory_offset = read_u64le(header + 32)") -or
+    -not $godotPatchSrc.Contains("embed_format3_runtime_scripts") -or
+    -not $godotPatchSrc.Contains("build_runtime_override") -or
+    -not $godotPatchSrc.Contains("[autoload_prepend]") -or
+    -not $godotPatchSrc.Contains("GODOT_AUTOLOAD_OVERRIDE_PATH") -or
+    -not $godotPatchSrc.Contains("info.engine_minor >= 6u") -or
+    -not $godotPatchSrc.Contains("godot_patch_pack_has_runtime_autoload")) {
+    throw "Godot 4.6 PCK format 3 must use its tail directory and prepend a runtime autoload through override.cfg"
 }
 $godot4Sidecar = [regex]::Match(
     $godotPatchSrc,
@@ -186,7 +218,19 @@ $godot4Sidecar = [regex]::Match(
 if ([string]::IsNullOrWhiteSpace($godot4Sidecar) -or
     -not $godot4Sidecar.Contains("DST_MAX_CACHE") -or
     -not $godot4Sidecar.Contains("DST_MAX_MISS") -or
+    -not $godot4Sidecar.Contains('"const DST_MAX_TRACKED_CONTROLS = 4096\n"') -or
     -not $godot4Sidecar.Contains("_dst_cache_order") -or
+    -not $godot4Sidecar.Contains("_dst_queue_head") -or
+    $godot4Sidecar.Contains("_dst_queue.pop_front()") -or
+    -not $godot4Sidecar.Contains("node_added.connect") -or
+    -not $godot4Sidecar.Contains("req.process_mode = Node.PROCESS_MODE_ALWAYS") -or
+    -not $godot4Sidecar.Contains("timer.process_mode = Node.PROCESS_MODE_ALWAYS") -or
+    $godot4Sidecar.Contains('"if self is Node\n"') -or
+    $godot4Sidecar.Contains('"self.set(\"process_mode\""') -or
+    -not $godot4Sidecar.Contains("_dst_track_control") -or
+    -not $godot4Sidecar.Contains("_dst_scan_controls()") -or
+    -not $godot4Sidecar.Contains("_dst_control_cursor") -or
+    -not $godot4Sidecar.Contains("while scanned < count") -or
     -not $godot4Sidecar.Contains("_dst_recent_miss") -or
     -not $godot4Sidecar.Contains("_dst_mark_miss")) {
     throw "Godot 4 runtime translation must bound cache and failed-request state"
@@ -239,8 +283,8 @@ if (-not $godotPatchSrc.Contains("godot_patch_story_text_path") -or
 if (-not $godotPatchSrc.Contains("GODOT_PATCH_NEXT_NAME") -or
     -not $godotPatchSrc.Contains("GODOT_PATCH_BUILDING_NAME") -or
     -not $godotPatchSrc.Contains("godot_promote_staged_patch_pack") -or
-    -not $godotPatchSrc.Contains("MoveFileExW(build_pack, final_pack") -or
-    -not $godotPatchSrc.Contains("MoveFileExW(build_pack, next_pack") -or
+    -not $godotPatchSrc.Contains("move_file_safe(build_pack, final_pack") -or
+    -not $godotPatchSrc.Contains("move_file_safe(build_pack, next_pack") -or
     -not $godotPatchSrc.Contains("active patch pack is busy; staged refreshed pack for next launch") -or
     -not $godotPatchSrc.Contains("_wcsicmp(fd.cFileName, GODOT_PATCH_NEXT_NAME)") -or
     -not $godotPatchSrc.Contains("_wcsicmp(fd.cFileName, GODOT_PATCH_BUILDING_NAME)")) {
@@ -293,12 +337,84 @@ if (-not $uiSrc.Contains($productName)) {
 if ($uiSrc -notmatch 'DS_TRANSLATOR_VERSION_W' -or $uiSrc -match 'v3\.1\.70') {
     throw "launcher footer must use the VERSION-derived product version, not a hard-coded stale version"
 }
+$paintBody = [regex]::Match(
+    $uiSrc,
+    'void paint_background\(HWND hwnd, HDC dc\) \{(?s:.*?)^\}',
+    [System.Text.RegularExpressions.RegexOptions]::Multiline
+).Value
+$tickBody = [regex]::Match(
+    $uiSrc,
+    'void tick_ui_animation\(HWND hwnd\) \{(?s:.*?)^\}',
+    [System.Text.RegularExpressions.RegexOptions]::Multiline
+).Value
+$layoutBody = [regex]::Match(
+    $uiSrc,
+    'void layout\(HWND hwnd\) \{(?s:.*?)^\}',
+    [System.Text.RegularExpressions.RegexOptions]::Multiline
+).Value
+if ([string]::IsNullOrWhiteSpace($paintBody) -or
+    -not $uiSrc.Contains('draw_tech_grid') -or
+    -not $uiSrc.Contains('draw_panel_shell') -or
+    -not $uiSrc.Contains('draw_hero_data_line') -or
+    -not $uiSrc.Contains('draw_button_icon') -or
+    -not $uiSrc.Contains('MAKEINTRESOURCEW(IDI_APP_ICON)') -or
+    -not $uiSrc.Contains('DwmSetWindowAttribute') -or
+    -not $uiSrc.Contains('DarkMode_Explorer') -or
+    -not $uiSrc.Contains('C_VIOLET') -or
+    -not $uiSrc.Contains('C_AMBER') -or
+    $mainSrc -notmatch 'SetTimer\(hwnd,\s*2,\s*\d+,\s*NULL\)' -or
+    -not $mainSrc.Contains('tick_ui_animation(hwnd)') -or
+    $paintBody.Contains('server_alive()')) {
+    throw "launcher visual system must keep branded dark chrome, multi-accent panels, icon buttons, and IO-free lightweight animation"
+}
+if ([string]::IsNullOrWhiteSpace($tickBody) -or
+    [string]::IsNullOrWhiteSpace($layoutBody) -or
+    -not $mainSrc.Contains('WS_CLIPCHILDREN') -or
+    -not $mainSrc.Contains('paint_background_buffered(hwnd, dc, &ps.rcPaint)') -or
+    -not $mainSrc.Contains('case WM_PRINTCLIENT:') -or
+    -not $tickBody.Contains('data_line') -or
+    $tickBody.Contains('log_header') -or
+    $tickBody.Contains('RECT hero') -or
+    -not $layoutBody.Contains('SWP_NOREDRAW') -or
+    -not $uiSrc.Contains('DT_END_ELLIPSIS')) {
+    throw "launcher repainting must isolate animation from text, clip child controls, buffer the parent background, and constrain button text"
+}
+if ($mainSrc -notmatch 'IDC_RESTORE' -or
+    $mainSrc -notmatch 'restore_selected_game\(\)' -or
+    $uiSrc -notmatch 'MB_DEFBUTTON2' -or
+    $uiSrc -notmatch 'restore_game\(g_game, engine\)') {
+    throw "launcher must expose a confirmed restore-game action"
+}
+$clearCacheBody = [regex]::Match(
+    $uiSrc,
+    'void clear_translation_cache\(void\) \{(?s:.*?)^\}',
+    [System.Text.RegularExpressions.RegexOptions]::Multiline
+).Value
+if ($mainSrc -notmatch 'IDC_CLEAR_CACHE' -or
+    $mainSrc -notmatch 'clear_translation_cache\(\)' -or
+    $uiSrc -notmatch '(?:MoveWindow|position_control)\(g_btn_clear_cache' -or
+    [string]::IsNullOrWhiteSpace($clearCacheBody) -or
+    -not $clearCacheBody.Contains('translation_memory_c.tsv') -or
+    -not $clearCacheBody.Contains('MB_DEFBUTTON2') -or
+    -not $clearCacheBody.Contains('stop_server();') -or
+    -not $clearCacheBody.Contains('delete_file_safe(cache_path)') -or
+    -not $clearCacheBody.Contains('start_server();') -or
+    -not $clearCacheBody.Contains('server_stopped')) {
+    throw "CACHE card must expose a confirmed clear action that stops the server before deleting the shared cache"
+}
 $fsutilSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\fsutil.c") -Raw
 if ($fsutilSrc -notmatch 'static int read_handle_all' -or $fsutilSrc -notmatch 'static int write_handle_all') {
     throw "launcher file IO must centralize complete ReadFile/WriteFile loops"
 }
 if ($fsutilSrc -notmatch '\*out = NULL;\s*\*size = 0;') {
     throw "launcher file reads must clear output ownership before attempting IO"
+}
+if ($fsutilSrc -notmatch 'path_has_reparse_point' -or
+    $fsutilSrc -notmatch 'FILE_ATTRIBUTE_REPARSE_POINT' -or
+    $fsutilSrc -notmatch 'path_append_suffix' -or
+    $fsutilSrc -notmatch 'move_file_safe' -or
+    $fsutilSrc -notmatch 'delete_file_safe') {
+    throw "launcher filesystem mutations must fail closed on directory and file reparse points"
 }
 $serverProcSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\server_proc.c") -Raw
 $startServerBat = Get-Content -LiteralPath (Join-Path $root "start_server.bat") -Raw
@@ -328,6 +444,10 @@ if ($serverProcSrc -notmatch 'static\s+int\s+request_server_shutdown' -or
     $serverProcSrc -notmatch 'GetExitCodeProcess') {
     throw "launcher shutdown and startup failures must retain HTTP status and child exit diagnostics"
 }
+if ($serverProcSrc -notmatch 'wait_for_server_stopped' -or
+    $serverProcSrc -notmatch '(?s)request_server_shutdown\(\).*?wait_for_server_stopped\(1500\)') {
+    throw "launcher must wait for an adopted server to release the cache before maintenance"
+}
 if ($mainSrc -notmatch '(?s)case\s+WM_CREATE:.*refresh_server_status\(\).*layout\(hwnd\);') {
     throw "launcher must refresh server status during startup before first layout"
 }
@@ -353,12 +473,17 @@ if ($unityDetect -lt 0 -or $godotDetect -lt 0 -or $unityDetect -gt $godotDetect)
 }
 if (-not $engineSrc.Contains($productExeName) -or
     $engineSrc -notmatch 'DeepSeekTranslator\.exe' -or
+    $engineSrc -notmatch 'dst_godot_patch\.exe' -or
     $engineSrc -notmatch 'dst_server\.exe') {
     throw "launcher engine detection must ignore current and legacy translator executables"
 }
 $warmupSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\warmup.c") -Raw
 $warmupInternalSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\warmup_internal.h") -Raw
 $godotWarmupSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\godot_warmup.c") -Raw
+if (-not $godotWarmupSrc.Contains("GODOT_PCK_V3_HEADER_SIZE 112u") -or
+    -not $godotWarmupSrc.Contains("directory_offset = read_u64le(header + 32)")) {
+    throw "Godot warmup must read PCK format 3 resources through the pack-tail directory"
+}
 if ($warmupSrc -notmatch 'scan_renpy_script_dir') {
     throw "Ren'Py warmup must scan script files for prefetch candidates"
 }
@@ -409,6 +534,9 @@ if ($warmupSrc -notmatch 'prefetch\.max_items = GODOT_WARMUP_MAX_ITEMS;' -or
     $warmupSrc -notmatch 'ENGINE_GODOT\)\s+warmup_godot') {
     throw "Godot warmup must scan resources and be wired into warmup_translations"
 }
+if ($uiSrc -notmatch 'engine == ENGINE_GODOT(?s:.*?)warmup_translations\(dir, engine\)') {
+    throw "Godot launch flow must run resource warmup after starting the game"
+}
 if ($godotWarmupSrc -notmatch 'scan_godot_po_strings' -or
     $godotWarmupSrc -notmatch 'scan_godot_csv_strings' -or
     $godotWarmupSrc -notmatch 'scan_godot_binary_buffer' -or
@@ -421,8 +549,11 @@ if ($warmupSrc -notmatch 'prefetch\.max_items = RPGM_WARMUP_MAX_ITEMS;') {
 if ($warmupSrc -notmatch 'should_warm_rpgm_text') {
     throw "RPG Maker warmup must preserve valid engine control sequences instead of rejecting every backslash"
 }
-if ($warmupSrc -notmatch 'scan_rpgm_external_texts\(dir,\s*&prefetch\);') {
-    throw "RPG Maker warmup must include plugin-owned external text files such as quest/Quests.txt"
+if ($warmupSrc -notmatch 'warmup_scan_rpgm_resources\(dir,\s*&prefetch\);' -or
+    $warmupSrc -notmatch 'scan_rpgm_external_texts\(content_root,\s*prefetch\);' -or
+    $warmupSrc -notmatch 'scan_rpgm_csv_file' -or
+    $warmupSrc -notmatch 'wide_ends_with_i\(fd\.cFileName,\s*L"\.csv"\)') {
+    throw "RPG Maker warmup must resolve the content root and include plugin-owned external TXT/CSV localization files"
 }
 if ($warmupSrc -notmatch 'static int local_http_post\(LocalHttp \*h') {
     throw "warmup must reuse one localhost connection across batches"
@@ -460,15 +591,16 @@ if ($mainSrc -notmatch '--godot-patch-worker' -or
     $mainSrc -notmatch 'godot_prepare_patch_pack\(argv\[i \+ 1\]' -or
     $mainSrc -notmatch 'start_server\(\)' -or
     $uiSrc -notmatch 'start_godot_patch_worker' -or
+    $uiSrc -notmatch 'godot_prepare_patch_launcher' -or
     $uiSrc -notmatch '--main-pack' -or
     $uiSrc -notmatch 'dst_godot_patch\.pck' -or
-    $uiSrc -notmatch 'CreateProcessW\(exe,\s*cmd' -or
+    $uiSrc -notmatch 'CreateProcessW\(runtime_exe,\s*cmd' -or
     $uiSrc -notmatch '\\"%s\\" --main-pack \\"%s\\" --language en') {
     throw "Godot launch flow must build and use an external translation patch pack through the detached worker"
 }
-if ($uiSrc -notmatch 'Godot: existing patch pack found; launching before detached patch refresh\.' -or
-    $uiSrc -notmatch 'Godot: no patch pack yet; launching first and starting detached patch preparation for the next start\.' -or
-    $uiSrc -notmatch '(?s)else if \(engine == ENGINE_GODOT\).*?int had_patch = exists_path\(patch\);.*?if \(had_patch\).*?launch_game_for_engine\(dir, engine\);.*?start_godot_patch_worker\(dir\).*?else.*?launch_game_for_engine\(dir, engine\);.*?start_godot_patch_worker\(dir\)') {
+if ($uiSrc -notmatch 'Godot: existing patch pack found; launching before cache warmup and patch refresh\.' -or
+    $uiSrc -notmatch 'Godot: no patch pack yet; launching first, then warming resources for patch preparation\.' -or
+    $uiSrc -notmatch '(?s)else if \(engine == ENGINE_GODOT\).*?int had_patch = exists_path\(patch\);.*?if \(had_patch\).*?launch_game_for_engine\(dir, engine\);.*?else.*?launch_game_for_engine\(dir, engine\);.*?warmup_translations\(dir, engine\);.*?start_godot_patch_worker\(dir\)') {
     throw "Godot launch must not block game startup on large patch-pack generation"
 }
 if (-not $uiSrc.Contains("godot_promote_staged_patch_pack(dir)") -or
@@ -489,11 +621,22 @@ if (-not $uiSrc.Contains("launch_godot_export_with_runtime_sidecar") -or
     throw "Godot exported packs must use the generic runtime translator both before and after static patch generation"
 }
 if (-not $uiSrc.Contains("godot_runtime_sidecar_preflight") -or
-    -not $uiSrc.Contains("--check-only") -or
+    -not $uiSrc.Contains("godot_runtime_autoload_preflight") -or
+    -not $uiSrc.Contains("godot_patch_pack_has_runtime_autoload") -or
+    -not $uiSrc.Contains('\"%s\" --headless -- --dst-preflight') -or
+    -not $uiSrc.Contains("runtime autoload preflight failed; trying script-launch compatibility") -or
+    -not $uiSrc.Contains("--dst-preflight") -or
+    $uiSrc.Contains("--check-only") -or
     -not $uiSrc.Contains("WaitForSingleObject") -or
     -not $uiSrc.Contains("CREATE_NO_WINDOW") -or
     -not $uiSrc.Contains("Godot: runtime sidecar preflight failed; falling back to the static launch path.")) {
     throw "Godot runtime sidecars must be preflighted before launch so unsupported exports fall back safely"
+}
+if (-not $uiSrc.Contains("godot_output_explicitly_rejects_main_pack") -or
+    -not $uiSrc.Contains("STARTF_USESTDHANDLES") -or
+    -not $uiSrc.Contains("support remains inconclusive and translation launch will still be attempted") -or
+    $uiSrc -match 'rejected\s*=\s*waited\s*==\s*WAIT_OBJECT_0\s*&&\s*[\r\n\s]*GetExitCodeProcess') {
+    throw "Godot --main-pack compatibility must distinguish an explicit option rejection from unrelated headless startup failures"
 }
 $cacheSrc = Get-Content -LiteralPath (Join-Path $root "native\src\server\cache.c") -Raw
 $httpSrc = Get-Content -LiteralPath (Join-Path $root "native\src\server\http.c") -Raw
@@ -503,8 +646,9 @@ if ($httpSrc -notmatch 'ASYNC_BATCH_MAX 48' -or
     $httpSrc -notmatch 'LIVE_BATCH_CHAR_BUDGET 9600') {
     throw "server live and warmup translation paths should use larger API batches for faster VN catch-up"
 }
-if ($cacheSrc -notmatch '(?s)void cache_set_persist.*?AcquireSRWLockExclusive\(&c->io_lock\);.*?AcquireSRWLockExclusive\(&c->lock\);.*?int changed = cache_insert_locked.*?ReleaseSRWLockExclusive\(&c->lock\);.*?if \(changed\).*?fprintf\(f,.*?ReleaseSRWLockExclusive\(&c->io_lock\);') {
-    throw "persistent cache updates must stay ordered on io_lock and release the map lock before disk IO"
+if ($cacheSrc -notmatch '(?s)void cache_set_many_persist.*?AcquireSRWLockExclusive\(&c->io_lock\);.*?AcquireSRWLockExclusive\(&c->lock\);.*?cache_insert_locked.*?ReleaseSRWLockExclusive\(&c->lock\);.*?fprintf\(f,.*?if \(wrote && fflush\(f\) != 0\).*?ReleaseSRWLockExclusive\(&c->io_lock\);' -or
+    $cacheSrc -notmatch '(?s)void cache_set_persist.*?cache_set_many_persist\(c, keys, values, 1\);') {
+    throw "persistent cache batches must stay ordered on io_lock, release the map lock before disk IO, and flush once"
 }
 $deploySrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\deploy.c") -Raw
 if ($deploySrc -match 'catch\s*\(e\)\s*\{\s*\}') {
@@ -523,6 +667,12 @@ if (-not (Test-Path (Join-Path $root "scripts\install_runtime_payloads.ps1"))) {
     throw "runtime payload installer script must ship with source and program packages"
 }
 $runtimeInstallerSrc = Get-Content -LiteralPath (Join-Path $root "scripts\install_runtime_payloads.ps1") -Raw
+if ($runtimeInstallerSrc -notmatch 'Assert-NoReparseTraversal' -or
+    $runtimeInstallerSrc -notmatch 'FileAttributes\]::ReparsePoint' -or
+    $runtimeInstallerSrc.IndexOf('Assert-UnderRoot $DownloadCache') -gt
+    $runtimeInstallerSrc.IndexOf('New-Item -ItemType Directory -Force -Path $DownloadCache')) {
+    throw "runtime installer must reject reparse traversal before creating, extracting, or deleting payload paths"
+}
 if ($runtimeInstallerSrc -notmatch 'Newtonsoft\.Json\.13\.0\.4\.zip' -or $runtimeInstallerSrc -notmatch 'Copy-Item -LiteralPath \$pkg -Destination \$zipPkg') {
     throw "runtime payload installer must rename NuGet .nupkg to .zip before Expand-Archive for Windows PowerShell 5.1"
 }
@@ -531,6 +681,25 @@ if ($runtimeInstallerSrc -notmatch 'TMP_Font_AssetBundles_2025-12-08\.7z' -or
     $runtimeInstallerSrc -notmatch 'payloads\\UnityIL2CPP\\TMPFontAssetBundles\\BepInEx\\font' -or
     $runtimeInstallerSrc -notmatch 'Expand-WithExternalArchiveTool') {
     throw "runtime payload installer must install XUnity TMP font asset bundles for public Unity TMP parity"
+}
+if ($runtimeInstallerSrc -notmatch 'BepInEx_win_x86_5\.4\.23\.5\.zip' -or
+    $runtimeInstallerSrc -notmatch 'BepInEx-Unity\.Mono-win-x86-6\.0\.0-be\.755\+3fab71a\.zip' -or
+    $runtimeInstallerSrc -notmatch 'UnityMonoRuntimeX86' -or
+    $runtimeInstallerSrc -notmatch 'UnityMonoRuntime6X86') {
+    throw "runtime payload installer must provide x86 and x64 BepInEx runtimes for Unity Mono"
+}
+if ($runtimeInstallerSrc -notmatch 'mono-6\.12\.0\.206-x64-0\.msi' -or
+    $runtimeInstallerSrc -notmatch '4125f57d97cfa88257915edc969e913de198cd8e22396a29849037479a0ac368' -or
+    $runtimeInstallerSrc -notmatch 'download\.mono-project\.com/archive/6\.12\.0/windows-installer' -or
+    $runtimeInstallerSrc -notmatch 'UnityMonoCorlib' -or
+    $runtimeInstallerSrc -notmatch '/a' -or
+    $runtimeInstallerSrc -notmatch 'payloads\\UnityMonoCorlib') {
+    throw "runtime payload installer must reproducibly extract the pinned official Mono corlib payload"
+}
+if ($deploySrc -notmatch 'unity_player_machine' -or
+    $deploySrc -notmatch 'loader_machine != machine' -or
+    $deploySrc -notmatch 'UnityMonoRuntime6X86') {
+    throw "Unity Mono deploy must select Doorstop architecture from the Unity player and repair mismatches"
 }
 if ($deploySrc -notmatch 'install_runtime_payloads\.ps1' -or $deploySrc -notmatch '-UnityMono5' -or $deploySrc -notmatch '-UnityMono6' -or $deploySrc -notmatch '-UnityIL2CPP') {
     throw "Unity deploy must tell users the exact runtime payload install command when payloads are missing"
@@ -561,18 +730,26 @@ if ($deploySrc -notmatch '_ds_protect_old_percent' -or
 if (-not $deploySrc.Contains("_ds_restore_renpy_tokens") -or
     -not $deploySrc.Contains("_ds_restore_span_sequence(src, out, '[', ']')") -or
     -not $deploySrc.Contains("_ds_restore_span_sequence(src, out, '{', '}')") -or
-    -not $deploySrc.Contains("len(_ds_collect_renpy_spans(out, open_ch, close_ch)) != len(src_spans)") -or
+    -not $deploySrc.Contains("len(out_spans) != len(src_spans)") -or
     -not $deploySrc.Contains("return src") -or
-    -not $deploySrc.Contains("_ds_memo_put(k, _ds_restore_renpy_tokens(k, v), now)")) {
+    -not $deploySrc.Contains("restored = _ds_restore_renpy_tokens(k, v)") -or
+    -not $deploySrc.Contains("_ds_memo_put(k, restored, now)") -or
+    -not $deploySrc.Contains("_ds_mark_terminal_negative(k)") -or
+    -not $deploySrc.Contains("_ds_terminal_negative_ttl = 30.0") -or
+    -not $deploySrc.Contains("_ds_is_terminal_negative(s, now)") -or
+    -not $deploySrc.Contains("terminal-negative-recheck")) {
     throw "Ren'Py hook must restore interpolation variables and text tags, or preserve source when tokens are lost"
 }
 if ($deploySrc.Contains("x.open('POST',URL,false)") -or
-    -not $deploySrc.Contains("x.open('POST',URL,true)") -or
+    -not $deploySrc.Contains("function sendRpgmJson") -or
+    -not $deploySrc.Contains("process.versions.nw") -or
+    -not $deploySrc.Contains("require('http')") -or
+    -not $deploySrc.Contains("x.open('POST',endpoint,true)") -or
     -not $deploySrc.Contains("pending[key]=true")) {
-    throw "RPG Maker renderer hooks must use deduplicated asynchronous local-cache requests"
+    throw "RPG Maker renderer hooks must use deduplicated asynchronous transport with an NW.js Node HTTP path"
 }
 if ($deploySrc.Contains("JSON.stringify({text:key,cache_only:true})") -or
-    -not $deploySrc.Contains("x.timeout=12000")) {
+    -not $deploySrc.Contains("sendRpgmJson(URL,{text:key},12000")) {
     throw "RPG Maker visible misses must bypass background warmup priority without blocking the renderer"
 }
 if (-not $deploySrc.Contains("function isLayoutOnly") -or
@@ -584,13 +761,40 @@ if (-not $deploySrc.Contains("safeRpgmTranslation") -or
     -not $deploySrc.Contains("rpgmControlTokens") -or
     -not $deploySrc.Contains("original.length>24||joined.length>4000") -or
     -not $deploySrc.Contains("planMessagePage") -or
-    -not $deploySrc.Contains("syncLookupConvertedKeys(plan.candidates,512)") -or
-    -not $deploySrc.Contains("translateTextArray(original,plan.large)")) {
-    throw "Large RPG Maker message pages must use control-safe per-line cache lookups instead of whole-page translation"
+    -not $deploySrc.Contains("[plan.joined].concat(plan.candidates)") -or
+    -not $deploySrc.Contains("MESSAGE_PAGE_BATCH_MAX=32") -or
+    -not $deploySrc.Contains("MESSAGE_PAGE_CHAR_BUDGET=6000") -or
+    -not $deploySrc.Contains("primeMessagePage(plan.liveCandidates)") -or
+    -not $deploySrc.Contains("withLookupRequestsSuppressed(function(){return translateTextArray(original,false,true);})")) {
+    throw "Large RPG Maker message pages must use control-safe, language-atomic per-line cache lookups instead of whole-page translation"
+}
+if (-not $deploySrc.Contains("translateConvertedRpgmText(s,true)") -or
+    -not $deploySrc.Contains("requestLocalCacheKeys([orig],1)") -or
+    -not $deploySrc.Contains("hasSuspiciousRpgmSourceResidue") -or
+    -not $deploySrc.Contains("rpgmLatinWords")) {
+    throw "RPG Maker first draws must use local-only cache hits and reject copied English clauses inside CJK results"
+}
+if (-not $deploySrc.Contains("messagePageHasLocalLookupPending") -or
+    -not $deploySrc.Contains("deferRpgmMessageForLocalCache") -or
+    -not $deploySrc.Contains("if(deferRpgmMessageForLocalCache(original,translated)){this._dsRpgmDeferredMessageStart=true; this._waitCount=Math.max(Number(this._waitCount)||0,1); return;}") -or
+    -not $deploySrc.Contains("scheduleActiveMessageCachePoll") -or
+    -not $deploySrc.Contains("ACTIVE_MESSAGE_POLL_WINDOW_MS") -or
+    -not $deploySrc.Contains("active-message-cache-poll-timeout") -or
+    -not $deploySrc.Contains("refreshActiveRpgmMessage") -or
+    -not $deploySrc.Contains("translateMessageLines(original,true)") -or
+    -not $deploySrc.Contains("refresh-active-message") -or
+    -not $deploySrc.Contains("_dsRpgmDeferredMessageStart=true") -or
+    -not $deploySrc.Contains("if(win._dsRpgmDeferredMessageStart&&typeof win.startMessage==='function')") -or
+    $deploySrc.Contains("MESSAGE_FIRST_DRAW_WAIT_MS")) {
+    throw "RPG Maker dialogue may gate only on an asynchronous local-cache read, must yield MZ's synchronous message loop, and must resume a deferred first message or update an active source page"
 }
 if (-not $deploySrc.Contains("primeGalvQuestCache") -or
     -not $deploySrc.Contains("MAX_QUEST_PRIME=128") -or
-    -not $deploySrc.Contains("walkSceneWindows")) {
+    -not $deploySrc.Contains("walkSceneWindows") -or
+    -not $deploySrc.Contains("walkSceneOwnedWindows") -or
+    -not $deploySrc.Contains("walkSceneOwnedWindows(scene,seen,state)") -or
+    -not $deploySrc.Contains("list-scene-owned-windows") -or
+    -not $deploySrc.Contains("read-scene-owned-window")) {
     throw "RPG Maker must prime current Galv quest text and refresh nested custom windows on first open"
 }
 if (-not $deploySrc.Contains("QUEST_PRIME_BATCH=16") -or
@@ -613,17 +817,25 @@ if (-not $deploySrc.Contains("installTextExAutoWrapHook") -or
     -not $deploySrc.Contains("while(records.length>32)")) {
     throw "RPG Maker drawTextEx must wrap translated CJK at the renderer width and retain bounded diagnostics"
 }
-if (-not $deploySrc.Contains("syncLookupConvertedKeys") -or
+if (-not $deploySrc.Contains("requestLocalCacheKeys") -or
     -not $deploySrc.Contains("CACHE_LOOKUP_URL") -or
-    -not $deploySrc.Contains("CACHE_LOOKUP_URL,false") -or
-    -not $deploySrc.Contains("syncLookupConvertedKeys(plan.candidates,512)")) {
-    throw "RPG Maker HUD and message text must batch first-frame hits through the local cache-only endpoint"
+    -not $deploySrc.Contains("sendRpgmJson(CACHE_LOOKUP_URL,{texts:batch},1500") -or
+    $deploySrc.Contains("CACHE_LOOKUP_URL,false") -or
+    -not $deploySrc.Contains("[plan.joined].concat(plan.candidates)")) {
+    throw "RPG Maker HUD and message text must use the local cache-only endpoint without blocking the render thread"
 }
 if (-not $deploySrc.Contains("installMessageRuntimeHooks") -or
     -not $deploySrc.Contains("installPluginLoadHook") -or
     -not $deploySrc.Contains("_dsRpgmPluginLoadHook") -or
     -not $deploySrc.Contains("script.addEventListener('load'")) {
     throw "RPG Maker hooks must reinstall at the plugin script load seam instead of relying only on fixed timers"
+}
+if (-not $deploySrc.Contains("installWindowOpenRefreshHook") -or
+    -not $deploySrc.Contains("Window_Base.prototype.updateOpen") -or
+    -not $deploySrc.Contains("_dsRpgmOpenRefreshHook") -or
+    -not $deploySrc.Contains("!wasOpen&&nowOpen&&canAutoRefreshWindow(this)") -or
+    -not $deploySrc.Contains("refresh-window-open-transition")) {
+    throw "RPG Maker cache hits that arrive while a window is closed must redraw on the engine-owned open transition"
 }
 if (-not $deploySrc.Contains("HUDManager.types") -or
     -not $deploySrc.Contains("entry.class")) {
@@ -638,8 +850,8 @@ if (-not $deploySrc.Contains("_ds_install_character_call_hook") -or
 if ($deploySrc -notmatch 'down_until') {
     throw "Ren'Py hook must back off when the local server is unreachable"
 }
-if (-not $deploySrc.Contains("while time.time() < _ds_state['down_until']:") -or
-    -not $deploySrc.Contains("wake.wait(max(0.05, _ds_state['down_until'] - time.time()))")) {
+if (-not $deploySrc.Contains("while _ds_time.time() < _ds_state['down_until']:") -or
+    -not $deploySrc.Contains("wake.wait(max(0.05, _ds_state['down_until'] - _ds_time.time()))")) {
     throw "Ren'Py live worker must honor server backoff before draining another batch"
 }
 if ($deploySrc.Contains("_ds_pending_placeholder") -or
@@ -705,8 +917,8 @@ if ($deploySrc -notmatch 'len\(_ds_pending\) >= 1200') {
 if ($deploySrc -notmatch "if _ds_pending\[k\] > 120") {
     throw "Ren'Py heal poller must abandon texts the server never translates"
 }
-if ($deploySrc -notmatch 'OverrideFont=Microsoft YaHei') {
-    throw "Unity XUnityAutoTranslator config must default UGUI text to a CJK-capable font"
+if ($deploySrc -notmatch 'OverrideFont=\\n' -or $deploySrc -match 'OverrideFont=Microsoft YaHei') {
+    throw "Unity IL2CPP must leave XUnity font override empty because the renderer plugin owns CJK fallback without stripped font factories"
 }
 if ($deploySrc -notmatch 'MaxConcurrency=8') {
     throw "Unity IL2CPP XUnity config must use high local concurrency for cache-hit responsiveness"
@@ -716,6 +928,9 @@ if ($deploySrc -notmatch 'TranslationDelay=0\.1') {
 }
 if ($deploySrc -notmatch 'DisplaySafePunctuation=True') {
     throw "Unity IL2CPP XUnity config must enable renderer-local punctuation safety"
+}
+if ($deploySrc -notmatch 'QueueWaitSeconds=30' -or $deploySrc -notmatch 'QueuePollIntervalSeconds=0\.2') {
+    throw "Unity IL2CPP XUnity config must bound asynchronous local-cache polling"
 }
 if ($deploySrc -notmatch 'deploy_rpgm_font') {
     throw "RPG Maker deploy must ship a renderer-local CJK font"
@@ -734,11 +949,12 @@ if ($deploySrc -notmatch 'standardFontFace') {
 if ($deploySrc -notmatch 'mainFontFace') {
     throw "RPG Maker MZ hook must override Game_System.mainFontFace for translated text"
 }
-if ($deploySrc -notmatch 'www\\\\fonts' -or $deploySrc -notmatch 'ds_font\.ttf') {
-    throw "RPG Maker CJK font must be deployed under www\\fonts"
+if ($deploySrc -notmatch 'content_root,\s*L"fonts"' -or $deploySrc -notmatch 'ds_font\.ttf') {
+    throw "RPG Maker CJK font must be deployed under the resolved content-root fonts directory"
 }
 $buildSrc = Get-Content -LiteralPath (Join-Path $root "build_native.bat") -Raw
 $sourceReleaseSrc = Get-Content -LiteralPath (Join-Path $root "scripts\prepare_open_source_release.ps1") -Raw
+$programReleaseSrc = Get-Content -LiteralPath (Join-Path $root "scripts\prepare_program_release.ps1") -Raw
 $readmeSrc = Get-Content -LiteralPath (Join-Path $root "README.md") -Raw -Encoding UTF8
 $userGuideSrc = Get-Content -LiteralPath (Join-Path $root "docs\USER_GUIDE.md") -Raw -Encoding UTF8
 $openSourceReleaseDoc = Get-Content -LiteralPath (Join-Path $root "OPEN_SOURCE_RELEASE.md") -Raw -Encoding UTF8
@@ -782,6 +998,18 @@ if ($sourceReleaseSrc -notmatch '"CONTEXT\.md"') {
 if ($sourceReleaseSrc -notmatch '"assets"') {
     throw "source release script must include the launcher icon assets"
 }
+foreach ($releaseScript in @($sourceReleaseSrc, $programReleaseSrc)) {
+    if ($releaseScript -notmatch 'Invalid release version' -or
+        $releaseScript -notmatch '\\A\[0-9A-Za-z\]') {
+        throw "release scripts must reject path/control characters in version-derived output names"
+    }
+    if ($releaseScript -notmatch 'Assert-Under\s+\$stage') {
+        throw "release scripts must validate the stage path before it exists"
+    }
+    if ($releaseScript -notmatch 'FileAttributes\]::ReparsePoint') {
+        throw "release scripts must reject filesystem reparse traversal below build output roots"
+    }
+}
 if ($buildSrc -notmatch 'APP_VERSION' -or $buildSrc -notmatch 'DS_TRANSLATOR_VERSION') {
     throw "build_native.bat must inject VERSION into the launcher footer at compile time"
 }
@@ -797,7 +1025,7 @@ if ($buildSrc -notmatch 'where gcc' -or $buildSrc -notmatch 'where windres') {
 if ($buildSrc -notmatch 'windres' -or $buildSrc -notmatch 'launcher_payloads\.rc' -or $buildSrc -notmatch 'launcher_payloads\.o') {
     throw "build_native.bat must embed first-party payload resources into the launcher"
 }
-if ($buildSrc -notmatch '1 ICON "assets/app_icon\.ico"') {
+if ($buildSrc -notmatch '1 ICON "%ROOT_RC%assets/app_icon\.ico"') {
     throw "build_native.bat must embed assets\app_icon.ico as the Windows application icon"
 }
 if ($buildSrc -notmatch 'native/dst_server\.exe' -or $buildSrc -notmatch 'scripts/install_runtime_payloads\.ps1' -or $buildSrc -notmatch 'payloads/UnityTranslator/UnityTranslator\.dll') {
@@ -808,6 +1036,11 @@ if ($buildSrc -notmatch 'self_update\.c') {
 }
 if ($buildSrc -notmatch 'UnityTranslator\.BepInEx6\.dll') {
     throw "build_native.bat must refresh the BepInEx6 UnityTranslator payload"
+}
+if ($buildSrc -notmatch 'DeepSeekUnityFontPatcher\.csproj' -or
+    $buildSrc -notmatch 'DeepSeekUnityFontPatcher\.dll' -or
+    $buildSrc -notmatch '205 RCDATA "%ROOT_RC%payloads/UnityTranslator/DeepSeekUnityFontPatcher\.dll"') {
+    throw "build_native.bat must build and embed the stripped Unity Mono font metadata patcher"
 }
 if ($buildSrc -notmatch 'DeepSeekTMPFontFallback\.csproj') {
     throw "build_native.bat must wire the IL2CPP TMP font fallback source build when interop refs are available"
@@ -821,6 +1054,16 @@ if ($buildSrc -notmatch 'IL2CPP_INTEROP_DIR') {
 }
 if ($buildSrc -notmatch 'UnityEngine\.TextRenderingModule\.dll') {
     throw "DeepSeekTMPFontFallback build must validate the UnityEngine.TextRenderingModule interop reference"
+}
+if ($deploySrc -notmatch 'install_stripped_unity_font_patcher' -or
+    $deploySrc -notmatch 'BepInEx\\\\patchers\\\\DeepSeekUnityFontPatcher\.dll' -or
+    $deploySrc -notmatch 'DeepSeekUnityFontPatcher\.dll\.dst-owned') {
+    throw "stripped Unity Mono deploy must install the first-party font patcher with ownership metadata"
+}
+$selfUpdateSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\self_update.c") -Raw
+if ($selfUpdateSrc -notmatch 'IDR_PAYLOAD_UNITY_FONT_PATCHER\s+205' -or
+    $selfUpdateSrc -notmatch 'payloads\\\\UnityTranslator\\\\DeepSeekUnityFontPatcher\.dll') {
+    throw "launcher self-update must synchronize the embedded stripped Unity Mono font patcher"
 }
 if ($buildSrc -notmatch 'launcher_build\.exe' -or
     $buildSrc -notmatch 'Move-Item -LiteralPath \$env:LAUNCHER_TMP' -or
@@ -839,11 +1082,24 @@ $xunityEndpointSrc = Get-Content -LiteralPath (Join-Path $root "payloads\UnityIL
 if ($xunityEndpointSrc -notmatch 'private int _maxConcurrency = 8') {
     throw "DeepSeek XUnity endpoint should default to 8 local requests for faster cache-hit fanout"
 }
+if ($deploySrc -notmatch 'MaxCharactersPerTranslation=2500') {
+    throw "Unity IL2CPP deploy must use XUnity's supported 2500-character maximum instead of the old 400-character limit"
+}
+if ($xunityEndpointSrc -notmatch 'ProtectMixedCjkForRequest' -or
+    $xunityEndpointSrc -notmatch 'TryRestoreMixedCjk' -or
+    $xunityEndpointSrc -notmatch 'protected CJK token') {
+    throw "DeepSeek XUnity endpoint must protect translated CJK prefixes while translating newly appended English"
+}
 if ($xunityEndpointSrc -notmatch 'TranslationDelay\", 0\.1f') {
     throw "DeepSeek XUnity endpoint should default to XUnity's minimum accepted delay"
 }
 if ($xunityEndpointSrc -notmatch 'if \(value < 0\.1f\) return 0\.1f;') {
     throw "DeepSeek XUnity endpoint must clamp configured delay to XUnity's accepted minimum"
+}
+if ($xunityEndpointSrc -notmatch 'public override IEnumerator OnBeforeTranslate\(IHttpTranslationContext context\)' -or
+    $xunityEndpointSrc -notmatch 'GetSupportedEnumerator' -or
+    $xunityEndpointSrc -notmatch 'Stopwatch\.StartNew\(\)') {
+    throw "DeepSeek XUnity endpoint must wait asynchronously for queued local-cache translations"
 }
 if ($xunityEndpointSrc -notmatch 'PrepareDisplayTranslation\(one\)' -or $xunityEndpointSrc -notmatch 'PrepareDisplayTranslations\(results\)') {
     throw "DeepSeek XUnity endpoint must sanitize IL2CPP TMP punctuation before XUnity writes text"
@@ -855,7 +1111,7 @@ $tmpFallbackSrc = Get-Content -LiteralPath (Join-Path $root "payloads\UnityIL2CP
 if ($tmpFallbackSrc -match 'ManagedSpanWrapper' -or $tmpFallbackSrc -match 'UnityEngine\.Bindings') {
     throw "IL2CPP TMP font fallback must not depend on Unity-version-specific ManagedSpanWrapper internals"
 }
-if ($tmpFallbackSrc -notmatch '1\.2\.9') {
+if ($tmpFallbackSrc -notmatch '1\.2\.20') {
     throw "IL2CPP TMP font fallback version must be bumped when changing runtime behavior"
 }
 if ($tmpFallbackSrc -notmatch 'HarmonyLib' -or $tmpFallbackSrc -notmatch 'TryInstallTextSetterPatch' -or $tmpFallbackSrc -notmatch 'PrefixTmpTextString\(object __instance, ref string __0\)') {
@@ -885,8 +1141,8 @@ if ($tmpFallbackSrc -notmatch 'FastNormalizeInterval = 0\.05f' -or $tmpFallbackS
 if ($tmpFallbackSrc -notmatch 'SteadyNormalizeInterval = 2\.0f' -or $tmpFallbackSrc -notmatch 'ShouldUseFastNormalizeScan') {
     throw "IL2CPP TMP font fallback must slow the fallback scan once the setter patch is installed"
 }
-if ($tmpFallbackSrc -notmatch 'MakeGenericMethod\(assetType\)') {
-    throw "IL2CPP TMP font fallback must support generic AssetBundle LoadAsset/LoadAllAssets overloads"
+if ($tmpFallbackSrc -notmatch 'bundle\.LoadAllAssets\(tmpFontType\)' -or $tmpFallbackSrc -notmatch 'AsTmpFontAsset') {
+    throw "IL2CPP TMP font fallback must use native typed AssetBundle overloads and rewrap base IL2CPP objects"
 }
 if ($tmpFallbackSrc -notmatch 'NormalizeTmpTextForFallback' -or $tmpFallbackSrc -notmatch '\\uff0c' -or $tmpFallbackSrc -notmatch '\\u3002') {
     throw "IL2CPP TMP font fallback must normalize full-width comma before TMP rendering"
@@ -898,7 +1154,7 @@ if (-not (Test-Path (Join-Path $root "payloads\UnityIL2CPP\DeepSeekTMPFontFallba
     throw "IL2CPP TMP font fallback payload DLL must exist when source build is skipped"
 }
 $selfUpdateSrc = Get-Content -LiteralPath (Join-Path $root "native\src\launcher\self_update.c") -Raw
-if ($selfUpdateSrc -notmatch 'FindResourceW' -or $selfUpdateSrc -notmatch 'MoveFileExW' -or $selfUpdateSrc -notmatch 'file_matches_bytes') {
+if ($selfUpdateSrc -notmatch 'FindResourceW' -or $selfUpdateSrc -notmatch 'move_file_safe' -or $selfUpdateSrc -notmatch 'file_matches_bytes') {
     throw "embedded payload sync must read Win32 resources, compare bytes, and replace atomically"
 }
 if ($selfUpdateSrc -match 'Newtonsoft\.Json' -or $selfUpdateSrc -match 'BepInExRuntime' -or $selfUpdateSrc -match 'XUnityAutoTranslator' -or $selfUpdateSrc -match 'TMPFontAssetBundles') {
@@ -927,6 +1183,13 @@ if ($deploySrc -notmatch 'EnableUIResizing=False') {
 }
 if ($deploySrc -notmatch 'IgnoreTextStartingWith=.*Confidence increased' -or $deploySrc -notmatch 'Confidence decreased') {
     throw "Unity IL2CPP XUnity deploy must ignore stat notification text that can control tutorial/input flow"
+}
+if ($deploySrc -notmatch 'int restore_game\(' -or
+    $deploySrc -notmatch 'strip_owned_rpgm_hook_tags' -or
+    $deploySrc -notmatch '\.dst-owned' -or
+    $deploySrc -notmatch '\.dst-installed-by-ds' -or
+    $deploySrc -notmatch 'files_equal\(installed, payload\)') {
+    throw "restore-game must use engine-specific ownership checks and preserve user-modified Unity files"
 }
 
 if (Test-Path $fixtures) {
@@ -957,15 +1220,53 @@ function New-GodotEmbeddedExe($path) {
     [IO.File]::WriteAllBytes($path, $bytes)
 }
 
+function New-PeFile($path, [uint16]$machine) {
+    $parent = Split-Path -Parent $path
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    $bytes = New-Object byte[] 512
+    $bytes[0] = 0x4d
+    $bytes[1] = 0x5a
+    [BitConverter]::GetBytes([int32]0x80).CopyTo($bytes, 0x3c)
+    $bytes[0x80] = 0x50
+    $bytes[0x81] = 0x45
+    [BitConverter]::GetBytes($machine).CopyTo($bytes, 0x84)
+    [IO.File]::WriteAllBytes($path, $bytes)
+}
+
 try {
     New-File (Join-Path $fixtures "renpy\game\script.rpy") "label start:`n    `"Hello`""
+    New-File (Join-Path $fixtures "renpy\game\iron_deepseek.rpyc") "stale launcher hook bytecode"
     New-File (Join-Path $fixtures "rpgm\www\index.html") "<html><body><script type=`"text/javascript`" src=`"js/plugins.js`"></script><script>window.assetName='hook_rpgm_mv.js';</script><script type=`"text/javascript`" src=`"js/main.js`"></script><script type=`"text/javascript`" src=`"js/hook_rpgm_mv.js`"></script></body></html>"
     New-Item -ItemType Directory -Force -Path (Join-Path $fixtures "rpgm\www\js") | Out-Null
+    New-File (Join-Path $fixtures "rpgm\www\js\main.js") "window.onload = function() {};"
+    New-File (Join-Path $fixtures "rpgm\www\js\rpg_core.js") "function Rectangle() {}"
+    New-File (Join-Path $fixtures "rpgm\www\data\System.json") '{"gameTitle":"RPG Maker MV"}'
+    New-File (Join-Path $fixtures "rpgm_flat\index.html") "<html><body><script type=`"text/javascript`" src=`"js/main.js`"></script></body></html>"
+    New-File (Join-Path $fixtures "rpgm_flat\package.json") '{"name":"rmmz-game","main":"index.html"}'
+    New-File (Join-Path $fixtures "rpgm_flat\js\rmmz_core.js") "function Rectangle() {}"
+    New-File (Join-Path $fixtures "rpgm_flat\js\main.js") "window.onload = function() {};"
+    New-File (Join-Path $fixtures "rpgm_flat\data\System.json") '{"gameTitle":"Flat RPG Maker MZ"}'
+    New-File (Join-Path $fixtures "rpgm_flat\data\Map001.json") '{"events":[{"pages":[{"list":[{"code":401,"parameters":["Flat layout dialogue from Map001."]}]}]}]}'
+    New-File (Join-Path $fixtures "rpgm_flat\game_messages.csv") "id;source;English`n1;`"Texto con delimitador; sigue`";`"Localized CSV dialogue must be prefetched before first display.`""
+    New-File (Join-Path $fixtures "rpgm_flat_mv\index.html") "<html><body><script type=`"text/javascript`" src=`"js/main.js`"></script></body></html>"
+    New-File (Join-Path $fixtures "rpgm_flat_mv\js\rpg_core.js") "function Rectangle() {}"
+    New-File (Join-Path $fixtures "rpgm_flat_mv\js\main.js") "window.onload = function() {};"
+    New-File (Join-Path $fixtures "rpgm_flat_mv\data\System.json") '{"gameTitle":"Flat RPG Maker MV"}'
+    New-File (Join-Path $fixtures "generic_nw\index.html") "<html><body><script src=`"js/main.js`"></script></body></html>"
+    New-File (Join-Path $fixtures "generic_nw\js\main.js") "console.log('plain NW.js app');"
     New-Item -ItemType Directory -Force -Path (Join-Path $fixtures "rpgm_fail\www\js") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $fixtures "rpgm_fail\www\index.html") | Out-Null
+    # rpgm_fail keeps a complete marker set so detection still resolves the www
+    # content root; only index.html is an unreadable directory, which is what
+    # must make deploy/restore fail.
+    New-File (Join-Path $fixtures "rpgm_fail\www\js\main.js") "window.onload = function() {};"
+    New-File (Join-Path $fixtures "rpgm_fail\www\js\rpg_core.js") "function Rectangle() {}"
+    New-File (Join-Path $fixtures "rpgm_fail\www\data\System.json") '{"gameTitle":"Unreadable index RPGM"}'
     New-File (Join-Path $fixtures "godot\demo.pck") "Godot PCK`0Start your journey."
     New-GodotEmbeddedExe (Join-Path $fixtures "godot_embedded\EmbeddedGodot.exe")
     New-File (Join-Path $fixtures "godot_embedded\Config.exe") "not the game executable"
+    New-File (Join-Path $fixtures "godot_embedded\dst_godot_patch.exe") "launcher-owned Godot patch executable"
+    New-File (Join-Path $fixtures "godot_embedded\dst_godot_patch.pck") "launcher-owned Godot patch pack"
 
     New-File (Join-Path $fixtures "exe_select\Config.exe") "configuration helper"
     New-File (Join-Path $fixtures "exe_select\RealGame.exe") "game executable"
@@ -976,13 +1277,29 @@ try {
     New-File (Join-Path $fixtures "unity_mono\mods.pck") "Unity-side pack must not override _Data detection."
     New-GodotEmbeddedExe (Join-Path $fixtures "unity_mono\GodotLikeHelper.exe")
 
+    New-Item -ItemType Directory -Force -Path (Join-Path $fixtures "unity_stripped\Example_Data\Managed") | Out-Null
+    New-File (Join-Path $fixtures "unity_stripped\Example_Data\globalgamemanagers") "2022.3.62f2"
+    $strippedMscorlib = Join-Path $fixtures "unity_stripped\Example_Data\Managed\mscorlib.dll"
+    [IO.File]::WriteAllBytes($strippedMscorlib, [Text.Encoding]::ASCII.GetBytes("MZ mscorlib System.IO ReadAllText deliberately lacks the BepInEx-required writer"))
+    New-PeFile (Join-Path $fixtures "unity_stripped\UnityPlayer.dll") 0x8664
+
     New-Item -ItemType Directory -Force -Path (Join-Path $fixtures "unity6_mono\Example_Data") | Out-Null
     New-File (Join-Path $fixtures "unity6_mono\Example_Data\globalgamemanagers") "6000.3.8f1"
+    New-PeFile (Join-Path $fixtures "unity6_mono\UnityPlayer.dll") 0x8664
+
+    New-Item -ItemType Directory -Force -Path (Join-Path $fixtures "unity6_mono_x86\Example_Data") | Out-Null
+    New-File (Join-Path $fixtures "unity6_mono_x86\Example_Data\globalgamemanagers") "6000.3.8f1"
+    New-PeFile (Join-Path $fixtures "unity6_mono_x86\UnityPlayer.dll") 0x014c
+    New-Item -ItemType Directory -Force -Path (Join-Path $fixtures "unity6_mono_x86\BepInEx\core") | Out-Null
+    Copy-Item -LiteralPath (Join-Path $root "payloads\UnityMonoRuntime6\winhttp.dll") -Destination (Join-Path $fixtures "unity6_mono_x86\winhttp.dll")
+    Copy-Item -LiteralPath (Join-Path $root "payloads\UnityMonoRuntime6\BepInEx\core\BepInEx.Unity.Mono.dll") -Destination (Join-Path $fixtures "unity6_mono_x86\BepInEx\core\BepInEx.Unity.Mono.dll")
 
     New-Item -ItemType Directory -Force -Path (Join-Path $fixtures "unity_il2cpp\Example_Data\il2cpp_data") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $fixtures "unity_il2cpp\BepInEx\plugins") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $fixtures "unity_il2cpp\BepInEx\core") | Out-Null
     Copy-Item -LiteralPath (Join-Path $root "payloads\UnityTranslator\UnityTranslator.dll") -Destination (Join-Path $fixtures "unity_il2cpp\BepInEx\plugins\UnityTranslator.dll")
+    New-File (Join-Path $fixtures "unity_il2cpp\BepInEx\core\Il2Cppmscorlib.dll") "legacy-interop"
+    New-File (Join-Path $fixtures "unity_il2cpp\BepInEx\config\AutoTranslatorConfig.ini") "[User]`nKeep=True"
     New-File (Join-Path $fixtures "unity_il2cpp\GameAssembly.dll") "il2cpp"
     New-File (Join-Path $fixtures "unity_il2cpp\doorstop_config.ini") "[UnityDoorstop]`nenabled=true"
 
@@ -991,7 +1308,7 @@ try {
     New-File (Join-Path $fixtures "unity_custom\BepInEx\plugins\UnityTranslator.dll") "custom-il2cpp-plugin"
     New-File (Join-Path $fixtures "unity_custom\GameAssembly.dll") "il2cpp"
 
-    gcc -std=c17 -O2 -municode -D_CRT_SECURE_NO_WARNINGS `
+    gcc -std=c17 -O2 -Wall -Wextra -Werror -municode -D_CRT_SECURE_NO_WARNINGS `
         -I"$root\native\src\launcher" `
         "$PSScriptRoot\launcher_probe.c" `
         "$root\native\src\launcher\engine.c" `
@@ -1002,6 +1319,36 @@ try {
 
     & $probeExe $root $fixtures
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    New-Item -ItemType Directory -Force -Path $reparseOutside | Out-Null
+    $reparseSource = Join-Path $fixtures "reparse_source.bin"
+    New-File $reparseSource "safe source"
+    New-Item -ItemType Junction -Path $reparseLink -Target $reparseOutside | Out-Null
+    & $probeExe --fsutil-reparse $reparseSource $reparseLink
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ((Test-Path -LiteralPath (Join-Path $reparseOutside "created-by-launcher")) -or
+        (Test-Path -LiteralPath (Join-Path $reparseOutside "payload.bin"))) {
+        throw "launcher filesystem helpers must not write through directory reparse points"
+    }
+    [System.IO.Directory]::Delete($reparseLink)
+
+    New-Item -ItemType Directory -Force -Path $restoreReparseRoot | Out-Null
+    New-File (Join-Path $reparseOutside "iron_deepseek.rpy") "outside sentinel"
+    New-Item -ItemType Junction -Path $restoreReparseLink -Target $reparseOutside | Out-Null
+    & $probeExe --restore-reparse $restoreReparseRoot
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if (-not (Test-Path -LiteralPath (Join-Path $reparseOutside "iron_deepseek.rpy"))) {
+        throw "restore must not delete launcher-named files through a directory reparse point"
+    }
+    [System.IO.Directory]::Delete($restoreReparseLink)
+    if ($ProbeGamePath) {
+        & $probeExe --detect $ProbeGamePath
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+    if ($DeployRpgmPath) {
+        & $probeExe --deploy-rpgm $DeployRpgmPath
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
 
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) {
@@ -1030,13 +1377,14 @@ try {
         exit 1
     }
 
-    gcc -std=c17 -O2 -D_CRT_SECURE_NO_WARNINGS `
+    gcc -std=c17 -O2 -Wall -Wextra -Werror -municode -D_CRT_SECURE_NO_WARNINGS `
         -I"$root\native\src\launcher" `
         "$PSScriptRoot\warmup_probe.c" `
+        "$root\native\src\launcher\engine.c" `
         -lwinhttp -o "$warmupProbeExe"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    & $warmupProbeExe
+    & $warmupProbeExe (Join-Path $fixtures "rpgm_flat")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     gcc -std=c17 -O2 -municode -D_CRT_SECURE_NO_WARNINGS `
@@ -1051,11 +1399,42 @@ try {
     & $godotPatchProbeExe $fixtures
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+    gcc -std=c17 -O2 -Wall -Wextra -Werror `
+        -I"$root\native\src\launcher" `
+        "$PSScriptRoot\godot_cli_probe.c" `
+        "$root\native\src\launcher\godot_probe.c" `
+        -o "$godotCliProbeExe"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    & $godotCliProbeExe
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     & node $rpgmHookProbe (Join-Path $fixtures "rpgm\www\js\hook_rpgm_mv.js")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    gcc -std=c17 -O2 -Wall -Wextra -Werror -municode -D_CRT_SECURE_NO_WARNINGS `
+        -I"$root\native\src\launcher" `
+        "$PSScriptRoot\restore_probe.c" `
+        "$root\native\src\launcher\engine.c" `
+        "$root\native\src\launcher\fsutil.c" `
+        "$root\native\src\launcher\deploy.c" `
+        -lgdi32 -lmsimg32 -o "$restoreProbeExe"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    & $restoreProbeExe $root $fixtures
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
+    if (Test-Path -LiteralPath $reparseLink) {
+        [System.IO.Directory]::Delete($reparseLink)
+    }
+    if (Test-Path -LiteralPath $restoreReparseLink) {
+        [System.IO.Directory]::Delete($restoreReparseLink)
+    }
     Remove-Item -LiteralPath $probeExe -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $restoreProbeExe -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $godotCliProbeExe -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $warmupProbeExe -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $godotPatchProbeExe -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $fixtures -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $reparseOutside -Recurse -Force -ErrorAction SilentlyContinue
 }

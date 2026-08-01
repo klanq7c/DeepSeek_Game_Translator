@@ -17,6 +17,8 @@ HWND g_status;
 HWND g_log;
 HWND g_btn_server;
 HWND g_btn_api;
+HWND g_btn_restore;
+HWND g_btn_clear_cache;
 
 /* 路径缓冲——MAX_PATH*4 预留长路径（游戏目录可能嵌套很深）。 */
 WCHAR g_root[MAX_PATH * 4];
@@ -36,24 +38,28 @@ HFONT g_font_mono_small;
 
 /* 预创建画刷——避免每帧重复 CreateSolidBrush。 */
 HBRUSH g_brush_page;
+HBRUSH g_brush_card;
 HBRUSH g_brush_edit;
 HBRUSH g_brush_log;
 HBRUSH g_brush_transparent;
 
 /* 暗色主题色板定义。背景由深到浅，文本由亮到暗，accent 用于重点高亮。 */
-const COLORREF C_PAGE        = RGB(8, 14, 24);
-const COLORREF C_RAIL        = RGB(13, 20, 32);
-const COLORREF C_CARD        = RGB(20, 28, 44);
-const COLORREF C_CARD_ELEV   = RGB(28, 38, 56);
-const COLORREF C_LINE        = RGB(36, 50, 72);
-const COLORREF C_LINE_BRIGHT = RGB(56, 78, 108);
-const COLORREF C_TEXT        = RGB(232, 240, 248);
-const COLORREF C_TEXT_DIM    = RGB(165, 180, 205);
-const COLORREF C_MUTED       = RGB(108, 124, 152);
-const COLORREF C_ACCENT      = RGB(94, 222, 210);
-const COLORREF C_ACCENT_DARK = RGB(48, 174, 162);
-const COLORREF C_ACCENT_DEEP = RGB(18, 88, 84);
-const COLORREF C_GREEN       = RGB(72, 220, 156);
-const COLORREF C_DANGER      = RGB(248, 113, 113);
-const COLORREF C_LOG         = RGB(5, 10, 18);
-const COLORREF C_LOG_TEXT    = RGB(180, 230, 220);
+const COLORREF C_PAGE        = RGB(9, 12, 18);
+const COLORREF C_RAIL        = RGB(11, 15, 23);
+const COLORREF C_CARD        = RGB(17, 23, 33);
+const COLORREF C_CARD_ELEV   = RGB(25, 33, 47);
+const COLORREF C_LINE        = RGB(33, 43, 58);
+const COLORREF C_LINE_BRIGHT = RGB(64, 80, 102);
+const COLORREF C_TEXT        = RGB(238, 243, 248);
+const COLORREF C_TEXT_DIM    = RGB(170, 181, 197);
+const COLORREF C_MUTED       = RGB(106, 120, 142);
+const COLORREF C_ACCENT      = RGB(78, 222, 201);
+const COLORREF C_ACCENT_DARK = RGB(42, 176, 159);
+const COLORREF C_ACCENT_DEEP = RGB(19, 86, 79);
+const COLORREF C_GREEN       = RGB(96, 214, 148);
+const COLORREF C_DANGER      = RGB(246, 106, 122);
+const COLORREF C_BLUE        = RGB(98, 160, 255);
+const COLORREF C_VIOLET      = RGB(180, 138, 255);
+const COLORREF C_AMBER       = RGB(247, 188, 78);
+const COLORREF C_LOG         = RGB(6, 9, 14);
+const COLORREF C_LOG_TEXT    = RGB(178, 229, 219);

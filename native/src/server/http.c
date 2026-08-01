@@ -36,6 +36,7 @@ void http_set_ctx(HttpCtx *ctx) { g_ctx = ctx; }
 /* Sized for whole-script Ren'Py warmups (30k lines): jobs are ~150 bytes, so
    the worst case stays around 10 MB while the queue drains through the API. */
 #define ASYNC_QUEUE_LIMIT 65536              /* 异步队列上限，防失控占满内存 */
+#define ASYNC_QUEUE_BYTE_LIMIT (32u * 1024u * 1024u)
 #define ASYNC_BATCH_MAX 48                   /* 单批最多合并的文本数 */
 #define ASYNC_BATCH_CHAR_BUDGET 9600         /* 单批字符预算，控制单次 API 请求体量 */
 #define ASYNC_BATCH_COALESCE_MS 25           /* 合批等待窗口：攒够一批或超时即发 */
@@ -44,12 +45,14 @@ void http_set_ctx(HttpCtx *ctx) { g_ctx = ctx; }
 #define LIVE_BATCH_MAX 48
 #define LIVE_BATCH_CHAR_BUDGET 9600
 #define LIVE_BATCH_COALESCE_MS 35
+#define LIVE_QUEUE_BYTE_LIMIT (32u * 1024u * 1024u)
 #define HTTP_REQUEST_BUFFER_POOL_LIMIT 32    /* 仅缓存固定 64 KiB 初始块，常驻上限约 2 MiB */
 
 /* 异步任务节点。同时挂在两个结构上：
    qnext 串成 FIFO 等待队列；knext 串成去重桶的冲突链。 */
 typedef struct AsyncJob {
     char *text;
+    size_t memory_bytes;
     uint64_t hash;
     struct AsyncJob *qnext;
     struct AsyncJob *knext;
@@ -59,6 +62,7 @@ typedef struct AsyncJob {
 typedef struct LiveJob {
     char *text;
     char *result;
+    size_t memory_bytes;
     int done;
     CONDITION_VARIABLE cv;
     struct LiveJob *next;
@@ -86,7 +90,9 @@ static AsyncJob *g_async_head;
 static AsyncJob *g_async_tail;
 static AsyncJob *g_async_known[ASYNC_KNOWN_BUCKETS];
 static size_t g_async_len;
+static size_t g_async_memory_bytes;
 static volatile LONG g_async_started;        /* worker 池是否已启动（一次性） */
+static volatile LONG g_async_budget_rejections;
 
 /* 实时队列全局状态，结构对称。 */
 static SRWLOCK g_live_lock = SRWLOCK_INIT;
@@ -94,9 +100,15 @@ static CONDITION_VARIABLE g_live_cv = CONDITION_VARIABLE_INIT;
 static LiveJob *g_live_head;
 static LiveJob *g_live_tail;
 static size_t g_live_len;
+static size_t g_live_memory_bytes;
 static volatile LONG g_live_started;
+static volatile LONG g_live_budget_rejections;
+static SRWLOCK g_worker_start_lock = SRWLOCK_INIT;
+static volatile LONG g_worker_start_failures;
 /* 当前活跃的前台（实时）请求数，用于后台 worker 判断是否该让路。 */
 static volatile LONG g_foreground_requests;
+static volatile LONG g_origin_rejections;
+static _Thread_local char g_cors_allow_origin[64] = "null";
 
 static DWORD WINAPI async_worker(LPVOID arg);
 static DWORD WINAPI live_worker(LPVOID arg);
@@ -154,12 +166,37 @@ static size_t async_queue_len(void) {
     return n;
 }
 
+static size_t async_memory_bytes(void) {
+    AcquireSRWLockShared(&g_async_lock);
+    size_t n = g_async_memory_bytes;
+    ReleaseSRWLockShared(&g_async_lock);
+    return n;
+}
+
 /* 线程安全地读取实时队列长度。 */
 static size_t live_queue_len(void) {
     AcquireSRWLockShared(&g_live_lock);
     size_t n = g_live_len;
     ReleaseSRWLockShared(&g_live_lock);
     return n;
+}
+
+static size_t live_memory_bytes(void) {
+    AcquireSRWLockShared(&g_live_lock);
+    size_t n = g_live_memory_bytes;
+    ReleaseSRWLockShared(&g_live_lock);
+    return n;
+}
+
+static void report_live_budget_rejection(size_t used) {
+    LONG count = InterlockedIncrement(&g_live_budget_rejections);
+    if (count <= 3 || (count > 0 && (count & (count - 1)) == 0)) {
+        fprintf(stderr,
+                "[live] rejected translation memory budget "
+                "(used=%zu limit=%u occurrence=%ld)\n",
+                used, (unsigned)LIVE_QUEUE_BYTE_LIMIT, (long)count);
+        fflush(stderr);
+    }
 }
 
 /* 进入前台临界区：实时请求开始前调用，计数 +1。 */
@@ -204,17 +241,17 @@ static int sendall(SOCKET s, const char *p, size_t n) {
 /* 发送 JSON 响应：固定 CORS 头 + Connection: close。code/msg 为状态行，body 为正文。 */
 static void resp(SOCKET s, int code, const char *msg, const char *body) {
     const char *ctype = "application/json; charset=utf-8";
-    char h[512];
+    char h[640];
     size_t n = strlen(body);
     int k = snprintf(h, sizeof h,
                      "HTTP/1.1 %d %s\r\n"
                      "Content-Type: %s\r\n"
                      "Content-Length: %zu\r\n"
-                     "Access-Control-Allow-Origin: *\r\n"
+                     "Access-Control-Allow-Origin: %s\r\n"
                      "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                      "Access-Control-Allow-Headers: Content-Type\r\n"
                      "Connection: close\r\n\r\n",
-                     code, msg, ctype, n);
+                     code, msg, ctype, n, g_cors_allow_origin);
     if (k < 0 || (size_t)k >= sizeof h) return; /* never read past the buffer */
     sendall(s, h, (size_t)k);
     sendall(s, body, n);
@@ -222,17 +259,17 @@ static void resp(SOCKET s, int code, const char *msg, const char *body) {
 
 /* 发送纯文本响应（/translate?text=... 这类 GET 走纯文本协议）。 */
 static void resp_plain(SOCKET s, int code, const char *msg, const char *body) {
-    char h[512];
+    char h[640];
     size_t n = strlen(body ? body : "");
     int k = snprintf(h, sizeof h,
                      "HTTP/1.1 %d %s\r\n"
                      "Content-Type: text/plain; charset=utf-8\r\n"
                      "Content-Length: %zu\r\n"
-                     "Access-Control-Allow-Origin: *\r\n"
+                     "Access-Control-Allow-Origin: %s\r\n"
                      "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                      "Access-Control-Allow-Headers: Content-Type\r\n"
                      "Connection: close\r\n\r\n",
-                     code, msg, n);
+                     code, msg, n, g_cors_allow_origin);
     if (k < 0 || (size_t)k >= sizeof h) return; /* never read past the buffer */
     sendall(s, h, (size_t)k);
     sendall(s, body ? body : "", n);
@@ -335,6 +372,92 @@ static int parse_content_length(char *req, char *headers_end,
     return 1;
 }
 
+static int origin_port_suffix_valid(const char *value, size_t length) {
+    if (!length) return 1;
+    if (value[0] != ':' || length == 1 || length > 6) return 0;
+    unsigned port = 0;
+    for (size_t i = 1; i < length; i++) {
+        if (value[i] < '0' || value[i] > '9') return 0;
+        port = port * 10u + (unsigned)(value[i] - '0');
+    }
+    return port >= 1u && port <= 65535u;
+}
+
+static int origin_value_allowed(const char *value, size_t length) {
+    static const char *const exact[] = {"null", "file://"};
+    static const char *const local_prefixes[] = {
+        "http://127.0.0.1", "https://127.0.0.1",
+        "http://localhost", "https://localhost",
+        "http://[::1]", "https://[::1]"
+    };
+    for (size_t i = 0; i < sizeof exact / sizeof exact[0]; i++) {
+        size_t n = strlen(exact[i]);
+        if (length == n && mem_ieq(value, exact[i], n)) return 1;
+    }
+    for (size_t i = 0; i < sizeof local_prefixes / sizeof local_prefixes[0]; i++) {
+        size_t n = strlen(local_prefixes[i]);
+        if (length >= n && mem_ieq(value, local_prefixes[i], n) &&
+            origin_port_suffix_valid(value + n, length - n)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Browser game hooks need file/null-origin CORS, while arbitrary websites
+   must not read translation memory or spend the configured provider account.
+   Native engine clients omit Origin and remain unaffected. */
+static int apply_origin_policy(char *req, char *headers_end, int *present_out) {
+    static const char name[] = "Origin";
+    const size_t name_len = sizeof name - 1;
+    char *p = strstr(req, "\r\n");
+    *present_out = 0;
+    memcpy(g_cors_allow_origin, "null", 5);
+    if (!p || p >= headers_end) return 0;
+    p += 2;
+    while (p < headers_end) {
+        char *line_end = strstr(p, "\r\n");
+        if (!line_end || line_end > headers_end) line_end = headers_end;
+        char *colon = memchr(p, ':', (size_t)(line_end - p));
+        if (colon && (size_t)(colon - p) == name_len &&
+            mem_ieq(p, name, name_len)) {
+            if (*present_out) return 0;
+            *present_out = 1;
+            char *value = colon + 1;
+            while (value < line_end && (*value == ' ' || *value == '\t')) value++;
+            char *value_end = line_end;
+            while (value_end > value &&
+                   (value_end[-1] == ' ' || value_end[-1] == '\t')) {
+                value_end--;
+            }
+            size_t length = (size_t)(value_end - value);
+            if (!length || length >= sizeof g_cors_allow_origin ||
+                !origin_value_allowed(value, length)) {
+                return 0;
+            }
+            memcpy(g_cors_allow_origin, value, length);
+            g_cors_allow_origin[length] = 0;
+        }
+        if (line_end == headers_end) break;
+        p = line_end + 2;
+    }
+    return 1;
+}
+
+static int browser_admin_path(const char *path) {
+    return ieq(path, "/shutdown") || ieq(path, "/cache/import") ||
+           ieq(path, "/cache/dump") || ieq(path, "/cache/export");
+}
+
+static void report_origin_rejection(const char *reason) {
+    LONG count = InterlockedIncrement(&g_origin_rejections);
+    if (count <= 3 || (count > 0 && (count & (count - 1)) == 0)) {
+        fprintf(stderr, "[http] browser origin rejected #%ld (%s)\n",
+                (long)count, reason);
+        fflush(stderr);
+    }
+}
+
 /* 取 JSON 体中某个布尔字段是否为真。先用 strstr 快速短路，避免对大 body
    做完整 json_key 扫描。识别 true/1。 */
 static int json_bool_true(const char *json, const char *key) {
@@ -403,36 +526,60 @@ static int worker_pool_size(void) {
     return n;
 }
 
+/* Prefetch must never occupy every remote channel before visible text arrives.
+   With more than one configured channel, keep one available for the live lane;
+   a single-channel provider necessarily shares its only connection. */
+static int async_worker_pool_size(void) {
+    int n = worker_pool_size();
+    return n > 1 ? n - 1 : 1;
+}
+
 /* 首次需要 worker 时启动一整池（数量 = 并发通道数）。started 用 CAS 保证
    只启动一次；启动失败则回退标志，下次再试。返回是否已有可用 worker。 */
-static int ensure_worker_pool(volatile LONG *started, LPTHREAD_START_ROUTINE fn) {
-    if (InterlockedCompareExchange(started, 1, 0) == 0) {
-        int created = 0;
-        int want = worker_pool_size();
-        for (int i = 0; i < want; i++) {
-            HANDLE th = CreateThread(NULL, 64 * 1024, fn, NULL,
-                                     STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-            if (th) {
-                CloseHandle(th);
-                created++;
-            }
-        }
-        if (!created) {
-            InterlockedExchange(started, 0);
-            return 0;
+static int ensure_worker_pool(volatile LONG *started, LPTHREAD_START_ROUTINE fn,
+                              int want, const char *lane) {
+    DWORD last_error = ERROR_SUCCESS;
+    AcquireSRWLockExclusive(&g_worker_start_lock);
+    LONG current = InterlockedCompareExchange(started, 0, 0);
+    int created = 0;
+    for (int i = (int)current; i < want; i++) {
+        HANDLE th = CreateThread(NULL, 64 * 1024, fn, NULL,
+                                 STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        if (th) {
+            CloseHandle(th);
+            created++;
+        } else {
+            last_error = GetLastError();
         }
     }
-    return 1;
+    LONG available = current + created;
+    InterlockedExchange(started, available);
+    ReleaseSRWLockExclusive(&g_worker_start_lock);
+
+    if (available < want) {
+        LONG count = InterlockedIncrement(&g_worker_start_failures);
+        if (count <= 3 || (count > 0 && (count & (count - 1)) == 0)) {
+            fprintf(stderr,
+                    "[http] %s worker pool creation incomplete "
+                    "(wanted=%d available=%ld error=%lu occurrence=%ld)\n",
+                    lane, want, (long)available, (unsigned long)last_error,
+                    (long)count);
+            fflush(stderr);
+        }
+    }
+    return available > 0;
 }
 
 /* 确保异步 worker 池已启动。 */
 static int ensure_async_worker(void) {
-    return ensure_worker_pool(&g_async_started, async_worker);
+    return ensure_worker_pool(&g_async_started, async_worker,
+                              async_worker_pool_size(), "async");
 }
 
 /* 确保实时 worker 池已启动。 */
 static int ensure_live_worker(void) {
-    return ensure_worker_pool(&g_live_started, live_worker);
+    return ensure_worker_pool(&g_live_started, live_worker,
+                              worker_pool_size(), "live");
 }
 
 /* 持锁查询某文本是否已在异步队列中（去重），避免重复排队。
@@ -459,14 +606,32 @@ static int async_enqueue_miss(const char *text) {
     if (!ensure_async_worker()) return 0;
 
     uint64_t h = h64(text);
+    size_t text_bytes = strlen(text) + 1;
+    if (text_bytes > ASYNC_QUEUE_BYTE_LIMIT - sizeof(AsyncJob)) return 0;
+    size_t memory_bytes = sizeof(AsyncJob) + text_bytes;
     AcquireSRWLockExclusive(&g_async_lock);
     if (g_async_len >= ASYNC_QUEUE_LIMIT || async_known_locked(text, h)) {
         ReleaseSRWLockExclusive(&g_async_lock);
         return 0;
     }
+    if (g_async_memory_bytes > ASYNC_QUEUE_BYTE_LIMIT - memory_bytes) {
+        size_t used_at_rejection = g_async_memory_bytes;
+        ReleaseSRWLockExclusive(&g_async_lock);
+        LONG count = InterlockedIncrement(&g_async_budget_rejections);
+        if (count <= 3 || (count > 0 && (count & (count - 1)) == 0)) {
+            fprintf(stderr,
+                    "[http] async queue byte budget rejected #%ld "
+                    "(used=%zu, limit=%u)\n",
+                    (long)count, used_at_rejection,
+                    (unsigned)ASYNC_QUEUE_BYTE_LIMIT);
+            fflush(stderr);
+        }
+        return 0;
+    }
 
     AsyncJob *job = xmalloc(sizeof *job);
     job->text = xstrdup(text);
+    job->memory_bytes = memory_bytes;
     job->hash = h;
     job->qnext = NULL;
     size_t slot = (size_t)h & (ASYNC_KNOWN_BUCKETS - 1);
@@ -476,6 +641,7 @@ static int async_enqueue_miss(const char *text) {
     else g_async_head = job;
     g_async_tail = job;
     g_async_len++;
+    g_async_memory_bytes += memory_bytes;
     WakeConditionVariable(&g_async_cv);
     ReleaseSRWLockExclusive(&g_async_lock);
     return 1;
@@ -542,7 +708,14 @@ static size_t async_pop_batch(AsyncJob **jobs, size_t cap) {
 /* 一批 job 处理完毕：从去重桶摘除并释放内存。 */
 static void async_finish_jobs(AsyncJob **jobs, size_t count) {
     AcquireSRWLockExclusive(&g_async_lock);
-    for (size_t i = 0; i < count; i++) async_forget_locked(jobs[i]);
+    for (size_t i = 0; i < count; i++) {
+        async_forget_locked(jobs[i]);
+        if (g_async_memory_bytes >= jobs[i]->memory_bytes) {
+            g_async_memory_bytes -= jobs[i]->memory_bytes;
+        } else {
+            g_async_memory_bytes = 0;
+        }
+    }
     ReleaseSRWLockExclusive(&g_async_lock);
     for (size_t i = 0; i < count; i++) {
         free(jobs[i]->text);
@@ -577,26 +750,44 @@ static void async_translate_pending(AsyncJob **jobs, size_t count) {
     async_wait_for_foreground();
     if (server_stopping() || !g_ctx->api || !g_ctx->api->enabled) return;
     if (api_translate_batch(g_ctx->api, texts, pn, &translated)) {
+        const char *persist_keys[ASYNC_BATCH_MAX];
+        const char *persist_values[ASYNC_BATCH_MAX];
+        size_t persist_n = 0;
         for (size_t i = 0; i < pn; i++) {
             if (is_resolved_translation(pending[i]->text, translated[i])) {
-                cache_set_persist(g_ctx->cache, pending[i]->text, translated[i]);
+                persist_keys[persist_n] = pending[i]->text;
+                persist_values[persist_n] = translated[i];
+                persist_n++;
             }
+        }
+        cache_set_many_persist(g_ctx->cache, persist_keys, persist_values, persist_n);
+        for (size_t i = 0; i < pn; i++) {
             free(translated[i]);
         }
         free(translated);
         return;
     }
 
+    const char *persist_keys[ASYNC_BATCH_MAX];
+    const char *persist_values[ASYNC_BATCH_MAX];
+    char *owned_values[ASYNC_BATCH_MAX] = {0};
+    size_t persist_n = 0;
     for (size_t i = 0; i < pn; i++) {
         char *live = NULL;
         async_wait_for_foreground();
         if (server_stopping() || !g_ctx->api || !g_ctx->api->enabled) break;
         if (api_translate(g_ctx->api, pending[i]->text, &live) &&
             is_resolved_translation(pending[i]->text, live)) {
-            cache_set_persist(g_ctx->cache, pending[i]->text, live);
+            persist_keys[persist_n] = pending[i]->text;
+            persist_values[persist_n] = live;
+            owned_values[persist_n] = live;
+            persist_n++;
+            live = NULL;
         }
         free(live);
     }
+    cache_set_many_persist(g_ctx->cache, persist_keys, persist_values, persist_n);
+    for (size_t i = 0; i < persist_n; i++) free(owned_values[i]);
 }
 
 /* 异步 worker 主循环：取批 -> 翻译 -> 收尾，直到服务器关闭且队列空。 */
@@ -704,11 +895,19 @@ static void live_translate_jobs(LiveJob **jobs, size_t count, char **results) {
 
     char **translated = NULL;
     if (api_translate_batch(g_ctx->api, texts, pn, &translated)) {
+        const char *persist_keys[LIVE_BATCH_MAX];
+        const char *persist_values[LIVE_BATCH_MAX];
+        size_t persist_n = 0;
         for (size_t i = 0; i < pn; i++) {
             if (is_resolved_translation(pending[i]->text, translated[i])) {
                 pending[i]->result = NULL;
-                cache_set_persist(g_ctx->cache, pending[i]->text, translated[i]);
+                persist_keys[persist_n] = pending[i]->text;
+                persist_values[persist_n] = translated[i];
+                persist_n++;
             }
+        }
+        cache_set_many_persist(g_ctx->cache, persist_keys, persist_values, persist_n);
+        for (size_t i = 0; i < pn; i++) {
             free(translated[i]);
         }
         free(translated);
@@ -722,12 +921,15 @@ static void live_translate_jobs(LiveJob **jobs, size_t count, char **results) {
         char *live = NULL;
         if (api_translate(g_ctx->api, texts[0], &live) &&
             is_resolved_translation(texts[0], live)) {
-            cache_set_persist(g_ctx->cache, texts[0], live);
-            for (size_t i = 0; i < count; i++) {
-                if (jobs[i] == pending[0] && !results[i]) {
-                    results[i] = live;
-                    live = NULL;
-                    break;
+            CachePersistResult persisted =
+                cache_set_persist_result(g_ctx->cache, texts[0], live);
+            if (persisted.accepted) {
+                for (size_t i = 0; i < count; i++) {
+                    if (jobs[i] == pending[0] && !results[i]) {
+                        results[i] = live;
+                        live = NULL;
+                        break;
+                    }
                 }
             }
         }
@@ -770,20 +972,92 @@ static char *live_translate_batched(const char *text) {
 
     LiveJob job;
     memset(&job, 0, sizeof job);
+    size_t text_bytes = strlen(text) + 1;
+    if (text_bytes > LIVE_QUEUE_BYTE_LIMIT - sizeof job) return NULL;
+    job.memory_bytes = sizeof job + text_bytes;
     job.text = xstrdup(text);
     InitializeConditionVariable(&job.cv);
 
     foreground_enter();
     AcquireSRWLockExclusive(&g_live_lock);
+    if (g_live_memory_bytes > LIVE_QUEUE_BYTE_LIMIT - job.memory_bytes) {
+        size_t used_at_rejection = g_live_memory_bytes;
+        ReleaseSRWLockExclusive(&g_live_lock);
+        foreground_leave();
+        free(job.text);
+        report_live_budget_rejection(used_at_rejection);
+        return NULL;
+    }
+    g_live_memory_bytes += job.memory_bytes;
     live_enqueue_locked(&job);
     while (!job.done) {
         SleepConditionVariableSRW(&job.cv, &g_live_lock, INFINITE, 0);
     }
+    g_live_memory_bytes -= job.memory_bytes;
     ReleaseSRWLockExclusive(&g_live_lock);
     foreground_leave();
 
     free(job.text);
     return job.result;
+}
+
+/* Submit all unique misses from one HTTP batch to the live worker pool at
+   once. Workers split them by item/character budget and can use independent
+   API channels concurrently. Results retain input order; unresolved entries
+   remain original echoes and are rejected by the caller. */
+static void live_translate_group(char **texts, size_t count, char **results) {
+    if (!texts || !count || !results || !g_ctx || !g_ctx->api ||
+        !g_ctx->api->enabled || !ensure_live_worker()) return;
+    if (count > LIVE_QUEUE_BYTE_LIMIT / sizeof(LiveJob)) {
+        report_live_budget_rejection(live_memory_bytes());
+        return;
+    }
+
+    LiveJob *jobs = xcalloc(count, sizeof *jobs);
+    size_t memory_bytes = count * sizeof *jobs;
+    for (size_t i = 0; i < count; i++) {
+        size_t text_bytes = strlen(texts[i]) + 1;
+        if (text_bytes > LIVE_QUEUE_BYTE_LIMIT - memory_bytes) {
+            for (size_t j = 0; j < i; j++) free(jobs[j].text);
+            free(jobs);
+            report_live_budget_rejection(live_memory_bytes());
+            return;
+        }
+        memory_bytes += text_bytes;
+        jobs[i].memory_bytes = sizeof *jobs + text_bytes;
+        jobs[i].text = xstrdup(texts[i]);
+        InitializeConditionVariable(&jobs[i].cv);
+    }
+
+    foreground_enter();
+    AcquireSRWLockExclusive(&g_live_lock);
+    if (g_live_memory_bytes > LIVE_QUEUE_BYTE_LIMIT - memory_bytes) {
+        size_t used_at_rejection = g_live_memory_bytes;
+        ReleaseSRWLockExclusive(&g_live_lock);
+        foreground_leave();
+        for (size_t i = 0; i < count; i++) free(jobs[i].text);
+        free(jobs);
+        report_live_budget_rejection(used_at_rejection);
+        return;
+    }
+    g_live_memory_bytes += memory_bytes;
+    for (size_t i = 0; i < count; i++) live_enqueue_locked(&jobs[i]);
+    for (size_t i = 0; i < count; i++) {
+        while (!jobs[i].done) {
+            SleepConditionVariableSRW(&jobs[i].cv, &g_live_lock, INFINITE, 0);
+        }
+        results[i] = jobs[i].result;
+        jobs[i].result = NULL;
+    }
+    g_live_memory_bytes -= memory_bytes;
+    ReleaseSRWLockExclusive(&g_live_lock);
+    foreground_leave();
+
+    for (size_t i = 0; i < count; i++) {
+        free(jobs[i].text);
+        free(jobs[i].result);
+    }
+    free(jobs);
 }
 
 /* 单条文本的核心翻译决策（被 /translate、op_batch 共用）。
@@ -808,9 +1082,12 @@ static char *translate_value(const char *text, int cache_only, int queue_miss, c
     if (!cache_only && g_ctx->api && g_ctx->api->enabled) {
         char *live = live_translate_batched(text);
         if (is_resolved_translation(text, live)) {
-            cache_set_persist(g_ctx->cache, text, live);
-            if (source) *source = "api_batch";
-            return live;
+            CachePersistResult persisted =
+                cache_set_persist_result(g_ctx->cache, text, live);
+            if (persisted.accepted) {
+                if (source) *source = "api_batch";
+                return live;
+            }
         }
         free(live);
     }
@@ -826,8 +1103,16 @@ static void op_health(Buf *b) {
     buf_int(b, (long long)cache_size(g_ctx->cache));
     buf_add(b, ",\"async_queue\":");
     buf_int(b, (long long)async_queue_len());
+    buf_add(b, ",\"async_memory_bytes\":");
+    buf_int(b, (long long)async_memory_bytes());
+    buf_add(b, ",\"async_memory_limit\":");
+    buf_int(b, ASYNC_QUEUE_BYTE_LIMIT);
     buf_add(b, ",\"live_queue\":");
     buf_int(b, (long long)live_queue_len());
+    buf_add(b, ",\"live_memory_bytes\":");
+    buf_int(b, (long long)live_memory_bytes());
+    buf_add(b, ",\"live_memory_limit\":");
+    buf_int(b, LIVE_QUEUE_BYTE_LIMIT);
     buf_add(b, ",\"request_buffer_pool_cached\":");
     buf_int(b, (long long)request_buffer_pool_count());
     buf_add(b, ",\"request_buffer_pool_limit\":");
@@ -836,6 +1121,23 @@ static void op_health(Buf *b) {
     buf_int(b, (long long)(unsigned long)InterlockedCompareExchange(&g_request_buffer_pool_hits, 0, 0));
     buf_add(b, ",\"request_buffer_pool_misses\":");
     buf_int(b, (long long)(unsigned long)InterlockedCompareExchange(&g_request_buffer_pool_misses, 0, 0));
+    buf_add(b, ",\"active_connections\":");
+    buf_int(b, g_ctx->active_connections
+        ? (long long)InterlockedCompareExchange(g_ctx->active_connections, 0, 0)
+        : 0);
+    buf_add(b, ",\"connection_limit\":");
+    buf_int(b, (long long)g_ctx->connection_limit);
+    buf_add(b, ",\"connection_rejections\":");
+    buf_int(b, g_ctx->connection_rejections
+        ? (long long)(unsigned long)InterlockedCompareExchange(g_ctx->connection_rejections, 0, 0)
+        : 0);
+    buf_add(b, ",\"connection_thread_failures\":");
+    buf_int(b, g_ctx->connection_thread_failures
+        ? (long long)(unsigned long)InterlockedCompareExchange(g_ctx->connection_thread_failures, 0, 0)
+        : 0);
+    buf_add(b, ",\"worker_start_failures\":");
+    buf_int(b, (long long)(unsigned long)InterlockedCompareExchange(
+        &g_worker_start_failures, 0, 0));
     buf_add(b, ",\"api_enabled\":");
     buf_add(b, (g_ctx->api && g_ctx->api->enabled) ? "true" : "false");
     buf_add(b, ",\"runtime_cache_only\":false,\"uptime_seconds\":");
@@ -913,17 +1215,36 @@ static void op_batch(Buf *b, List *l, int single, int cache_only) {
     char **vals = xcalloc(l->n ? l->n : 1, sizeof *vals);
     const char **sources = xcalloc(l->n ? l->n : 1, sizeof *sources);
     size_t *miss = xcalloc(l->n ? l->n : 1, sizeof *miss);
+    size_t *duplicate_of = xmalloc((l->n ? l->n : 1) * sizeof *duplicate_of);
     size_t miss_n = 0;
 
+    /* 去重用开放寻址哈希表（h64 + 线性探测，负载因子 ≤ 0.5），桶内存放首个
+       出现的下标+1（0=空桶）。语义与逐对 strcmp 一致（duplicate_of 仍指向
+       首个相同文本的下标），但 30k 行整脚本批量从 O(n^2)（约 4.5 亿次比较）
+       降为 O(n)。 */
+    size_t dedup_cap = 16;
+    while (dedup_cap < l->n * 2) {
+        if (dedup_cap > SIZE_MAX / 2) die("batch too large");
+        dedup_cap *= 2;
+    }
+    size_t *dedup_idx = xcalloc(dedup_cap, sizeof *dedup_idx);
+    uint64_t *dedup_hash = xmalloc(dedup_cap * sizeof *dedup_hash);
+
     for (size_t i = 0; i < l->n; i++) {
-        for (size_t j = 0; j < i; j++) {
-            if (vals[j] && strcmp(l->v[i], l->v[j]) == 0) {
-                vals[i] = xstrdup(vals[j]);
-                sources[i] = sources[j];
+        duplicate_of[i] = SIZE_MAX;
+        uint64_t h = h64(l->v[i]);
+        size_t slot = (size_t)h & (dedup_cap - 1);
+        while (dedup_idx[slot]) {
+            size_t j = dedup_idx[slot] - 1;
+            if (dedup_hash[slot] == h && strcmp(l->v[j], l->v[i]) == 0) {
+                duplicate_of[i] = j;
                 break;
             }
+            slot = (slot + 1) & (dedup_cap - 1);
         }
-        if (vals[i]) continue;
+        if (duplicate_of[i] != SIZE_MAX) continue;
+        dedup_idx[slot] = i + 1;
+        dedup_hash[slot] = h;
 
         vals[i] = cache_get(g_ctx->cache, l->v[i]);
         if (vals[i]) {
@@ -945,49 +1266,37 @@ static void op_batch(Buf *b, List *l, int single, int cache_only) {
         }
     }
 
-    if (miss_n) foreground_enter();
-    for (size_t start = 0; start < miss_n; start += ASYNC_BATCH_MAX) {
-        size_t n = miss_n - start;
-        if (n > ASYNC_BATCH_MAX) n = ASYNC_BATCH_MAX;
-        char *texts[ASYNC_BATCH_MAX];
-        for (size_t j = 0; j < n; j++) texts[j] = l->v[miss[start + j]];
-
-        char **translated = NULL;
-        if (api_translate_batch(g_ctx->api, texts, n, &translated)) {
-            for (size_t j = 0; j < n; j++) {
-                size_t idx = miss[start + j];
-                if (is_resolved_translation(l->v[idx], translated[j])) {
-                    vals[idx] = translated[j];
-                    sources[idx] = "api_batch";
-                    cache_set_persist(g_ctx->cache, l->v[idx], translated[j]);
-                    translated[j] = NULL;
-                }
-                free(translated[j]);
+    if (miss_n) {
+        char **texts = xmalloc(miss_n * sizeof *texts);
+        char **translated = xcalloc(miss_n, sizeof *translated);
+        for (size_t i = 0; i < miss_n; i++) texts[i] = l->v[miss[i]];
+        live_translate_group(texts, miss_n, translated);
+        for (size_t i = 0; i < miss_n; i++) {
+            size_t idx = miss[i];
+            if (is_resolved_translation(l->v[idx], translated[i])) {
+                vals[idx] = translated[i];
+                translated[i] = NULL;
+                sources[idx] = "api_batch";
             }
-            free(translated);
+            free(translated[i]);
         }
-        for (size_t j = 0; j < n; j++) {
-            size_t idx = miss[start + j];
-            if (vals[idx]) continue;
-            char *live = NULL;
-            if (api_translate(g_ctx->api, l->v[idx], &live) &&
-                is_resolved_translation(l->v[idx], live)) {
-                vals[idx] = live;
-                sources[idx] = "api";
-                cache_set_persist(g_ctx->cache, l->v[idx], live);
-                live = NULL;
-            }
-            free(live);
-        }
+        free(translated);
+        free(texts);
     }
-    if (miss_n) foreground_leave();
 
     for (size_t i = 0; i < l->n; i++) {
+        if (duplicate_of[i] != SIZE_MAX) continue;
         if (!vals[i]) {
             vals[i] = xstrdup(l->v[i]);
             sources[i] = "miss";
         }
         if (!sources[i]) sources[i] = "miss";
+    }
+    for (size_t i = 0; i < l->n; i++) {
+        if (duplicate_of[i] == SIZE_MAX) continue;
+        size_t original = duplicate_of[i];
+        vals[i] = xstrdup(vals[original]);
+        sources[i] = sources[original];
     }
 
     buf_add(b, "{\"translations\":{");
@@ -1014,6 +1323,9 @@ static void op_batch(Buf *b, List *l, int single, int cache_only) {
     free(vals);
     free(sources);
     free(miss);
+    free(duplicate_of);
+    free(dedup_idx);
+    free(dedup_hash);
 }
 
 /* Return the position just past the matching '}' for the object starting at
@@ -1044,34 +1356,78 @@ static const char *json_object_end(const char *p) {
     return NULL;
 }
 
-/* /cache/import：从 {entries:[{key,value},...]} 导入条目到缓存（仅写内存，
-   不落盘——导入的数据由后续新增翻译触发持久化，或保留在内存供本次运行使用）。
+/* /cache/import：从 {entries:[{key,value},...]} 导入条目到缓存并落盘（与正常
+   翻译路径共享清洗/等值拒绝规则）。文件系统失败属于外部边界：有效译文仍留在
+   内存供 cache-first 读取，但 status/imported/memory_only 必须明确指出重启风险，
+   不能把未落盘条目伪装成完整导入成功。
+   扫描以数组闭括号 ']' 为上界：逐项要求下一个非空白字符是 ','、']' 或 '{'，
+   防止 strchr 越过 entries 末尾把后面的兄弟成员误当条目导入。
    用 json_object_end 逐个对象切片再解析，避免 value 含 '}' 时误切。 */
 static void op_import(Buf *b, const char *json) {
     const char *p = json_top_key(json, "entries");
-    int n = 0;
+    size_t n = 0, cap = 0;
+    const char **keys = NULL, **values = NULL;
     if (p && *p == '[') {
         p++;
-        while (*p) {
-            const char *obj = strchr(p, '{');
-            if (!obj) break;
-            const char *end = json_object_end(obj);
+        for (;;) {
+            p = json_skipws(p);
+            if (*p == ']') break;
+            if (*p == ',') {
+                p++;
+                continue;
+            }
+            if (*p != '{') break;
+            const char *end = json_object_end(p);
             if (!end) break;
-            char *tmp = xstrndup(obj, (size_t)(end - obj));
+            char *tmp = xstrndup(p, (size_t)(end - p));
             char *k = json_top_get_str(tmp, "key");
             char *v = json_top_get_str(tmp, "value");
             if (k && v && *k && *v) {
-                cache_set(g_ctx->cache, k, v);
+                if (n == cap) {
+                    if (cap > SIZE_MAX / 2 / sizeof *keys) die("import too large");
+                    cap = cap ? cap * 2 : 64;
+                    keys = xrealloc(keys, cap * sizeof *keys);
+                    values = xrealloc(values, cap * sizeof *values);
+                }
+                /* cache_set_many_persist 只读不接管，k/v 所有权留在本函数。 */
+                keys[n] = k;
+                values[n] = v;
                 n++;
+            } else {
+                free(k);
+                free(v);
             }
-            free(k);
-            free(v);
             free(tmp);
             p = end;
         }
     }
-    buf_add(b, "{\"status\":\"ok\",\"imported\":");
-    buf_int(b, n);
+    CachePersistResult persisted =
+        cache_set_many_persist_result(g_ctx->cache, keys, values, n);
+    for (size_t i = 0; i < n; i++) {
+        free((void *)keys[i]);
+        free((void *)values[i]);
+    }
+    free(keys);
+    free(values);
+    const char *status = "ok";
+    if (persisted.status == CACHE_PERSIST_FAILED) {
+        status = "error";
+    } else if (persisted.status == CACHE_PERSIST_PARTIAL ||
+               (persisted.accepted && persisted.rejected)) {
+        status = "partial";
+    } else if (!persisted.accepted && persisted.rejected) {
+        status = "rejected";
+    }
+    buf_add(b, "{\"status\":");
+    buf_json(b, status);
+    buf_add(b, ",\"imported\":");
+    buf_int(b, (long long)persisted.persisted);
+    buf_add(b, ",\"accepted\":");
+    buf_int(b, (long long)persisted.accepted);
+    buf_add(b, ",\"rejected\":");
+    buf_int(b, (long long)persisted.rejected);
+    buf_add(b, ",\"memory_only\":");
+    buf_int(b, (long long)(persisted.accepted - persisted.persisted));
     buf_add(b, "}");
 }
 
@@ -1091,6 +1447,46 @@ static void op_prefetch(Buf *b, List *l) {
    这是 public API 契约的集中地，路由与响应字段改动需格外谨慎（AGENTS.md）。
    接收策略：先设收发超时与 TCP_NODELAY；按需扩容缓冲，读到头部完整后按
    Content-Length 判断 body 是否收齐，避免过度读取或阻塞。 */
+static int parse_request_line(const char *request, const char *headers_end,
+                              char *method, size_t method_cap,
+                              char *path, size_t path_cap) {
+    if (!request || !headers_end || !method || method_cap < 2 ||
+        !path || path_cap < 2) return 0;
+    const char *line_end = strstr(request, "\r\n");
+    if (!line_end || line_end >= headers_end) return 0;
+    const char *space1 = memchr(request, ' ', (size_t)(line_end - request));
+    if (!space1 || space1 == request) return 0;
+    const char *space2 = memchr(space1 + 1, ' ', (size_t)(line_end - space1 - 1));
+    if (!space2 || space2 == space1 + 1) return 0;
+    if (memchr(space2 + 1, ' ', (size_t)(line_end - space2 - 1))) return 0;
+
+    size_t method_len = (size_t)(space1 - request);
+    size_t path_len = (size_t)(space2 - space1 - 1);
+    size_t version_len = (size_t)(line_end - space2 - 1);
+    if (method_len >= method_cap || path_len >= path_cap) return 0;
+    if (version_len != 8 ||
+        (memcmp(space2 + 1, "HTTP/1.1", 8) &&
+         memcmp(space2 + 1, "HTTP/1.0", 8))) return 0;
+    for (size_t i = 0; i < method_len; i++) {
+        if (!isalpha((unsigned char)request[i])) return 0;
+    }
+    for (size_t i = 0; i < path_len; i++) {
+        unsigned char c = (unsigned char)space1[1 + i];
+        if (c <= 0x20 || c == 0x7f) return 0;
+    }
+    if (space1[1] != '/' &&
+        !(path_len == 1 && space1[1] == '*' &&
+          method_len == 7 && !_strnicmp(request, "OPTIONS", 7))) {
+        return 0;
+    }
+
+    memcpy(method, request, method_len);
+    method[method_len] = 0;
+    memcpy(path, space1 + 1, path_len);
+    path[path_len] = 0;
+    return 1;
+}
+
 static void serve_one(SOCKET s) {
     DWORD timeout = HTTP_RECV_TIMEOUT_MS;
     if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout) == SOCKET_ERROR ||
@@ -1114,13 +1510,19 @@ static void serve_one(SOCKET s) {
     for (;;) {
         if (n + 1 >= cap) {
             if (cap >= HTTP_MAX_REQ) {
-                request_error = 413;
-                break;
+                /* 缓冲已顶到上限。若头部已收齐且声明的总长未超上限（恰好 2MB
+                   的合法请求），允许用缓冲内剩余空间再 recv 一次收尾，而不是
+                   把差一字节的请求误报 413；否则维持拒绝。 */
+                if (!headers_complete || expected_total > cap || n >= expected_total) {
+                    request_error = 413;
+                    break;
+                }
+            } else {
+                size_t new_cap = cap * 2;
+                if (new_cap > HTTP_MAX_REQ) new_cap = HTTP_MAX_REQ;
+                req = xrealloc(req, new_cap + 1);
+                cap = new_cap;
             }
-            size_t new_cap = cap * 2;
-            if (new_cap > HTTP_MAX_REQ) new_cap = HTTP_MAX_REQ;
-            req = xrealloc(req, new_cap + 1);
-            cap = new_cap;
         }
         r = recv(s, req + n, (int)(cap - n), 0);
         if (r <= 0) {
@@ -1165,9 +1567,25 @@ static void serve_one(SOCKET s) {
         return;
     }
 
+    char *headers_end = strstr(req, "\r\n\r\n");
+    int origin_present = 0;
+    if (!headers_end || !apply_origin_policy(req, headers_end, &origin_present)) {
+        report_origin_rejection("untrusted-or-malformed");
+        resp(s, 403, "Forbidden", "{\"error\":\"origin_forbidden\"}");
+        request_buffer_release(req, cap);
+        closesocket(s);
+        return;
+    }
+
     /* 解析请求行（方法 + 路径），拆出查询串，路径统一转小写以简化匹配。 */
     char method[16] = {0}, path[8192] = {0};
-    sscanf(req, "%15s %8191s", method, path);
+    if (!parse_request_line(req, headers_end, method, sizeof method,
+                            path, sizeof path)) {
+        resp(s, 400, "Bad Request", "{\"error\":\"malformed_request_line\"}");
+        request_buffer_release(req, cap);
+        closesocket(s);
+        return;
+    }
     char *query = NULL;
     char *q = strchr(path, '?');
     if (q) {
@@ -1175,6 +1593,14 @@ static void serve_one(SOCKET s) {
         query = q + 1;
     }
     for (char *p = path; *p; p++) *p = (char)tolower((unsigned char)*p);
+
+    if (origin_present && browser_admin_path(path)) {
+        report_origin_rejection("administrative-route");
+        resp(s, 403, "Forbidden", "{\"error\":\"origin_forbidden\"}");
+        request_buffer_release(req, cap);
+        closesocket(s);
+        return;
+    }
 
     char *body = strstr(req, "\r\n\r\n");
     body = body ? body + 4 : "";

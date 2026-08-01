@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -41,9 +42,65 @@ static int read_handle_all(HANDLE h, char *buf, DWORD size) {
 /* 拼接两个路径段：a 末尾无 '\' 时自动补上。 */
 void path_join(WCHAR *out, size_t cap, const WCHAR *a, const WCHAR *b) {
     if (!out || cap == 0) return;
-    _snwprintf(out, cap, L"%s%s%s", a,
-               (a[0] && a[wcslen(a) - 1] != L'\\') ? L"\\" : L"", b);
-    out[cap - 1] = 0;
+    out[0] = 0;
+    if (!a || !b) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return;
+    }
+    int written = _snwprintf(out, cap, L"%s%s%s", a,
+                             (a[0] && a[wcslen(a) - 1] != L'\\') ? L"\\" : L"", b);
+    if (written < 0 || (size_t)written >= cap) {
+        out[0] = 0;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+    }
+}
+
+/*
+ * Backup/ownership marker names are derived from an existing path. CRT wide
+ * formatting can leave a truncated buffer, which is unsafe for deploy and
+ * restore operations because that name may identify a different file.
+ */
+int path_append_suffix(WCHAR *out, size_t cap, const WCHAR *path,
+                       const WCHAR *suffix) {
+    if (!out || cap == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    out[0] = 0;
+    if (!path || !suffix) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    size_t path_len = wcslen(path);
+    size_t suffix_len = wcslen(suffix);
+    if (path_len >= cap || suffix_len >= cap - path_len) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    memcpy(out, path, path_len * sizeof(*out));
+    memcpy(out + path_len, suffix, (suffix_len + 1) * sizeof(*out));
+    return 1;
+}
+
+/* Format process command lines and other ownership-sensitive values without
+ * ever passing a truncated string to Win32. */
+int wide_format_checked(WCHAR *out, size_t cap, const WCHAR *fmt, ...) {
+    if (!out || cap == 0 || !fmt) {
+        if (out && cap) out[0] = 0;
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    out[0] = 0;
+    va_list args;
+    va_start(args, fmt);
+    int written = _vsnwprintf(out, cap, fmt, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= cap) {
+        out[0] = 0;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    return 1;
 }
 
 /* 路径是否存在（文件或目录均可）。 */
@@ -58,28 +115,134 @@ int is_dir(const WCHAR *p) {
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/*
+ * Deployment paths can be inside a user-selected, untrusted game directory.
+ * A junction or directory symlink in that tree must not redirect launcher
+ * writes outside the selected directory.  Inspect each existing component,
+ * because querying only the final path follows intermediate reparse points.
+ *
+ * This check intentionally fails closed when a component cannot be inspected.
+ * Callers already record the surrounding deploy/write failure in the launcher
+ * log, without exposing the contents of the affected game file.
+ */
+static int full_path_for_safety_check(const WCHAR *path, WCHAR *full, size_t cap,
+                                      size_t *root_len_out) {
+    if (!path || !path[0] || !full || cap < 4 || !root_len_out) return 0;
+    DWORD count = GetFullPathNameW(path, (DWORD)cap, full, NULL);
+    if (count == 0 || count >= cap) return 0;
+
+    size_t len = wcslen(full);
+    while (len > 3 && full[len - 1] == L'\\') full[--len] = 0;
+
+    size_t root_len = 0;
+    if (len >= 3 && full[1] == L':' && full[2] == L'\\') {
+        root_len = 3;
+    } else if (len >= 5 && full[0] == L'\\' && full[1] == L'\\') {
+        /* Device namespaces can bypass ordinary Win32 path assumptions. */
+        if ((full[2] == L'?' || full[2] == L'.') && full[3] == L'\\') return 0;
+        WCHAR *server_end = wcschr(full + 2, L'\\');
+        if (!server_end || !server_end[1]) return 0;
+        WCHAR *share_end = wcschr(server_end + 1, L'\\');
+        root_len = share_end ? (size_t)(share_end - full + 1) : len;
+    } else {
+        return 0;
+    }
+    *root_len_out = root_len;
+    return 1;
+}
+
+static int component_is_unsafe(const WCHAR *path, int require_directory) {
+    DWORD attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        return error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND;
+    }
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return 1;
+    return require_directory && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+int path_has_reparse_point(const WCHAR *path, int include_leaf) {
+    WCHAR full[MAX_PATH * 4];
+    size_t root_len = 0;
+    if (!full_path_for_safety_check(path, full, MAX_PATH * 4, &root_len)) return 1;
+
+    size_t len = wcslen(full);
+    for (size_t i = root_len; i <= len; i++) {
+        if (full[i] != L'\\' && full[i] != 0) continue;
+        if (i == len && !include_leaf) break;
+        WCHAR saved = full[i];
+        full[i] = 0;
+        int unsafe = component_is_unsafe(full, i != len || !include_leaf);
+        full[i] = saved;
+        if (unsafe) return 1;
+    }
+    return 0;
+}
+
+static int ensure_checked_directory(const WCHAR *path) {
+    DWORD attrs = GetFileAttributesW(path);
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        return (attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+               !(attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+    }
+    DWORD error = GetLastError();
+    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return 0;
+    if (!CreateDirectoryW(path, NULL)) return 0;
+    attrs = GetFileAttributesW(path);
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+           !(attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+}
+
 /* 递归创建目录：逐级扫描 '\' 分隔符，逐级 CreateDirectory。
    已存在的中间目录跳过，最终 CreateDirectory 失败但 ERROR_ALREADY_EXISTS 也算成功。 */
 int ensure_dir(const WCHAR *path) {
-    if (is_dir(path)) return 1;
-    WCHAR tmp[MAX_PATH * 4];
-    size_t len = wcslen(path);
-    if (len >= MAX_PATH * 4) return 0;
-    memcpy(tmp, path, (len + 1) * sizeof(WCHAR));
-    for (WCHAR *p = tmp; *p; p++) {
-        if (*p == L'\\') {
-            WCHAR old = *p;
-            *p = 0;
-            if (wcslen(tmp) > 2 && !is_dir(tmp)) CreateDirectoryW(tmp, NULL);
-            *p = old;
+    WCHAR full[MAX_PATH * 4];
+    size_t root_len = 0;
+    if (!full_path_for_safety_check(path, full, MAX_PATH * 4, &root_len)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    if (component_is_unsafe(full, 1) && exists_path(full)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+
+    size_t len = wcslen(full);
+    for (size_t i = root_len; i <= len; i++) {
+        if (full[i] != L'\\' && full[i] != 0) continue;
+        WCHAR saved = full[i];
+        full[i] = 0;
+        int ok = ensure_checked_directory(full);
+        full[i] = saved;
+        if (!ok) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return 0;
         }
     }
-    return CreateDirectoryW(tmp, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
+    return 1;
+}
+
+static int write_target_is_safe(const WCHAR *path) {
+    if (path_has_reparse_point(path, 0)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    DWORD attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+    }
+    if (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    return 1;
 }
 
 /* 以 CREATE_ALWAYS 写 UTF-8 文本，返回是否写入完整。 */
 int write_text_file_utf8(const WCHAR *path, const char *bytes) {
-    if (!path || !bytes) return 0;
+    if (!path || !bytes || !write_target_is_safe(path)) return 0;
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     size_t len = strlen(bytes);
@@ -119,7 +282,7 @@ int read_file_bytes(const WCHAR *path, char **out, DWORD *size) {
 
 /* 写入原始字节到文件，CREATE_ALWAYS 覆盖。 */
 int write_file_bytes(const WCHAR *path, const char *buf, DWORD size) {
-    if (!path || (!buf && size != 0)) return 0;
+    if (!path || (!buf && size != 0) || !write_target_is_safe(path)) return 0;
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     int ok = write_handle_all(h, buf, size);
@@ -128,19 +291,70 @@ int write_file_bytes(const WCHAR *path, const char *buf, DWORD size) {
 }
 
 /* 复制单个文件。自动确保目标父目录已存在。FALSE = 覆盖已有。 */
-int copy_file_safe(const WCHAR *from, const WCHAR *to) {
+static int copy_file_checked(const WCHAR *from, const WCHAR *to,
+                             int fail_if_exists) {
+    if (!from || !to || path_has_reparse_point(from, 1)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    DWORD source_attrs = GetFileAttributesW(from);
+    if (source_attrs == INVALID_FILE_ATTRIBUTES ||
+        (source_attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+        return 0;
+    }
     WCHAR parent[MAX_PATH * 4];
     size_t len = wcslen(to);
     if (len >= MAX_PATH * 4) return 0;
     memcpy(parent, to, (len + 1) * sizeof(WCHAR));
     WCHAR *slash = wcsrchr(parent, L'\\');
-    if (slash) { *slash = 0; ensure_dir(parent); }
-    return CopyFileW(from, to, FALSE);
+    if (slash) {
+        *slash = 0;
+        if (!ensure_dir(parent)) return 0;
+    }
+    if (!write_target_is_safe(to)) return 0;
+    return CopyFileW(from, to, fail_if_exists ? TRUE : FALSE);
+}
+
+int copy_file_safe(const WCHAR *from, const WCHAR *to) {
+    return copy_file_checked(from, to, 0);
+}
+
+int copy_file_if_absent_safe(const WCHAR *from, const WCHAR *to) {
+    return copy_file_checked(from, to, 1);
+}
+
+int move_file_safe(const WCHAR *from, const WCHAR *to, DWORD flags) {
+    if (!from || !to || path_has_reparse_point(from, 1) ||
+        !write_target_is_safe(to)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    DWORD attrs = GetFileAttributesW(from);
+    if (attrs == INVALID_FILE_ATTRIBUTES ||
+        (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    return MoveFileExW(from, to, flags);
+}
+
+int delete_file_safe(const WCHAR *path) {
+    if (!path || path_has_reparse_point(path, 0)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    DWORD attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES ||
+        (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
+    return DeleteFileW(path);
 }
 
 /* 递归复制目录树。跳过 . 和 ..，目录递归，文件走 copy_file_safe。 */
 int copy_tree_safe(const WCHAR *from, const WCHAR *to) {
-    if (!is_dir(from)) return 0;
+    if (!is_dir(from) || path_has_reparse_point(from, 1)) return 0;
     if (!ensure_dir(to)) return 0;
 
     WCHAR pat[MAX_PATH * 4];
@@ -155,6 +369,10 @@ int copy_tree_safe(const WCHAR *from, const WCHAR *to) {
         WCHAR src[MAX_PATH * 4], dst[MAX_PATH * 4];
         path_join(src, MAX_PATH * 4, from, fd.cFileName);
         path_join(dst, MAX_PATH * 4, to, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            ok = 0;
+            continue;
+        }
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (!copy_tree_safe(src, dst)) ok = 0;
         } else {

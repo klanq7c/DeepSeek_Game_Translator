@@ -1,10 +1,10 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using BepInEx;
 using BepInEx.Logging;
 using BepInEx.Unity.IL2CPP;
@@ -24,11 +24,12 @@ namespace DeepSeekTMPFontFallback;
  *   -> Start/Update 周期调用 TmpFontFallbackInstaller.Apply()
  *   -> 给 TMP/UGUI 字体资产附加中文 fallback，并刷新已加载文本。
  *
- * LateUpdate 的快速扫描只在 TMP setter Harmony 补丁未安装时兜底。
+ * LateUpdate 的快速扫描只在 TMP setter Harmony 补丁尚未安装、且最近一次安装
+ * 没有失败时兜底；已确认不兼容的运行时降到低频扫描并定期重试补丁。
  * 所有 Unity 对象、反射缓存和集合都只在 Unity 主线程访问，因此本文件
  * 不加锁；不得从后台线程直接调用 Installer。
  */
-[BepInPlugin("com.deepseek.game-translator.tmp-font-fallback", "DeepSeek TMP Font Fallback", "1.2.9")]
+[BepInPlugin("com.deepseek.game-translator.tmp-font-fallback", "DeepSeek TMP Font Fallback", "1.2.20")]
 public sealed class TmpFontFallbackPlugin : BasePlugin
 {
     internal static ManualLogSource Logger;
@@ -196,11 +197,18 @@ internal static class TmpFontFallbackInstaller
     private static readonly HashSet<int> PatchedFontAssets = new();
     private static readonly HashSet<int> DirtiedTexts = new();
     private static readonly HashSet<int> PatchedUguiTexts = new();
+    private static readonly HashSet<string> AttemptedFallbackBundlePaths = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<char> WarmedFallbackCharacters = new(CjkWarmupText);
     private static readonly Dictionary<int, string> LastTmpTextById = new();
+    private static readonly Dictionary<int, string> LastUguiTextById = new();
+    private static readonly Dictionary<int, object> OriginalTmpFontByTextId = new();
     private static readonly Dictionary<int, object> InteractiveOverlayTextBySourceId = new();
     private static readonly Dictionary<int, string> InteractiveOriginalTextBySourceId = new();
     private static readonly Dictionary<int, Color> InteractiveOriginalColorBySourceId = new();
     private static readonly HashSet<int> InteractiveOverlayTextIds = new();
+    private static readonly Dictionary<int, object> TmpUguiOverlayTextBySourceId = new();
+    private static readonly Dictionary<int, Color> TmpUguiOriginalColorBySourceId = new();
+    private static readonly HashSet<int> TmpUguiOverlayTextIds = new();
     /*
      * 上述集合保存跨帧状态，但 Unity 场景对象本身是分代出现/销毁的。下面的 scratch
      * 集合只在慢速 Apply 中复用：定期标记当前活对象，再清扫已销毁对象的 InstanceID
@@ -218,33 +226,50 @@ internal static class TmpFontFallbackInstaller
     private static object _fallbackAsset;
     private static object _uguiFont;
     private static AssetBundle _fallbackBundle;
-    private static byte[] _fallbackManagedBundleBytes;
-    private static Il2CppStructArray<byte> _fallbackBundleBytes;
-    private static Il2CppSystem.IO.MemoryStream _fallbackBundleStream;
+    private static AssetBundleCreateRequest _fallbackBundleRequest;
+    private static string _fallbackBundleRequestPath;
+    private static string _fallbackBundleRequestAssetName;
+    private static GameObject _tmpUguiCanvasObject;
     private static bool _reportedNoTmp;
     private static bool _reportedNoUguiFont;
     private static bool _uguiFontLoadAttempted;
     private static bool _reportedFailure;
+    private static bool _assetBundleInteropIncompatible;
+    private static bool _reportedAssetBundleInteropFallback;
     private static DateTime _nextFallbackLoadAttemptUtc = DateTime.MinValue;
     private static bool _textSetterPatchInstalled;
     private static bool _textSetterPatchFailed;
+    private static bool _textSetterInteropCheckComplete;
+    private static bool _textSetterPatchDeferredForFreshInterop;
+    private static DateTime _nextTextSetterPatchAttemptUtc = DateTime.MinValue;
+    private static int _textSetterPatchFailureCount;
+    private static bool _reportedColdInteractiveLayoutRepair;
     private static int _lastFontCount = -1;
     private static int _lastTextCount = -1;
     private static int _lastUguiTextCount = -1;
+    private static string _lastTmpUguiScanSignature;
     private static int _stateSweepTick;
     private static Harmony _harmony;
 
     private const string InteractiveOverlayName = "DeepSeekTranslationOverlay";
+    private const string TmpUguiOverlayName = "DeepSeekTmpUguiFallback";
+    private const string TmpUguiCanvasName = "DeepSeekTmpUguiCanvas";
     private const int StateSweepInterval = 12;
     private const int SweepScratchTrimThreshold = 16384;
     private static readonly TimeSpan FallbackLoadRetryInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan TextSetterPatchRetryInterval = TimeSpan.FromSeconds(30);
 
     // 反射结果做进程级缓存，避免永久轮询每次重新解析；仅主线程访问，无需锁。
     private static MethodInfo _findObjectsOfTypeAll;
     private static readonly Dictionary<Type, object> _il2CppTypeCache = new();
     private static readonly Dictionary<Type, MethodInfo> _instanceIdMethods = new();
 
-    public static bool ShouldUseFastNormalizeScan => !_textSetterPatchInstalled;
+    public static bool ShouldUseFastNormalizeScan =>
+        _tmpTextType != null &&
+        !_textSetterPatchInstalled &&
+        !_textSetterPatchFailed &&
+        !_textSetterPatchDeferredForFreshInterop &&
+        _fallbackAsset != null;
 
     /* 慢速主入口：先处理 UGUI，再解析 TMP 类型、安装 setter 补丁、加载 fallback，
        最后把 fallback 接到已加载字体资产并刷新文本。单步失败会保留后续重试机会。 */
@@ -271,8 +296,6 @@ internal static class TmpFontFallbackInstaller
             return;
         }
 
-        TryInstallTextSetterPatch();
-
         if (_fallbackAsset == null)
         {
             DateTime now = DateTime.UtcNow;
@@ -281,29 +304,67 @@ internal static class TmpFontFallbackInstaller
                 return;
             }
 
-            _nextFallbackLoadAttemptUtc = now + FallbackLoadRetryInterval;
+            _nextFallbackLoadAttemptUtc = now +
+                (_fallbackBundleRequest != null ? TimeSpan.Zero : FallbackLoadRetryInterval);
             _fallbackAsset = LoadFallbackFontAsset();
             if (_fallbackAsset == null)
             {
+                if (_fallbackBundleRequest != null)
+                {
+                    _nextFallbackLoadAttemptUtc = DateTime.MinValue;
+                    return;
+                }
                 if (!_reportedFailure)
                 {
                     _reportedFailure = true;
                     TmpFontFallbackPlugin.Logger.LogWarning("No TMP fallback font asset could be loaded.");
                 }
+                _ = EnsureUguiFont();
                 return;
             }
             _reportedFailure = false;
             _nextFallbackLoadAttemptUtc = DateTime.MinValue;
         }
 
-        _ = AddToListProperty(_tmpSettingsType, null, "fallbackFontAssets", _fallbackAsset, out bool settingsChanged);
-        int fontCount = PatchLoadedFontAssets(out bool fontTablesChanged);
+        TryInstallTextSetterPatch();
+
+        /* 三个步骤分别隔离异常：单步失败只跳过自身并记录诊断，
+           其余步骤本周期照常执行，下一步周期再整体重试。 */
+        bool settingsChanged = false;
+        try
+        {
+            _ = AddToListProperty(_tmpSettingsType, null, "fallbackFontAssets", _fallbackAsset, out settingsChanged);
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "phase=tmp-settings-fallback-list");
+        }
+
+        int fontCount = _lastFontCount;
+        bool fontTablesChanged = false;
+        try
+        {
+            fontCount = PatchLoadedFontAssets(out fontTablesChanged);
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "phase=patch-loaded-font-assets");
+        }
+
         if (settingsChanged || fontTablesChanged)
         {
             /* Games may replace TMP fallback lists after a scene/addressable load. */
             DirtiedTexts.Clear();
         }
-        int textCount = RefreshLoadedTexts();
+        int textCount = _lastTextCount;
+        try
+        {
+            textCount = RefreshLoadedTexts();
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "phase=refresh-loaded-texts");
+        }
         if (fontCount != _lastFontCount || textCount != _lastTextCount)
         {
             _lastFontCount = fontCount;
@@ -366,11 +427,16 @@ internal static class TmpFontFallbackInstaller
                 CollectStaleInteractiveSources(InteractiveOverlayTextBySourceId.Keys);
                 CollectStaleInteractiveSources(InteractiveOriginalTextBySourceId.Keys);
                 CollectStaleInteractiveSources(InteractiveOriginalColorBySourceId.Keys);
+                CollectStaleInteractiveSources(OriginalTmpFontByTextId.Keys);
+                CollectStaleInteractiveSources(TmpUguiOverlayTextBySourceId.Keys);
+                CollectStaleInteractiveSources(TmpUguiOriginalColorBySourceId.Keys);
                 foreach (int sourceId in StaleInteractiveSourceIds)
                 {
                     DestroyInteractiveOverlay(sourceId);
                     InteractiveOriginalTextBySourceId.Remove(sourceId);
                     InteractiveOriginalColorBySourceId.Remove(sourceId);
+                    OriginalTmpFontByTextId.Remove(sourceId);
+                    DestroyTmpUguiOverlay(sourceId);
                 }
             }
 
@@ -381,6 +447,19 @@ internal static class TmpFontFallbackInstaller
                     LiveUguiTextIds.Add(InstanceId(text));
                 }
                 PatchedUguiTexts.IntersectWith(LiveUguiTextIds);
+
+                foreach (int id in LastUguiTextById.Keys)
+                {
+                    if (!LiveUguiTextIds.Contains(id))
+                    {
+                        StaleStateIds.Add(id);
+                    }
+                }
+                foreach (int id in StaleStateIds)
+                {
+                    LastUguiTextById.Remove(id);
+                }
+                StaleStateIds.Clear();
             }
         }
         finally
@@ -424,22 +503,58 @@ internal static class TmpFontFallbackInstaller
 
     private static void TryInstallTextSetterPatch()
     {
-        if (_textSetterPatchInstalled || _textSetterPatchFailed || _tmpTextType == null)
+        if (_textSetterPatchInstalled || _tmpTextType == null)
         {
             return;
         }
 
+        if (ShouldDeferTextSetterPatchForFreshInterop())
+        {
+            return;
+        }
+
+        DateTime now = DateTime.UtcNow;
+        if (_textSetterPatchFailed && now < _nextTextSetterPatchAttemptUtc)
+        {
+            return;
+        }
+
+        /*
+         * External boundary policy:
+         * 1. Generated IL2CPP wrappers or Harmony can temporarily omit/reject a
+         *    TMP setter while assemblies are still loading.
+         * 2. The shared server cannot repair methods inside the game process.
+         * 3. A failed hook falls back to the existing two-second renderer scan;
+         *    it never reports translation/cache success and never keeps the
+         *    previous 50 ms full-scene scan running indefinitely.
+         * 4. Failures are rate-limited below and retried after a bounded delay;
+         *    concrete patch exceptions go through ReportCaughtException.
+         */
         try
         {
             _harmony ??= new Harmony("com.deepseek.game-translator.tmp-font-fallback.text");
             MethodInfo prefix = typeof(TmpFontFallbackInstaller).GetMethod(nameof(PrefixTmpTextString), BindingFlags.NonPublic | BindingFlags.Static);
+            if (prefix == null)
+            {
+                ScheduleTextSetterPatchRetry("the TMP text prefix method could not be resolved");
+                return;
+            }
+
             int patched = 0;
+            int failed = 0;
+            HarmonyMethod harmonyPrefix = new HarmonyMethod(prefix);
 
             MethodInfo setter = _tmpTextType.GetProperty("text")?.GetSetMethod();
             if (setter != null)
             {
-                _harmony.Patch(setter, prefix: new HarmonyMethod(prefix));
-                patched++;
+                if (TryPatchTextSetterMethod(setter, harmonyPrefix))
+                {
+                    patched++;
+                }
+                else
+                {
+                    failed++;
+                }
             }
 
             foreach (MethodInfo method in _tmpTextType.GetMethods(BindingFlags.Instance | BindingFlags.Public))
@@ -452,27 +567,124 @@ internal static class TmpFontFallbackInstaller
                 ParameterInfo[] parameters = method.GetParameters();
                 if (parameters.Length > 0 && parameters[0].ParameterType == typeof(string))
                 {
-                    _harmony.Patch(method, prefix: new HarmonyMethod(prefix));
-                    patched++;
+                    if (TryPatchTextSetterMethod(method, harmonyPrefix))
+                    {
+                        patched++;
+                    }
+                    else
+                    {
+                        failed++;
+                    }
                 }
             }
 
             if (patched > 0)
             {
                 _textSetterPatchInstalled = true;
+                _textSetterPatchFailed = false;
+                _nextTextSetterPatchAttemptUtc = DateTime.MinValue;
                 TmpFontFallbackPlugin.Logger.LogInfo("TMP text setter punctuation guard installed. Patched methods: " + patched + ".");
+                if (failed > 0)
+                {
+                    TmpFontFallbackPlugin.Logger.LogWarning(
+                        "TMP text setter punctuation guard installed partially; failed methods=" + failed +
+                        ". The low-frequency renderer scan remains active for uncovered writes.");
+                }
+                return;
+            }
+
+            ScheduleTextSetterPatchRetry("no compatible TMP text setter could be patched");
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(
+                ex,
+                "phase=install-tmp-text-setter-patch; retrySeconds=" + TextSetterPatchRetryInterval.TotalSeconds,
+                "install-tmp-text-setter-patch");
+            ScheduleTextSetterPatchRetry("the Harmony installation boundary threw " + ex.GetType().FullName);
+        }
+    }
+
+    private static bool ShouldDeferTextSetterPatchForFreshInterop()
+    {
+        if (_textSetterInteropCheckComplete)
+        {
+            return _textSetterPatchDeferredForFreshInterop;
+        }
+        _textSetterInteropCheckComplete = true;
+
+        string markerPath = Path.Combine(Paths.BepInExRootPath, "interop", "assembly-hash.txt");
+        try
+        {
+            if (!File.Exists(markerPath))
+            {
+                return false;
+            }
+
+            DateTime markerWriteUtc = File.GetLastWriteTimeUtc(markerPath);
+            DateTime processStartUtc;
+            using (Process process = Process.GetCurrentProcess())
+            {
+                processStartUtc = process.StartTime.ToUniversalTime();
+            }
+
+            if (markerWriteUtc >= processStartUtc)
+            {
+                _textSetterPatchDeferredForFreshInterop = true;
+                TmpFontFallbackPlugin.Logger.LogWarning(
+                    "[TMP-SETTER-PATCH] deferred for this process because BepInEx generated IL2CPP interop " +
+                    (markerWriteUtc - processStartUtc).TotalSeconds.ToString("F1") +
+                    " seconds after process start. This avoids the CoreCLR DynamicClass.Invoker_VoidThis " +
+                    "fatal boundary; the low-frequency renderer scan remains active and the next game start retries.");
             }
         }
         catch (Exception ex)
         {
-            _textSetterPatchFailed = true;
-            TmpFontFallbackPlugin.Logger.LogWarning("TMP text setter punctuation guard failed; falling back to fast scan: " + ex.Message);
+            TmpFontFallbackPlugin.ReportCaughtException(
+                ex,
+                "marker=" + markerPath + "; fallback=attempt-normal-setter-patch",
+                "detect-fresh-il2cpp-interop");
+        }
+
+        return _textSetterPatchDeferredForFreshInterop;
+    }
+
+    private static bool TryPatchTextSetterMethod(MethodInfo method, HarmonyMethod prefix)
+    {
+        try
+        {
+            _harmony.Patch(method, prefix: prefix);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(
+                ex,
+                "method=" + method.DeclaringType?.FullName + "." + method.Name,
+                "patch-tmp-text-setter-method");
+            return false;
+        }
+    }
+
+    private static void ScheduleTextSetterPatchRetry(string reason)
+    {
+        _textSetterPatchFailed = true;
+        _nextTextSetterPatchAttemptUtc = DateTime.UtcNow + TextSetterPatchRetryInterval;
+        _textSetterPatchFailureCount++;
+        int count = _textSetterPatchFailureCount;
+        if (count <= 3 || (count & (count - 1)) == 0)
+        {
+            TmpFontFallbackPlugin.Logger.LogWarning(
+                "[TMP-SETTER-PATCH] attempt=" + count + " failed: " + reason +
+                ". Using the low-frequency renderer scan; next retry is scheduled after " +
+                TextSetterPatchRetryInterval.TotalSeconds + " seconds.");
         }
     }
 
     private static void PrefixTmpTextString(object __instance, ref string __0)
     {
         string normalized = NormalizeTmpTextForFallback(__0);
+        PatchTmpHostFontFromText(__instance, normalized);
         if (TryProtectInteractiveTmpTranslation(__instance, normalized, out string preservedOriginal))
         {
             __0 = preservedOriginal;
@@ -507,6 +719,19 @@ internal static class TmpFontFallbackInstaller
 
     private static object LoadFallbackFontAsset()
     {
+        object completedAsyncAsset = TryCompleteFallbackBundleAsync();
+        if (completedAsyncAsset != null)
+        {
+            return completedAsyncAsset;
+        }
+        if (_fallbackBundleRequest != null)
+        {
+            return null;
+        }
+
+        string asyncCandidatePath = null;
+        string asyncCandidateAssetName = null;
+
         /* 优先使用与 Unity 大版本匹配的预制 TMP AssetBundle；若版本不兼容或
            文件缺失，再尝试 Windows 系统字体动态构建。失败只影响字体兜底，
            不会修改翻译内容或共享缓存。 */
@@ -518,29 +743,24 @@ internal static class TmpFontFallbackInstaller
                 TmpFontFallbackPlugin.Logger.LogWarning("TMP fallback font asset is missing: " + path);
                 continue;
             }
+            if (!AttemptedFallbackBundlePaths.Add(path))
+            {
+                continue;
+            }
 
             try
             {
                 _fallbackBundle = LoadAssetBundleFromFile(path);
                 if (_fallbackBundle == null)
                 {
-                    string tempPath = CopyFontAssetToTempPath(path, assetName);
-                    if (tempPath != null)
+                    TmpFontFallbackPlugin.Logger.LogWarning("AssetBundle file load returned null for " + assetName +
+                        "; the synchronous path will not be retried in this process because Unity may retain a native bundle " +
+                        "without returning a managed wrapper.");
+                    if (_assetBundleInteropIncompatible)
                     {
-                        _fallbackBundle = LoadAssetBundleFromFile(tempPath);
+                        asyncCandidatePath = path;
+                        asyncCandidateAssetName = assetName;
                     }
-                }
-                if (_fallbackBundle == null)
-                {
-                    _fallbackBundle = LoadAssetBundleFromMemory(path);
-                }
-                if (_fallbackBundle == null)
-                {
-                    _fallbackBundle = LoadAssetBundleFromStream(path);
-                }
-                if (_fallbackBundle == null)
-                {
-                    TmpFontFallbackPlugin.Logger.LogWarning("AssetBundle load returned null for " + assetName);
                     continue;
                 }
 
@@ -561,76 +781,255 @@ internal static class TmpFontFallbackInstaller
             }
         }
 
-        return CreateSystemFallbackFontAsset();
+        if (_assetBundleInteropIncompatible)
+        {
+            if (!_reportedAssetBundleInteropFallback)
+            {
+                _reportedAssetBundleInteropFallback = true;
+                TmpFontFallbackPlugin.Logger.LogWarning(
+                    "[TMP-FONT-BOUNDARY] Unity's generated AssetBundle wrapper is incompatible with the current " +
+                    "ReadOnlySpan ABI. Trying the separate dynamic path-font boundary before the compatible async " +
+                    "bundle loader; the renderer-local UGUI overlay remains the terminal fallback.");
+            }
+        }
+
+        object systemFontAsset = CreateSystemFallbackFontAsset();
+        if (systemFontAsset != null)
+        {
+            return systemFontAsset;
+        }
+        if (!string.IsNullOrEmpty(asyncCandidatePath) &&
+            TryBeginFallbackBundleAsync(asyncCandidatePath, asyncCandidateAssetName))
+        {
+            return null;
+        }
+        return null;
+    }
+
+    private static bool TryBeginFallbackBundleAsync(string path, string assetName)
+    {
+        if (!_assetBundleInteropIncompatible || _fallbackBundleRequest != null)
+        {
+            return false;
+        }
+
+        /*
+         * The observed Unity 6000 wrapper throws while marshalling the path,
+         * before LoadFromFile_Internal_Injected reaches native Unity. Its
+         * public async wrapper still uses the retained managed-string invoke
+         * path, so this is not a duplicate native load. Apply polls the request
+         * on Unity's main thread and never blocks gameplay.
+         */
+        try
+        {
+            AssetBundleCreateRequest request = AssetBundle.LoadFromFileAsync(path);
+            if (request == null)
+            {
+                TmpFontFallbackPlugin.Logger.LogWarning(
+                    "[TMP-FONT-BOUNDARY] compatible async AssetBundle loader returned no request for " + assetName + ".");
+                return false;
+            }
+
+            _fallbackBundleRequest = request;
+            _fallbackBundleRequestPath = path;
+            _fallbackBundleRequestAssetName = assetName;
+            TmpFontFallbackPlugin.Logger.LogWarning(
+                "[TMP-FONT-BOUNDARY] synchronous AssetBundle path failed before native invocation; " +
+                "started the compatible async load for " + assetName + ".");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(
+                ex,
+                "path=" + path + "; asset=" + assetName,
+                "begin-async-font-bundle");
+            return false;
+        }
+    }
+
+    private static object TryCompleteFallbackBundleAsync()
+    {
+        if (_fallbackBundleRequest == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            if (!_fallbackBundleRequest.isDone)
+            {
+                return null;
+            }
+
+            AssetBundle bundle = _fallbackBundleRequest.assetBundle;
+            string path = _fallbackBundleRequestPath;
+            string assetName = _fallbackBundleRequestAssetName;
+            _fallbackBundleRequest = null;
+            _fallbackBundleRequestPath = null;
+            _fallbackBundleRequestAssetName = null;
+
+            if (bundle == null)
+            {
+                TmpFontFallbackPlugin.Logger.LogWarning(
+                    "[TMP-FONT-BOUNDARY] compatible async AssetBundle load completed without a bundle: " + path + ".");
+                return null;
+            }
+
+            _fallbackBundle = bundle;
+            object fontAsset = FindTmpFontAssetInBundle(bundle, assetName);
+            if (fontAsset == null)
+            {
+                TmpFontFallbackPlugin.Logger.LogWarning(
+                    "No TMP_FontAsset found after compatible async load of " + assetName + ".");
+                return null;
+            }
+
+            SetPropertyIfExists(fontAsset, "isMultiAtlasTexturesEnabled", true);
+            SetEnumPropertyIfExists(fontAsset, "atlasPopulationMode", "Dynamic");
+            TmpFontFallbackPlugin.Logger.LogInfo(
+                "Loaded TMP fallback font asset through compatible async boundary: " + assetName);
+            return fontAsset;
+        }
+        catch (Exception ex)
+        {
+            string context = "path=" + _fallbackBundleRequestPath + "; asset=" + _fallbackBundleRequestAssetName;
+            _fallbackBundleRequest = null;
+            _fallbackBundleRequestPath = null;
+            _fallbackBundleRequestAssetName = null;
+            TmpFontFallbackPlugin.ReportCaughtException(ex, context, "complete-async-font-bundle");
+            return null;
+        }
     }
 
     private static object FindTmpFontAssetInBundle(AssetBundle bundle, string assetName)
     {
-        foreach (object asset in Enumerate(InvokeAssetBundleMethod(bundle, "LoadAllAssets", null, _tmpFontAssetType)))
+        if (bundle == null || _tmpFontAssetType == null)
         {
-            if (IsTmpFontAsset(asset))
+            return null;
+        }
+
+        Il2CppSystem.Type tmpFontType;
+        try
+        {
+            tmpFontType = Il2CppType.From(_tmpFontAssetType, false);
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "asset=" + assetName + "; phase=resolve-il2cpp-type");
+            return null;
+        }
+
+        try
+        {
+            foreach (object asset in Enumerate(bundle.LoadAllAssets(tmpFontType)))
             {
-                return asset;
+                object typedAsset = AsTmpFontAsset(asset);
+                if (typedAsset != null)
+                {
+                    return typedAsset;
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "asset=" + assetName + "; phase=load-all-typed");
         }
 
         foreach (string name in GetAssetNames(bundle, assetName))
         {
-            foreach (object asset in Enumerate(InvokeAssetBundleMethod(bundle, "LoadAssetWithSubAssets", name, _tmpFontAssetType)))
+            object typedAsset = null;
+            try
             {
-                if (IsTmpFontAsset(asset))
-                {
-                    return asset;
-                }
+                typedAsset = bundle.LoadAsset(name, tmpFontType);
+            }
+            catch (Exception ex)
+            {
+                TmpFontFallbackPlugin.ReportCaughtException(ex, "asset=" + assetName + "; name=" + name + "; phase=load-named-typed");
             }
 
-            object typedAsset = InvokeAssetBundleMethod(bundle, "LoadAsset", name, _tmpFontAssetType);
-            if (IsTmpFontAsset(typedAsset))
+            typedAsset = AsTmpFontAsset(typedAsset);
+            if (typedAsset != null)
             {
                 return typedAsset;
-            }
-
-            object untypedAsset = InvokeAssetBundleMethod(bundle, "LoadAsset", name, null);
-            if (IsTmpFontAsset(untypedAsset))
-            {
-                return untypedAsset;
-            }
-        }
-
-        foreach (object asset in Enumerate(InvokeAssetBundleMethod(bundle, "LoadAllAssets", null, null)))
-        {
-            if (IsTmpFontAsset(asset))
-            {
-                return asset;
             }
         }
 
         return null;
     }
 
+    private static object AsTmpFontAsset(object asset)
+    {
+        if (asset == null)
+        {
+            return null;
+        }
+        if (_tmpFontAssetType.IsInstanceOfType(asset))
+        {
+            return asset;
+        }
+
+        try
+        {
+            IntPtr pointer = GetIl2CppObjectPointer(asset);
+            if (pointer == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            ConstructorInfo pointerConstructor = _tmpFontAssetType.GetConstructor(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                null,
+                new[] { typeof(IntPtr) },
+                null);
+            object wrapped = pointerConstructor?.Invoke(new object[] { pointer });
+            if (wrapped != null && _tmpFontAssetType.IsInstanceOfType(wrapped))
+            {
+                TmpFontFallbackPlugin.Logger.LogInfo("Rewrapped native TMP font asset exposed as " + asset.GetType().FullName + ".");
+                return wrapped;
+            }
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "phase=rewrap-native-tmp-font; wrapper=" + asset.GetType().FullName);
+        }
+        return null;
+    }
+
+    private static IntPtr GetIl2CppObjectPointer(object value)
+    {
+        for (Type type = value.GetType(); type != null; type = type.BaseType)
+        {
+            PropertyInfo pointerProperty = type.GetProperty(
+                "Pointer",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+            if (pointerProperty?.GetValue(value) is IntPtr pointer)
+            {
+                return pointer;
+            }
+        }
+        return IntPtr.Zero;
+    }
+
     private static IEnumerable<string> GetAssetNames(AssetBundle bundle, string fallbackName)
     {
         HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
-        foreach (MethodInfo method in typeof(AssetBundle).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            .Where(m => m.Name == "GetAllAssetNames" && m.GetParameters().Length == 0))
+        object names = null;
+        try
         {
-            object names = null;
-            try
-            {
-                names = method.Invoke(bundle, null);
-            }
-            catch (Exception ex)
-            {
-            	TmpFontFallbackPlugin.ReportCaughtException(ex);
-            }
+            names = bundle.GetAllAssetNames();
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "asset=" + fallbackName + "; phase=get-asset-names");
+        }
 
-            foreach (object name in Enumerate(names))
+        foreach (object name in Enumerate(names))
+        {
+            string text = name?.ToString();
+            if (!string.IsNullOrEmpty(text) && seen.Add(text))
             {
-                string text = name?.ToString();
-                if (!string.IsNullOrEmpty(text) && seen.Add(text))
-                {
-                    yield return text;
-                }
+                yield return text;
             }
         }
 
@@ -643,97 +1042,6 @@ internal static class TmpFontFallbackInstaller
         }
     }
 
-    private static object InvokeAssetBundleMethod(AssetBundle bundle, string methodName, string assetName, Type assetType)
-    {
-        foreach (MethodInfo method in typeof(AssetBundle).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            .Where(m => m.Name == methodName))
-        {
-            MethodInfo callable = method;
-            bool typeSuppliedByGeneric = false;
-            if (callable.ContainsGenericParameters)
-            {
-                if (assetType == null || callable.GetGenericArguments().Length != 1)
-                {
-                    continue;
-                }
-
-                try
-                {
-                    callable = callable.MakeGenericMethod(assetType);
-                    typeSuppliedByGeneric = true;
-                }
-                catch (Exception ex)
-                {
-                    TmpFontFallbackPlugin.ReportCaughtException(ex, "genericMethod=" + method.Name);
-                    continue;
-                }
-            }
-
-            object[] args = BuildAssetBundleAssetArgs(callable.GetParameters(), assetName, assetType, typeSuppliedByGeneric);
-            if (args == null)
-            {
-                continue;
-            }
-
-            try
-            {
-                return callable.Invoke(bundle, args);
-            }
-            catch (Exception ex)
-            {
-            	TmpFontFallbackPlugin.ReportCaughtException(ex);
-            }
-        }
-
-        return null;
-    }
-
-    private static object[] BuildAssetBundleAssetArgs(ParameterInfo[] parameters, string assetName, Type assetType, bool typeSuppliedByGeneric)
-    {
-        object[] args = new object[parameters.Length];
-        bool hasName = false;
-        bool hasType = false;
-        for (int i = 0; i < parameters.Length; i++)
-        {
-            Type t = parameters[i].ParameterType;
-            if (assetName != null && t == typeof(string))
-            {
-                args[i] = assetName;
-                hasName = true;
-            }
-            else if (assetType != null && t == typeof(Type))
-            {
-                args[i] = assetType;
-                hasType = true;
-            }
-            else if (assetType != null && t.FullName == "Il2CppSystem.Type")
-            {
-                args[i] = ResolveIl2CppType(assetType);
-                hasType = true;
-            }
-            else
-            {
-                return null;
-            }
-        }
-
-        if (assetName != null && !hasName)
-        {
-            return null;
-        }
-        if (assetType != null && !hasType && !typeSuppliedByGeneric)
-        {
-            return null;
-        }
-
-        return args;
-    }
-
-    private static bool IsTmpFontAsset(object asset)
-    {
-        return asset != null && (_tmpFontAssetType.IsInstanceOfType(asset) || asset.GetType().FullName == _tmpFontAssetType.FullName);
-    }
-
     private static object CreateSystemFallbackFontAsset()
     {
         object fileFontAsset = CreateSystemFontFileAsset();
@@ -742,21 +1050,6 @@ internal static class TmpFontFallbackInstaller
             return fileFontAsset;
         }
 
-        Type fontType = FindType("UnityEngine.Font");
-        if (fontType == null)
-        {
-            return null;
-        }
-
-        MethodInfo createFont = fontType.GetMethods(BindingFlags.Static | BindingFlags.Public)
-            .FirstOrDefault(m =>
-            {
-                ParameterInfo[] parameters = m.GetParameters();
-                return m.Name == "CreateDynamicFontFromOSFont"
-                    && parameters.Length == 2
-                    && parameters[0].ParameterType == typeof(string)
-                    && parameters[1].ParameterType == typeof(int);
-            });
         MethodInfo createTmpFont = _tmpFontAssetType.GetMethods(BindingFlags.Static | BindingFlags.Public)
             .FirstOrDefault(m =>
             {
@@ -765,7 +1058,7 @@ internal static class TmpFontFallbackInstaller
                     && parameters.Length == 1
                     && parameters[0].ParameterType.FullName == "UnityEngine.Font";
             });
-        if (createFont == null || createTmpFont == null)
+        if (createTmpFont == null)
         {
             return null;
         }
@@ -774,7 +1067,7 @@ internal static class TmpFontFallbackInstaller
         {
             try
             {
-                object font = createFont.Invoke(null, new object[] { fontName, 90 });
+                object font = CreateUnityFont(fontName);
                 if (font == null)
                 {
                     continue;
@@ -884,9 +1177,9 @@ internal static class TmpFontFallbackInstaller
                     return fontAsset;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                TmpFontFallbackPlugin.Logger.LogInfo("Unity Font constructor fallback skipped for " + source + ".");
+                TmpFontFallbackPlugin.Logger.LogInfo("Unity Font constructor fallback skipped for " + source + ": " + Unwrap(ex).Message);
             }
         }
 
@@ -1097,150 +1390,21 @@ internal static class TmpFontFallbackInstaller
         }
     }
 
-    private static void CopyToIl2CppArray(byte[] source, Il2CppStructArray<byte> destination)
-    {
-        IntPtr ptr = GetIl2CppArrayStartPointer(destination);
-        if (ptr != IntPtr.Zero)
-        {
-            Marshal.Copy(source, 0, ptr, source.Length);
-            return;
-        }
-
-        for (int i = 0; i < source.Length; i++)
-        {
-            destination[i] = source[i];
-        }
-    }
-
-    private static IntPtr GetIl2CppArrayStartPointer(Il2CppStructArray<byte> array)
-    {
-        PropertyInfo arrayStartPointer = array.GetType().BaseType?.GetProperty(
-            "ArrayStartPointer",
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        if (arrayStartPointer == null)
-        {
-            return IntPtr.Zero;
-        }
-
-        return (IntPtr)arrayStartPointer.GetValue(array);
-    }
-
-    private static AssetBundle LoadAssetBundleFromStream(string path)
-    {
-        byte[] bytes = File.ReadAllBytes(path);
-        _fallbackBundleBytes = new Il2CppStructArray<byte>(bytes.LongLength);
-        CopyToIl2CppArray(bytes, _fallbackBundleBytes);
-        _fallbackBundleStream = new Il2CppSystem.IO.MemoryStream(_fallbackBundleBytes, false);
-        return AssetBundle.LoadFromStream(_fallbackBundleStream);
-    }
-
     private static AssetBundle LoadAssetBundleFromFile(string path)
-    {
-        foreach (MethodInfo method in typeof(AssetBundle).GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
-            .Where(m => (m.Name == "LoadFromFile" || m.Name == "LoadFromFile_Internal") && m.ReturnType == typeof(AssetBundle)))
-        {
-            object[] args = BuildAssetBundleLoadArgs(method.GetParameters(), path, null);
-            if (args == null)
-            {
-                continue;
-            }
-
-            try
-            {
-                return method.Invoke(null, args) as AssetBundle;
-            }
-            catch (Exception ex)
-            {
-            	TmpFontFallbackPlugin.ReportCaughtException(ex);
-            }
-        }
-
-        return null;
-    }
-
-    private static AssetBundle LoadAssetBundleFromMemory(string path)
-    {
-        _fallbackManagedBundleBytes = File.ReadAllBytes(path);
-        _fallbackBundleBytes = new Il2CppStructArray<byte>(_fallbackManagedBundleBytes.LongLength);
-        CopyToIl2CppArray(_fallbackManagedBundleBytes, _fallbackBundleBytes);
-
-        foreach (MethodInfo method in typeof(AssetBundle).GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
-            .Where(m => (m.Name == "LoadFromMemory" || m.Name == "LoadFromMemory_Internal") && m.ReturnType == typeof(AssetBundle)))
-        {
-            object[] args = BuildAssetBundleLoadArgs(method.GetParameters(), null, _fallbackBundleBytes);
-            if (args == null)
-            {
-                continue;
-            }
-
-            try
-            {
-                return method.Invoke(null, args) as AssetBundle;
-            }
-            catch (Exception ex)
-            {
-            	TmpFontFallbackPlugin.ReportCaughtException(ex);
-            }
-        }
-
-        return null;
-    }
-
-    private static object[] BuildAssetBundleLoadArgs(ParameterInfo[] parameters, string path, Il2CppStructArray<byte> bytes)
-    {
-        object[] args = new object[parameters.Length];
-        bool hasPayload = false;
-        for (int i = 0; i < parameters.Length; i++)
-        {
-            Type t = parameters[i].ParameterType;
-            if (path != null && t == typeof(string))
-            {
-                args[i] = path;
-                hasPayload = true;
-            }
-            else if (bytes != null && t.IsInstanceOfType(bytes))
-            {
-                args[i] = bytes;
-                hasPayload = true;
-            }
-            else if (t == typeof(uint))
-            {
-                args[i] = 0u;
-            }
-            else if (t == typeof(ulong))
-            {
-                args[i] = 0UL;
-            }
-            else if (t == typeof(int))
-            {
-                args[i] = 0;
-            }
-            else if (t == typeof(long))
-            {
-                args[i] = 0L;
-            }
-            else
-            {
-                return null;
-            }
-        }
-
-        return hasPayload ? args : null;
-    }
-
-    private static string CopyFontAssetToTempPath(string sourcePath, string assetName)
     {
         try
         {
-            string dir = Path.Combine(Path.GetTempPath(), "DeepSeekTMPFontFallback");
-            Directory.CreateDirectory(dir);
-            string dest = Path.Combine(dir, assetName);
-            File.Copy(sourcePath, dest, true);
-            return dest;
+            return AssetBundle.LoadFromFile(path);
         }
         catch (Exception ex)
         {
-            TmpFontFallbackPlugin.ReportCaughtException(ex, "source=" + sourcePath);
+            Exception root = Unwrap(ex);
+            if (root is MissingMethodException &&
+                root.Message.IndexOf("GetPinnableReference", StringComparison.Ordinal) >= 0)
+            {
+                _assetBundleInteropIncompatible = true;
+            }
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "path=" + path, "load-font-bundle");
             return null;
         }
     }
@@ -1259,20 +1423,26 @@ internal static class TmpFontFallbackInstaller
 
     private static IEnumerable<string> SelectAssetCandidates()
     {
-        string selected = SelectAssetName();
-        yield return selected;
-
-        foreach (string assetName in FontByMajor.Values.Distinct())
-        {
-            if (assetName != selected)
-            {
-                yield return assetName;
-            }
-        }
+        yield return SelectAssetName();
     }
 
     private static int DetectUnityMajor()
     {
+        try
+        {
+            string reportedVersion = Application.unityVersion;
+            int separator = string.IsNullOrWhiteSpace(reportedVersion) ? -1 : reportedVersion.IndexOf('.');
+            if (separator > 0 && int.TryParse(reportedVersion.Substring(0, separator), out int reportedMajor) &&
+                (reportedMajor == 5 || (reportedMajor >= 2017 && reportedMajor <= 2023) || reportedMajor >= 6000))
+            {
+                return reportedMajor;
+            }
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "operation=read-application-unity-version");
+        }
+
         foreach (string path in Directory.GetFiles(Paths.GameRootPath, "globalgamemanagers", SearchOption.AllDirectories))
         {
             try
@@ -1301,6 +1471,16 @@ internal static class TmpFontFallbackInstaller
                         minorDigits++;
                     }
                     if (minorDigits == 0 || j >= bytes.Length || bytes[j] != '.') continue;
+                    j++;
+
+                    int patchDigits = 0;
+                    while (j < bytes.Length && bytes[j] >= '0' && bytes[j] <= '9' && patchDigits < 4)
+                    {
+                        j++;
+                        patchDigits++;
+                    }
+                    if (patchDigits == 0 || j >= bytes.Length ||
+                        (bytes[j] != 'f' && bytes[j] != 'p' && bytes[j] != 'a' && bytes[j] != 'b' && bytes[j] != 'c')) continue;
 
                     if (major == 5 || (major >= 2017 && major <= 2023) || major >= 6000)
                     {
@@ -1355,10 +1535,34 @@ internal static class TmpFontFallbackInstaller
         foreach (object text in cjkTexts)
         {
             int id = InstanceId(text);
+            string value = GetStringProperty(text, "text");
+            bool textChanged = !string.Equals(
+                value,
+                LastUguiTextById.TryGetValue(id, out string lastValue) ? lastValue : null,
+                StringComparison.Ordinal);
+            if (textChanged)
+            {
+                /*
+                 * Unity's legacy UGUI renderer may keep a dynamic OS font but
+                 * omit newly translated glyphs from its current atlas. This is
+                 * separate from TMP's atlas and must be warmed at the exact
+                 * text size/style before the component is dirtied.
+                 */
+                if (!TryWarmUguiGlyphs(font as Font, text, value))
+                {
+                    continue;
+                }
+                LastUguiTextById[id] = value;
+            }
+
             object currentFont = GetPropertyValue(text, "font");
             if (currentFont != null && InstanceId(currentFont) == fontId)
             {
                 PatchedUguiTexts.Add(id);
+                if (textChanged)
+                {
+                    InvokeNoThrow(text, "SetAllDirty");
+                }
                 continue;
             }
 
@@ -1370,6 +1574,34 @@ internal static class TmpFontFallbackInstaller
         }
 
         return PatchedUguiTexts.Count;
+    }
+
+    private static bool TryWarmUguiGlyphs(Font font, object text, string value)
+    {
+        if (font == null || string.IsNullOrEmpty(value))
+        {
+            return false;
+        }
+
+        try
+        {
+            int fontSize = GetPropertyValue(text, "fontSize") is int requestedSize && requestedSize > 0
+                ? requestedSize
+                : 90;
+            FontStyle fontStyle = GetPropertyValue(text, "fontStyle") is FontStyle requestedStyle
+                ? requestedStyle
+                : FontStyle.Normal;
+            font.RequestCharactersInTexture(value, fontSize, fontStyle);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(
+                ex,
+                "phase=warm-ugui-glyphs; component=" + text.GetType().FullName,
+                "warm-ugui-glyphs");
+            return false;
+        }
     }
 
     private static object EnsureUguiFont()
@@ -1397,10 +1629,22 @@ internal static class TmpFontFallbackInstaller
 
                 /* Unity 的动态字体接口接收系统字体族名，不接受字体文件路径。
                    文件路径创建由上面的 TMP 专用反射链负责。 */
-                _uguiFont = CreateUnityFont(faceName);
+                _uguiFont = ValidateUguiFont(CreateUnityFontWithConstructor(path), path + " via Font constructor");
+                if (_uguiFont == null)
+                {
+                    _uguiFont = ValidateUguiFont(CreateUnityFontWithConstructor(faceName), faceName + " via Font constructor");
+                }
+                if (_uguiFont == null)
+                {
+                    _uguiFont = ValidateUguiFont(CreateUnityFontFromPath(path), path);
+                }
+                if (_uguiFont == null)
+                {
+                    _uguiFont = ValidateUguiFont(CreateUnityFont(faceName), faceName);
+                }
                 if (_uguiFont != null)
                 {
-                    TmpFontFallbackPlugin.Logger.LogInfo("Loaded UGUI Chinese font: " + faceName);
+                    TmpFontFallbackPlugin.Logger.LogInfo("Loaded UGUI Chinese font: " + path);
                     return _uguiFont;
                 }
             }
@@ -1408,7 +1652,7 @@ internal static class TmpFontFallbackInstaller
 
         foreach (string fontName in PreferredSystemFonts)
         {
-            _uguiFont = CreateUnityFont(fontName);
+            _uguiFont = ValidateUguiFont(CreateUnityFont(fontName), fontName);
             if (_uguiFont != null)
             {
                 TmpFontFallbackPlugin.Logger.LogInfo("Loaded UGUI Chinese font: " + fontName);
@@ -1417,6 +1661,28 @@ internal static class TmpFontFallbackInstaller
         }
 
         return null;
+    }
+
+    private static object ValidateUguiFont(object candidate, string source)
+    {
+        Font font = candidate as Font;
+        if (font == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            font.RequestCharactersInTexture(CjkWarmupText, 90, FontStyle.Normal);
+            bool hasCjk = font.HasCharacter('\u4e2d');
+            TmpFontFallbackPlugin.Logger.LogInfo("UGUI font glyph probe: " + source + "; hasCjk=" + hasCjk + ".");
+            return hasCjk ? font : null;
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "font=" + source + "; phase=ugui-glyph-probe");
+            return null;
+        }
     }
 
     private static object CreateUnityFont(string fontName)
@@ -1428,11 +1694,60 @@ internal static class TmpFontFallbackInstaller
 
         try
         {
-            return Font.CreateDynamicFontFromOSFont(fontName, 90);
+            Il2CppStringArray fontNames = new Il2CppStringArray(1);
+            fontNames[0] = fontName;
+            Font font = new Font();
+            Font.Internal_CreateDynamicFont(font, fontNames, 90);
+            return font;
         }
         catch (Exception ex)
         {
-            TmpFontFallbackPlugin.ReportCaughtException(ex, "font=" + fontName);
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "font=" + fontName + "; api=Internal_CreateDynamicFont");
+        }
+
+        try
+        {
+            Font font = new Font();
+            Font.Internal_CreateFont(font, fontName);
+            return font;
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "font=" + fontName + "; api=Internal_CreateFont");
+            return null;
+        }
+    }
+
+    private static object CreateUnityFontWithConstructor(string source)
+    {
+        if (string.IsNullOrEmpty(source))
+        {
+            return null;
+        }
+
+        try
+        {
+            ConstructorInfo ctor = typeof(Font).GetConstructor(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(string) }, null);
+            return ctor?.Invoke(new object[] { source });
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "font=" + source + "; api=Font(string)");
+            return null;
+        }
+    }
+
+    private static object CreateUnityFontFromPath(string fontPath)
+    {
+        try
+        {
+            Font font = new Font();
+            Font.Internal_CreateFontFromPath(font, fontPath);
+            return font;
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "path=" + fontPath + "; api=Internal_CreateFontFromPath");
             return null;
         }
     }
@@ -1481,6 +1796,131 @@ internal static class TmpFontFallbackInstaller
         return PatchedFontAssets.Count;
     }
 
+    private static bool TryWarmFallbackGlyphs(string value, out bool glyphsAdded)
+    {
+        glyphsAdded = false;
+        if (_fallbackAsset == null || !ContainsCjk(value))
+        {
+            return false;
+        }
+
+        HashSet<char> missing = null;
+        foreach (char ch in value)
+        {
+            bool isCjk = (ch >= '\u3400' && ch <= '\u9fff') || (ch >= '\uf900' && ch <= '\ufaff');
+            if (isCjk && !WarmedFallbackCharacters.Contains(ch))
+            {
+                missing ??= new HashSet<char>();
+                missing.Add(ch);
+            }
+        }
+        if (missing == null || missing.Count == 0)
+        {
+            return true;
+        }
+
+        string glyphs = new string(missing.ToArray());
+        if (!TryAddCharactersToTmpFontAsset(_fallbackAsset, glyphs))
+        {
+            return false;
+        }
+
+        foreach (char ch in missing)
+        {
+            WarmedFallbackCharacters.Add(ch);
+        }
+        glyphsAdded = true;
+        return true;
+    }
+
+    private static bool PatchTmpHostFontFromText(object text, string value)
+    {
+        if (_fallbackAsset == null || text == null)
+        {
+            return false;
+        }
+        if (!ContainsCjk(value))
+        {
+            return RestoreTmpOriginalFont(text);
+        }
+        if (!TryWarmFallbackGlyphs(value, out bool glyphsAdded))
+        {
+            return false;
+        }
+
+        /*
+         * Some IL2CPP players keep serialized TMP_FontAsset objects outside
+         * Resources.FindObjectsOfTypeAll even though live TMP_Text components
+         * still expose them through their font property. The shared server
+         * cannot repair this renderer-owned resource visibility boundary.
+         * Discover the host through the live component, append (never replace)
+         * the process-owned fallback, and report a bounded diagnostic if the
+         * generated wrapper cannot expose its fallback table.
+         */
+        try
+        {
+            object fontAsset = GetPropertyValue(text, "font");
+            if (fontAsset == null)
+            {
+                return false;
+            }
+
+            int textId = InstanceId(text);
+            int fontId = InstanceId(fontAsset);
+            if (fontId == InstanceId(_fallbackAsset))
+            {
+                if (glyphsAdded)
+                {
+                    DirtiedTexts.Remove(textId);
+                }
+                return true;
+            }
+
+            if (!OriginalTmpFontByTextId.ContainsKey(textId))
+            {
+                OriginalTmpFontByTextId[textId] = fontAsset;
+            }
+            if (!AddToListProperty(_tmpFontAssetType, fontAsset, "fallbackFontAssetTable", _fallbackAsset, out bool added))
+            {
+                return false;
+            }
+
+            PatchedFontAssets.Add(fontId);
+            bool directFontApplied = TrySetPropertyIfExists(text, "font", _fallbackAsset);
+            if (added || glyphsAdded)
+            {
+                DirtiedTexts.Remove(textId);
+            }
+            return directFontApplied;
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(
+                ex,
+                "phase=patch-live-tmp-host-font; component=" + text.GetType().FullName,
+                "patch-live-tmp-host-font");
+            return false;
+        }
+    }
+
+    private static bool RestoreTmpOriginalFont(object text)
+    {
+        int textId = InstanceId(text);
+        if (!OriginalTmpFontByTextId.TryGetValue(textId, out object originalFont))
+        {
+            return false;
+        }
+
+        if (!TrySetPropertyIfExists(text, "font", originalFont))
+        {
+            return false;
+        }
+
+        OriginalTmpFontByTextId.Remove(textId);
+        DirtiedTexts.Remove(textId);
+        return true;
+    }
+
     private static int RefreshLoadedTexts()
     {
         if (_tmpTextType == null)
@@ -1493,6 +1933,7 @@ internal static class TmpFontFallbackInstaller
             int id = InstanceId(text);
             bool changed = false;
             string current = GetStringProperty(text, "text");
+            PatchTmpHostFontFromText(text, current);
             if (!string.Equals(current, LastTmpTextById.TryGetValue(id, out string last) ? last : null, StringComparison.Ordinal))
             {
                 LastTmpTextById[id] = current;
@@ -1518,6 +1959,15 @@ internal static class TmpFontFallbackInstaller
 
     public static int NormalizeLoadedTextsFast()
     {
+        if (_fallbackAsset == null)
+        {
+            if (_fallbackBundleRequest != null)
+            {
+                return 0;
+            }
+            return RefreshTmpTextsWithUguiOverlay();
+        }
+
         if (_tmpTextType == null)
         {
             ResolveTmpTypes();
@@ -1532,6 +1982,7 @@ internal static class TmpFontFallbackInstaller
         {
             int id = InstanceId(text);
             string current = GetStringProperty(text, "text");
+            PatchTmpHostFontFromText(text, current);
             if (string.Equals(current, LastTmpTextById.TryGetValue(id, out string last) ? last : null, StringComparison.Ordinal))
             {
                 continue;
@@ -1551,6 +2002,463 @@ internal static class TmpFontFallbackInstaller
         }
 
         return changedCount;
+    }
+
+    private static int RefreshTmpTextsWithUguiOverlay()
+    {
+        if (_tmpTextType == null || _uguiTextType == null || _uguiFont == null)
+        {
+            return 0;
+        }
+
+        int scannedCount = 0;
+        int cjkCount = 0;
+        int visibleCount = 0;
+        int noComponentCount = 0;
+        int noRectCount = 0;
+        int invisibleCount = 0;
+        int createFailedCount = 0;
+        int textWriteFailedCount = 0;
+        foreach (object text in FindUnityObjects(_tmpTextType))
+        {
+            scannedCount++;
+            int sourceId = InstanceId(text);
+            if (InteractiveOverlayTextIds.Contains(sourceId) || TmpUguiOverlayTextIds.Contains(sourceId))
+            {
+                continue;
+            }
+
+            string current = GetStringProperty(text, "text");
+            object enabledValue = GetPropertyValue(text, "enabled");
+            bool enabled = enabledValue is not bool isEnabled || isEnabled;
+            bool hiddenByOverlay = TmpUguiOverlayTextBySourceId.ContainsKey(sourceId);
+            if ((!enabled && !hiddenByOverlay) || !ContainsCjk(current))
+            {
+                DestroyTmpUguiOverlay(sourceId);
+                continue;
+            }
+            cjkCount++;
+
+            if (TryUpdateTmpUguiOverlay(text, sourceId, current, out string failure))
+            {
+                visibleCount++;
+            }
+            else
+            {
+                switch (failure)
+                {
+                    case "component": noComponentCount++; break;
+                    case "rect": noRectCount++; break;
+                    case "invisible": invisibleCount++; break;
+                    case "create": createFailedCount++; break;
+                    case "text": textWriteFailedCount++; break;
+                }
+            }
+        }
+
+        string signature = scannedCount + ":" + cjkCount + ":" + visibleCount + ":" + noComponentCount + ":" + noRectCount + ":" + invisibleCount + ":" + createFailedCount + ":" + textWriteFailedCount;
+        if (!string.Equals(signature, _lastTmpUguiScanSignature, StringComparison.Ordinal))
+        {
+            _lastTmpUguiScanSignature = signature;
+            TmpFontFallbackPlugin.Logger.LogInfo("TMP UGUI fallback scan: scanned=" + scannedCount + "; cjk=" + cjkCount + "; overlays=" + visibleCount +
+                "; noComponent=" + noComponentCount + "; noRect=" + noRectCount + "; invisible=" + invisibleCount +
+                "; createFailed=" + createFailedCount + "; textWriteFailed=" + textWriteFailedCount + ".");
+        }
+
+        return visibleCount;
+    }
+
+    private static bool TryUpdateTmpUguiOverlay(object sourceText, int sourceId, string translated, out string failure)
+    {
+        failure = null;
+        Component source = sourceText as Component;
+        if (source == null || source.gameObject == null)
+        {
+            failure = "component";
+            DestroyTmpUguiOverlay(sourceId);
+            return false;
+        }
+        RectTransform sourceRect = ResolveRectTransform(source);
+        if (string.IsNullOrWhiteSpace(translated))
+        {
+            failure = "rect";
+            DestroyTmpUguiOverlay(sourceId);
+            return false;
+        }
+        if (!source.gameObject.activeInHierarchy)
+        {
+            failure = "invisible";
+            DestroyTmpUguiOverlay(sourceId);
+            return false;
+        }
+
+        Color displayColor;
+        if (!TmpUguiOriginalColorBySourceId.TryGetValue(sourceId, out displayColor))
+        {
+            if (!TryGetColor(sourceText, out displayColor) || displayColor.a <= 0.01f)
+            {
+                failure = "invisible";
+                return false;
+            }
+            TmpUguiOriginalColorBySourceId[sourceId] = displayColor;
+        }
+
+        object overlayText = GetOrCreateTmpUguiOverlay(source, sourceRect, sourceId);
+        if (overlayText == null)
+        {
+            failure = "create";
+            return false;
+        }
+
+        int projectedFontSize = 0;
+        if (sourceRect != null)
+        {
+            CopyRectTransform(sourceRect, ResolveRectTransform(overlayText as Component));
+        }
+        else if (!TryPositionWorldSpaceTmpOverlay(source, overlayText, out projectedFontSize))
+        {
+            failure = "rect";
+            DestroyTmpUguiOverlay(sourceId);
+            return false;
+        }
+        TrySetPropertyIfExists(overlayText, "font", _uguiFont);
+        if (sourceRect == null)
+        {
+            TrySetPropertyIfExists(overlayText, "fontSize", projectedFontSize);
+        }
+        else if (TryGetFloatProperty(sourceText, "fontSize", out float fontSize) && fontSize > 0.1f)
+        {
+            TrySetPropertyIfExists(overlayText, "fontSize", Math.Max(10, (int)Math.Round(fontSize)));
+        }
+        TrySetPropertyIfExists(overlayText, "lineSpacing", 1.0f);
+        TrySetPropertyIfExists(overlayText, "supportRichText", true);
+        TrySetPropertyIfExists(overlayText, "resizeTextForBestFit", false);
+        TrySetPropertyIfExists(overlayText, "raycastTarget", false);
+        SetEnumPropertyIfExists(overlayText, "alignment", GetUguiTextAnchorName(sourceText));
+        SetEnumPropertyIfExists(overlayText, "horizontalOverflow", GetTmpWordWrap(sourceText) ? "Wrap" : "Overflow");
+        SetEnumPropertyIfExists(overlayText, "verticalOverflow", "Overflow");
+        TrySetPropertyIfExists(overlayText, "color", displayColor);
+
+        string displayText = NormalizeTmpTextForFallback(translated);
+        if (!TrySetPropertyIfExists(overlayText, "text", displayText))
+        {
+            failure = "text";
+            DestroyTmpUguiOverlay(sourceId);
+            return false;
+        }
+
+        TrySetPropertyIfExists(overlayText, "enabled", true);
+        InvokeNoThrow(overlayText, "SetAllDirty");
+        HideTmpSourceForUguiOverlay(sourceText, sourceId);
+        return true;
+    }
+
+    private static object GetOrCreateTmpUguiOverlay(Component source, RectTransform sourceRect, int sourceId)
+    {
+        if (TmpUguiOverlayTextBySourceId.TryGetValue(sourceId, out object existing))
+        {
+            Component existingComponent = existing as Component;
+            if (existingComponent != null && existingComponent.gameObject != null)
+            {
+                existingComponent.gameObject.SetActive(true);
+                return existing;
+            }
+            TmpUguiOverlayTextBySourceId.Remove(sourceId);
+        }
+
+        try
+        {
+            Il2CppSystem.Type rectTransformType = Il2CppType.From(typeof(RectTransform), false);
+            Il2CppSystem.Type uguiTextType = Il2CppType.From(_uguiTextType, false);
+            GameObject overlayObject = new GameObject(TmpUguiOverlayName, new Il2CppSystem.Type[] { rectTransformType, uguiTextType });
+            overlayObject.layer = source.gameObject.layer;
+            overlayObject.hideFlags = (HideFlags)52;
+            if (sourceRect != null)
+            {
+                overlayObject.transform.SetParent(source.transform.parent, false);
+                overlayObject.transform.SetSiblingIndex(source.transform.GetSiblingIndex() + 1);
+            }
+            else
+            {
+                Transform canvasRoot = EnsureTmpUguiCanvas();
+                if (canvasRoot == null)
+                {
+                    UnityEngine.Object.Destroy(overlayObject);
+                    return null;
+                }
+                overlayObject.transform.SetParent(canvasRoot, false);
+            }
+
+            Component overlayComponent = overlayObject.GetComponent(uguiTextType);
+            if (overlayComponent == null)
+            {
+                UnityEngine.Object.Destroy(overlayObject);
+                return null;
+            }
+
+            if (sourceRect != null)
+            {
+                CopyRectTransform(sourceRect, ResolveRectTransform(overlayComponent));
+            }
+            TmpUguiOverlayTextBySourceId[sourceId] = overlayComponent;
+            TmpUguiOverlayTextIds.Add(InstanceId(overlayComponent));
+            return overlayComponent;
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "sourceId=" + sourceId + "; phase=create-tmp-ugui-overlay");
+            return null;
+        }
+    }
+
+    private static Transform EnsureTmpUguiCanvas()
+    {
+        if (_tmpUguiCanvasObject != null)
+        {
+            try
+            {
+                if (_tmpUguiCanvasObject.transform != null)
+                {
+                    return _tmpUguiCanvasObject.transform;
+                }
+            }
+            catch (Exception ex)
+            {
+                TmpFontFallbackPlugin.ReportCaughtException(ex, "phase=reuse-tmp-ugui-canvas");
+                _tmpUguiCanvasObject = null;
+            }
+        }
+
+        Type canvasType = FindType("UnityEngine.Canvas");
+        if (canvasType == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            Il2CppSystem.Type rectTransformType = Il2CppType.From(typeof(RectTransform), false);
+            Il2CppSystem.Type canvasIl2CppType = Il2CppType.From(canvasType, false);
+            GameObject canvasObject = new GameObject(TmpUguiCanvasName, new Il2CppSystem.Type[] { rectTransformType, canvasIl2CppType });
+            object canvas = canvasObject.GetComponent(canvasIl2CppType);
+            if (canvas == null)
+            {
+                UnityEngine.Object.Destroy(canvasObject);
+                return null;
+            }
+
+            canvasObject.hideFlags = (HideFlags)52;
+            SetEnumPropertyIfExists(canvas, "renderMode", "ScreenSpaceOverlay");
+            TrySetPropertyIfExists(canvas, "overrideSorting", true);
+            TrySetPropertyIfExists(canvas, "sortingOrder", 32760);
+            UnityEngine.Object.DontDestroyOnLoad(canvasObject);
+            _tmpUguiCanvasObject = canvasObject;
+            return canvasObject.transform;
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "phase=create-tmp-ugui-canvas");
+            return null;
+        }
+    }
+
+    private static bool TryPositionWorldSpaceTmpOverlay(Component source, object overlayText, out int projectedFontSize)
+    {
+        projectedFontSize = 24;
+        RectTransform overlayRect = ResolveRectTransform(overlayText as Component);
+        Camera camera = ResolveActiveCamera();
+        if (overlayRect == null || camera == null)
+        {
+            return false;
+        }
+
+        Renderer renderer = source.gameObject.GetComponent(Il2CppType.From(typeof(Renderer), false)) as Renderer;
+        float minX = float.MaxValue;
+        float minY = float.MaxValue;
+        float maxX = float.MinValue;
+        float maxY = float.MinValue;
+        bool projected = false;
+        if (renderer != null && renderer.enabled)
+        {
+            Bounds bounds = renderer.bounds;
+            for (int x = 0; x < 2; x++)
+            {
+                for (int y = 0; y < 2; y++)
+                {
+                    for (int z = 0; z < 2; z++)
+                    {
+                        Vector3 world = new Vector3(x == 0 ? bounds.min.x : bounds.max.x, y == 0 ? bounds.min.y : bounds.max.y, z == 0 ? bounds.min.z : bounds.max.z);
+                        Vector3 screen = camera.WorldToScreenPoint(world);
+                        if (screen.z <= 0.0f)
+                        {
+                            continue;
+                        }
+                        projected = true;
+                        minX = Math.Min(minX, screen.x);
+                        minY = Math.Min(minY, screen.y);
+                        maxX = Math.Max(maxX, screen.x);
+                        maxY = Math.Max(maxY, screen.y);
+                    }
+                }
+            }
+        }
+
+        if (!projected)
+        {
+            Vector3 screen = camera.WorldToScreenPoint(source.transform.position);
+            if (screen.z <= 0.0f)
+            {
+                return false;
+            }
+            minX = screen.x - 120.0f;
+            maxX = screen.x + 120.0f;
+            minY = screen.y - 24.0f;
+            maxY = screen.y + 24.0f;
+        }
+
+        float width = Math.Max(40.0f, maxX - minX);
+        float height = Math.Max(20.0f, maxY - minY);
+        overlayRect.position = new Vector3((minX + maxX) * 0.5f, (minY + maxY) * 0.5f, 0.0f);
+        overlayRect.sizeDelta = new Vector2(width * 1.12f, height * 1.30f);
+        projectedFontSize = Math.Max(10, (int)Math.Round(height * 0.78f));
+        return true;
+    }
+
+    private static Camera ResolveActiveCamera()
+    {
+        Camera main = Camera.main;
+        if (main != null && main.enabled && main.gameObject != null && main.gameObject.activeInHierarchy)
+        {
+            return main;
+        }
+
+        try
+        {
+            foreach (Camera camera in Camera.allCameras)
+            {
+                if (camera != null && camera.enabled && camera.gameObject != null && camera.gameObject.activeInHierarchy)
+                {
+                    return camera;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "phase=enumerate-active-cameras");
+        }
+
+        foreach (object candidate in FindUnityObjects(typeof(Camera)))
+        {
+            Camera camera = candidate as Camera;
+            if (camera != null && camera.enabled && camera.gameObject != null && camera.gameObject.activeInHierarchy)
+            {
+                return camera;
+            }
+        }
+        return null;
+    }
+
+    private static RectTransform ResolveRectTransform(Component component)
+    {
+        if (component == null || component.gameObject == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return component.GetComponent<RectTransform>();
+        }
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex, "phase=resolve-native-rect-transform; component=" + component.GetType().FullName);
+            return null;
+        }
+    }
+
+    private static bool GetTmpWordWrap(object sourceText)
+    {
+        object raw = GetPropertyValue(sourceText, "enableWordWrapping");
+        return raw is not bool value || value;
+    }
+
+    private static string GetUguiTextAnchorName(object sourceText)
+    {
+        string alignment = GetPropertyValue(sourceText, "alignment")?.ToString() ?? string.Empty;
+        bool left = alignment.IndexOf("Left", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            alignment.IndexOf("Justified", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            alignment.IndexOf("Flush", StringComparison.OrdinalIgnoreCase) >= 0;
+        bool right = !left && alignment.IndexOf("Right", StringComparison.OrdinalIgnoreCase) >= 0;
+        string horizontal = left ? "Left" : right ? "Right" : "Center";
+        if (alignment.IndexOf("Top", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            return "Upper" + horizontal;
+        }
+        if (alignment.IndexOf("Bottom", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            alignment.IndexOf("Baseline", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            return "Lower" + horizontal;
+        }
+        return "Middle" + horizontal;
+    }
+
+    private static void HideTmpSourceForUguiOverlay(object sourceText, int sourceId)
+    {
+        if (!TryGetColor(sourceText, out Color color))
+        {
+            return;
+        }
+        if (!TmpUguiOriginalColorBySourceId.ContainsKey(sourceId) && color.a > 0.01f)
+        {
+            TmpUguiOriginalColorBySourceId[sourceId] = color;
+        }
+        color.a = 0.0f;
+        TrySetPropertyIfExists(sourceText, "color", color);
+        TrySetPropertyIfExists(sourceText, "enabled", false);
+    }
+
+    private static void DestroyTmpUguiOverlay(int sourceId)
+    {
+        if (!TmpUguiOriginalColorBySourceId.ContainsKey(sourceId) && !TmpUguiOverlayTextBySourceId.ContainsKey(sourceId))
+        {
+            return;
+        }
+
+        if (TmpUguiOriginalColorBySourceId.TryGetValue(sourceId, out Color originalColor))
+        {
+            foreach (object sourceText in FindUnityObjects(_tmpTextType))
+            {
+                if (InstanceId(sourceText) == sourceId)
+                {
+                    /* 仅当源文本仍保持插件设置的隐藏状态（enabled==false 且 color.a≈0）
+                       才恢复；游戏在此期间自行改状态的，跳过恢复以免覆盖游戏状态。 */
+                    bool stillHidden = GetPropertyValue(sourceText, "enabled") is bool isEnabled && !isEnabled
+                        && TryGetColor(sourceText, out Color currentColor) && currentColor.a <= 0.01f;
+                    if (stillHidden)
+                    {
+                        TrySetPropertyIfExists(sourceText, "color", originalColor);
+                        TrySetPropertyIfExists(sourceText, "enabled", true);
+                    }
+                    else
+                    {
+                        TmpFontFallbackPlugin.Logger.LogInfo("Skipped TMP uGUI source restore for sourceId=" + sourceId + ": source state changed outside the plugin.");
+                    }
+                    break;
+                }
+            }
+            TmpUguiOriginalColorBySourceId.Remove(sourceId);
+        }
+
+        if (TmpUguiOverlayTextBySourceId.TryGetValue(sourceId, out object overlay))
+        {
+            Component overlayComponent = overlay as Component;
+            TmpUguiOverlayTextIds.Remove(InstanceId(overlay));
+            if (overlayComponent != null && overlayComponent.gameObject != null)
+            {
+                UnityEngine.Object.Destroy(overlayComponent.gameObject);
+            }
+            TmpUguiOverlayTextBySourceId.Remove(sourceId);
+        }
     }
 
     private static bool TryProtectInteractiveTmpTranslation(object text, string translated, out string preservedOriginal)
@@ -1710,17 +2618,28 @@ internal static class TmpFontFallbackInstaller
 
     private static string GetUnityObjectPath(Component component)
     {
-        System.Text.StringBuilder path = new System.Text.StringBuilder(128);
-        Transform t = component.transform;
-        for (int depth = 0; t != null && depth < 12; depth++, t = t.parent)
+        /* Harmony 前缀会同步调到本方法；场景销毁竞态下 transform/gameObject
+           访问可能抛异常，必须就地拦截并记录，不能顺前缀抛回游戏调用方。
+           失败返回空路径：不命中任何交互式 UI 路径判定，按非交互文本放行。 */
+        try
         {
-            if (path.Length > 0)
+            System.Text.StringBuilder path = new System.Text.StringBuilder(128);
+            Transform t = component.transform;
+            for (int depth = 0; t != null && depth < 12; depth++, t = t.parent)
             {
-                path.Insert(0, '/');
+                if (path.Length > 0)
+                {
+                    path.Insert(0, '/');
+                }
+                path.Insert(0, t.gameObject != null ? t.gameObject.name : t.name);
             }
-            path.Insert(0, t.gameObject != null ? t.gameObject.name : t.name);
+            return path.ToString();
         }
-        return path.ToString();
+        catch (Exception ex)
+        {
+            TmpFontFallbackPlugin.ReportCaughtException(ex);
+            return string.Empty;
+        }
     }
 
     private static bool TryUpdateInteractiveOverlay(object sourceText, string translated)
@@ -1787,7 +2706,7 @@ internal static class TmpFontFallbackInstaller
                 return null;
             }
 
-            CopyRectTransform(source.transform as RectTransform, overlayComponent.transform as RectTransform);
+            CopyRectTransform(ResolveRectTransform(source), ResolveRectTransform(overlayComponent));
             InteractiveOverlayTextBySourceId[sourceId] = overlayComponent;
             InteractiveOverlayTextIds.Add(InstanceId(overlayComponent));
             return overlayComponent;
@@ -1914,9 +2833,34 @@ internal static class TmpFontFallbackInstaller
 
         if (TryGetFloatProperty(source, "fontSize", out float fontSize) && fontSize > 0.1f)
         {
-            TrySetPropertyIfExists(overlay, "fontSizeMax", fontSize);
-            TrySetPropertyIfExists(overlay, "fontSizeMin", Math.Max(10.0f, fontSize * 0.55f));
-            TrySetPropertyIfExists(overlay, "fontSize", Math.Max(10.0f, fontSize * 0.92f));
+            float preferredFontSize = fontSize;
+            bool sourceAutoSizing = GetPropertyValue(source, "enableAutoSizing") is bool enabled && enabled;
+            if (TryGetFloatProperty(source, "fontSizeMax", out float fontSizeMax) &&
+                fontSizeMax > 0.1f &&
+                (sourceAutoSizing || fontSize < 10.0f))
+            {
+                preferredFontSize = Math.Max(fontSize, fontSizeMax);
+            }
+            preferredFontSize = Math.Max(10.0f, preferredFontSize);
+
+            float preferredFontSizeMin = Math.Max(10.0f, preferredFontSize * 0.55f);
+            if (sourceAutoSizing &&
+                TryGetFloatProperty(source, "fontSizeMin", out float fontSizeMin) &&
+                fontSizeMin > 0.1f)
+            {
+                preferredFontSizeMin = Math.Max(10.0f, Math.Min(fontSizeMin, preferredFontSize));
+            }
+
+            TrySetPropertyIfExists(overlay, "fontSizeMax", preferredFontSize);
+            TrySetPropertyIfExists(overlay, "fontSizeMin", preferredFontSizeMin);
+            TrySetPropertyIfExists(overlay, "fontSize", preferredFontSize);
+
+            if (fontSize < 10.0f && preferredFontSize > fontSize && !_reportedColdInteractiveLayoutRepair)
+            {
+                _reportedColdInteractiveLayoutRepair = true;
+                TmpFontFallbackPlugin.Logger.LogInfo(
+                    "[INTERACTIVE-LAYOUT] Replaced a transient cold-start TMP font size with its configured auto-size upper bound.");
+            }
         }
     }
 
@@ -1959,7 +2903,16 @@ internal static class TmpFontFallbackInstaller
 
         if (InteractiveOriginalColorBySourceId.TryGetValue(sourceId, out Color originalColor))
         {
-            TrySetPropertyIfExists(text, "color", originalColor);
+            /* 仅当当前透明度仍是插件设置的隐藏值（a≈0）才恢复原色；
+               游戏已自行改色的跳过恢复，避免覆盖游戏状态。 */
+            if (TryGetColor(text, out Color currentColor) && currentColor.a <= 0.01f)
+            {
+                TrySetPropertyIfExists(text, "color", originalColor);
+            }
+            else
+            {
+                TmpFontFallbackPlugin.Logger.LogInfo("Skipped interactive source color restore for sourceId=" + sourceId + ": source state changed outside the plugin.");
+            }
             InteractiveOriginalColorBySourceId.Remove(sourceId);
         }
 

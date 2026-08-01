@@ -7,6 +7,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.Serialization;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -33,9 +34,15 @@ using UnityEngine.UI;
  * 引擎边界：本文件只随 Unity Mono payload 部署。Ren'Py、RPG Maker ... * Unity IL2CPP 分别使用启动...hook、XUnity 端点...IL2CPP TMP fallback... * 不会执行这里的代码... *
  * 所有权约定... *   - _cache / _glossary / _localCacheKeys 由本插件拥有，访问时..._cache... *   - 请求、去抖、待应用和组件状态由 _pendingLock 保护... *   - _serverStateLock 只保护熔断状态；
  *   - _cachePersistLock 只保护持久化调度标志，不包住磁盘 IO... *   - UnityEngine.Object 只能...Unity 主线程读取或写入，后台线程不得持有强引用... */
-[BepInPlugin("com.deepseek.translator", "Unity Translator", "3.1.111")]
+[BepInPlugin("com.deepseek.translator", "Unity Translator", "3.1.126")]
 public class DeepSeekTranslator : BaseUnityPlugin
 {
+	private const float CollapsedTmpOverlayWidth = 24f;
+
+	private const float NarrowTmpOverlayWidthToHeight = 0.75f;
+
+	private const float NarrowTmpOverlayParentWidthMultiplier = 2.5f;
+
 	/* TMP 字体无法覆盖译文时创建的 UGUI 覆盖层状态；WeakReference 避免阻止场景卸载...*/
 	private sealed class TmpOverlayState : MonoBehaviour
 	{
@@ -47,6 +54,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 		public bool hasOriginalColor;
 
+		public bool sourceWasEnabled;
+
+		public bool hasSourceEnabledState;
+
+		public int pendingExternalWriteDepth;
+
+		public string pendingExternalTextNormalized;
+
 		public string sourceText;
 
 		public string sourceNormalized;
@@ -56,6 +71,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public WeakReference componentRef;
 
 		public bool registered;
+
+		public int overlayGeometryRetryCount;
+	}
+
+	private sealed class TmpOverlayMarker : MonoBehaviour
+	{
 	}
 
 	private sealed class UguiShortLabelLayoutState
@@ -65,7 +86,27 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public string AppliedText;
 	}
 
+	private sealed class TmpParagraphLayoutState
+	{
+		public object OriginalAlignment;
+
+		public string AppliedText;
+	}
+
+	private sealed class TmpShortLabelLayoutState
+	{
+		public object OriginalAlignment;
+
+		public Vector2 OriginalAnchoredPosition;
+
+		public string AppliedText;
+	}
+
 	private static readonly ConditionalWeakTable<Text, UguiShortLabelLayoutState> _uguiShortLabelLayouts = new ConditionalWeakTable<Text, UguiShortLabelLayoutState>();
+
+	private static readonly ConditionalWeakTable<Component, TmpParagraphLayoutState> _tmpParagraphLayouts = new ConditionalWeakTable<Component, TmpParagraphLayoutState>();
+
+	private static readonly ConditionalWeakTable<Component, TmpShortLabelLayoutState> _tmpShortLabelLayouts = new ConditionalWeakTable<Component, TmpShortLabelLayoutState>();
 
 	/* 后台翻译完成后等待主线程写回组件的不可变工作项...*/
 	private sealed class PendingTranslationApply
@@ -105,6 +146,28 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public ProtectedTextPayload Payload;
 
 		public bool LowPriority;
+
+		public List<Action<string>> Callbacks = new List<Action<string>>();
+	}
+
+	/* One long source fans out to bounded atomic requests. The aggregate remains
+	   unresolved until every segment succeeds, so partial translations never
+	   enter the full-text cache or reach a Unity renderer. */
+	private sealed class PendingLongTextRequest
+	{
+		public string Key;
+
+		public string OriginalText;
+
+		public IReadOnlyList<UnityLongTextPart> Parts;
+
+		public ProtectedTextPayload[] Payloads;
+
+		public string[] Results;
+
+		public int Remaining;
+
+		public bool Failed;
 
 		public List<Action<string>> Callbacks = new List<Action<string>>();
 	}
@@ -170,9 +233,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	public const string PluginGuid = "com.deepseek.translator";
 
-	private const string PluginRuntimeVersion = "3.1.111";
+	private const string PluginRuntimeVersion = "3.1.126";
 
 	private static DeepSeekTranslator _instance;
+
+	private static GameObject _pluginHostRoot;
+
+	private static int _pluginHostLifetimeBlockCount;
 
 	private static readonly object _caughtExceptionLogLock = new object();
 
@@ -214,6 +281,18 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private Harmony _harmony;
 
+	private EventInfo _sceneLoadedEvent;
+
+	private Delegate _sceneLoadedCallback;
+
+	private EventInfo _canvasRenderEvent;
+
+	private Delegate _canvasRenderCallback;
+
+	private EventInfo _beforeRenderEvent;
+
+	private Delegate _beforeRenderCallback;
+
 	private ConfigEntry<string> _serverUrl;
 
 	private ConfigEntry<string> _fontName;
@@ -254,6 +333,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private volatile bool _firstFrameLocalCachePrimed;
 
+	private volatile bool _bootCacheLoadComplete;
+
 	private readonly Dictionary<string, string> _mixedRepairOriginals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
 	private readonly Dictionary<string, string> _mixedRepairTranslations = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -270,13 +351,19 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private readonly Dictionary<string, PendingBatchRequest> _pendingBatchRequests = new Dictionary<string, PendingBatchRequest>(StringComparer.Ordinal);
 
+	private readonly Dictionary<string, PendingLongTextRequest> _pendingLongTextRequests = new Dictionary<string, PendingLongTextRequest>(StringComparer.Ordinal);
+
 	private readonly List<string> _pendingBatchQueue = new List<string>();
 
 	private readonly HashSet<string> _warmupRequestedSources = new HashSet<string>(StringComparer.Ordinal);
 
+	private readonly HashSet<string> _fungusPrefetchSeen = new HashSet<string>(StringComparer.Ordinal);
+
 	private readonly List<WeakReference> _activeTmpOverlays = new List<WeakReference>();
 
 	private readonly HashSet<int> _deepScannedObjects = new HashSet<int>();
+
+	private readonly HashSet<int> _cjkRenderDiagnostics = new HashSet<int>();
 
 	private readonly HashSet<string> _deepPrefetchSeen = new HashSet<string>(StringComparer.Ordinal);
 
@@ -329,17 +416,33 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private volatile bool _shuttingDown;
 
+	private volatile bool _applicationQuitting;
+
+	private bool _runtimeOwner;
+
+	private bool _unityVersionResolved;
+
+	private string _resolvedUnityVersion = string.Empty;
+
 	private bool _cachePersistScheduled;
 
 	private bool _cachePersistDirty;
 
 	private volatile int _hookCallCount;
 
+	private volatile int _tmpRegistryHookCount;
+
+	private volatile int _tmpRegistryRegisteredCount;
+
 	private volatile int _canvasRenderCount;
 
 	private volatile int _driverTickCount;
 
 	private volatile int _framePumpTickCount;
+
+	private volatile int _beforeRenderTickCount;
+
+	private int _beforeRenderPumpActive;
 
 	private int _framePumpActive;
 
@@ -462,6 +565,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	/* 与本地服...API 通道池对齐：最...4 个批次并行，避免单次往返串行化...*/
 	private const int MaxConcurrentBatchFlushes = 4;
 
+	private const int LongTextParallelThreshold = 480;
+
+	private const int LongTextTargetSegmentChars = 320;
+
+	private const int MaxParallelLongTextSegments = 4;
+
+	private const string LongTextLaneMarker = "|unity-long|";
+
 	/* flush 异常退出后的重启必须限速，否则确定性错误会变成高频死循环...*/
 	private const int BatchFlushFaultRestartDelayMs = 1000;
 
@@ -521,6 +632,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const float UiTextSettleDebounceSeconds = 0.03f;
 
+	private const string UguiTypewriterLengthPaddingTag = "<color=#00000000></color>";
+
 	private const int MaxDebouncedStartsPerTick = 24;
 
 	private const int MaxSceneWarmupCandidates = 96;
@@ -561,6 +674,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int MaxTargetedCacheQueuesPerActivation = 48;
 
+	private const int MaxTmpRegistryDiscoveryPerPass = 128;
+
+	private const float TmpRegistryDiscoveryIntervalSeconds = 0.5f;
+
+	private float _lastTmpRegistryDiscoveryRealtime = -999f;
+
 	private const int SceneCacheApplyPasses = 6;
 
 	private const int MaxRemoteLowPriorityPendingRequests = 4;
@@ -578,6 +697,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private const int MaxDeepPrefetchSeen = 4096;
 
 	private const int MaxDeepPrefetchQueue = 512;
+
+	private const int FungusLookaheadMaxCommands = 24;
+
+	private const int FungusPrefetchMaxRequestTexts = 32;
+
+	private const int MaxFungusPrefetchSeen = 2048;
 
 	private const float StatePruneIntervalSeconds = 30f;
 
@@ -689,21 +814,35 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly HashSet<string> UnityTextSupportedTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "b", "i", "size", "color", "material", "quad" };
 
-	private static readonly string[] StartupHotTexts = new string[31]
+	private static readonly string[] StartupHotTexts = new string[37]
 	{
 		"Continue", "CONTINUE", "Leave", "LEAVE", "Load Game", "LOAD GAME", "New Game", "NEW GAME", "Screen", "SCREEN",
 		"Main Menu", "MAIN MENU", "Info", "INFO", "Sound", "SOUND", "Cheats", "CHEATS", "Debug", "DEBUG",
 		"Exit", "EXIT", "Exit Game", "EXIT GAME", "Quest Log", "QUEST LOG", "Back", "OK", "Cancel", "Yes",
-		"No"
+		"No", "Inventory", "INVENTORY", "Use", "USE", "Equip", "EQUIP"
 	};
 
 	private static volatile int _asyncQueueLoggedCount;
 
 	private static readonly HashSet<string> _asyncQueueLogged = new HashSet<string>();
 
+	private static int _tmpExternalWriteBoundaryLogged;
+
+	private static int _tmpOverlayColorOwnershipLogged;
+
+	private static int _tmpCollapsedOverlayRectLogged;
+
+	private static int _tmpOverlayReparentLogged;
+
 	private static volatile int _setTextAnyOverloadCount;
 
 	private Font _chineseFont;
+
+	private MethodInfo _createDynamicFontFromOsFontMethod;
+
+	private MethodInfo _internalCreateDynamicFontMethod;
+
+	private bool _createDynamicFontFromOsFontResolved;
 
 	private object _chineseTMPFont;
 
@@ -714,6 +853,38 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private static readonly Dictionary<string, MethodInfo> _quietMethodCache = new Dictionary<string, MethodInfo>();
 
 	private static readonly object _quietMethodCacheLock = new object();
+
+	private static readonly Dictionary<string, MethodInfo> _genericChildrenMethodCache = new Dictionary<string, MethodInfo>();
+
+	private static readonly object _genericChildrenMethodCacheLock = new object();
+
+	private static int _genericChildrenFallbackLogged;
+
+	private static MethodInfo _findObjectsOfTypeWithInactiveMethod;
+
+	private static MethodInfo _findObjectsOfTypeLegacyMethod;
+
+	private static MethodInfo _findObjectsOfTypeGenericMethod;
+
+	private static int _findObjectsMethodsResolved;
+
+	private static int _preferObjectFindObjectsFallback;
+
+	private static int _objectFindObjectsFallbackLogged;
+
+	private static int _tmpUpdateManagerFallbackLogged;
+
+	private static int _tmpUpdateManagerProbeLogged;
+
+	private static int _tmpUpdateManagerPopulatedLogged;
+
+	private static int _canvasRendererAlphaFallbackLogged;
+
+	private static int _guiStyleVisualFallbackLogged;
+
+	private static int _materialTextureFallbackLogged;
+
+	private static int _texturePixelFallbackLogged;
 
 	private Type _tmpSubMeshTypeCache;
 
@@ -731,11 +902,19 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int DeepInspectMax = 3;
 
+	private const int CjkRenderDiagnosticMax = 16;
+
 	/* BepInEx 真实入口。初始化顺序很重要：先准备配...缓存/字体，再安装 hook...	   最后启动预热和扫描。任何后台工作都不得在这里同步等待远...API...*/
 	private void Awake()
 	{
+		if (!EnsureDedicatedPluginHost())
+		{
+			return;
+		}
+		_runtimeOwner = true;
 		_shuttingDown = false;
 		_instance = this;
+		PinPluginHostAcrossSceneLoads();
 		_lastSceneLoadRealtime = Time.realtimeSinceStartup;
 		_serverUrl = base.Config.Bind("General", "ServerUrl", "http://127.0.0.1:19999", "Translation server URL");
 		_fontName = base.Config.Bind("General", "FontName", "Microsoft YaHei UI", "Fallback Chinese font");
@@ -760,10 +939,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		EnsureDriver();
 		_harmony = new Harmony("com.deepseek.translator");
 		InstallHooks();
-		SceneManager.sceneLoaded += OnSceneLoaded;
+		RegisterSceneLoadedCallback();
 		base.Logger.LogInfo("=== ds游戏翻译器 v" + (typeof(DeepSeekTranslator).GetCustomAttribute<BepInPlugin>()?.Version?.ToString() ?? "unknown") + " Ready ===");
-		Canvas.willRenderCanvases += OnWillRenderCanvases;
-		base.Logger.LogInfo("Registered Canvas.willRenderCanvases callback");
+		RegisterCanvasRenderCallback();
+		RegisterBeforeRenderPump();
+		LogCoroutineDelayCompatibility();
 		if (!IsFontModeNone())
 		{
 			StartManagedCoroutine(EnsureTmpFontReadyCoroutine());
@@ -790,16 +970,19 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			try
 			{
 				string path = Path.Combine(pluginDir, "translator_runtime_diag.txt");
-				string[] value = new string[18]
+				string[] value = new string[]
 				{
 					$"DiagTime={DateTime.Now}",
 					"Version=" + PluginRuntimeVersion,
 					"FontMode=" + diagnosticFontMode,
 					"PerformanceMode=" + diagnosticPerformanceMode,
 					$"HookCalls={translatorRef._hookCallCount}",
+					$"TmpRegistryHookCalls={translatorRef._tmpRegistryHookCount}",
+					$"TmpRegistryRegistered={translatorRef._tmpRegistryRegisteredCount}",
 					$"CanvasRenderCalls={translatorRef._canvasRenderCount}",
 					$"DriverTicks={translatorRef._driverTickCount}",
 					$"FramePumpTicks={translatorRef._framePumpTickCount}",
+					$"BeforeRenderTicks={translatorRef._beforeRenderTickCount}",
 					$"CacheSize={translatorRef.GetCacheCount()}",
 					$"GlossarySize={translatorRef.GetGlossaryCount()}",
 					$"ProcessedCount={translatorRef.GetTranslatedComponentCount()}",
@@ -829,7 +1012,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					count = translatorRef._pendingApplyQueue.Count;
 				}
-				string[] value2 = new string[21]
+				string[] value2 = new string[]
 				{
 					$"ScanDiagTime={DateTime.Now}",
 					"FontMode=" + diagnosticFontMode,
@@ -838,6 +1021,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					$"CanvasRenderCalls={translatorRef._canvasRenderCount}",
 					$"DriverTicks={translatorRef._driverTickCount}",
 					$"FramePumpTicks={translatorRef._framePumpTickCount}",
+					$"BeforeRenderTicks={translatorRef._beforeRenderTickCount}",
 					$"TotalTMPFound={translatorRef._totalTmpFound}",
 					$"TranslateCacheHits={translatorRef._translateCacheHits}",
 					$"AsyncScheduled={translatorRef._asyncScheduled}",
@@ -898,6 +1082,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						$"TextEnableHooks={translatorRef._textEnableHookCount}",
 						$"ScanCount={translatorRef._scanCount}",
 						$"HookCalls={translatorRef._hookCallCount}",
+						$"TmpRegistryHookCalls={translatorRef._tmpRegistryHookCount}",
+						$"TmpRegistryRegistered={translatorRef._tmpRegistryRegisteredCount}",
 						$"FontApplyAttached={translatorRef._fontApplyAttached}",
 						$"FontApplyFailures={translatorRef._fontApplyFailures}",
 						$"GlyphRetryCount={translatorRef._glyphRetryCount}",
@@ -943,6 +1129,74 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	private bool EnsureDedicatedPluginHost()
+	{
+		GameObject currentRoot = ((Component)this).gameObject;
+		GameObject existingRoot = _pluginHostRoot;
+		if ((Object)(object)existingRoot != (Object)null)
+		{
+			bool ownsRuntime = (Object)(object)currentRoot == (Object)(object)existingRoot;
+			if (!ownsRuntime)
+			{
+				/* A later BepInEx manager instance can be created while the dedicated
+				   runtime root is still alive. It has no configuration/runtime state and
+				   cannot be repaired by the owner instance. Disabling only this duplicate
+				   prevents an empty Update from running every frame; the owner remains
+				   active, and the Update owner guard records the same invariant in code. */
+				((Behaviour)this).enabled = false;
+				base.Logger.LogWarning("Disabled duplicate Unity Mono translator instance; dedicated runtime owner is already active.");
+			}
+			return ownsRuntime;
+		}
+		GameObject hostRoot = null;
+		try
+		{
+			hostRoot = new GameObject("DeepSeekTranslatorRuntime");
+			((Object)hostRoot).hideFlags = (HideFlags)61;
+			_pluginHostRoot = hostRoot;
+			Object.DontDestroyOnLoad((Object)(object)hostRoot);
+			DeepSeekTranslator runtime = hostRoot.AddComponent<DeepSeekTranslator>();
+			if ((Object)(object)runtime == (Object)null)
+			{
+				throw new InvalidOperationException("Unity did not create the dedicated translator runtime component.");
+			}
+			base.Logger.LogInfo("Dedicated translator runtime host started outside the BepInEx manager root");
+			/* 专用宿主已接管运行时；本实例保持未初始化（_serverUrl 等均为 null），必须禁用，
+			   否则其 Update 会每帧空跑 PumpOnce 并在批量请求处 NRE。 */
+			((Behaviour)this).enabled = false;
+			return false;
+		}
+		catch (Exception ex)
+		{
+			_pluginHostRoot = null;
+			if ((Object)(object)hostRoot != (Object)null)
+			{
+				Object.Destroy((Object)(object)hostRoot);
+			}
+			ReportCaughtException(ex, "boundary=dedicated-plugin-host-bootstrap");
+			return true;
+		}
+	}
+
+	private void PinPluginHostAcrossSceneLoads()
+	{
+		/* A scene transition may destroy the BepInEx manager root in some Unity games.
+		   The game owns that lifecycle, so it cannot be repaired in the shared server.
+		   Pinning only extends the plugin host lifetime; normal quit still reaches OnDestroy.
+		   The startup log records that this compatibility boundary was activated. */
+		try
+		{
+			GameObject hostRoot = ((Component)this).gameObject;
+			_pluginHostRoot = hostRoot;
+			Object.DontDestroyOnLoad((Object)(object)hostRoot);
+			base.Logger.LogInfo("Pinned BepInEx plugin host across scene loads");
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "boundary=plugin-host-lifetime");
+		}
+	}
+
 	private void EnsureDriver()
 	{
 		/* Driver 与插件宿主解耦并跨场景存活，集中执行所...Unity 对象操作...		   创建失败时协程可退回插件自身，Harmony 帧泵仍提供第二条活跃路径...*/
@@ -977,6 +1231,93 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return ((MonoBehaviour)this).StartCoroutine(routine);
 		}
 		return _driver.StartRoutine(routine);
+	}
+
+	private void RegisterSceneLoadedCallback()
+	{
+		RegisterOptionalStaticEvent(typeof(SceneManager), "sceneLoaded", "OnSceneLoaded", ref _sceneLoadedEvent, ref _sceneLoadedCallback);
+	}
+
+	private void RegisterCanvasRenderCallback()
+	{
+		RegisterOptionalStaticEvent(typeof(Canvas), "willRenderCanvases", "OnWillRenderCanvases", ref _canvasRenderEvent, ref _canvasRenderCallback);
+	}
+
+	private void RegisterBeforeRenderPump()
+	{
+		RegisterOptionalStaticEvent(typeof(Application), "onBeforeRender", "OnBeforeRenderPump", ref _beforeRenderEvent, ref _beforeRenderCallback);
+	}
+
+	private void UnregisterSceneLoadedCallback()
+	{
+		UnregisterOptionalStaticEvent("SceneManager.sceneLoaded", ref _sceneLoadedEvent, ref _sceneLoadedCallback);
+	}
+
+	private void UnregisterCanvasRenderCallback()
+	{
+		UnregisterOptionalStaticEvent("Canvas.willRenderCanvases", ref _canvasRenderEvent, ref _canvasRenderCallback);
+	}
+
+	private void UnregisterBeforeRenderPump()
+	{
+		UnregisterOptionalStaticEvent("Application.onBeforeRender", ref _beforeRenderEvent, ref _beforeRenderCallback);
+	}
+
+	/* Highly stripped Mono players may remove optional Unity event accessors even
+	   though the declaring type remains. The game build owns that incompatibility,
+	   so each event is bound reflectively and its absence is logged. Skipping one
+	   lifecycle callback can reduce scan responsiveness, but it never accepts or
+	   persists a translation and the driver/frame hooks remain active. */
+	private void RegisterOptionalStaticEvent(Type ownerType, string eventName, string handlerName, ref EventInfo registeredEvent, ref Delegate registeredCallback)
+	{
+		if (registeredCallback != null)
+		{
+			return;
+		}
+		try
+		{
+			EventInfo eventInfo = ownerType.GetEvent(eventName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+			MethodInfo handler = GetType().GetMethod(handlerName, BindingFlags.Instance | BindingFlags.NonPublic);
+			if (eventInfo == null || eventInfo.EventHandlerType == null || handler == null)
+			{
+				base.Logger.LogWarning("Optional Unity event unavailable: " + ownerType.FullName + "." + eventName + "; continuing with remaining translation pumps.");
+				return;
+			}
+			Delegate callback = Delegate.CreateDelegate(eventInfo.EventHandlerType, this, handler, throwOnBindFailure: false);
+			if (callback == null)
+			{
+				base.Logger.LogWarning("Optional Unity event signature mismatch: " + ownerType.FullName + "." + eventName + "; continuing with remaining translation pumps.");
+				return;
+			}
+			eventInfo.AddEventHandler(null, callback);
+			registeredEvent = eventInfo;
+			registeredCallback = callback;
+			base.Logger.LogInfo("Registered " + ownerType.FullName + "." + eventName + " callback");
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono event=" + ownerType.FullName + "." + eventName, "RegisterOptionalStaticEvent");
+		}
+	}
+
+	private void UnregisterOptionalStaticEvent(string eventName, ref EventInfo registeredEvent, ref Delegate registeredCallback)
+	{
+		EventInfo eventInfo = registeredEvent;
+		Delegate callback = registeredCallback;
+		registeredEvent = null;
+		registeredCallback = null;
+		if (eventInfo == null || callback == null)
+		{
+			return;
+		}
+		try
+		{
+			eventInfo.RemoveEventHandler(null, callback);
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono event=" + eventName, "UnregisterOptionalStaticEvent");
+		}
 	}
 
 	private string GetFontMode()
@@ -1137,6 +1478,27 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		finally
 		{
 			Interlocked.Exchange(ref _framePumpActive, 0);
+		}
+	}
+
+	private void OnBeforeRenderPump()
+	{
+		if (Interlocked.Exchange(ref _beforeRenderPumpActive, 1) == 1)
+		{
+			return;
+		}
+		try
+		{
+			Interlocked.Increment(ref _beforeRenderTickCount);
+			PumpOnce("BEFORE_RENDER");
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "source=BEFORE_RENDER");
+		}
+		finally
+		{
+			Interlocked.Exchange(ref _beforeRenderPumpActive, 0);
 		}
 	}
 
@@ -1309,6 +1671,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			EnsureScannerInitialized("TEXT_ENABLE");
 			string currentComponentText = GetCurrentComponentText(component, isTmp);
+			if (isTmp && HasPendingTmpExternalTextWrite(component))
+			{
+				return false;
+			}
 			if (isTmp)
 			{
 				EnsureTmpOverlayMatchesCurrentText(component, currentComponentText);
@@ -1428,7 +1794,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			int num = 0;
 			if (_tmpTextTypeCache != null && CanHandleTmp())
 			{
-				Component[] componentsInChildren = root.GetComponentsInChildren(_tmpTextTypeCache, true);
+				Component[] componentsInChildren = GetComponentsInChildrenByTypeSafe(root, _tmpTextTypeCache, includeInactive: true);
 				foreach (Component val in componentsInChildren)
 				{
 					if (num >= maxQueue)
@@ -1518,7 +1884,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		List<string> list = new List<string>(8);
 		if (_tmpTextTypeCache != null && CanHandleTmp())
 		{
-			Object[] array = Resources.FindObjectsOfTypeAll(_tmpTextTypeCache);
+			Object[] array = FindTmpTextObjectsSafe(_tmpTextTypeCache);
 			_totalTmpFound = array.Length;
 			num = array.Length;
 			Object[] array2 = array;
@@ -1551,10 +1917,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					if (!IsTmpOverlayCurrent(val, text, text))
 					{
 						ApplyTMPFont(val);
-						ApplyTmpOverlay(val, text, text, !tmpFontCoversText);
-					}
-					MarkProcessed(componentInstanceId, text);
-					continue;
+					ApplyTmpOverlay(val, text, text, !tmpFontCoversText);
+				}
+				MarkProcessed(componentInstanceId, text);
+				LogCjkRenderStateOnce(val, text);
+				continue;
 				}
 				if (TryGetLocalTranslation(text, out var translated))
 				{
@@ -1591,7 +1958,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		Text[] array3 = Resources.FindObjectsOfTypeAll<Text>();
+		Text[] array3 = FindObjectsOfTypeAllSafe<Text>();
 		foreach (Text val2 in array3)
 		{
 			if ((Object)(object)val2 == (Object)null || string.IsNullOrWhiteSpace(val2.text) || !IsComponentActive(val2))
@@ -1621,6 +1988,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 					MarkProcessed(componentInstanceId2, text2);
 				}
+				LogCjkRenderStateOnce(val2, text2);
 			}
 			else if (TryGetLocalTranslation(text2, out translated2))
 			{
@@ -1678,7 +2046,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			int num = 0;
 			int alphaRescuedCount = _alphaRescuedCount;
-			Object[] array = Resources.FindObjectsOfTypeAll(_tmpTextTypeCache);
+			Object[] array = FindTmpTextObjectsSafe(_tmpTextTypeCache);
 			foreach (Object val in array)
 			{
 				if (!(val == (Object)null) && IsComponentActive(val) && (_chineseTMPFont == null || AccessTools.Property(((object)val).GetType(), "font")?.GetValue(val) == _chineseTMPFont))
@@ -1788,7 +2156,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		if (_textAssetTypeCache != null)
 		{
 			PropertyInfo propertyInfo = AccessTools.Property(_textAssetTypeCache, "text");
-			Object[] array = Resources.FindObjectsOfTypeAll(_textAssetTypeCache);
+			Object[] array = FindObjectsOfTypeAllSafe(_textAssetTypeCache);
 			foreach (Object val in array)
 			{
 				if (!(val == (Object)null) && TryMarkDeepScanned(val))
@@ -1804,7 +2172,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		if (num < maxObjects && list.Count < maxTexts)
 		{
-			ScriptableObject[] array2 = Resources.FindObjectsOfTypeAll<ScriptableObject>();
+			ScriptableObject[] array2 = FindObjectsOfTypeAllSafe<ScriptableObject>();
 			foreach (ScriptableObject val2 in array2)
 			{
 				if (!((Object)(object)val2 == (Object)null) && TryMarkDeepScanned(val2))
@@ -1820,7 +2188,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		if (num < maxObjects && list.Count < maxTexts)
 		{
-			MonoBehaviour[] array3 = Resources.FindObjectsOfTypeAll<MonoBehaviour>();
+			MonoBehaviour[] array3 = FindObjectsOfTypeAllSafe<MonoBehaviour>();
 			foreach (MonoBehaviour val3 in array3)
 			{
 				if (!((Object)(object)val3 == (Object)null) && IsComponentActive(val3) && TryMarkDeepScanned(val3))
@@ -2063,7 +2431,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		int num = 0;
 		if (_tmpTextTypeCache != null && CanHandleTmp())
 		{
-			Object[] array = Resources.FindObjectsOfTypeAll(_tmpTextTypeCache);
+			Object[] array = FindTmpTextObjectsSafe(_tmpTextTypeCache);
 			foreach (Object val in array)
 			{
 				if (num >= maxApply)
@@ -2098,7 +2466,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		Text[] array2 = Resources.FindObjectsOfTypeAll<Text>();
+		Text[] array2 = FindObjectsOfTypeAllSafe<Text>();
 		foreach (Text val2 in array2)
 		{
 			if (num >= maxApply)
@@ -2257,6 +2625,23 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return null;
 	}
 
+	/* 服务器 /batch 的 sources 与请求按序对齐：miss/queued 是回显原文，pass 是透传。 */
+	private static string GetBatchResponseSource(JObject response, int index)
+	{
+		if (response != null && response["sources"] is JArray sources && index >= 0 && index < ((JContainer)sources).Count)
+		{
+			return ((object)sources[index])?.ToString();
+		}
+		return null;
+	}
+
+	private static bool IsBatchPassThroughSource(string source)
+	{
+		return string.Equals(source, "miss", StringComparison.OrdinalIgnoreCase)
+			|| string.Equals(source, "queued", StringComparison.OrdinalIgnoreCase)
+			|| string.Equals(source, "pass", StringComparison.OrdinalIgnoreCase);
+	}
+
 	private static string SerializeStringMap(IReadOnlyDictionary<string, string> map)
 	{
 		StringBuilder stringBuilder = new StringBuilder();
@@ -2338,7 +2723,18 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			tcpClient.ReceiveTimeout = timeoutMs;
 			tcpClient.SendTimeout = timeoutMs;
-			tcpClient.Connect(uri.Host, port);
+			/* Connect 本身不受 Receive/SendTimeout 约束，目标不可达时会按系统默认
+			   阻塞数十秒；BeginConnect + WaitOne 把连接也纳入同一超时预算。 */
+			IAsyncResult connectResult = tcpClient.BeginConnect(uri.Host, port, null, null);
+			using (connectResult.AsyncWaitHandle)
+			{
+				if (!connectResult.AsyncWaitHandle.WaitOne(timeoutMs))
+				{
+					tcpClient.Close();
+					throw new TimeoutException("TCP connect to " + uri.Host + ":" + port + " timed out after " + timeoutMs + "ms.");
+				}
+				tcpClient.EndConnect(connectResult);
+			}
 			using (NetworkStream networkStream = tcpClient.GetStream())
 			{
 				networkStream.ReadTimeout = timeoutMs;
@@ -2455,13 +2851,26 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	private void OnApplicationQuit()
+	{
+		if (_runtimeOwner)
+		{
+			_applicationQuitting = true;
+		}
+	}
+
 	private void OnDestroy()
 	{
+		if (!_runtimeOwner)
+		{
+			return;
+		}
 		/* 先停止会闭包引用本插件的诊断线程，再同步写最后一次本地快照并解绑入口...*/
 		_shuttingDown = true;
 		if (ReferenceEquals(_instance, this))
 		{
 			_instance = null;
+			_pluginHostRoot = null;
 		}
 		_diagnosticsStop?.Set();
 		Thread diagnosticsThread = _diagnosticsThread;
@@ -2471,8 +2880,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		_diagnosticsThread = null;
 		FlushLocalCacheToDisk();
-		SceneManager.sceneLoaded -= OnSceneLoaded;
-		Canvas.willRenderCanvases -= OnWillRenderCanvases;
+		UnregisterSceneLoadedCallback();
+		UnregisterBeforeRenderPump();
+		UnregisterCanvasRenderCallback();
 		UnpatchHarmony();
 		if ((Object)(object)_driver != (Object)null)
 		{
@@ -2509,6 +2919,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void Update()
 	{
+		/* 幻影实例（非运行时宿主）未初始化，绝不能进入泵逻辑。 */
+		if (!_runtimeOwner)
+		{
+			return;
+		}
 		/* 独立 driver 是正常泵；宿...Update 仅在 driver 丢失或被禁用时兜底...*/
 		if ((Object)(object)_driver == (Object)null || !((Behaviour)_driver).isActiveAndEnabled)
 		{
@@ -2572,7 +2987,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				return;
 			}
-			List<string> texts = CollectGameScriptWarmupTexts(MaxGameScriptWarmupTexts);
+			List<string> texts = await RunBackground(() => CollectGameScriptWarmupTexts(MaxGameScriptWarmupTexts));
 			if (texts.Count == 0)
 			{
 				return;
@@ -2807,16 +3222,53 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	private void InstallPluginHostLifetimeHooks()
+	{
+		/* Some games explicitly purge persistent roots while replacing their bootstrap
+		   scene. The shared server cannot repair a destroyed in-process adapter. Only the
+		   plugin-owned root is protected, normal application quit is never suppressed, and
+		   every blocked operation is recorded by LogPluginHostLifetimeBlock. */
+		int patched = 0;
+		HarmonyMethod prefix = new HarmonyMethod(typeof(DeepSeekTranslator), "PluginHostDestroyPrefix");
+		try
+		{
+			MethodInfo destroy = AccessTools.Method(typeof(Object), "Destroy", new Type[1] { typeof(Object) });
+			if (destroy != null)
+			{
+				_harmony.Patch(destroy, prefix);
+				patched++;
+			}
+			MethodInfo destroyImmediate = AccessTools.Method(typeof(Object), "DestroyImmediate", new Type[1] { typeof(Object) });
+			if (destroyImmediate != null)
+			{
+				_harmony.Patch(destroyImmediate, prefix);
+				patched++;
+			}
+			base.Logger.LogInfo($"Plugin host lifetime hooks installed: {patched}");
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "boundary=plugin-host-destroy-hook");
+		}
+	}
+
 	private void InstallHooks()
 	{
 		/* Harmony hook 是文本进入管线的第一入口；扫描器只是漏网兜底...		   这里只挂 Unity Mono ...TMP/UGUI/Fungus，不参与 IL2CPP/XUnity...*/
+		InstallPluginHostLifetimeHooks();
 		Type type = AccessTools.TypeByName("TMPro.TMP_Text");
 		if (type != null)
 		{
 			MethodInfo methodInfo = AccessTools.Method(type, "set_text", new Type[1] { typeof(string) });
 			if (methodInfo != null)
 			{
-				_harmony.Patch(methodInfo, new HarmonyMethod(typeof(DeepSeekTranslator), "TMPSetTextPrefix"));
+				_harmony.Patch(
+					methodInfo,
+					new HarmonyMethod(typeof(DeepSeekTranslator), "TMPSetTextPrefix"),
+					new HarmonyMethod(typeof(DeepSeekTranslator), "TMPSetTextPostfix"),
+					null,
+					new HarmonyMethod(typeof(DeepSeekTranslator), "TMPSetTextFinalizer"),
+					null);
 				base.Logger.LogInfo("Hooked TMPro.set_text");
 			}
 			int num = 0;
@@ -2841,7 +3293,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 					try
 					{
-						_harmony.Patch(methodInfo2, new HarmonyMethod(typeof(DeepSeekTranslator), "TMPSetTextAnyPrefix"));
+					_harmony.Patch(
+						methodInfo2,
+						new HarmonyMethod(typeof(DeepSeekTranslator), "TMPSetTextAnyPrefix"),
+						new HarmonyMethod(typeof(DeepSeekTranslator), "TMPSetTextAnyPostfix"),
+						null,
+						new HarmonyMethod(typeof(DeepSeekTranslator), "TMPSetTextAnyFinalizer"),
+						null);
 						base.Logger.LogInfo("Hooked TMPro.SetText(" + string.Join(",", parameters.Select((ParameterInfo p) => p.ParameterType.Name)) + ")");
 						num++;
 					}
@@ -2864,6 +3322,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			TryPatchDeclaredTmpOnEnable(AccessTools.TypeByName("TMPro.TextMeshProUGUI"));
 			TryPatchDeclaredTmpOnEnable(AccessTools.TypeByName("TMPro.TextMeshPro"));
+			TryPatchDeclaredTmpRenderDiscovery(AccessTools.TypeByName("TMPro.TextMeshProUGUI"));
+			TryPatchDeclaredTmpRenderDiscovery(AccessTools.TypeByName("TMPro.TextMeshPro"));
+			TryPatchTmpUpdateManagerDiscovery();
 		}
 		else
 		{
@@ -2886,7 +3347,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			MethodInfo methodInfo6 = AccessTools.Method(typeof(GameObject), "SetActive", new Type[1] { typeof(bool) });
 			if (methodInfo6 != null)
 			{
-				_harmony.Patch(methodInfo6, null, new HarmonyMethod(typeof(DeepSeekTranslator), "GameObjectSetActivePostfix"));
+				_harmony.Patch(methodInfo6, new HarmonyMethod(typeof(DeepSeekTranslator), "GameObjectSetActivePrefix"), new HarmonyMethod(typeof(DeepSeekTranslator), "GameObjectSetActivePostfix"));
 				base.Logger.LogInfo("Hooked GameObject.SetActive");
 			}
 		}
@@ -2939,22 +3400,125 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private void InstallImGuiHooks()
+	/* A stripped player can make both Resources and Object global enumeration return
+	   empty arrays for live TMP objects that were created before plugin hooks. Canvas
+	   rebuild is the retained renderer-owned boundary that still exposes the instance.
+	   It only queues the normal local-first pipeline, cannot manufacture a successful
+	   translation, and hook selection/failures remain visible in BepInEx diagnostics. */
+	private void TryPatchDeclaredTmpRenderDiscovery(Type tmpType)
 	{
+		if (tmpType == null)
+		{
+			return;
+		}
 		try
 		{
-			MethodInfo methodInfo = AccessTools.Method(typeof(GUI), "Label", new Type[3] { typeof(Rect), typeof(string), typeof(GUIStyle) });
+			MethodInfo methodInfo = AccessTools.Method(tmpType, "Rebuild", new Type[1] { typeof(CanvasUpdate) });
 			if (methodInfo == null)
 			{
-				base.Logger.LogWarning("GUI.Label(Rect,String,GUIStyle) hook skipped: overload not found");
+				base.Logger.LogWarning(tmpType.FullName + ".Rebuild render-discovery hook skipped: overload not found");
 				return;
 			}
-			_harmony.Patch(methodInfo, new HarmonyMethod(typeof(DeepSeekTranslator), "GUILabelPrefix"));
-			base.Logger.LogInfo("Hooked GUI.Label(Rect,String,GUIStyle)");
+			if (methodInfo.DeclaringType != tmpType)
+			{
+				base.Logger.LogInfo("Skipped " + tmpType.FullName + ".Rebuild render-discovery hook; inherited from " + methodInfo.DeclaringType?.FullName);
+				return;
+			}
+			_harmony.Patch(methodInfo, null, new HarmonyMethod(typeof(DeepSeekTranslator), "TMPTextRenderDiscoveryPostfix"));
+			base.Logger.LogInfo("Hooked " + tmpType.FullName + ".Rebuild for render discovery");
 		}
 		catch (Exception ex)
 		{
-			base.Logger.LogWarning("GUI.Label(Rect,String,GUIStyle) hook skipped: " + ex.Message);
+			base.Logger.LogWarning(tmpType.FullName + ".Rebuild render-discovery hook skipped: " + ex.Message);
+		}
+	}
+
+	private void TryPatchTmpUpdateManagerDiscovery()
+	{
+		try
+		{
+			Type type = AccessTools.TypeByName("TMPro.TMP_UpdateManager");
+			MethodInfo methodInfo = AccessTools.Method(type, "DoRebuilds", Type.EmptyTypes);
+			if (methodInfo == null)
+			{
+				base.Logger.LogWarning("TMPro.TMP_UpdateManager.DoRebuilds registry-discovery hook skipped: method not found");
+				return;
+			}
+			_harmony.Patch(methodInfo, null, new HarmonyMethod(typeof(DeepSeekTranslator), "TMPUpdateManagerDiscoveryPostfix"));
+			base.Logger.LogInfo("Hooked TMPro.TMP_UpdateManager.DoRebuilds for registry discovery");
+		}
+		catch (Exception ex)
+		{
+			base.Logger.LogWarning("TMPro.TMP_UpdateManager.DoRebuilds registry-discovery hook skipped: " + ex.Message);
+		}
+	}
+
+	private void InstallImGuiHooks()
+	{
+		PatchGuiStringControl("Label", new Type[3] { typeof(Rect), typeof(string), typeof(GUIStyle) }, "GUI.Label(Rect,String,GUIStyle)", "GUILabelPrefix");
+		PatchGuiStringControl("Box", new Type[3] { typeof(Rect), typeof(string), typeof(GUIStyle) }, "GUI.Box(Rect,String,GUIStyle)", "GUIBoxPrefix");
+		PatchGuiStringControl("Button", new Type[3] { typeof(Rect), typeof(string), typeof(GUIStyle) }, "GUI.Button(Rect,String,GUIStyle)", "GUIButtonPrefix");
+		PatchGuiStringControl("Toggle", new Type[4] { typeof(Rect), typeof(bool), typeof(string), typeof(GUIStyle) }, "GUI.Toggle(Rect,Bool,String,GUIStyle)", "GUITogglePrefix");
+		PatchGUILayoutLabel(new Type[2] { typeof(string), typeof(GUILayoutOption[]) }, "GUILayout.Label(String,Options)", "GUILayoutLabelPrefix");
+		PatchGUILayoutLabel(new Type[3] { typeof(string), typeof(GUIStyle), typeof(GUILayoutOption[]) }, "GUILayout.Label(String,GUIStyle,Options)", "GUILayoutLabelStylePrefix");
+		PatchGUILayoutLabel(new Type[2] { typeof(GUIContent), typeof(GUILayoutOption[]) }, "GUILayout.Label(GUIContent,Options)", "GUILayoutContentLabelPrefix");
+		PatchGUILayoutLabel(new Type[3] { typeof(GUIContent), typeof(GUIStyle), typeof(GUILayoutOption[]) }, "GUILayout.Label(GUIContent,GUIStyle,Options)", "GUILayoutContentLabelStylePrefix");
+		PatchGUILayoutStringControl("Button", new Type[2] { typeof(string), typeof(GUILayoutOption[]) }, "GUILayout.Button(String,Options)", "GUILayoutButtonPrefix");
+		PatchGUILayoutStringControl("Button", new Type[3] { typeof(string), typeof(GUIStyle), typeof(GUILayoutOption[]) }, "GUILayout.Button(String,GUIStyle,Options)", "GUILayoutButtonStylePrefix");
+		PatchGUILayoutStringControl("Button", new Type[2] { typeof(GUIContent), typeof(GUILayoutOption[]) }, "GUILayout.Button(GUIContent,Options)", "GUILayoutContentButtonPrefix");
+		PatchGUILayoutStringControl("Button", new Type[3] { typeof(GUIContent), typeof(GUIStyle), typeof(GUILayoutOption[]) }, "GUILayout.Button(GUIContent,GUIStyle,Options)", "GUILayoutContentButtonStylePrefix");
+		PatchGUILayoutStringControl("Toggle", new Type[3] { typeof(bool), typeof(string), typeof(GUILayoutOption[]) }, "GUILayout.Toggle(Bool,String,Options)", "GUILayoutTogglePrefix");
+		PatchGUILayoutStringControl("Toggle", new Type[4] { typeof(bool), typeof(string), typeof(GUIStyle), typeof(GUILayoutOption[]) }, "GUILayout.Toggle(Bool,String,GUIStyle,Options)", "GUILayoutToggleStylePrefix");
+		PatchGUILayoutStringControl("Toggle", new Type[3] { typeof(bool), typeof(GUIContent), typeof(GUILayoutOption[]) }, "GUILayout.Toggle(Bool,GUIContent,Options)", "GUILayoutContentTogglePrefix");
+		PatchGUILayoutStringControl("Toggle", new Type[4] { typeof(bool), typeof(GUIContent), typeof(GUIStyle), typeof(GUILayoutOption[]) }, "GUILayout.Toggle(Bool,GUIContent,GUIStyle,Options)", "GUILayoutContentToggleStylePrefix");
+		PatchGUILayoutStringControl("Box", new Type[2] { typeof(string), typeof(GUILayoutOption[]) }, "GUILayout.Box(String,Options)", "GUILayoutBoxPrefix");
+		PatchGUILayoutStringControl("Box", new Type[3] { typeof(string), typeof(GUIStyle), typeof(GUILayoutOption[]) }, "GUILayout.Box(String,GUIStyle,Options)", "GUILayoutBoxStylePrefix");
+		PatchGUILayoutStringControl("Box", new Type[2] { typeof(GUIContent), typeof(GUILayoutOption[]) }, "GUILayout.Box(GUIContent,Options)", "GUILayoutContentBoxPrefix");
+		PatchGUILayoutStringControl("Box", new Type[3] { typeof(GUIContent), typeof(GUIStyle), typeof(GUILayoutOption[]) }, "GUILayout.Box(GUIContent,GUIStyle,Options)", "GUILayoutContentBoxStylePrefix");
+		PatchGUILayoutStringControl("SelectionGrid", new Type[4] { typeof(int), typeof(string[]), typeof(int), typeof(GUILayoutOption[]) }, "GUILayout.SelectionGrid(Int,StringArray,Int,Options)", "GUILayoutSelectionGridPrefix");
+		PatchGUILayoutStringControl("SelectionGrid", new Type[5] { typeof(int), typeof(string[]), typeof(int), typeof(GUIStyle), typeof(GUILayoutOption[]) }, "GUILayout.SelectionGrid(Int,StringArray,Int,GUIStyle,Options)", "GUILayoutSelectionGridStylePrefix");
+	}
+
+	private void PatchGuiStringControl(string methodName, Type[] parameterTypes, string signature, string prefixName)
+	{
+		try
+		{
+			MethodInfo methodInfo = AccessTools.Method(typeof(GUI), methodName, parameterTypes);
+			if (methodInfo == null)
+			{
+				base.Logger.LogWarning(signature + " hook skipped: overload not found");
+				return;
+			}
+			_harmony.Patch(methodInfo, new HarmonyMethod(typeof(DeepSeekTranslator), prefixName));
+			base.Logger.LogInfo("Hooked " + signature);
+		}
+		catch (Exception ex)
+		{
+			base.Logger.LogWarning(signature + " hook skipped: " + ex.Message);
+		}
+	}
+
+	private void PatchGUILayoutLabel(Type[] parameterTypes, string signature, string prefixName)
+	{
+		PatchGUILayoutStringControl("Label", parameterTypes, signature, prefixName);
+	}
+
+	private void PatchGUILayoutStringControl(string methodName, Type[] parameterTypes, string signature, string prefixName)
+	{
+		try
+		{
+			MethodInfo methodInfo = AccessTools.Method(typeof(GUILayout), methodName, parameterTypes);
+			if (methodInfo == null)
+			{
+				base.Logger.LogWarning(signature + " hook skipped: overload not found");
+				return;
+			}
+			_harmony.Patch(methodInfo, new HarmonyMethod(typeof(DeepSeekTranslator), prefixName));
+			base.Logger.LogInfo("Hooked " + signature);
+		}
+		catch (Exception ex)
+		{
+			base.Logger.LogWarning(signature + " hook skipped: " + ex.Message);
 		}
 	}
 
@@ -2986,6 +3550,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void InstallFungusHooks()
 	{
+		int dialogueHooks = 0;
+		int commandHooks = 0;
+		int menuHooks = 0;
 		Type type = AccessTools.TypeByName("Fungus.SayDialog");
 		if (type != null)
 		{
@@ -2998,27 +3565,41 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				if (parameters.Length >= 1 && parameters[0].ParameterType == typeof(string))
 				{
 					_harmony.Patch(methodInfo, new HarmonyMethod(typeof(DeepSeekTranslator), "FungusSayPrefix"));
-					base.Logger.LogInfo($"Hooked Fungus.SayDialog.Say ({parameters.Length} params)");
+					dialogueHooks++;
 				}
 			}
 		}
-		Type type2 = AccessTools.TypeByName("Fungus.Writer");
+		Type type2 = AccessTools.TypeByName("Fungus.Say");
 		if (type2 != null)
 		{
-			MethodInfo methodInfo2 = AccessTools.Method(type2, "WriteChar", new Type[1] { typeof(char) });
+			MethodInfo methodInfo2 = AccessTools.GetDeclaredMethods(type2).FirstOrDefault(method => method.Name == "OnEnter" && method.GetParameters().Length == 0);
 			if (methodInfo2 != null)
 			{
-				_harmony.Patch(methodInfo2, new HarmonyMethod(typeof(DeepSeekTranslator), "FungusWriteCharPrefix"));
+				_harmony.Patch(methodInfo2, null, new HarmonyMethod(typeof(DeepSeekTranslator), "FungusSayCommandOnEnterPostfix"));
+				commandHooks++;
 			}
 		}
 		Type type3 = AccessTools.TypeByName("Fungus.MenuDialog");
 		if (type3 != null)
 		{
-			MethodInfo methodInfo3 = AccessTools.Method(type3, "SetOptions", new Type[1] { typeof(List<string>) });
-			if (methodInfo3 != null)
+			foreach (MethodInfo methodInfo3 in AccessTools.GetDeclaredMethods(type3))
 			{
-				_harmony.Patch(methodInfo3, new HarmonyMethod(typeof(DeepSeekTranslator), "FungusMenuPrefix"));
+				ParameterInfo[] parameters = methodInfo3.GetParameters();
+				if (methodInfo3.Name == "SetOptions" && parameters.Length >= 1 && parameters[0].ParameterType == typeof(List<string>))
+				{
+					_harmony.Patch(methodInfo3, new HarmonyMethod(typeof(DeepSeekTranslator), "FungusMenuPrefix"));
+					menuHooks++;
+				}
+				else if (methodInfo3.Name == "AddOption" && parameters.Length >= 1 && parameters[0].ParameterType == typeof(string))
+				{
+					_harmony.Patch(methodInfo3, new HarmonyMethod(typeof(DeepSeekTranslator), "FungusMenuAddOptionPrefix"));
+					menuHooks++;
+				}
 			}
+		}
+		if (dialogueHooks + commandHooks + menuHooks > 0)
+		{
+			base.Logger.LogInfo($"Fungus hooks installed: dialogue={dialogueHooks}, lookahead={commandHooks}, menu={menuHooks}");
 		}
 	}
 
@@ -3140,14 +3721,33 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void ApplyImGuiFont(GUIStyle style)
 	{
-		if (style != null && (Object)(object)_chineseFont != (Object)null && (Object)(object)style.font != (Object)(object)_chineseFont)
+		if (style == null || (Object)(object)_chineseFont == (Object)null)
 		{
-			style.font = _chineseFont;
+			return;
+		}
+		try
+		{
+			PropertyInfo fontProperty = GetPropertyQuiet(style.GetType(), "font");
+			if (fontProperty == null || !fontProperty.CanRead || !fontProperty.CanWrite)
+			{
+				ReportGuiStyleVisualFallbackOnce();
+				return;
+			}
+			Font currentFont = fontProperty.GetValue(style) as Font;
+			if ((Object)(object)currentFont != (Object)(object)_chineseFont)
+			{
+				fontProperty.SetValue(style, _chineseFont);
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=IMGUI property=GUIStyle.font", "ApplyImGuiFont");
 		}
 	}
 
-	private static bool TMPSetTextAnyPrefix(object __instance, object __originalMethod, object[] __args)
+	private static bool TMPSetTextAnyPrefix(object __instance, object __originalMethod, object[] __args, out bool __state)
 	{
+		__state = false;
 		if ((Object)(object)_instance == (Object)null || __args == null || __args.Length == 0)
 		{
 			return true;
@@ -3179,6 +3779,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		if (obj is string)
 		{
 			string value2 = text;
+			/* TMP SetText(string, ...) overloads do not consistently call the text
+			   property setter. Own a separate boundary for this overload so both the
+			   successful and exceptional paths can close the depth increment. */
+			__state = true;
 			bool result = TMPSetTextPrefix(__instance, ref value2);
 			__args[0] = value2;
 			return result;
@@ -3199,6 +3803,29 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return true;
 	}
 
+	private static void TMPSetTextAnyPostfix(object __instance, object[] __args, bool __state)
+	{
+		if (!__state || (Object)(object)_instance == (Object)null)
+		{
+			return;
+		}
+		string value = (__args != null && __args.Length > 0) ? __args[0] as string : null;
+		_instance.EndTmpExternalTextWrite(__instance, value);
+	}
+
+	/* External TMP SetText overloads may throw before their postfix. That game/TMP
+	   exception cannot be repaired in the renderer or shared server. The finalizer
+	   resets only translator-owned depth state, never suppresses the exception or
+	   accepts a translation, and ReportCaughtException records the exact boundary. */
+	private static void TMPSetTextAnyFinalizer(object __instance, Exception __exception, bool __state)
+	{
+		if (!__state || __exception == null || (Object)(object)_instance == (Object)null)
+		{
+			return;
+		}
+		_instance.ResetTmpExternalWriteDepthAfterSetterException(__instance, __exception, "tmp-SetText-overload-depth-reset");
+	}
+
 	private static bool TMPSetTextPrefix(object __instance, ref string value)
 	{
 		if ((Object)(object)_instance == (Object)null)
@@ -3210,6 +3837,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return true;
 		}
+		_instance.BeginTmpExternalTextWrite(__instance, value);
+		RestoreTmpParagraphLayout(__instance, value);
+		RestoreTmpShortLabelLayout(__instance, value);
 		if (string.IsNullOrWhiteSpace(value))
 		{
 			_instance.RestoreTmpOverlay(__instance);
@@ -3262,7 +3892,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			text2 = _instance.NormalizeTmpPunctuationForMissingGlyphs(text2);
 			if (!_instance.CanTranslateTmp() && _instance.ShouldUseTmpOverlay())
 			{
-				_instance.ApplyTmpOverlay(__instance, text2, value);
+				if (!_instance.ApplyTmpOverlay(__instance, text2, value))
+				{
+					_instance.ClearInProgress(componentInstanceId, rawText);
+					return true;
+				}
 				RevealTmpText(__instance, text2);
 				_instance.MarkProcessed(componentInstanceId, rawText);
 				_instance.TryMarkAppliedCacheKeyForPersist(rawText, cachedText);
@@ -3287,9 +3921,40 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return true;
 	}
 
+	private static void TMPSetTextPostfix(object __instance, string value)
+	{
+		if ((Object)(object)_instance == (Object)null)
+		{
+			return;
+		}
+		_instance.EndTmpExternalTextWrite(__instance, value);
+	}
+
+	/* 原方法抛异常时 postfix 不会执行，pendingExternalWriteDepth 会永久卡住
+	   并让所有周期校验跳过该组件；finalizer 兜底把深度归零。void 签名不改变
+	   异常的传播，游戏仍收到自己的异常。 */
+	private static void TMPSetTextFinalizer(object __instance, Exception __exception)
+	{
+		if (__exception == null || (Object)(object)_instance == (Object)null)
+		{
+			return;
+		}
+		_instance.ResetTmpExternalWriteDepthAfterSetterException(__instance, __exception, "tmp-set-text-depth-reset");
+	}
+
+	private static bool IsTranslatorOwnedTmpOverlay(Text component)
+	{
+		return (Object)(object)component != (Object)null &&
+			(Object)(object)((Component)component).GetComponent<TmpOverlayMarker>() != (Object)null;
+	}
+
 	private static bool UGUITextPrefix(Text __instance, ref string value)
 	{
 		if ((Object)(object)_instance == (Object)null)
+		{
+			return true;
+		}
+		if (IsTranslatorOwnedTmpOverlay(__instance))
 		{
 			return true;
 		}
@@ -3334,6 +3999,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		string text = _instance.Translate(value);
 		if (text != value)
 		{
+			_instance.ApplyFont(__instance);
 			value = PrepareTranslatedTextForUGUIText(__instance, text, rawText);
 			_instance.MarkProcessed(componentInstanceId, rawText);
 			_instance.TryMarkAppliedCacheKeyForPersist(rawText, text);
@@ -3351,6 +4017,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private static void UGUITextPostfix(Text __instance)
 	{
 		if ((Object)(object)_instance == (Object)null || (Object)(object)__instance == (Object)null)
+		{
+			return;
+		}
+		if (IsTranslatorOwnedTmpOverlay(__instance))
 		{
 			return;
 		}
@@ -3384,6 +4054,241 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	private static void GUILayoutLabelPrefix(ref string text, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelString(ref text, null);
+	}
+
+	private static void GUILayoutLabelStylePrefix(ref string text, GUIStyle style, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelString(ref text, style);
+	}
+
+	private static void GUILayoutContentLabelPrefix(GUIContent content, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelContent(content, null);
+	}
+
+	private static void GUILayoutContentLabelStylePrefix(GUIContent content, GUIStyle style, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelContent(content, style);
+	}
+
+	private static void GUIBoxPrefix(ref Rect position, ref string text, GUIStyle style)
+	{
+		TranslateImGuiString(ref text, style, false, ref position);
+	}
+
+	private static void GUIButtonPrefix(ref Rect position, ref string text, GUIStyle style)
+	{
+		TranslateImGuiString(ref text, style, false, ref position);
+	}
+
+	private static void GUITogglePrefix(ref Rect position, bool value, ref string text, GUIStyle style)
+	{
+		TranslateImGuiString(ref text, style, false, ref position);
+	}
+
+	private static void GUILayoutButtonPrefix(ref string text, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelString(ref text, GetEffectiveImGuiStyle(null, "button"));
+	}
+
+	private static void GUILayoutButtonStylePrefix(ref string text, GUIStyle style, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelString(ref text, GetEffectiveImGuiStyle(style, "button"));
+	}
+
+	private static void GUILayoutContentButtonPrefix(GUIContent content, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelContent(content, GetEffectiveImGuiStyle(null, "button"));
+	}
+
+	private static void GUILayoutContentButtonStylePrefix(GUIContent content, GUIStyle style, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelContent(content, GetEffectiveImGuiStyle(style, "button"));
+	}
+
+	private static void GUILayoutTogglePrefix(bool value, ref string text, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelString(ref text, GetEffectiveImGuiStyle(null, "toggle"));
+	}
+
+	private static void GUILayoutToggleStylePrefix(bool value, ref string text, GUIStyle style, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelString(ref text, GetEffectiveImGuiStyle(style, "toggle"));
+	}
+
+	private static void GUILayoutContentTogglePrefix(bool value, GUIContent content, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelContent(content, GetEffectiveImGuiStyle(null, "toggle"));
+	}
+
+	private static void GUILayoutContentToggleStylePrefix(bool value, GUIContent content, GUIStyle style, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelContent(content, GetEffectiveImGuiStyle(style, "toggle"));
+	}
+
+	private static void GUILayoutBoxPrefix(ref string text, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelString(ref text, GetEffectiveImGuiStyle(null, "box"));
+	}
+
+	private static void GUILayoutBoxStylePrefix(ref string text, GUIStyle style, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelString(ref text, GetEffectiveImGuiStyle(style, "box"));
+	}
+
+	private static void GUILayoutContentBoxPrefix(GUIContent content, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelContent(content, GetEffectiveImGuiStyle(null, "box"));
+	}
+
+	private static void GUILayoutContentBoxStylePrefix(GUIContent content, GUIStyle style, GUILayoutOption[] options)
+	{
+		TranslateGUILayoutLabelContent(content, GetEffectiveImGuiStyle(style, "box"));
+	}
+
+	private static void GUILayoutSelectionGridPrefix(int selected, ref string[] texts, int xCount, GUILayoutOption[] options)
+	{
+		TranslateImGuiStringArray(ref texts, GetEffectiveImGuiStyle(null, "button"));
+	}
+
+	private static void GUILayoutSelectionGridStylePrefix(int selected, ref string[] texts, int xCount, GUIStyle style, GUILayoutOption[] options)
+	{
+		TranslateImGuiStringArray(ref texts, GetEffectiveImGuiStyle(style, "button"));
+	}
+
+	private static void TranslateGUILayoutLabelString(ref string text, GUIStyle style)
+	{
+		Rect unused = default(Rect);
+		TranslateImGuiString(ref text, GetEffectiveGUILayoutLabelStyle(style), false, ref unused);
+	}
+
+	private static void TranslateImGuiString(ref string text, GUIStyle style, bool adjustShortLabelRect, ref Rect position)
+	{
+		if ((Object)(object)_instance == (Object)null || string.IsNullOrWhiteSpace(text))
+		{
+			return;
+		}
+		GUIStyle effectiveStyle = GetEffectiveGUILayoutLabelStyle(style);
+		if (ContainsCjk(text))
+		{
+			_instance.ApplyImGuiFont(effectiveStyle);
+			return;
+		}
+		string originalText = text;
+		string translated = _instance.Translate(text);
+		if (!string.Equals(translated, originalText, StringComparison.Ordinal))
+		{
+			text = PrepareTranslatedTextForString(translated, originalText);
+			_instance.ApplyImGuiFont(effectiveStyle);
+			if (adjustShortLabelRect)
+			{
+				PrepareImGuiTranslatedShortLabelLayout(ref position, effectiveStyle, text, originalText);
+			}
+			_instance.TryMarkAppliedCacheKeyForPersist(originalText, translated);
+			return;
+		}
+		if (!ShouldSkipText(text) && !_instance.IsTranslationRetryCoolingDown(text))
+		{
+			_instance.QueueImGuiTranslation(text);
+		}
+	}
+
+	private static void TranslateGUILayoutLabelContent(GUIContent content, GUIStyle style)
+	{
+		if (content == null)
+		{
+			return;
+		}
+		string text = content.text;
+		if ((Object)(object)_instance == (Object)null || string.IsNullOrWhiteSpace(text))
+		{
+			return;
+		}
+		GUIStyle effectiveStyle = GetEffectiveGUILayoutLabelStyle(style);
+		if (ContainsCjk(text))
+		{
+			_instance.ApplyImGuiFont(effectiveStyle);
+			return;
+		}
+		string originalText = text;
+		string translated = _instance.Translate(text);
+		if (!string.Equals(translated, originalText, StringComparison.Ordinal))
+		{
+			content.text = PrepareTranslatedTextForString(translated, originalText);
+			_instance.ApplyImGuiFont(effectiveStyle);
+			_instance.TryMarkAppliedCacheKeyForPersist(originalText, translated);
+			return;
+		}
+		if (!ShouldSkipText(text) && !_instance.IsTranslationRetryCoolingDown(text))
+		{
+			_instance.QueueImGuiTranslation(text);
+		}
+	}
+
+	private static GUIStyle GetEffectiveGUILayoutLabelStyle(GUIStyle style)
+	{
+		return GetEffectiveImGuiStyle(style, "label");
+	}
+
+	private static GUIStyle GetEffectiveImGuiStyle(GUIStyle style, string fallback)
+	{
+		if (style != null)
+		{
+			return style;
+		}
+		GUISkin skin = GUI.skin;
+		if (skin == null)
+		{
+			return null;
+		}
+		switch (fallback)
+		{
+		case "button":
+			return skin.button;
+		case "toggle":
+			return skin.toggle;
+		case "box":
+			return skin.box;
+		default:
+			return skin.label;
+		}
+	}
+
+	private static void TranslateImGuiStringArray(ref string[] texts, GUIStyle style)
+	{
+		if (texts == null || texts.Length == 0 || (Object)(object)_instance == (Object)null)
+		{
+			return;
+		}
+		string[] translatedTexts = null;
+		for (int i = 0; i < texts.Length; i++)
+		{
+			string item = texts[i];
+			if (string.IsNullOrWhiteSpace(item))
+			{
+				continue;
+			}
+			string replacement = item;
+			Rect unused = default(Rect);
+			TranslateImGuiString(ref replacement, style, false, ref unused);
+			if (!string.Equals(replacement, item, StringComparison.Ordinal))
+			{
+				if (translatedTexts == null)
+				{
+					translatedTexts = (string[])texts.Clone();
+				}
+				translatedTexts[i] = replacement;
+			}
+		}
+		if (translatedTexts != null)
+		{
+			texts = translatedTexts;
+		}
+	}
+
 	private static void PrepareImGuiTranslatedShortLabelLayout(ref Rect position, GUIStyle style, string translatedText, string sourceText)
 	{
 		if (style == null || string.IsNullOrEmpty(translatedText) || string.IsNullOrEmpty(sourceText))
@@ -3400,15 +4305,17 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		try
 		{
 			GUIContent content = new GUIContent(translatedText);
-			style.CalcMinMaxWidth(content, out var minWidth, out var maxWidth);
-			float requiredWidth = Mathf.Ceil(Mathf.Max(style.CalcSize(content).x, Mathf.Max(minWidth, maxWidth)));
+			if (!TryMeasureImGuiContentSafe(style, content, out var requiredWidth, out var alignment))
+			{
+				return;
+			}
 			if (requiredWidth <= position.width + 0.5f)
 			{
 				return;
 			}
 			float originalWidth = position.width;
 			float widthDelta = requiredWidth - originalWidth;
-			switch (style.alignment)
+			switch (alignment)
 			{
 			case TextAnchor.UpperCenter:
 			case TextAnchor.MiddleCenter:
@@ -3425,7 +4332,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			int count = Interlocked.Increment(ref _instance._imguiShortLabelWidthCount);
 			if (count <= 3 || (count & (count - 1)) == 0)
 			{
-				_instance.Logger.LogInfo($"[IMGUI-LAYOUT] short-label width occurrence={count} originalWidth={originalWidth:0.0} requiredWidth={requiredWidth:0.0} visibleLength={visibleText.Length} sourceLength={sourceVisibleText.Length} alignment={style.alignment}");
+				_instance.Logger.LogInfo($"[IMGUI-LAYOUT] short-label width occurrence={count} originalWidth={originalWidth:0.0} requiredWidth={requiredWidth:0.0} visibleLength={visibleText.Length} sourceLength={sourceVisibleText.Length} alignment={alignment}");
 			}
 		}
 		catch (Exception ex)
@@ -3434,9 +4341,60 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private static void GameObjectSetActivePostfix(GameObject __instance, bool value)
+	private static bool ShouldProtectPluginHost(Object candidate)
 	{
-		if (!((Object)(object)_instance == (Object)null) && value && !((Object)(object)__instance == (Object)null) && _instance.LooksLikeUiGameObject(__instance))
+		DeepSeekTranslator runtime = _instance;
+		GameObject hostRoot = _pluginHostRoot;
+		if (ReferenceEquals(runtime, null) || runtime._applicationQuitting ||
+			(Object)(object)candidate == (Object)null || (Object)(object)hostRoot == (Object)null)
+		{
+			return false;
+		}
+		if ((Object)(object)candidate == (Object)(object)hostRoot)
+		{
+			return true;
+		}
+		Component component = candidate as Component;
+		return (Object)(object)component != (Object)null && (Object)(object)component.gameObject == (Object)(object)hostRoot;
+	}
+
+	private static bool PluginHostDestroyPrefix(Object obj)
+	{
+		if (!ShouldProtectPluginHost(obj))
+		{
+			return true;
+		}
+		LogPluginHostLifetimeBlock("Blocked explicit destruction of the BepInEx plugin host");
+		return false;
+	}
+
+	private static bool GameObjectSetActivePrefix(GameObject __instance, bool value, ref bool __state)
+	{
+		__state = __instance.activeSelf;
+		if (value || !ShouldProtectPluginHost(__instance))
+		{
+			return true;
+		}
+		LogPluginHostLifetimeBlock("Blocked explicit deactivation of the BepInEx plugin host");
+		return false;
+	}
+
+	private static void LogPluginHostLifetimeBlock(string message)
+	{
+		int count = Interlocked.Increment(ref _pluginHostLifetimeBlockCount);
+		if (count <= 3 || (count & (count - 1)) == 0)
+		{
+			DeepSeekTranslator runtime = _instance;
+			if (!ReferenceEquals(runtime, null))
+			{
+				runtime.Logger.LogWarning($"[HOST-LIFETIME] {message}; occurrence={count}");
+			}
+		}
+	}
+
+	private static void GameObjectSetActivePostfix(GameObject __instance, bool value, bool __state)
+	{
+		if (!((Object)(object)_instance == (Object)null) && value && !__state && !((Object)(object)__instance == (Object)null) && _instance.LooksLikeUiGameObject(__instance))
 		{
 			_instance.QueueCachedTextsInHierarchy(__instance, MaxTargetedCacheQueuesPerActivation, allowRemoteFallback: true);
 			_instance.RequestUiCacheApplyBurst();
@@ -3460,10 +4418,35 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	private static void TMPTextRenderDiscoveryPostfix(object __instance)
+	{
+		if (!((Object)(object)_instance == (Object)null) && IsUnityObjectAlive(__instance) && _instance.CanHandleTmp())
+		{
+			_instance.QueueCachedComponentTextIfAvailable(__instance, isTmp: true, allowRemoteFallback: true);
+		}
+	}
+
+	private static void TMPUpdateManagerDiscoveryPostfix(object __instance)
+	{
+		DeepSeekTranslator deepSeekTranslator = _instance;
+		if (!ReferenceEquals(deepSeekTranslator, null))
+		{
+			Interlocked.Increment(ref deepSeekTranslator._tmpRegistryHookCount);
+			deepSeekTranslator.DiscoverTmpUpdateManagerRegistry(__instance);
+		}
+	}
+
 	private static void TMPFontPostfix(object __instance)
 	{
 		if (!((Object)(object)_instance == (Object)null) && IsUnityObjectAlive(__instance) && _instance.CanHandleTmp())
 		{
+			string currentText = GetCurrentComponentText(__instance, isTmp: true);
+			if (ContainsCjk(currentText))
+			{
+				_instance.EnsureTMPFontCoversText(__instance, currentText);
+				InvokeForceMeshUpdate(__instance, __instance.GetType());
+				return;
+			}
 			_instance.ApplyTMPFont(__instance);
 		}
 	}
@@ -3479,6 +4462,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static void FungusSayPrefix(object __instance, ref string text)
 	{
+		if (_instance == null)
+		{
+			return;
+		}
 		if (!string.IsNullOrWhiteSpace(text))
 		{
 			_instance.LogVerbose("[Fungus] Say='" + text + "'");
@@ -3495,13 +4482,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private static void FungusWriteCharPrefix(object __instance, char character)
+	private static void FungusSayCommandOnEnterPostfix(object __instance)
 	{
+		_instance?.QueueFungusLookahead(__instance);
 	}
 
 	private static void FungusMenuPrefix(ref List<string> options)
 	{
-		if (options == null)
+		if (_instance == null || options == null)
 		{
 			return;
 		}
@@ -3518,6 +4506,179 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					options[i] = text;
 				}
+			}
+		}
+	}
+
+	private static void FungusMenuAddOptionPrefix(ref string text)
+	{
+		if (_instance == null || string.IsNullOrWhiteSpace(text))
+		{
+			return;
+		}
+		string translated = _instance.Translate(text);
+		if (!string.Equals(translated, text, StringComparison.Ordinal))
+		{
+			text = PrepareTranslatedTextForString(translated, text);
+		}
+	}
+
+	private void QueueFungusLookahead(object command)
+	{
+		if (_shuttingDown || !IsUnityObjectAlive(command))
+		{
+			return;
+		}
+		try
+		{
+			Type commandType = command.GetType();
+			object parentBlock = AccessTools.Property(commandType, "ParentBlock")?.GetValue(command) ?? AccessTools.Field(commandType, "<ParentBlock>k__BackingField")?.GetValue(command);
+			if (!IsUnityObjectAlive(parentBlock))
+			{
+				return;
+			}
+			IList commandList = AccessTools.Property(parentBlock.GetType(), "CommandList")?.GetValue(parentBlock) as IList ?? AccessTools.Field(parentBlock.GetType(), "commandList")?.GetValue(parentBlock) as IList;
+			if (commandList == null || commandList.Count == 0)
+			{
+				return;
+			}
+			int commandIndex = -1;
+			object indexValue = AccessTools.Property(commandType, "CommandIndex")?.GetValue(command) ?? AccessTools.Field(commandType, "<CommandIndex>k__BackingField")?.GetValue(command);
+			if (indexValue is int value)
+			{
+				commandIndex = value;
+			}
+			if (commandIndex < 0 || commandIndex >= commandList.Count || !ReferenceEquals(commandList[commandIndex], command))
+			{
+				commandIndex = commandList.IndexOf(command);
+			}
+			if (commandIndex < 0)
+			{
+				return;
+			}
+			List<string> candidates = new List<string>();
+			int end = Math.Min(commandList.Count, commandIndex + 1 + FungusLookaheadMaxCommands);
+			for (int i = commandIndex + 1; i < end; i++)
+			{
+				object nextCommand = commandList[i];
+				if (!IsUnityObjectAlive(nextCommand))
+				{
+					continue;
+				}
+				Type nextType = nextCommand.GetType();
+				string candidate = null;
+				if (string.Equals(nextType.FullName, "Fungus.Say", StringComparison.Ordinal))
+				{
+					candidate = AccessTools.Field(nextType, "storyText")?.GetValue(nextCommand) as string;
+				}
+				else if (string.Equals(nextType.FullName, "Fungus.Menu", StringComparison.Ordinal))
+				{
+					candidate = AccessTools.Field(nextType, "text")?.GetValue(nextCommand) as string;
+				}
+				if (!string.IsNullOrWhiteSpace(candidate))
+				{
+					candidates.Add(candidate);
+				}
+			}
+			QueueFungusPrefetchTexts(candidates);
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "adapter=Fungus;operation=collect-lookahead");
+		}
+	}
+
+	private void QueueFungusPrefetchTexts(IEnumerable<string> candidates)
+	{
+		List<string> sourceKeys = new List<string>();
+		List<string> requestTexts = new List<string>();
+		HashSet<string> requestSeen = new HashSet<string>(StringComparer.Ordinal);
+		foreach (string candidate in candidates ?? Enumerable.Empty<string>())
+		{
+			if (requestTexts.Count >= FungusPrefetchMaxRequestTexts || string.IsNullOrWhiteSpace(candidate) || ContainsCjk(candidate) || ShouldSkipText(candidate) || LooksLikeTypewriterFragment(candidate) || TryGetLocalTranslation(candidate, out _))
+			{
+				continue;
+			}
+			string sourceKey = NormalizeRequestText(candidate);
+			if (string.IsNullOrWhiteSpace(sourceKey))
+			{
+				continue;
+			}
+			lock (_pendingLock)
+			{
+				if (_fungusPrefetchSeen.Count >= MaxFungusPrefetchSeen || !_fungusPrefetchSeen.Add(sourceKey))
+				{
+					continue;
+				}
+			}
+			sourceKeys.Add(sourceKey);
+			ProtectedTextPayload fullPayload = ProtectTextForTranslation(candidate);
+			IReadOnlyList<UnityLongTextPart> parts = UnityLongTextPlanner.Plan(fullPayload.RequestText, LongTextParallelThreshold, LongTextTargetSegmentChars, MaxParallelLongTextSegments);
+			if (parts != null && parts.Count > 1)
+			{
+				foreach (UnityLongTextPart part in parts)
+				{
+					if (requestTexts.Count >= FungusPrefetchMaxRequestTexts)
+					{
+						break;
+					}
+					string requestText = BuildLongTextSegmentPayload(part, fullPayload).RequestText;
+					if (!string.IsNullOrWhiteSpace(requestText) && !IsTokenDominatedFragment(requestText) && requestSeen.Add(requestText))
+					{
+						requestTexts.Add(requestText);
+					}
+				}
+			}
+			else if (!IsTokenDominatedFragment(fullPayload.RequestText) && requestSeen.Add(fullPayload.RequestText))
+			{
+				requestTexts.Add(fullPayload.RequestText);
+			}
+		}
+		if (requestTexts.Count == 0)
+		{
+			ReleaseFungusPrefetchKeys(sourceKeys);
+			return;
+		}
+		_ = PrefetchServerTextsAsync(requestTexts, sourceKeys, "dialogue");
+	}
+
+	private async Task PrefetchServerTextsAsync(List<string> requestTexts, List<string> sourceKeys, string domain)
+	{
+		/* The optional lookahead can fail when the local server is restarting or an
+		   older server lacks /prefetch. That boundary cannot be repaired inside the
+		   renderer. It never marks a translation successful or suppresses the normal
+		   visible-text request; the adapter and operation are recorded below. */
+		if (_shuttingDown || requestTexts == null || requestTexts.Count == 0 || IsServerBackoffActive())
+		{
+			ReleaseFungusPrefetchKeys(sourceKeys);
+			return;
+		}
+		try
+		{
+			string body = BuildBatchPayload(requestTexts, domain);
+			string serverUrl = _serverUrl.Value;
+			string response = await RunBackground(() => HttpPost(serverUrl + "/prefetch", body, 3000));
+			if (string.IsNullOrWhiteSpace(response))
+			{
+				throw new IOException("The local server returned an empty prefetch response.");
+			}
+			NoteServerRequestSucceeded();
+			LogVerbose($"[Fungus] queued {requestTexts.Count} protected lookahead texts");
+		}
+		catch (Exception ex)
+		{
+			ReleaseFungusPrefetchKeys(sourceKeys);
+			ReportCaughtException(ex, $"adapter=Fungus;operation=prefetch;count={requestTexts.Count}");
+		}
+	}
+
+	private void ReleaseFungusPrefetchKeys(IEnumerable<string> sourceKeys)
+	{
+		lock (_pendingLock)
+		{
+			foreach (string sourceKey in sourceKeys ?? Enumerable.Empty<string>())
+			{
+				_fungusPrefetchSeen.Remove(sourceKey);
 			}
 		}
 	}
@@ -3584,7 +4745,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			if (TryMarkInProgress(componentInstanceId, originalText))
 			{
 				LogVerbose($"[Fungus] Queue async translation for id={componentInstanceId}");
-				ScheduleAsyncApply(component, componentInstanceId, originalText, isTmp, preserveRichText: false);
+				bool preserveColorTags = ContainsColorRichTextTag(originalText);
+				ScheduleAsyncApply(component, componentInstanceId, originalText, isTmp, preserveRichText: preserveColorTags);
 			}
 		}
 	}
@@ -3622,6 +4784,16 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			string sourceForFormatting = originalText ?? translated;
 			translated = ((preserveRichText && ShouldPreserveRichTextForDisplayWithColor(sourceForFormatting, translated)) ? PrepareTranslatedTextForComponent(component, translated, sourceForFormatting) : StripRichTextForPlainText(translated));
 			translated = NormalizeTmpPunctuationForMissingGlyphs(translated);
+			if (!CanTranslateTmp())
+			{
+				if (!ApplyTmpOverlay(component, translated, sourceForFormatting))
+				{
+					return;
+				}
+				RevealTmpText(component, translated);
+				TryMarkAppliedCacheKeyForPersist(sourceForFormatting, translated);
+				return;
+			}
 			LogFirstWrites(component, type, translated);
 			bool tmpFontCoversText = EnsureTMPFontCoversText(component, translated);
 			propertyInfo?.SetValue(component, translated);
@@ -3645,6 +4817,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		try
 		{
+			Component overlayOwner = (Component)((tmpComponent is Component) ? tmpComponent : null);
+			TmpOverlayState overlayState = overlayOwner?.GetComponent<TmpOverlayState>();
+			if ((Object)(object)overlayState?.overlayText != (Object)null && ((Behaviour)overlayState.overlayText).enabled)
+			{
+				return;
+			}
 			Color tmpColor = GetTmpColor(tmpComponent);
 			float num = TryReadColorAlpha(tmpComponent, "faceColor");
 			float num2 = TryReadColorAlpha(tmpComponent, "outlineColor");
@@ -3655,7 +4833,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				CanvasRenderer component = val.GetComponent<CanvasRenderer>();
 				if ((Object)(object)component != (Object)null)
 				{
-					num3 = component.GetAlpha();
+					num3 = GetCanvasRendererAlphaSafe(component, 1f);
 				}
 			}
 			if (!(tmpColor.a < 0.01f) && (float.IsNaN(num) || !(num < 0.01f)) && (float.IsNaN(num2) || !(num2 < 0.01f)) && !(num3 < 0.01f))
@@ -4240,7 +5418,16 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				JObject val = JObject.Parse(text3);
 				string text4 = ((object)(val["translated_text"] ?? val["translation"] ?? val["translated"]))?.ToString();
 				text4 = RestoreProtectedText(text4, protectedPayload);
-				if (IsAcceptableTranslation(text, text4))
+				if (!HasRequiredProtectedValues(text4, protectedPayload))
+				{
+					/* A provider/cache result that drops renderer tokens is a content
+					   rejection, not a transport miss. The renderer is the first boundary
+					   that can validate those tokens; bounded rejection prevents a bad
+					   cached value from being requested forever, and abandonment is logged. */
+					MarkRejectedTranslationRetry(text, text4);
+					callback?.Invoke(text);
+				}
+				else if (IsAcceptableTranslation(text, text4))
 				{
 					StoreCachedTranslation(text, text4);
 					callback?.Invoke(text4);
@@ -4424,7 +5611,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		if (abandoned)
 		{
-			LogVerbose("[RETRY] Abandoning repeatedly rejected translation after " + attempts + " attempts: '" + PreviewForLog(text) + "' -> '" + PreviewForLog(rejectedTranslation) + "'");
+			base.Logger.LogWarning("[RETRY] Abandoning repeatedly rejected translation after " + attempts + " attempts: '" + PreviewForLog(text) + "' -> '" + PreviewForLog(rejectedTranslation) + "'");
 		}
 	}
 
@@ -4485,7 +5672,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private async Task<Dictionary<string, string>> WarmupTextsAsync(IEnumerable<string> texts, string domain)
 	{
-		List<string> list = (from text5 in texts?.Where((string text5) => !string.IsNullOrWhiteSpace(text5) && !ContainsCjk(text5) && !LooksLikeTypewriterFragment(text5) && !ShouldSkipText(text5))
+		List<string> list = (from text5 in texts?.Where((string text5) => !string.IsNullOrWhiteSpace(text5) && !ContainsCjk(text5) && !LooksLikeTypewriterFragment(text5) && !ShouldSkipText(text5) && !IsTranslationRetryCoolingDown(text5))
 			select text5.Trim()).Distinct(StringComparer.Ordinal).ToList() ?? new List<string>();
 		Dictionary<string, string> results = new Dictionary<string, string>(StringComparer.Ordinal);
 		if (list.Count == 0)
@@ -4535,8 +5722,18 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			for (int num = 0; num < requestItems.Count; num++)
 			{
 				string item = requestItems[num].Original;
+				string batchSource = GetBatchResponseSource(response, num);
 				string text4 = RestoreProtectedText(GetBatchTranslation(response, num, item, requestItems[num].Payload), requestItems[num].Payload);
-				if (IsAcceptableTranslation(item, text4))
+				if (IsBatchPassThroughSource(batchSource))
+				{
+					/* miss/queued/pass 回显：只瞬时冷却，不计拒绝、不写缓存。 */
+					MarkTranslationRetryCooldown(item);
+				}
+				else if (!HasRequiredProtectedValues(text4, requestItems[num].Payload))
+				{
+					MarkRejectedTranslationRetry(item, text4);
+				}
+				else if (IsAcceptableTranslation(item, text4))
 				{
 					StoreCachedTranslation(item, text4);
 					results[item] = text4;
@@ -4627,6 +5824,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static int GetDomainPriority(string domain)
 	{
+		domain = GetBaseRequestDomain(domain);
 		if (string.Equals(domain, "dialogue", StringComparison.OrdinalIgnoreCase))
 		{
 			return 0;
@@ -4644,6 +5842,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static int GetClientBatchWindowMs(string domain)
 	{
+		domain = GetBaseRequestDomain(domain);
 		if (string.Equals(domain, "ui", StringComparison.OrdinalIgnoreCase))
 		{
 			return UiClientBatchWindowMs;
@@ -4660,7 +5859,22 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return domain + "\n" + text;
 	}
 
-	private void InvokePendingRequestCallbacks(IEnumerable<PendingBatchRequest> requests, IReadOnlyDictionary<string, string> results, bool requestFailed = false)
+	private static string GetBaseRequestDomain(string domain)
+	{
+		if (string.IsNullOrWhiteSpace(domain))
+		{
+			return "dialogue";
+		}
+		int marker = domain.IndexOf(LongTextLaneMarker, StringComparison.Ordinal);
+		return marker > 0 ? domain.Substring(0, marker) : domain;
+	}
+
+	private static string BuildLongTextLaneDomain(string domain, int segmentIndex)
+	{
+		return GetBaseRequestDomain(domain) + LongTextLaneMarker + (segmentIndex % MaxParallelLongTextSegments);
+	}
+
+	private void InvokePendingRequestCallbacks(IEnumerable<PendingBatchRequest> requests, IReadOnlyDictionary<string, string> results)
 	{
 		foreach (PendingBatchRequest request in requests)
 		{
@@ -4674,20 +5888,16 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 				catch (Exception ex)
 				{
-					try
-					{
-						LogVerbose("[BATCH] Callback failed for '" + PreviewForLog(request.OriginalText) + "': " + ex.Message);
-					}
-					catch (Exception reportedException)
-					{
-						ReportCaughtException(reportedException);
-					}
+					/* A renderer callback is external to the batch dispatcher. One callback
+					   must not abort its peers, but normal DebugMode=false still records the
+					   failed request boundary and never turns it into a successful result. */
+					ReportCaughtException(ex, "boundary=batch-callback Callback failed for '" + PreviewForLog(request.OriginalText) + "'");
 				}
 			}
 		}
 	}
 
-	private void RequestSharedTranslation(string text, string domain, Action<string> callback, bool lowPriority = false)
+	private void RequestSharedTranslation(string text, string domain, Action<string> callback, bool lowPriority = false, bool allowLongTextSplit = true, ProtectedTextPayload preparedPayload = null)
 	{
 		/* ...domain+原文合并并发等待者。_batchFlushScheduled 是单一调度令牌...		   只有持有它的 flush 任务能消费队列，finally 必须清除或重启...*/
 		if (string.IsNullOrWhiteSpace(text))
@@ -4705,6 +5915,15 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			callback?.Invoke(translated);
 			return;
 		}
+		/* Every caller, including long-text segment fan-out, must honor the shared
+		   transient/abandoned state. Call-site-only checks let rejected segments
+		   bypass their retry budget. This returns no successful value, preserves
+		   source display, and the rejection owner logs terminal abandonment. */
+		if (IsTranslationRetryCoolingDown(text))
+		{
+			callback?.Invoke(null);
+			return;
+		}
 		if (IsServerBackoffActive())
 		{
 			callback?.Invoke(null);
@@ -4717,10 +5936,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		string domain2 = (string.IsNullOrWhiteSpace(domain) ? GetRequestDomain(text) : domain);
 		int clientBatchWindowMs = GetClientBatchWindowMs(domain2);
-		ProtectedTextPayload protectedTextPayload = ProtectTextForTranslation(text);
+		ProtectedTextPayload protectedTextPayload = preparedPayload ?? ProtectTextForTranslation(text);
 		if (IsTokenDominatedFragment(protectedTextPayload.RequestText))
 		{
 			callback?.Invoke(text);
+			return;
+		}
+		if (allowLongTextSplit && TryQueueLongTextTranslation(text, domain2, protectedTextPayload, callback, lowPriority))
+		{
 			return;
 		}
 		string text2 = BuildBatchRequestKey(text, domain2);
@@ -4750,6 +5973,172 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		if (flag)
 		{
 			_ = FlushPendingBatchRequestsAsync(clientBatchWindowMs);
+		}
+	}
+
+	private bool TryQueueLongTextTranslation(string text, string domain, ProtectedTextPayload fullPayload, Action<string> callback, bool lowPriority)
+	{
+		IReadOnlyList<UnityLongTextPart> parts = UnityLongTextPlanner.Plan(
+			fullPayload.RequestText,
+			LongTextParallelThreshold,
+			LongTextTargetSegmentChars,
+			MaxParallelLongTextSegments);
+		if (parts == null || parts.Count < 2)
+		{
+			return false;
+		}
+
+		string key = "long\n" + BuildBatchRequestKey(text, GetBaseRequestDomain(domain));
+		PendingLongTextRequest state;
+		lock (_pendingLock)
+		{
+			if (_pendingLongTextRequests.TryGetValue(key, out state))
+			{
+				state.Callbacks.Add(callback);
+				return true;
+			}
+
+			ProtectedTextPayload[] payloads = new ProtectedTextPayload[parts.Count];
+			for (int i = 0; i < parts.Count; i++)
+			{
+				payloads[i] = BuildLongTextSegmentPayload(parts[i], fullPayload);
+			}
+			state = new PendingLongTextRequest
+			{
+				Key = key,
+				OriginalText = text,
+				Parts = parts,
+				Payloads = payloads,
+				Results = new string[parts.Count],
+				Remaining = parts.Count
+			};
+			state.Callbacks.Add(callback);
+			_pendingLongTextRequests[key] = state;
+		}
+
+		for (int i = 0; i < parts.Count; i++)
+		{
+			int segmentIndex = i;
+			ProtectedTextPayload segmentPayload = state.Payloads[segmentIndex];
+			RequestSharedTranslation(
+				segmentPayload.OriginalText,
+				BuildLongTextLaneDomain(domain, segmentIndex),
+				result => CompleteLongTextSegment(state, segmentIndex, result),
+				lowPriority,
+				allowLongTextSplit: false,
+				preparedPayload: segmentPayload);
+		}
+		return true;
+	}
+
+	private static ProtectedTextPayload BuildLongTextSegmentPayload(UnityLongTextPart part, ProtectedTextPayload fullPayload)
+	{
+		ProtectedTextPayload payload = new ProtectedTextPayload
+		{
+			OriginalText = part.Text,
+			RequestText = part.Text
+		};
+		foreach (KeyValuePair<string, string> token in fullPayload.Tokens)
+		{
+			if (payload.RequestText.IndexOf(token.Key, StringComparison.Ordinal) < 0)
+			{
+				continue;
+			}
+			payload.Tokens[token.Key] = token.Value;
+			payload.OriginalText = payload.OriginalText.Replace(token.Key, token.Value);
+		}
+		return payload;
+	}
+
+	private static bool HasRequiredProtectedValues(string translated, ProtectedTextPayload payload)
+	{
+		if (string.IsNullOrWhiteSpace(translated))
+		{
+			return false;
+		}
+		if (payload == null)
+		{
+			return true;
+		}
+		foreach (string value in payload.Tokens.Values)
+		{
+			if (!string.IsNullOrEmpty(value) && translated.IndexOf(value, StringComparison.Ordinal) < 0)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private void CompleteLongTextSegment(PendingLongTextRequest state, int segmentIndex, string result)
+	{
+		bool shouldComplete = false;
+		lock (_pendingLock)
+		{
+			if (state.Remaining <= 0 || segmentIndex < 0 || segmentIndex >= state.Results.Length)
+			{
+				return;
+			}
+			ProtectedTextPayload payload = state.Payloads[segmentIndex];
+			if (!IsAcceptableTranslation(payload.OriginalText, result) || !HasRequiredProtectedValues(result, payload))
+			{
+				state.Failed = true;
+			}
+			else
+			{
+				state.Results[segmentIndex] = result.Trim();
+			}
+			state.Remaining--;
+			shouldComplete = state.Remaining == 0;
+		}
+		if (!shouldComplete)
+		{
+			return;
+		}
+
+		string combined = null;
+		if (!state.Failed)
+		{
+			StringBuilder builder = new StringBuilder(state.OriginalText.Length);
+			for (int i = 0; i < state.Parts.Count; i++)
+			{
+				builder.Append(state.Parts[i].LeadingWhitespace);
+				builder.Append(state.Results[i]);
+				builder.Append(state.Parts[i].TrailingWhitespace);
+			}
+			combined = builder.ToString();
+			if (!IsAcceptableTranslation(state.OriginalText, combined))
+			{
+				state.Failed = true;
+				combined = null;
+			}
+		}
+		if (!state.Failed && combined != null)
+		{
+			StoreCachedTranslation(state.OriginalText, combined);
+		}
+
+		List<Action<string>> callbacks;
+		lock (_pendingLock)
+		{
+			_pendingLongTextRequests.Remove(state.Key);
+			callbacks = new List<Action<string>>(state.Callbacks);
+		}
+		InvokeLongTextCallbacks(callbacks, combined);
+	}
+
+	private void InvokeLongTextCallbacks(IEnumerable<Action<string>> callbacks, string result)
+	{
+		foreach (Action<string> callback in callbacks)
+		{
+			try
+			{
+				callback?.Invoke(result);
+			}
+			catch (Exception ex)
+			{
+				ReportCaughtException(ex, "boundary=long-text-callback");
+			}
 		}
 	}
 
@@ -4892,7 +6281,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 				try
 				{
-					InvokePendingRequestCallbacks(list, new Dictionary<string, string>(StringComparer.Ordinal), requestFailed: true);
+					InvokePendingRequestCallbacks(list, new Dictionary<string, string>(StringComparer.Ordinal));
 				}
 				catch (Exception reportedException)
 				{
@@ -4917,15 +6306,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private async Task ProcessPendingBatchGroupAsync(string domain, List<PendingBatchRequest> requests)
 	{
 		Dictionary<string, string> groupResults = new Dictionary<string, string>(StringComparer.Ordinal);
-		bool requestFailed = false;
 		if (IsServerBackoffActive())
 		{
-			InvokePendingRequestCallbacks(requests, groupResults, requestFailed: true);
+			InvokePendingRequestCallbacks(requests, groupResults);
 			return;
 		}
 		try
 		{
-			string body = BuildBatchPayload(requests.Select((PendingBatchRequest request) => request.Payload.RequestText), domain);
+			string body = BuildBatchPayload(requests.Select((PendingBatchRequest request) => request.Payload.RequestText), GetBaseRequestDomain(domain));
 			LogVerbose($"[BATCH] Sending {requests.Count} texts to /batch (domain={domain})");
 			string serverUrl = _serverUrl.Value;
 			string text = await RunBackground(() => HttpPost(serverUrl + "/batch", body));
@@ -4937,8 +6325,24 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				for (int num = 0; num < requests.Count; num++)
 				{
 					PendingBatchRequest pendingBatchRequest = requests[num];
+					string batchSource = GetBatchResponseSource(response, num);
 					string text2 = RestoreProtectedText(GetBatchTranslation(response, num, pendingBatchRequest.OriginalText, pendingBatchRequest.Payload), pendingBatchRequest.Payload);
-					if (!IsAcceptableTranslation(pendingBatchRequest.OriginalText, text2))
+					if (IsBatchPassThroughSource(batchSource))
+					{
+						/* miss/queued/pass 是服务器回显或透传：瞬时冷却后重试，
+						   不计入拒绝，也不写入缓存。 */
+						MarkTranslationRetryCooldown(pendingBatchRequest.OriginalText);
+						LogVerbose("[BATCH] " + batchSource.ToUpperInvariant() + ": '" + pendingBatchRequest.OriginalText?.Substring(0, Math.Min(pendingBatchRequest.OriginalText?.Length ?? 0, 30)) + "'");
+					}
+					else if (!HasRequiredProtectedValues(text2, pendingBatchRequest.Payload))
+					{
+						/* Missing renderer tokens are provider/content rejection. They
+						   cannot be repaired by the server transport boundary and must
+						   consume the finite rejection budget instead of polling forever. */
+						MarkRejectedTranslationRetry(pendingBatchRequest.OriginalText, text2);
+						LogVerbose("[BATCH] MISSING-TOKENS: '" + pendingBatchRequest.OriginalText?.Substring(0, Math.Min(pendingBatchRequest.OriginalText?.Length ?? 0, 30)) + "' -> '" + text2?.Substring(0, Math.Min(text2?.Length ?? 0, 30)) + "'");
+					}
+					else if (!IsAcceptableTranslation(pendingBatchRequest.OriginalText, text2))
 					{
 						MarkRejectedTranslationRetry(pendingBatchRequest.OriginalText, text2);
 						LogVerbose("[BATCH] REJECTED: '" + pendingBatchRequest.OriginalText?.Substring(0, Math.Min(pendingBatchRequest.OriginalText?.Length ?? 0, 30)) + "' -> '" + text2?.Substring(0, Math.Min(text2?.Length ?? 0, 30)) + "'");
@@ -4953,13 +6357,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			else
 			{
-				requestFailed = true;
 				NoteServerRequestFailed();
 			}
 		}
 		catch (Exception ex)
 		{
-			requestFailed = true;
+			ReportCaughtException(ex, "boundary=live-batch-request");
 			try
 			{
 				NoteServerRequestFailed(ex);
@@ -4973,18 +6376,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		try
 		{
 			LogVerbose($"[BATCH] Invoking callbacks for {requests.Count} requests, {groupResults.Count} results");
-			InvokePendingRequestCallbacks(requests, groupResults, requestFailed);
+			InvokePendingRequestCallbacks(requests, groupResults);
 		}
 		catch (Exception ex2)
 		{
-			try
-			{
-				LogVerbose("[BATCH] Callback dispatch failed: " + ex2.Message);
-			}
-			catch (Exception reportedException)
-			{
-				ReportCaughtException(reportedException);
-			}
+			ReportCaughtException(ex2, "boundary=batch-callback-dispatch");
 		}
 	}
 
@@ -5033,13 +6429,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private IEnumerator SceneWarmupCoroutine(int generation)
 	{
-		yield return (object)new WaitForSeconds(SceneWarmupDelaySeconds);
+		yield return (object)WaitForScaledSecondsSafe(SceneWarmupDelaySeconds);
 		if (TryStartSceneWarmupPass(generation))
 		{
-			yield return (object)new WaitForSeconds(SceneWarmupSecondPassDelaySeconds);
+			yield return (object)WaitForScaledSecondsSafe(SceneWarmupSecondPassDelaySeconds);
 			if (TryStartSceneWarmupPass(generation))
 			{
-				yield return (object)new WaitForSeconds(SceneWarmupThirdPassDelaySeconds);
+				yield return (object)WaitForScaledSecondsSafe(SceneWarmupThirdPassDelaySeconds);
 				TryStartSceneWarmupPass(generation);
 			}
 		}
@@ -5067,7 +6463,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		PropertyInfo propertyInfo = ((type != null) ? AccessTools.Property(type, "text") : null);
 		if (type != null && propertyInfo != null && CanHandleTmp())
 		{
-			Object[] array = Resources.FindObjectsOfTypeAll(type);
+			Object[] array = FindTmpTextObjectsSafe(type);
 			foreach (Object val in array)
 			{
 				if (val == (Object)null || !IsComponentActive(val))
@@ -5091,7 +6487,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 			}
 		}
-		Text[] array2 = Resources.FindObjectsOfTypeAll<Text>();
+		Text[] array2 = FindObjectsOfTypeAllSafe<Text>();
 		foreach (Text val2 in array2)
 		{
 			if (!((Object)(object)val2 == (Object)null) && IsComponentActive(val2) && TryReserveWarmupText(val2.text, seenTexts))
@@ -5140,7 +6536,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return;
 		}
 		List<WarmupCandidate> uiCandidates = new List<WarmupCandidate>();
-		HashSet<string> hashSet = new HashSet<string>(StringComparer.Ordinal);
+		Dictionary<string, HashSet<string>> warmupTextsByDomain = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
 		foreach (WarmupCandidate candidate in candidates)
 		{
 			if (!candidate.IsTmp || CanHandleTmp())
@@ -5149,15 +6545,43 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					QueueTranslationApply(candidate.ComponentRef?.Target, candidate.InstanceId, candidate.OriginalText, translated, candidate.IsTmp);
 				}
-				else if (LooksLikeUiText(candidate.OriginalText))
+				else if (LooksLikeVisibleWarmupText(candidate.OriginalText))
 				{
 					uiCandidates.Add(candidate);
-					hashSet.Add(candidate.OriginalText);
+					string requestDomain = GetRequestDomain(candidate.OriginalText);
+					if (!warmupTextsByDomain.TryGetValue(requestDomain, out var bucket))
+					{
+						bucket = new HashSet<string>(StringComparer.Ordinal);
+						warmupTextsByDomain[requestDomain] = bucket;
+					}
+					bucket.Add(candidate.OriginalText);
 				}
 			}
 		}
-		Dictionary<string, string> translations = (hashSet.Count > 0) ? await WarmupTextsAsync(hashSet, "ui") : new Dictionary<string, string>(StringComparer.Ordinal);
+		Dictionary<string, string> translations = new Dictionary<string, string>(StringComparer.Ordinal);
+		foreach (KeyValuePair<string, HashSet<string>> bucket in warmupTextsByDomain)
+		{
+			Dictionary<string, string> bucketTranslations = await WarmupTextsAsync(bucket.Value, bucket.Key);
+			foreach (KeyValuePair<string, string> pair in bucketTranslations)
+			{
+				translations[pair.Key] = pair.Value;
+			}
+		}
 		ApplyWarmupTranslations(uiCandidates, translations, generation);
+	}
+
+	private static bool LooksLikeVisibleWarmupText(string text)
+	{
+		if (LooksLikeUiText(text))
+		{
+			return true;
+		}
+		string visibleText = GetVisibleText(text);
+		if (visibleText.Length < 8 || visibleText.Length > 220)
+		{
+			return false;
+		}
+		return LooksLikeNaturalLanguage(visibleText) && EndsWithSentenceBoundary(visibleText);
 	}
 
 	private void ApplyWarmupTranslations(IEnumerable<WarmupCandidate> candidates, IReadOnlyDictionary<string, string> translations, int generation)
@@ -5267,7 +6691,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					Type type = _historyTmpTextType ?? (_historyTmpTextType = AccessTools.TypeByName("TMPro.TMP_Text"));
 					if (type != null)
 					{
-						Component[] componentsInChildren2 = ((Component)componentInParent.content).GetComponentsInChildren(type, true);
+						Component[] componentsInChildren2 = GetComponentsInChildrenByTypeSafe((Component)componentInParent.content, type, includeInactive: true);
 						num2 += ((componentsInChildren2 != null) ? componentsInChildren2.Length : 0);
 					}
 					flag = num2 >= 10;
@@ -5293,7 +6717,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		lock (_pendingLock)
 		{
-			return _pendingBatchRequests.Count + _inProgress.Count;
+			return _pendingBatchRequests.Count + _pendingLongTextRequests.Count + _inProgress.Count;
 		}
 	}
 
@@ -5831,6 +7255,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return false;
 		}
+		if (HasUnclosedOuterDialogueQuote(text2))
+		{
+			return true;
+		}
 		if (text2[0] == '<' && text2.IndexOf('>') < 0)
 		{
 			return true;
@@ -5875,6 +7303,36 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return true;
 		}
 		return false;
+	}
+
+	private static bool HasUnclosedOuterDialogueQuote(string text)
+	{
+		if (string.IsNullOrWhiteSpace(text))
+		{
+			return false;
+		}
+		string trimmed = text.Trim();
+		if (trimmed.Length == 0)
+		{
+			return false;
+		}
+		char opening = trimmed[0];
+		char closing;
+		switch (opening)
+		{
+		case '"':
+			closing = '"';
+			break;
+		case '\u201c':
+			closing = '\u201d';
+			break;
+		case '\u2018':
+			closing = '\u2019';
+			break;
+		default:
+			return false;
+		}
+		return trimmed.Length < 2 || trimmed[trimmed.Length - 1] != closing;
 	}
 
 	private static float GetTextSettleDelaySeconds(string text)
@@ -6074,7 +7532,28 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		prepared = RestoreOuterLineBreaks(prepared, sourceText);
 		PrepareUGUITranslatedShortLabelLayout(component, prepared, sourceText);
-		return ApplyUGUITextLayoutCompatibility(component, prepared);
+		prepared = ApplyUGUITextLayoutCompatibility(component, prepared);
+		return PreserveUguiTypewriterSourceLength(component, prepared, sourceText);
+	}
+
+	private static string PreserveUguiTypewriterSourceLength(Text component, string prepared, string sourceText)
+	{
+		if ((Object)(object)component == (Object)null || string.IsNullOrEmpty(prepared) || string.IsNullOrEmpty(sourceText) || prepared.Length >= sourceText.Length)
+		{
+			return prepared;
+		}
+		string visibleSource = GetVisibleText(sourceText);
+		if (visibleSource.Length < 24 || !LooksLikeNaturalLanguage(visibleSource))
+		{
+			return prepared;
+		}
+		component.supportRichText = true;
+		StringBuilder builder = new StringBuilder(prepared, sourceText.Length + UguiTypewriterLengthPaddingTag.Length);
+		while (builder.Length < sourceText.Length)
+		{
+			builder.Append(UguiTypewriterLengthPaddingTag);
+		}
+		return builder.ToString();
 	}
 
 	private static string RestoreOuterLineBreaks(string text, string originalText)
@@ -6816,10 +8295,21 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			bool trimDeepPrefetchQueue = _deepPrefetchQueue.Count > MaxDeepPrefetchQueue;
 			_translatedComponents.Clear();
 			_canvasGroupVisibleStates.Clear();
+			/* DontDestroyOnLoad 的 TMP overlay 会跨场景存活；清空注册表前先把存活
+			   state 的 registered 复位，否则 RegisterTmpOverlay 会永远拒绝重新注册，
+			   这些 overlay 将永久失去周期校验。 */
+			foreach (WeakReference overlayRef in _activeTmpOverlays)
+			{
+				if (overlayRef.Target is TmpOverlayState liveOverlay && (Object)(object)liveOverlay != (Object)null)
+				{
+					liveOverlay.registered = false;
+				}
+			}
 			_activeTmpOverlays.Clear();
 			_deepScannedObjects.Clear();
 			_deepPrefetchSeen.Clear();
 			_deepPrefetchQueue.Clear();
+			_fungusPrefetchSeen.Clear();
 			if (trimDeepScannedObjects)
 			{
 				_deepScannedObjects.TrimExcess();
@@ -7049,6 +8539,15 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		lock (_pendingLock)
 		{
+			if (_debouncedTextRequests.TryGetValue(instanceId, out var existing) &&
+				existing.IsTmp == isTmp &&
+				ReferenceEquals(existing.ComponentRef?.Target, component) &&
+				IsSameSourceText(existing.Text, text))
+			{
+				existing.PreserveRichText = preserveRichText;
+				existing.LowPriority = lowPriority;
+				return;
+			}
 			_debouncedTextRequests[instanceId] = new DebouncedTextRequest
 			{
 				ComponentRef = new WeakReference(component),
@@ -7550,16 +9049,26 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		StringBuilder stringBuilder = null;
 		HashSet<int> hashSet = new HashSet<int>();
 		string text = visible;
-		foreach (char c in text)
+		for (int i = 0; i < text.Length; i++)
 		{
+			char c = text[i];
 			int num = c;
+			int charCount = 1;
+			if (char.IsHighSurrogate(c) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+			{
+				/* emoji/扩展B 等代理项对必须按完整码点去重与检测，
+				   否则半个代理项永远不在 atlas 中，会永远误报 missing。 */
+				num = char.ConvertToUtf32(c, text[i + 1]);
+				charCount = 2;
+				i++;
+			}
 			if (num >= 128 && hashSet.Add(num))
 			{
 				if (stringBuilder == null)
 				{
 					stringBuilder = new StringBuilder();
 				}
-				stringBuilder.Append(c);
+				stringBuilder.Append(text, i - (charCount - 1), charCount);
 			}
 		}
 		if (stringBuilder == null || stringBuilder.Length == 0)
@@ -7579,7 +9088,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			});
 			if (method != null)
 			{
-				object[] array = new object[4] { text2, null, true, false };
+				// This is an own-atlas check. TMP fallback coverage can be true even
+				// when the host material cannot render the fallback glyphs.
+				object[] array = new object[4] { text2, null, false, false };
 				object obj = method.Invoke(fontAsset, array);
 				bool flag = default(bool);
 				int num2;
@@ -7599,17 +9110,38 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				string text3 = array[1] as string;
 				if (!string.IsNullOrEmpty(text3))
 				{
-					text = text3;
-					foreach (char item in text)
-					{
-						list.Add(item);
-					}
+					AddStringCodePoints(text3, list);
 					return list;
 				}
+				AddStringCodePoints(text2, list);
+				return list;
+			}
+			MethodInfo method3 = type.GetMethod("HasCharacter", new Type[2]
+			{
+				typeof(int),
+				typeof(bool)
+			});
+			if (method3 != null)
+			{
 				text = text2;
-				foreach (char item2 in text)
+				for (int j = 0; j < text.Length; j++)
 				{
-					list.Add(item2);
+					char c2 = text[j];
+					int codePoint = c2;
+					if (char.IsHighSurrogate(c2) && j + 1 < text.Length && char.IsLowSurrogate(text[j + 1]))
+					{
+						codePoint = char.ConvertToUtf32(c2, text[j + 1]);
+						j++;
+					}
+					object obj3 = method3.Invoke(fontAsset, new object[2]
+					{
+						codePoint,
+						false
+					});
+					if (obj3 is bool && !(bool)obj3)
+					{
+						list.Add(codePoint);
+					}
 				}
 				return list;
 			}
@@ -7639,51 +9171,29 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 				if (array2[1] is List<char> list2)
 				{
-					foreach (char item4 in list2)
-					{
-						list.Add(item4);
-					}
+					AddStringCodePoints(new string(list2.ToArray()), list);
 					return list;
 				}
-				text = text2;
-				foreach (char item3 in text)
-				{
-					list.Add(item3);
-				}
-				return list;
-			}
-			MethodInfo method3 = type.GetMethod("HasCharacter", new Type[2]
-			{
-				typeof(int),
-				typeof(bool)
-			});
-			if (method3 != null)
-			{
-				text = text2;
-				foreach (char c2 in text)
-				{
-					object obj3 = method3.Invoke(fontAsset, new object[2]
-					{
-						(int)c2,
-						true
-					});
-					if (obj3 is bool && !(bool)obj3)
-					{
-						list.Add(c2);
-					}
-				}
+				AddStringCodePoints(text2, list);
 				return list;
 			}
 			MethodInfo method4 = type.GetMethod("HasCharacter", new Type[1] { typeof(int) });
 			if (method4 != null)
 			{
 				text = text2;
-				foreach (char c3 in text)
+				for (int k = 0; k < text.Length; k++)
 				{
-					object obj4 = method4.Invoke(fontAsset, new object[1] { (int)c3 });
+					char c3 = text[k];
+					int codePoint2 = c3;
+					if (char.IsHighSurrogate(c3) && k + 1 < text.Length && char.IsLowSurrogate(text[k + 1]))
+					{
+						codePoint2 = char.ConvertToUtf32(c3, text[k + 1]);
+						k++;
+					}
+					object obj4 = method4.Invoke(fontAsset, new object[1] { codePoint2 });
 					if (obj4 is bool && !(bool)obj4)
 					{
-						list.Add(c3);
+						list.Add(codePoint2);
 					}
 				}
 				return list;
@@ -7694,6 +9204,25 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			ReportCaughtException(reportedException);
 		}
 		return list;
+	}
+
+	/* 把字符串按完整 Unicode 码点加入列表：代理项对合并为一个码点，
+	   避免半个代理项被当成独立缺字而永远误报 missing。 */
+	private static void AddStringCodePoints(string text, List<int> output)
+	{
+		for (int i = 0; i < text.Length; i++)
+		{
+			char c = text[i];
+			if (char.IsHighSurrogate(c) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+			{
+				output.Add(char.ConvertToUtf32(c, text[i + 1]));
+				i++;
+			}
+			else
+			{
+				output.Add(c);
+			}
+		}
 	}
 
 	private static bool AreAllGlyphsInAtlas(object fontAsset, string text)
@@ -7869,6 +9398,482 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	/* Some aggressively stripped Unity players retain Resources.FindObjectsOfTypeAll(Type)
+	   but return an empty array even while live TMP/UGUI components are rendering. The
+	   player owns that native enumeration mismatch, so use the retained Object scan as
+	   an include-inactive fallback. A real empty scene remains empty, and choosing or
+	   invoking the fallback is recorded instead of being treated as translation success. */
+	private static Object[] FindObjectsOfTypeAllSafe(Type componentType)
+	{
+		if (componentType == null)
+		{
+			return new Object[0];
+		}
+		Object[] array = null;
+		if (Volatile.Read(ref _preferObjectFindObjectsFallback) == 0)
+		{
+			try
+			{
+				array = Resources.FindObjectsOfTypeAll(componentType);
+				if (array != null && array.Length > 0)
+				{
+					return array;
+				}
+			}
+			catch (Exception ex)
+			{
+				ReportCaughtException(ex, "renderer=UnityMono method=Resources.FindObjectsOfTypeAll runtimeType=" + componentType.FullName, "FindObjectsOfTypeAllSafe");
+			}
+		}
+		try
+		{
+			ResolveFindObjectsFallbackMethods();
+			Object[] array2 = null;
+			if (_findObjectsOfTypeWithInactiveMethod != null)
+			{
+				array2 = _findObjectsOfTypeWithInactiveMethod.Invoke(null, new object[2] { componentType, true }) as Object[];
+			}
+			else if (_findObjectsOfTypeLegacyMethod != null)
+			{
+				array2 = _findObjectsOfTypeLegacyMethod.Invoke(null, new object[1] { componentType }) as Object[];
+			}
+			else if (_findObjectsOfTypeGenericMethod != null)
+			{
+				array2 = _findObjectsOfTypeGenericMethod.MakeGenericMethod(componentType).Invoke(null, null) as Object[];
+			}
+			if (array2 != null && array2.Length > 0)
+			{
+				Interlocked.Exchange(ref _preferObjectFindObjectsFallback, 1);
+				if (Interlocked.Exchange(ref _objectFindObjectsFallbackLogged, 1) == 0)
+				{
+					_instance?.Logger.LogWarning("Resources.FindObjectsOfTypeAll(Type) returned no live objects; using Object.FindObjectsOfType(Type,true) compatibility fallback.");
+				}
+				return array2;
+			}
+		}
+		catch (Exception ex2)
+		{
+			ReportCaughtException(ex2, "renderer=UnityMono method=Object.FindObjectsOfType runtimeType=" + componentType.FullName, "FindObjectsOfTypeAllSafe");
+		}
+		return array ?? new Object[0];
+	}
+
+	private static T[] FindObjectsOfTypeAllSafe<T>() where T : Object
+	{
+		Object[] array = FindObjectsOfTypeAllSafe(typeof(T));
+		List<T> list = new List<T>(array.Length);
+		foreach (Object val in array)
+		{
+			if (val is T)
+			{
+				list.Add((T)val);
+			}
+		}
+		return list.ToArray();
+	}
+
+	/* On some stripped TMP players both Unity global enumeration APIs stay empty even
+	   while text is rendering. TMP_UpdateManager owns a persistent active-text queue,
+	   so it is the closest renderer boundary that can recover those instances without
+	   game-specific type names. Discovery alone never creates a cache success, and the
+	   selected fallback or reflection failure is recorded. */
+	private static Object[] FindTmpTextObjectsSafe(Type tmpTextType)
+	{
+		Object[] array = FindObjectsOfTypeAllSafe(tmpTextType);
+		if (array.Length > 0 || tmpTextType == null)
+		{
+			return array;
+		}
+		try
+		{
+			Type type = AccessTools.TypeByName("TMPro.TMP_UpdateManager");
+			if (type == null)
+			{
+				LogTmpUpdateManagerProbeOnce("type-unavailable");
+				return array;
+			}
+			PropertyInfo propertyInfo = type.GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+			object obj = propertyInfo?.GetValue(null);
+			if (obj == null)
+			{
+				FieldInfo fieldInfo = type.GetField("s_Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+				obj = fieldInfo?.GetValue(null);
+			}
+			if (obj == null)
+			{
+				LogTmpUpdateManagerProbeOnce("instance-unavailable");
+				return array;
+			}
+			Object[] array2 = GetTmpUpdateManagerRegisteredTextObjects(obj, tmpTextType);
+			LogTmpUpdateManagerProbeOnce("registered=" + array2.Length);
+			if (array2.Length > 0 && Interlocked.Exchange(ref _tmpUpdateManagerFallbackLogged, 1) == 0)
+			{
+				_instance?.Logger.LogWarning("TMP global enumeration returned no live objects; using TMP_UpdateManager internal queue compatibility fallback.");
+			}
+			return array2;
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono registry=TMPro.TMP_UpdateManager.m_InternalUpdateQueue", "FindTmpTextObjectsSafe");
+			return array;
+		}
+	}
+
+	private static Object[] GetTmpUpdateManagerRegisteredTextObjects(object updateManager, Type tmpTextType)
+	{
+		if (updateManager == null || tmpTextType == null)
+		{
+			return new Object[0];
+		}
+		FieldInfo fieldInfo = updateManager.GetType().GetField("m_InternalUpdateQueue", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+		IEnumerable enumerable = fieldInfo?.GetValue(updateManager) as IEnumerable;
+		if (enumerable == null)
+		{
+			return new Object[0];
+		}
+		List<Object> list = new List<Object>();
+		foreach (object item in enumerable)
+		{
+			Object val = item as Object;
+			if (!ReferenceEquals(val, null) && tmpTextType.IsInstanceOfType(item))
+			{
+				list.Add(val);
+			}
+		}
+		return list.ToArray();
+	}
+
+	private static void LogTmpUpdateManagerProbeOnce(string outcome)
+	{
+		DeepSeekTranslator deepSeekTranslator = _instance;
+		if (!ReferenceEquals(deepSeekTranslator, null) && deepSeekTranslator._debugMode.Value && Interlocked.Exchange(ref _tmpUpdateManagerProbeLogged, 1) == 0)
+		{
+			deepSeekTranslator.Logger.LogInfo("[TMP-REGISTRY-PROBE] " + outcome);
+		}
+	}
+
+	private void DiscoverTmpUpdateManagerRegistry(object updateManager)
+	{
+		float realtimeSinceStartup = Time.realtimeSinceStartup;
+		if (realtimeSinceStartup - _lastTmpRegistryDiscoveryRealtime < TmpRegistryDiscoveryIntervalSeconds)
+		{
+			return;
+		}
+		_lastTmpRegistryDiscoveryRealtime = realtimeSinceStartup;
+		try
+		{
+			EnsureScannerInitialized("TMP_REGISTRY");
+			Object[] array = GetTmpUpdateManagerRegisteredTextObjects(updateManager, _tmpTextTypeCache);
+			_tmpRegistryRegisteredCount = array.Length;
+			if (_debugMode.Value && _tmpRegistryHookCount <= 3)
+			{
+				base.Logger.LogInfo($"[TMP-REGISTRY-DIAG] hook={_tmpRegistryHookCount} registered={array.Length}");
+			}
+			int num = 0;
+			int num2 = 0;
+			int num3 = 0;
+			foreach (Object val in array)
+			{
+				if (num >= MaxTmpRegistryDiscoveryPerPass)
+				{
+					break;
+				}
+				if (!ReferenceEquals(val, null) && IsComponentActive(val))
+				{
+					num2++;
+					if (!string.IsNullOrWhiteSpace(GetCurrentComponentText(val, isTmp: true)))
+					{
+						num3++;
+					}
+					QueueCachedComponentTextIfAvailable(val, isTmp: true, allowRemoteFallback: true);
+					num++;
+				}
+			}
+			if (array.Length > 0 && _debugMode.Value && Interlocked.Exchange(ref _tmpUpdateManagerPopulatedLogged, 1) == 0)
+			{
+				bool fontReference = !ReferenceEquals(_chineseFont, null);
+				bool fontUnityAlive = fontReference && (Object)(object)_chineseFont != (Object)null;
+				base.Logger.LogInfo($"[TMP-REGISTRY-DIAG] populated registered={array.Length} active={num2} nonempty={num3} canHandle={CanHandleTmp()} fontRef={fontReference} fontUnityAlive={fontUnityAlive}");
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono registry=TMPro.TMP_UpdateManager.DoRebuilds", "DiscoverTmpUpdateManagerRegistry");
+		}
+	}
+
+	private static void ResolveFindObjectsFallbackMethods()
+	{
+		if (Volatile.Read(ref _findObjectsMethodsResolved) != 0)
+		{
+			return;
+		}
+		lock (_quietMethodCacheLock)
+		{
+			if (_findObjectsMethodsResolved != 0)
+			{
+				return;
+			}
+			MethodInfo[] methods = typeof(Object).GetMethods(BindingFlags.Static | BindingFlags.Public);
+			foreach (MethodInfo methodInfo in methods)
+			{
+				if (!string.Equals(methodInfo.Name, "FindObjectsOfType", StringComparison.Ordinal))
+				{
+					continue;
+				}
+				ParameterInfo[] parameters = methodInfo.GetParameters();
+				if (!methodInfo.IsGenericMethodDefinition && parameters.Length == 2 && parameters[0].ParameterType == typeof(Type) && parameters[1].ParameterType == typeof(bool))
+				{
+					_findObjectsOfTypeWithInactiveMethod = methodInfo;
+				}
+				else if (!methodInfo.IsGenericMethodDefinition && parameters.Length == 1 && parameters[0].ParameterType == typeof(Type))
+				{
+					_findObjectsOfTypeLegacyMethod = methodInfo;
+				}
+				else if (methodInfo.IsGenericMethodDefinition && parameters.Length == 0)
+				{
+					_findObjectsOfTypeGenericMethod = methodInfo;
+				}
+			}
+			Volatile.Write(ref _findObjectsMethodsResolved, 1);
+		}
+	}
+
+	/* Stripped UnityEngine profiles can remove the runtime-Type hierarchy overload
+	   while retaining the equivalent generic overload. The external assembly owns
+	   that mismatch. Reflection preserves hierarchy scanning without converting a
+	   miss into a translation/cache success; selection and invocation failures are
+	   recorded once through BepInEx and ReportCaughtException. */
+	private static Component[] GetComponentsInChildrenByTypeSafe(object owner, Type componentType, bool includeInactive)
+	{
+		if (owner == null || componentType == null)
+		{
+			return new Component[0];
+		}
+		try
+		{
+			Type ownerType = owner.GetType();
+			MethodInfo dynamicMethod = ownerType.GetMethod("GetComponentsInChildren", BindingFlags.Instance | BindingFlags.Public, null, new Type[2]
+			{
+				typeof(Type),
+				typeof(bool)
+			}, null);
+			MethodInfo selectedMethod = dynamicMethod;
+			if (selectedMethod == null)
+			{
+				string cacheKey = ownerType.FullName + "::" + componentType.FullName;
+				lock (_genericChildrenMethodCacheLock)
+				{
+					if (!_genericChildrenMethodCache.TryGetValue(cacheKey, out selectedMethod))
+					{
+						MethodInfo genericDefinition = ownerType.GetMethods(BindingFlags.Instance | BindingFlags.Public)
+							.FirstOrDefault((MethodInfo method) => method.Name == "GetComponentsInChildren" && method.IsGenericMethodDefinition && method.GetParameters().Length == 1 && method.GetParameters()[0].ParameterType == typeof(bool));
+						selectedMethod = genericDefinition?.MakeGenericMethod(componentType);
+						_genericChildrenMethodCache[cacheKey] = selectedMethod;
+					}
+				}
+				if (selectedMethod != null && Interlocked.Exchange(ref _genericChildrenFallbackLogged, 1) == 0)
+				{
+					_instance?.Logger.LogWarning("[LIFECYCLE] Unity dynamic GetComponentsInChildren(Type,bool) is unavailable; using its generic overload.");
+				}
+			}
+			if (selectedMethod == null)
+			{
+				return new Component[0];
+			}
+			object[] arguments = dynamicMethod != null
+				? new object[2] { componentType, includeInactive }
+				: new object[1] { includeInactive };
+			Array values = selectedMethod.Invoke(owner, arguments) as Array;
+			if (values == null || values.Length == 0)
+			{
+				return new Component[0];
+			}
+			Component[] components = values as Component[];
+			if (components != null)
+			{
+				return components;
+			}
+			return values.Cast<object>().OfType<Component>().ToArray();
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono method=GetComponentsInChildren runtimeType=" + componentType.FullName, "GetComponentsInChildrenByTypeSafe");
+			return new Component[0];
+		}
+	}
+
+	private static void ReportCanvasRendererAlphaFallbackOnce()
+	{
+		if (Interlocked.Exchange(ref _canvasRendererAlphaFallbackLogged, 1) == 0)
+		{
+			_instance?.Logger.LogWarning("[RENDER] CanvasRenderer alpha accessors are unavailable; alpha diagnostics and repair will be skipped on this Unity profile.");
+		}
+	}
+
+	private static float GetCanvasRendererAlphaSafe(CanvasRenderer renderer, float fallback)
+	{
+		if ((Object)(object)renderer == (Object)null)
+		{
+			return fallback;
+		}
+		try
+		{
+			MethodInfo method = GetMethodQuiet(renderer.GetType(), "GetAlpha", Type.EmptyTypes);
+			if (method == null)
+			{
+				ReportCanvasRendererAlphaFallbackOnce();
+				return fallback;
+			}
+			object value = method.Invoke(renderer, null);
+			return (value is float) ? (float)value : fallback;
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono method=CanvasRenderer.GetAlpha", "GetCanvasRendererAlphaSafe");
+			return fallback;
+		}
+	}
+
+	private static void SetCanvasRendererAlphaSafe(CanvasRenderer renderer, float alpha)
+	{
+		if ((Object)(object)renderer == (Object)null)
+		{
+			return;
+		}
+		try
+		{
+			MethodInfo method = GetMethodQuiet(renderer.GetType(), "SetAlpha", new Type[1] { typeof(float) });
+			if (method == null)
+			{
+				ReportCanvasRendererAlphaFallbackOnce();
+				return;
+			}
+			method.Invoke(renderer, new object[1] { alpha });
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono method=CanvasRenderer.SetAlpha", "SetCanvasRendererAlphaSafe");
+		}
+	}
+
+	private static void ReportGuiStyleVisualFallbackOnce()
+	{
+		if (Interlocked.Exchange(ref _guiStyleVisualFallbackLogged, 1) == 0)
+		{
+			_instance?.Logger.LogWarning("[RENDER] GUIStyle measurement/font members are unavailable; related IMGUI visual enhancements will be skipped on this Unity profile.");
+		}
+	}
+
+	private static bool TryMeasureImGuiContentSafe(GUIStyle style, GUIContent content, out float requiredWidth, out TextAnchor alignment)
+	{
+		requiredWidth = 0f;
+		alignment = TextAnchor.UpperLeft;
+		if (style == null || content == null)
+		{
+			return false;
+		}
+		try
+		{
+			MethodInfo minMaxMethod = GetMethodQuiet(style.GetType(), "CalcMinMaxWidth", new Type[3]
+			{
+				typeof(GUIContent),
+				typeof(float).MakeByRefType(),
+				typeof(float).MakeByRefType()
+			});
+			MethodInfo sizeMethod = GetMethodQuiet(style.GetType(), "CalcSize", new Type[1] { typeof(GUIContent) });
+			PropertyInfo alignmentProperty = GetPropertyQuiet(style.GetType(), "alignment");
+			if (minMaxMethod == null || sizeMethod == null || alignmentProperty == null || !alignmentProperty.CanRead)
+			{
+				ReportGuiStyleVisualFallbackOnce();
+				return false;
+			}
+			object[] widthArguments = new object[3] { content, 0f, 0f };
+			minMaxMethod.Invoke(style, widthArguments);
+			float minWidth = (widthArguments[1] is float) ? (float)widthArguments[1] : 0f;
+			float maxWidth = (widthArguments[2] is float) ? (float)widthArguments[2] : 0f;
+			object sizeValue = sizeMethod.Invoke(style, new object[1] { content });
+			Vector2 size = (sizeValue is Vector2) ? (Vector2)sizeValue : default(Vector2);
+			object alignmentValue = alignmentProperty.GetValue(style);
+			if (alignmentValue is TextAnchor)
+			{
+				alignment = (TextAnchor)alignmentValue;
+			}
+			requiredWidth = Mathf.Ceil(Mathf.Max(size.x, Mathf.Max(minWidth, maxWidth)));
+			return requiredWidth > 0f;
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=IMGUI method=GUIStyle measurement", "TryMeasureImGuiContentSafe");
+			return false;
+		}
+	}
+
+	private static void SetMaterialTextureSafe(Material material, string propertyName, Texture texture)
+	{
+		if ((Object)(object)material == (Object)null || string.IsNullOrEmpty(propertyName))
+		{
+			return;
+		}
+		try
+		{
+			MethodInfo stringMethod = GetMethodQuiet(material.GetType(), "SetTexture", new Type[2] { typeof(string), typeof(Texture) });
+			if (stringMethod != null)
+			{
+				stringMethod.Invoke(material, new object[2] { propertyName, texture });
+				return;
+			}
+			MethodInfo idMethod = GetMethodQuiet(material.GetType(), "SetTexture", new Type[2] { typeof(int), typeof(Texture) });
+			if (idMethod != null)
+			{
+				idMethod.Invoke(material, new object[2] { Shader.PropertyToID(propertyName), texture });
+				if (Interlocked.Exchange(ref _materialTextureFallbackLogged, 1) == 0)
+				{
+					_instance?.Logger.LogWarning("[RENDER] Material.SetTexture(string,Texture) is unavailable; using the retained property-ID overload.");
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono method=Material.SetTexture", "SetMaterialTextureSafe");
+		}
+	}
+
+	private static Color GetTexturePixelSafe(Texture2D texture, int x, int y)
+	{
+		if ((Object)(object)texture == (Object)null)
+		{
+			return default(Color);
+		}
+		try
+		{
+			MethodInfo pixelMethod = GetMethodQuiet(texture.GetType(), "GetPixel", new Type[2] { typeof(int), typeof(int) });
+			if (pixelMethod != null)
+			{
+				object value = pixelMethod.Invoke(texture, new object[2] { x, y });
+				return (value is Color) ? (Color)value : default(Color);
+			}
+			MethodInfo bilinearMethod = GetMethodQuiet(texture.GetType(), "GetPixelBilinear", new Type[2] { typeof(float), typeof(float) });
+			if (bilinearMethod == null)
+			{
+				return default(Color);
+			}
+			float u = ((float)x + 0.5f) / Mathf.Max(1f, texture.width);
+			float v = ((float)y + 0.5f) / Mathf.Max(1f, texture.height);
+			object fallbackValue = bilinearMethod.Invoke(texture, new object[2] { u, v });
+			if (Interlocked.Exchange(ref _texturePixelFallbackLogged, 1) == 0)
+			{
+				_instance?.Logger.LogWarning("[RENDER] Texture2D.GetPixel is unavailable; diagnostics will sample the retained bilinear API.");
+			}
+			return (fallbackValue is Color) ? (Color)fallbackValue : default(Color);
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono method=Texture2D pixel sample", "GetTexturePixelSafe");
+			return default(Color);
+		}
+	}
+
 	private void RefreshTmpSubMeshMaterials()
 	{
 		if (!HasUsableTmpFont() || _chineseTMPFont == null)
@@ -7901,7 +9906,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				Object[] array2;
 				try
 				{
-					array2 = Resources.FindObjectsOfTypeAll(type);
+					array2 = FindObjectsOfTypeAllSafe(type);
 				}
 				catch (Exception ex)
 				{
@@ -8133,7 +10138,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					CanvasRenderer component2 = val.GetComponent<CanvasRenderer>();
 					if ((Object)(object)component2 != (Object)null)
 					{
-						text4 = component2.GetAlpha().ToString("0.00");
+						text4 = GetCanvasRendererAlphaSafe(component2, 1f).ToString("0.00");
 					}
 					StringBuilder stringBuilder = new StringBuilder();
 					Transform val2 = val.transform;
@@ -8262,6 +10267,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return false;
 		}
+		PrepareTmpCjkParagraphLayout(tmpComponent, translatedText);
 		try
 		{
 			Type type = tmpComponent.GetType();
@@ -8421,7 +10427,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				CanvasRenderer component = val.GetComponent<CanvasRenderer>();
 				if (component != null)
 				{
-					component.SetAlpha(alpha);
+					SetCanvasRendererAlphaSafe(component, alpha);
 				}
 			}
 		}
@@ -8468,6 +10474,55 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return 24;
 	}
 
+	private static bool GetTmpAutoSizing(object tmpComponent)
+	{
+		try
+		{
+			object value = AccessTools.Property(tmpComponent?.GetType(), "enableAutoSizing")?.GetValue(tmpComponent);
+			return value is bool enabled && enabled;
+		}
+		catch (Exception reportedException)
+		{
+			ReportCaughtException(reportedException, "renderer=UnityMono property=enableAutoSizing");
+			return false;
+		}
+	}
+
+	private static int GetTmpFontSizeMin(object tmpComponent, int fallback)
+	{
+		return GetTmpFontSizeBound(tmpComponent, "fontSizeMin", fallback);
+	}
+
+	private static int GetTmpFontSizeMax(object tmpComponent, int fallback)
+	{
+		return GetTmpFontSizeBound(tmpComponent, "fontSizeMax", fallback);
+	}
+
+	private static int GetTmpFontSizeBound(object tmpComponent, string propertyName, int fallback)
+	{
+		try
+		{
+			object value = AccessTools.Property(tmpComponent?.GetType(), propertyName)?.GetValue(tmpComponent);
+			if (value is float floatValue && floatValue > 0f)
+			{
+				return Mathf.Max(1, Mathf.RoundToInt(floatValue));
+			}
+			if (value is double doubleValue && doubleValue > 0.0)
+			{
+				return Mathf.Max(1, Mathf.RoundToInt((float)doubleValue));
+			}
+			if (value is int intValue && intValue > 0)
+			{
+				return intValue;
+			}
+		}
+		catch (Exception reportedException)
+		{
+			ReportCaughtException(reportedException, "renderer=UnityMono property=" + propertyName);
+		}
+		return Mathf.Max(1, fallback);
+	}
+
 	private static bool GetTmpWordWrap(object tmpComponent)
 	{
 		try
@@ -8485,12 +10540,258 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return true;
 	}
 
+	private static bool TryGetLeftParagraphAlignment(object alignment, out object leftAlignment)
+	{
+		leftAlignment = null;
+		if (alignment == null || !alignment.GetType().IsEnum)
+		{
+			return false;
+		}
+		string name = alignment.ToString();
+		if (name.IndexOf("Justified", StringComparison.OrdinalIgnoreCase) < 0 &&
+			name.IndexOf("Flush", StringComparison.OrdinalIgnoreCase) < 0)
+		{
+			return false;
+		}
+		string leftName = Regex.Replace(name, "Justified|Flush", "Left", RegexOptions.IgnoreCase);
+		try
+		{
+			leftAlignment = Enum.Parse(alignment.GetType(), leftName, ignoreCase: true);
+			return true;
+		}
+		catch (Exception reportedException)
+		{
+			ReportCaughtException(reportedException, "renderer=TMP;operation=map-cjk-paragraph-alignment");
+			return false;
+		}
+	}
+
+	private void PrepareTmpCjkParagraphLayout(object tmpComponent, string translatedText)
+	{
+		string visibleText = GetVisibleText(translatedText);
+		if (!ContainsCjk(visibleText) || visibleText.Length < 8)
+		{
+			return;
+		}
+		Component component = tmpComponent as Component;
+		if ((Object)(object)component == (Object)null)
+		{
+			return;
+		}
+		try
+		{
+			PropertyInfo alignmentProperty = AccessTools.Property(tmpComponent.GetType(), "alignment");
+			if (alignmentProperty == null || !alignmentProperty.CanRead || !alignmentProperty.CanWrite)
+			{
+				return;
+			}
+			if (_tmpParagraphLayouts.TryGetValue(component, out var existing))
+			{
+				existing.AppliedText = translatedText;
+				object current = alignmentProperty.GetValue(tmpComponent);
+				if (TryGetLeftParagraphAlignment(current, out var restoredLeft))
+				{
+					alignmentProperty.SetValue(tmpComponent, restoredLeft);
+				}
+				return;
+			}
+			object original = alignmentProperty.GetValue(tmpComponent);
+			if (!TryGetLeftParagraphAlignment(original, out var left))
+			{
+				return;
+			}
+			_tmpParagraphLayouts.Add(component, new TmpParagraphLayoutState
+			{
+				OriginalAlignment = original,
+				AppliedText = translatedText
+			});
+			alignmentProperty.SetValue(tmpComponent, left);
+			LogVerbose("[TMP-LAYOUT] changed justified/flush CJK paragraph to left alignment: " + GetComponentLogPath(tmpComponent));
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=TMP;operation=prepare-cjk-paragraph-layout");
+		}
+	}
+
+	private static bool TryGetLeftFromCenteredAlignment(object alignment, out object leftAlignment)
+	{
+		leftAlignment = null;
+		if (alignment == null || !alignment.GetType().IsEnum)
+		{
+			return false;
+		}
+		string name = alignment.ToString();
+		if (name.IndexOf("Center", StringComparison.OrdinalIgnoreCase) < 0)
+		{
+			return false;
+		}
+		try
+		{
+			leftAlignment = Enum.Parse(alignment.GetType(), Regex.Replace(name, "Center", "Left", RegexOptions.IgnoreCase), ignoreCase: true);
+			return true;
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=TMP;operation=map-short-label-alignment");
+			return false;
+		}
+	}
+
+	private void PrepareTmpTranslatedShortLabelLayout(object tmpComponent, string sourceText, string translatedText)
+	{
+		string sourceVisible = GetVisibleText(sourceText).Trim();
+		string translatedVisible = GetVisibleText(translatedText).Trim();
+		if (sourceVisible.Length < 5 || sourceVisible.Length > 16 || translatedVisible.Length == 0 || translatedVisible.Length > 4 ||
+			ContainsCjk(sourceVisible) || !ContainsCjk(translatedVisible) || sourceVisible.IndexOfAny(new char[2] { '\r', '\n' }) >= 0 ||
+			translatedVisible.IndexOfAny(new char[2] { '\r', '\n' }) >= 0)
+		{
+			return;
+		}
+		Component component = tmpComponent as Component;
+		if ((Object)(object)component == (Object)null)
+		{
+			return;
+		}
+		RectTransform rectTransform = component.GetComponent<RectTransform>();
+		Transform parent = component.transform.parent;
+		if ((Object)(object)rectTransform == (Object)null || (Object)(object)parent == (Object)null)
+		{
+			return;
+		}
+		try
+		{
+			Type type = tmpComponent.GetType();
+			PropertyInfo alignmentProperty = AccessTools.Property(type, "alignment");
+			if (alignmentProperty == null || !alignmentProperty.CanRead || !alignmentProperty.CanWrite)
+			{
+				return;
+			}
+			object originalAlignment = alignmentProperty.GetValue(tmpComponent);
+			if (!TryGetLeftFromCenteredAlignment(originalAlignment, out var leftAlignment))
+			{
+				return;
+			}
+
+			Rect rect = rectTransform.rect;
+			List<float> leftPeerX = new List<float>(4);
+			Component[] peers = GetComponentsInChildrenByTypeSafe(parent, type, includeInactive: false);
+			foreach (Component peer in peers)
+			{
+				if ((Object)(object)peer == (Object)null || (Object)(object)peer == (Object)(object)component || peer.transform.parent != parent)
+				{
+					continue;
+				}
+				RectTransform peerRect = peer.GetComponent<RectTransform>();
+				if ((Object)(object)peerRect == (Object)null || Mathf.Abs(peerRect.rect.width - rect.width) > 1f ||
+					Mathf.Abs(peerRect.rect.height - rect.height) > 1f || Mathf.Abs(peerRect.anchoredPosition.x - rectTransform.anchoredPosition.x) > rect.width * 0.25f)
+				{
+					continue;
+				}
+				float yDistance = Mathf.Abs(peerRect.anchoredPosition.y - rectTransform.anchoredPosition.y);
+				if (yDistance < 1f || yDistance > rect.height * 5f)
+				{
+					continue;
+				}
+				object peerAlignment = alignmentProperty.GetValue(peer);
+				string peerAlignmentName = peerAlignment?.ToString() ?? string.Empty;
+				if (peerAlignmentName.IndexOf("Left", StringComparison.OrdinalIgnoreCase) >= 0)
+				{
+					leftPeerX.Add(peerRect.anchoredPosition.x);
+				}
+			}
+			if (leftPeerX.Count < 2)
+			{
+				return;
+			}
+			leftPeerX.Sort();
+			float groupX = leftPeerX[leftPeerX.Count / 2];
+			_tmpShortLabelLayouts.Remove(component);
+			_tmpShortLabelLayouts.Add(component, new TmpShortLabelLayoutState
+			{
+				OriginalAlignment = originalAlignment,
+				OriginalAnchoredPosition = rectTransform.anchoredPosition,
+				AppliedText = translatedText
+			});
+			alignmentProperty.SetValue(tmpComponent, leftAlignment);
+			Vector2 position = rectTransform.anchoredPosition;
+			position.x = groupX;
+			rectTransform.anchoredPosition = position;
+			LogVerbose($"[TMP-LAYOUT] normalized translated short-label group alignment: {GetComponentLogPath(tmpComponent)} peers={leftPeerX.Count} x={groupX:0.0}");
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=TMP;operation=prepare-short-label-layout path=" + GetComponentLogPath(tmpComponent));
+		}
+	}
+
+	private static void RestoreTmpShortLabelLayout(object tmpComponent, string nextText)
+	{
+		Component component = tmpComponent as Component;
+		if ((Object)(object)component == (Object)null || !_tmpShortLabelLayouts.TryGetValue(component, out var state) ||
+			string.Equals(NormalizeRequestText(nextText), NormalizeRequestText(state.AppliedText), StringComparison.Ordinal))
+		{
+			return;
+		}
+		try
+		{
+			PropertyInfo alignmentProperty = AccessTools.Property(tmpComponent.GetType(), "alignment");
+			if (alignmentProperty != null && alignmentProperty.CanWrite && state.OriginalAlignment != null)
+			{
+				alignmentProperty.SetValue(tmpComponent, state.OriginalAlignment);
+			}
+			RectTransform rectTransform = component.GetComponent<RectTransform>();
+			if ((Object)(object)rectTransform != (Object)null)
+			{
+				rectTransform.anchoredPosition = state.OriginalAnchoredPosition;
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=TMP;operation=restore-short-label-layout path=" + GetComponentLogPath(tmpComponent));
+		}
+		finally
+		{
+			_tmpShortLabelLayouts.Remove(component);
+		}
+	}
+
+	private static void RestoreTmpParagraphLayout(object tmpComponent, string nextText)
+	{
+		Component component = tmpComponent as Component;
+		if ((Object)(object)component == (Object)null || !_tmpParagraphLayouts.TryGetValue(component, out var state))
+		{
+			return;
+		}
+		if (string.Equals(NormalizeRequestText(nextText), NormalizeRequestText(state.AppliedText), StringComparison.Ordinal))
+		{
+			return;
+		}
+		try
+		{
+			PropertyInfo alignmentProperty = AccessTools.Property(tmpComponent.GetType(), "alignment");
+			if (alignmentProperty != null && alignmentProperty.CanWrite && state.OriginalAlignment != null)
+			{
+				alignmentProperty.SetValue(tmpComponent, state.OriginalAlignment);
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=TMP;operation=restore-paragraph-layout");
+		}
+		finally
+		{
+			_tmpParagraphLayouts.Remove(component);
+		}
+	}
+
 	private static TextAnchor GetTmpTextAnchor(object tmpComponent)
 	{
 		try
 		{
 			string text = AccessTools.Property(tmpComponent?.GetType(), "alignment")?.GetValue(tmpComponent)?.ToString() ?? string.Empty;
-			int num = ((text.IndexOf("Right", StringComparison.OrdinalIgnoreCase) >= 0) ? 2 : ((text.IndexOf("Left", StringComparison.OrdinalIgnoreCase) < 0) ? 1 : 0));
+			bool isParagraphFill = text.IndexOf("Justified", StringComparison.OrdinalIgnoreCase) >= 0 || text.IndexOf("Flush", StringComparison.OrdinalIgnoreCase) >= 0;
+			int num = isParagraphFill ? 0 : ((text.IndexOf("Right", StringComparison.OrdinalIgnoreCase) >= 0) ? 2 : ((text.IndexOf("Left", StringComparison.OrdinalIgnoreCase) < 0) ? 1 : 0));
 			int num2 = ((text.IndexOf("Top", StringComparison.OrdinalIgnoreCase) < 0) ? ((text.IndexOf("Bottom", StringComparison.OrdinalIgnoreCase) < 0 && text.IndexOf("Baseline", StringComparison.OrdinalIgnoreCase) < 0) ? 1 : 2) : 0);
 			if (num2 == 0 && num == 0)
 			{
@@ -8586,13 +10887,53 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				Vector4 tmpMargin = GetTmpMargin(tmpComponent);
 				Component val2 = (Component)((tmpComponent is Component) ? tmpComponent : null);
 				RectTransform val3 = (RectTransform)(object)((val2?.transform is RectTransform) ? val2.transform : null);
-				if ((Object)(object)val3 != (Object)null && transform.parent == ((Transform)val3).parent)
+				Transform sourceParent = (Object)(object)val3 == (Object)null ? null : ((Transform)val3).parent;
+				if ((Object)(object)sourceParent != (Object)null && transform.parent != sourceParent)
 				{
-					val.anchorMin = val3.anchorMin;
-					val.anchorMax = val3.anchorMax;
-					val.pivot = val3.pivot;
-					val.offsetMin = val3.offsetMin + new Vector2(tmpMargin.x, tmpMargin.w);
-					val.offsetMax = val3.offsetMax + new Vector2(0f - tmpMargin.z, 0f - tmpMargin.y);
+					transform.SetParent(sourceParent, false);
+					transform.SetAsLastSibling();
+					if (Interlocked.Exchange(ref _tmpOverlayReparentLogged, 1) == 0)
+					{
+						_instance?.Logger.LogInfo(
+							"[OVERLAY-LAYOUT] UGUI fallback followed a TMP source that acquired or changed its parent after overlay creation.");
+					}
+				}
+				if ((Object)(object)val3 != (Object)null && transform.parent == sourceParent)
+				{
+					RectTransform parentRect = sourceParent as RectTransform;
+					float sourceWidth = val3.rect.width;
+					float sourceHeight = val3.rect.height;
+					bool sourceRectIsNarrow = sourceWidth > CollapsedTmpOverlayWidth &&
+						sourceWidth <= sourceHeight * NarrowTmpOverlayWidthToHeight &&
+						(Object)(object)parentRect != (Object)null &&
+						parentRect.rect.width >= sourceWidth * NarrowTmpOverlayParentWidthMultiplier;
+					bool useParentRect = (sourceWidth <= CollapsedTmpOverlayWidth || sourceRectIsNarrow) &&
+						(Object)(object)parentRect != (Object)null &&
+						parentRect.rect.width > CollapsedTmpOverlayWidth &&
+						parentRect.rect.height > CollapsedTmpOverlayWidth &&
+						parentRect.rect.width <= Mathf.Max(96f, sourceHeight * 4f) &&
+						parentRect.rect.height <= Mathf.Max(96f, sourceHeight * 2f);
+					if (useParentRect)
+					{
+						val.anchorMin = Vector2.zero;
+						val.anchorMax = Vector2.one;
+						val.pivot = val3.pivot;
+						val.offsetMin = new Vector2(tmpMargin.x, tmpMargin.w);
+						val.offsetMax = new Vector2(0f - tmpMargin.z, 0f - tmpMargin.y);
+						if (Interlocked.Exchange(ref _tmpCollapsedOverlayRectLogged, 1) == 0)
+						{
+							_instance?.Logger.LogInfo(
+								$"[OVERLAY-LAYOUT] A collapsed or narrow TMP source rect ({sourceWidth:0.0}x{sourceHeight:0.0}) is using its immediate parent bounds ({parentRect.rect.width:0.0}x{parentRect.rect.height:0.0}) for the UGUI fallback.");
+						}
+					}
+					else
+					{
+						val.anchorMin = val3.anchorMin;
+						val.anchorMax = val3.anchorMax;
+						val.pivot = val3.pivot;
+						val.offsetMin = val3.offsetMin + new Vector2(tmpMargin.x, tmpMargin.w);
+						val.offsetMax = val3.offsetMax + new Vector2(0f - tmpMargin.z, 0f - tmpMargin.y);
+					}
 					transform.localScale = ((Transform)val3).localScale;
 					transform.localRotation = ((Transform)val3).localRotation;
 				}
@@ -8687,10 +11028,27 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				tmpOverlayState.registered = false;
 				continue;
 			}
+			if (tmpOverlayState.pendingExternalWriteDepth > 0)
+			{
+				lock (_pendingLock)
+				{
+					_activeTmpOverlays.Insert(0, new WeakReference(tmpOverlayState));
+				}
+				continue;
+			}
 			string currentComponentText = GetCurrentComponentText(obj, isTmp: true);
 			EnsureTmpOverlayMatchesCurrentText(obj, currentComponentText);
 			if ((Object)(object)tmpOverlayState.overlayText != (Object)null && ((Behaviour)tmpOverlayState.overlayText).enabled)
 			{
+				RefreshTmpOverlayLiveStyle(tmpOverlayState.overlayText, obj, tmpOverlayState);
+				if (EnsureTmpOverlayGeometry(tmpOverlayState.overlayText, tmpOverlayState))
+				{
+					HideTmpSourceForOverlay(obj, tmpOverlayState);
+				}
+				else
+				{
+					RestoreTmpSourceVisibility(obj, tmpOverlayState);
+				}
 				lock (_pendingLock)
 				{
 					_activeTmpOverlays.Insert(0, new WeakReference(tmpOverlayState));
@@ -8745,21 +11103,218 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			((Behaviour)component.overlayText).enabled = false;
 			component.overlayText.text = string.Empty;
 		}
-		if (component.hasOriginalColor)
-		{
-			SetTmpColor(tmpComponent, component.originalColor);
-			SetTmpAlpha(tmpComponent, component.originalColor.a);
-		}
-		else if (component.originalAlpha >= 0f)
-		{
-			SetTmpAlpha(tmpComponent, component.originalAlpha);
-		}
+		RestoreTmpSourceVisibility(tmpComponent, component);
 		component.sourceText = null;
 		component.sourceNormalized = null;
 		component.displayNormalized = null;
+		component.hasSourceEnabledState = false;
 	}
 
-	private void ApplyTmpOverlay(object tmpComponent, string translatedText, string sourceText = null, bool force = false)
+	private void BeginTmpExternalTextWrite(object tmpComponent, string value)
+	{
+		Component component = tmpComponent as Component;
+		if ((Object)(object)component == (Object)null)
+		{
+			return;
+		}
+		TmpOverlayState state = component.GetComponent<TmpOverlayState>();
+		if ((Object)(object)state == (Object)null)
+		{
+			return;
+		}
+		if (state.pendingExternalWriteDepth == 0 &&
+			((Object)(object)state.overlayText != (Object)null || state.hasSourceEnabledState) &&
+			Interlocked.Exchange(ref _tmpExternalWriteBoundaryLogged, 1) == 0)
+		{
+			base.Logger.LogInfo("[OVERLAY-OWNERSHIP] A game-side TMP text setter replaced an overlaid label; overlay validation is deferred until the setter postfix commits the new text.");
+		}
+		state.pendingExternalWriteDepth++;
+		state.pendingExternalTextNormalized = NormalizeRequestText(value);
+	}
+
+	private static bool HasPendingTmpExternalTextWrite(object tmpComponent)
+	{
+		Component component = tmpComponent as Component;
+		if ((Object)(object)component == (Object)null)
+		{
+			return false;
+		}
+		TmpOverlayState state = component.GetComponent<TmpOverlayState>();
+		return (Object)(object)state != (Object)null && state.pendingExternalWriteDepth > 0;
+	}
+
+	private void EndTmpExternalTextWrite(object tmpComponent, string value)
+	{
+		Component component = tmpComponent as Component;
+		if ((Object)(object)component == (Object)null)
+		{
+			return;
+		}
+		TmpOverlayState state = component.GetComponent<TmpOverlayState>();
+		if ((Object)(object)state == (Object)null || state.pendingExternalWriteDepth <= 0)
+		{
+			return;
+		}
+		state.pendingExternalWriteDepth--;
+		if (state.pendingExternalWriteDepth > 0)
+		{
+			state.pendingExternalTextNormalized = NormalizeRequestText(value);
+			return;
+		}
+		state.pendingExternalTextNormalized = null;
+		string currentText = GetCurrentComponentText(tmpComponent, isTmp: true);
+		EnsureTmpOverlayMatchesCurrentText(tmpComponent, currentText);
+	}
+
+	/* TMP set_text 原方法抛异常时 postfix 被跳过，这里由 finalizer 兜底归零深度，
+	   异常本身不属于本插件的故障，但深度卡死是本插件的状态损坏，必须限速记录。 */
+	private void ResetTmpExternalWriteDepthAfterSetterException(object tmpComponent, Exception setterException, string boundary)
+	{
+		Component component = tmpComponent as Component;
+		if ((Object)(object)component == (Object)null)
+		{
+			return;
+		}
+		TmpOverlayState state = component.GetComponent<TmpOverlayState>();
+		if ((Object)(object)state == (Object)null || state.pendingExternalWriteDepth <= 0)
+		{
+			return;
+		}
+		state.pendingExternalWriteDepth = 0;
+		state.pendingExternalTextNormalized = null;
+		ReportCaughtException(setterException, "boundary=" + boundary);
+	}
+
+	private static void RestoreTmpSourceVisibility(object tmpComponent, TmpOverlayState state)
+	{
+		// The overlay owns only alpha and enabled. RGB remains game-owned because
+		// games commonly recolor a reusable TMP label while the overlay is active.
+		if (state != null && state.hasOriginalColor)
+		{
+			SetTmpAlpha(tmpComponent, state.originalColor.a);
+		}
+		else if (state != null && state.originalAlpha >= 0f)
+		{
+			SetTmpAlpha(tmpComponent, state.originalAlpha);
+		}
+		else
+		{
+			SetTmpAlpha(tmpComponent, 1f);
+		}
+		if (state != null && state.hasSourceEnabledState && tmpComponent is Behaviour sourceBehaviour && (Object)(object)sourceBehaviour != (Object)null)
+		{
+			sourceBehaviour.enabled = state.sourceWasEnabled;
+		}
+	}
+
+	private static void HideTmpSourceForOverlay(object tmpComponent, TmpOverlayState state)
+	{
+		if (tmpComponent is Behaviour sourceBehaviour && (Object)(object)sourceBehaviour != (Object)null)
+		{
+			if (state != null && !state.hasSourceEnabledState)
+			{
+				state.sourceWasEnabled = sourceBehaviour.enabled;
+				state.hasSourceEnabledState = true;
+			}
+			sourceBehaviour.enabled = false;
+		}
+		SetTmpAlpha(tmpComponent, 0f);
+	}
+
+	private bool EnsureTmpOverlayGeometry(Text overlayText, TmpOverlayState state)
+	{
+		if ((Object)(object)overlayText == (Object)null || !((Behaviour)overlayText).enabled || !((Component)overlayText).gameObject.activeInHierarchy)
+		{
+			return false;
+		}
+		try
+		{
+			TextGenerator generator = overlayText.cachedTextGenerator;
+			CanvasRenderer canvasRenderer = ((Component)overlayText).GetComponent<CanvasRenderer>();
+			int visibleCharacters = generator?.characterCountVisible ?? 0;
+			int materialCount = canvasRenderer?.materialCount ?? 0;
+			if (visibleCharacters > 0 && materialCount > 0)
+			{
+				return true;
+			}
+			if (state == null || state.overlayGeometryRetryCount >= 8)
+			{
+				return false;
+			}
+			state.overlayGeometryRetryCount++;
+			((Graphic)overlayText).SetAllDirty();
+			((Graphic)overlayText).Rebuild(CanvasUpdate.PreRender);
+			generator = overlayText.cachedTextGenerator;
+			canvasRenderer = ((Component)overlayText).GetComponent<CanvasRenderer>();
+			visibleCharacters = generator?.characterCountVisible ?? 0;
+			materialCount = canvasRenderer?.materialCount ?? 0;
+			bool ready = visibleCharacters > 0 && materialCount > 0;
+			if (!ready && (state.overlayGeometryRetryCount == 1 || state.overlayGeometryRetryCount == 8))
+			{
+				base.Logger.LogWarning($"[OVERLAY-GEOMETRY] UGUI overlay rebuild did not produce visible geometry (attempt={state.overlayGeometryRetryCount}, chars={visibleCharacters}, materials={materialCount}); TMP source remains visible.");
+			}
+			return ready;
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono overlay=UGUI", "EnsureTmpOverlayGeometry");
+			return false;
+		}
+	}
+
+	private void RefreshTmpOverlayLiveStyle(Text overlayText, object tmpComponent, TmpOverlayState state)
+	{
+		if ((Object)(object)overlayText == (Object)null || tmpComponent == null || state == null)
+		{
+			return;
+		}
+		try
+		{
+			Color tmpColor = GetTmpColor(tmpComponent);
+			if (!state.hasOriginalColor)
+			{
+				state.originalColor = tmpColor;
+				state.originalAlpha = tmpColor.a;
+				state.hasOriginalColor = true;
+			}
+			else
+			{
+				state.originalColor.r = tmpColor.r;
+				state.originalColor.g = tmpColor.g;
+				state.originalColor.b = tmpColor.b;
+				if (tmpColor.a > 0.001f)
+				{
+					state.originalColor.a = tmpColor.a;
+					state.originalAlpha = tmpColor.a;
+				}
+			}
+			((Component)overlayText).transform.SetAsLastSibling();
+			overlayText.font = _chineseFont;
+			overlayText.fontSize = GetTmpFontSize(tmpComponent);
+			bool tmpAutoSizing = GetTmpAutoSizing(tmpComponent);
+			overlayText.resizeTextForBestFit = tmpAutoSizing;
+			int fallbackMinSize = Mathf.Max(12, Mathf.RoundToInt((float)overlayText.fontSize * 0.55f));
+			overlayText.resizeTextMinSize = tmpAutoSizing
+				? GetTmpFontSizeMin(tmpComponent, fallbackMinSize)
+				: fallbackMinSize;
+			overlayText.resizeTextMaxSize = tmpAutoSizing
+				? Mathf.Max(overlayText.resizeTextMinSize, GetTmpFontSizeMax(tmpComponent, overlayText.fontSize))
+				: overlayText.fontSize;
+			overlayText.lineSpacing = GetTmpLineSpacing(tmpComponent);
+			overlayText.alignment = GetTmpTextAnchor(tmpComponent);
+			overlayText.horizontalOverflow = GetTmpWordWrap(tmpComponent) ? HorizontalWrapMode.Wrap : HorizontalWrapMode.Overflow;
+			overlayText.verticalOverflow = VerticalWrapMode.Truncate;
+			ApplyTmpOverlayRect(overlayText, tmpComponent);
+			((Graphic)overlayText).color = GetTmpOverlayDisplayColor(tmpComponent, tmpColor, state);
+			((Graphic)overlayText).SetAllDirty();
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono overlay=UGUI phase=refresh-live-style", "RefreshTmpOverlayLiveStyle");
+		}
+	}
+
+	private bool ApplyTmpOverlay(object tmpComponent, string translatedText, string sourceText = null, bool force = false)
 	{
 		/* 覆盖层是最终显示降级：仅当 TMP 字体不能完整覆盖文本时使用...		   ...TMP 组件仍保留，恢复时按保存的颜...透明度还原，避免破坏游戏逻辑...*/
 		if ((!force && !IsTmpOverlayMode() && HasUsableTmpFont()) || (Object)(object)_chineseFont == (Object)null || string.IsNullOrWhiteSpace(translatedText))
@@ -8770,7 +11325,17 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				RescueStrandedAlpha(tmpComponent);
 			}
-			return;
+			return false;
+		}
+		if (!IsUsableFontForText(_chineseFont, translatedText))
+		{
+			RestoreTmpOverlay(tmpComponent);
+			if (!_cjkFontWarningLogged)
+			{
+				_cjkFontWarningLogged = true;
+				base.Logger.LogWarning("[FONT] UGUI overlay font cannot render the translated glyphs; preserving the original TMP text.");
+			}
+			return false;
 		}
 		if (_overlayDisabled && !force && !ShouldUseTmpOverlay())
 		{
@@ -8785,18 +11350,30 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				_cjkFontWarningLogged = true;
 				base.Logger.LogWarning("[v3.1.47] CJK TMP font unavailable and overlay disabled. Text set directly on TMP components - may render as squares if font lacks CJK glyphs.");
 			}
-			return;
+			return false;
 		}
 		Component val3 = (Component)((tmpComponent is Component) ? tmpComponent : null);
 		if (val3 == null)
 		{
-			return;
+			return false;
 		}
 		Transform transform = val3.transform;
 		RectTransform val4 = (RectTransform)(object)((transform is RectTransform) ? transform : null);
-		if ((Object)(object)val4 == (Object)null || IsTmpOverlayCurrent(tmpComponent, translatedText, sourceText ?? translatedText))
+		if ((Object)(object)val4 == (Object)null)
 		{
-			return;
+			return false;
+		}
+		if (IsTmpOverlayCurrent(tmpComponent, translatedText, sourceText ?? translatedText))
+		{
+			TmpOverlayState currentState = val3.GetComponent<TmpOverlayState>();
+			RefreshTmpOverlayLiveStyle(currentState.overlayText, tmpComponent, currentState);
+			if (EnsureTmpOverlayGeometry(currentState.overlayText, currentState))
+			{
+				HideTmpSourceForOverlay(tmpComponent, currentState);
+				return true;
+			}
+			RestoreTmpSourceVisibility(tmpComponent, currentState);
+			return false;
 		}
 		try
 		{
@@ -8807,11 +11384,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			if ((Object)(object)tmpOverlayState.overlayText == (Object)null)
 			{
-				GameObject val5 = new GameObject("__DeepSeekOverlay", new Type[3]
+				GameObject val5 = new GameObject("__DeepSeekOverlay", new Type[5]
 				{
 					typeof(RectTransform),
 					typeof(CanvasRenderer),
-					typeof(Text)
+					typeof(Text),
+					typeof(LayoutElement),
+					typeof(TmpOverlayMarker)
 				});
 				((Object)val5).hideFlags = (HideFlags)52;
 				RectTransform component = val5.GetComponent<RectTransform>();
@@ -8828,6 +11407,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				component.pivot = val4.pivot;
 				((Transform)component).localScale = Vector3.one;
 				tmpOverlayState.overlayText = val5.GetComponent<Text>();
+				val5.GetComponent<LayoutElement>().ignoreLayout = true;
 				((Graphic)tmpOverlayState.overlayText).raycastTarget = false;
 				tmpOverlayState.overlayText.supportRichText = true;
 				tmpOverlayState.overlayText.resizeTextForBestFit = false;
@@ -8838,53 +11418,45 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			Text overlayText = tmpOverlayState.overlayText;
 			if (!((Object)(object)overlayText == (Object)null))
 			{
-				Color tmpColor = GetTmpColor(tmpComponent);
-				if (!tmpOverlayState.hasOriginalColor || tmpColor.a > 0.001f)
-				{
-					tmpOverlayState.originalColor = tmpColor;
-					tmpOverlayState.originalAlpha = tmpColor.a;
-					tmpOverlayState.hasOriginalColor = true;
-				}
-				((Component)overlayText).transform.SetAsLastSibling();
-				overlayText.font = _chineseFont;
-				overlayText.fontSize = GetTmpFontSize(tmpComponent);
-				overlayText.resizeTextForBestFit = false;
-				overlayText.resizeTextMinSize = Mathf.Max(12, Mathf.RoundToInt((float)overlayText.fontSize * 0.55f));
-				overlayText.resizeTextMaxSize = overlayText.fontSize;
-				overlayText.lineSpacing = GetTmpLineSpacing(tmpComponent);
-				overlayText.alignment = GetTmpTextAnchor(tmpComponent);
-				overlayText.horizontalOverflow = GetTmpWordWrap(tmpComponent) ? HorizontalWrapMode.Wrap : HorizontalWrapMode.Overflow;
-				overlayText.verticalOverflow = (VerticalWrapMode)0;
-				ApplyTmpOverlayRect(overlayText, tmpComponent);
-				Color val7 = GetTmpOverlayDisplayColor(tmpColor, tmpOverlayState);
-				((Graphic)overlayText).color = val7;
+				RefreshTmpOverlayLiveStyle(overlayText, tmpComponent, tmpOverlayState);
 				string sourceForFormatting = sourceText ?? translatedText;
 				string text = (ShouldPreserveRichTextForDisplayWithColor(sourceForFormatting, translatedText) ? PrepareTranslatedTextForComponent(overlayText, translatedText, sourceForFormatting) : StripRichTextForPlainText(translatedText));
 				if (string.IsNullOrWhiteSpace(GetVisibleText(text)) || (Object)(object)((Component)overlayText).GetComponentInParent<Canvas>() == (Object)null)
 				{
 					RestoreTmpOverlay(tmpComponent);
-					return;
+					return false;
 				}
 				overlayText.text = text;
 				((Behaviour)overlayText).enabled = true;
 				((Graphic)overlayText).SetAllDirty();
 				RevealTmpText(tmpComponent, text);
+				tmpOverlayState.overlayGeometryRetryCount = 0;
 				tmpOverlayState.sourceText = sourceText ?? translatedText;
 				tmpOverlayState.sourceNormalized = NormalizeRequestText(tmpOverlayState.sourceText);
 				tmpOverlayState.displayNormalized = NormalizeRequestText(overlayText.text);
 				RegisterTmpOverlay(tmpOverlayState, tmpComponent);
-				SetTmpAlpha(tmpComponent, 0f);
+				if (!EnsureTmpOverlayGeometry(overlayText, tmpOverlayState))
+				{
+					RestoreTmpSourceVisibility(tmpComponent, tmpOverlayState);
+					return false;
+				}
+				HideTmpSourceForOverlay(tmpComponent, tmpOverlayState);
+				return true;
 			}
+			return false;
 		}
 		catch (Exception ex)
 		{
 			base.Logger.LogWarning("[FONT] ApplyTmpOverlay failed: " + ex.Message);
+			RestoreTmpOverlay(tmpComponent);
+			return false;
 		}
 	}
 
-	private static Color GetTmpOverlayDisplayColor(Color currentColor, TmpOverlayState state)
+	private static Color GetTmpOverlayDisplayColor(object tmpComponent, Color currentColor, TmpOverlayState state)
 	{
-		// Preserve the live RGB because games often recolor reused TMP components.
+		// TMP shaders multiply the component's vertex color by _FaceColor. A UGUI
+		// fallback that copies only TMP_Text.color can turn dark labels white-on-white.
 		Color result = currentColor;
 		if (result.a <= 0f && state != null)
 		{
@@ -8901,7 +11473,107 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			result.a = 1f;
 		}
+		try
+		{
+			if (TryReadTmpFaceColor(tmpComponent, out Color faceColor))
+			{
+				result.r *= faceColor.r;
+				result.g *= faceColor.g;
+				result.b *= faceColor.b;
+				result.a *= faceColor.a;
+				if (Interlocked.Exchange(ref _tmpOverlayColorOwnershipLogged, 1) == 0)
+				{
+					_instance?.Logger.LogInfo("[OVERLAY-COLOR] UGUI fallback is using the live TMP vertex/face color and owns only source alpha/enabled state.");
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono overlay=UGUI property=_FaceColor", "GetTmpOverlayDisplayColor");
+		}
 		return result;
+	}
+
+	private static bool TryReadTmpFaceColor(object tmpComponent, out Color color)
+	{
+		color = Color.white;
+		if (tmpComponent == null)
+		{
+			return false;
+		}
+		try
+		{
+			object faceValue = GetPropertyQuiet(tmpComponent.GetType(), "faceColor")?.GetValue(tmpComponent);
+			if (faceValue is Color32 faceColor32)
+			{
+				color = new Color(
+					faceColor32.r / 255f,
+					faceColor32.g / 255f,
+					faceColor32.b / 255f,
+					faceColor32.a / 255f);
+				return true;
+			}
+			if (faceValue is Color faceColor)
+			{
+				color = faceColor;
+				return true;
+			}
+			Material material = ReadFontSharedMaterial(tmpComponent, tmpComponent.GetType());
+			return (Object)(object)material != (Object)null && material.HasProperty("_FaceColor") &&
+				TryReadMaterialColor(material, "_FaceColor", out color);
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono overlay=UGUI property=faceColor", "TryReadTmpFaceColor");
+			return false;
+		}
+	}
+
+	private static bool TryReadMaterialColor(Material material, string propertyName, out Color color)
+	{
+		color = Color.white;
+		if ((Object)(object)material == (Object)null || string.IsNullOrEmpty(propertyName))
+		{
+			return false;
+		}
+		try
+		{
+			MethodInfo stringGetter = material.GetType().GetMethod(
+				"GetColor",
+				BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+				null,
+				new Type[1] { typeof(string) },
+				null);
+			if (stringGetter != null && stringGetter.Invoke(material, new object[1] { propertyName }) is Color stringColor)
+			{
+				color = stringColor;
+				return true;
+			}
+			MethodInfo propertyToId = typeof(Shader).GetMethod(
+				"PropertyToID",
+				BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
+				null,
+				new Type[1] { typeof(string) },
+				null);
+			MethodInfo intGetter = material.GetType().GetMethod(
+				"GetColor",
+				BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+				null,
+				new Type[1] { typeof(int) },
+				null);
+			if (propertyToId != null && intGetter != null &&
+				propertyToId.Invoke(null, new object[1] { propertyName }) is int propertyId &&
+				intGetter.Invoke(material, new object[1] { propertyId }) is Color idColor)
+			{
+				color = idColor;
+				return true;
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono overlay=UGUI property=" + propertyName, "TryReadMaterialColor");
+		}
+		return false;
 	}
 
 	private static string ResolveGameRoot()
@@ -8980,6 +11652,77 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return true;
 	}
 
+	private void LogCjkRenderStateOnce(object component, string text)
+	{
+		string visibleText = GetVisibleText(text);
+		if (!IsUnityObjectAlive(component) || string.IsNullOrWhiteSpace(visibleText) || visibleText.Length < 32 || !ContainsCjk(visibleText))
+		{
+			return;
+		}
+		int componentInstanceId = GetComponentInstanceId(component);
+		lock (_pendingLock)
+		{
+			if (_cjkRenderDiagnostics.Count >= CjkRenderDiagnosticMax || !_cjkRenderDiagnostics.Add(componentInstanceId))
+			{
+				return;
+			}
+		}
+		try
+		{
+			Component unityComponent = component as Component;
+			RectTransform rectTransform = unityComponent?.GetComponent<RectTransform>();
+			string rect = (Object)(object)rectTransform == (Object)null
+				? "<none>"
+				: $"{rectTransform.rect.width:0.0}x{rectTransform.rect.height:0.0}@{rectTransform.anchoredPosition.x:0.0},{rectTransform.anchoredPosition.y:0.0} anchors={rectTransform.anchorMin.x:0.00},{rectTransform.anchorMin.y:0.00}/{rectTransform.anchorMax.x:0.00},{rectTransform.anchorMax.y:0.00} pivot={rectTransform.pivot.x:0.00},{rectTransform.pivot.y:0.00}";
+			string preview = visibleText.Replace("\r", "\\r").Replace("\n", "\\n");
+			if (preview.Length > 96)
+			{
+				preview = preview.Substring(0, 96) + "...";
+			}
+			Text uguiText = component as Text;
+			if ((Object)(object)uguiText != (Object)null)
+			{
+				Font font = uguiText.font;
+				char firstCjk = visibleText.FirstOrDefault(c => ContainsCjk(c.ToString()));
+				bool hasFirstCjk = (Object)(object)font != (Object)null && firstCjk != '\0' && font.HasCharacter(firstCjk);
+				TextGenerator generator = uguiText.cachedTextGenerator;
+				int generatedVisible = generator?.characterCountVisible ?? -1;
+				int generatedVertices = generator?.verts?.Count ?? -1;
+				Material material = uguiText.material;
+				string materialName = (Object)(object)material == (Object)null ? "<null>" : ((Object)material).name;
+				string textureName = (Object)(object)material == (Object)null || !material.HasProperty("_MainTex") || (Object)(object)material.GetTexture("_MainTex") == (Object)null
+					? "<null>"
+					: ((Object)material.GetTexture("_MainTex")).name;
+				base.Logger.LogWarning($"[CJK-RENDER-DIAG] renderer=UGUI path={GetComponentLogPath(component)} rect={rect} textLength={visibleText.Length} font='{((Object)(object)font == (Object)null ? "<null>" : ((Object)font).name)}' dynamic={((Object)(object)font != (Object)null && font.dynamic)} hasFirstCjk={hasFirstCjk} fontSize={uguiText.fontSize} alignment={uguiText.alignment} overflow={uguiText.horizontalOverflow}/{uguiText.verticalOverflow} bestFit={uguiText.resizeTextForBestFit} richText={uguiText.supportRichText} generatedVisible={generatedVisible} generatedVertices={generatedVertices} material='{materialName}' texture='{textureName}' text='{preview}'");
+				return;
+			}
+			Type componentType = component.GetType();
+			object fontAsset = GetPropertyQuiet(componentType, "font")?.GetValue(component);
+			Material fontMaterial = ReadFontSharedMaterial(component, componentType);
+			object alignment = GetPropertyQuiet(componentType, "alignment")?.GetValue(component);
+			object maxVisibleCharacters = GetPropertyQuiet(componentType, "maxVisibleCharacters")?.GetValue(component);
+			object maxVisibleWords = GetPropertyQuiet(componentType, "maxVisibleWords")?.GetValue(component);
+			object maxVisibleLines = GetPropertyQuiet(componentType, "maxVisibleLines")?.GetValue(component);
+			object overflowMode = GetPropertyQuiet(componentType, "overflowMode")?.GetValue(component);
+			object characterSpacing = GetPropertyQuiet(componentType, "characterSpacing")?.GetValue(component);
+			object wordSpacing = GetPropertyQuiet(componentType, "wordSpacing")?.GetValue(component);
+			object lineSpacing = GetPropertyQuiet(componentType, "lineSpacing")?.GetValue(component);
+			object paragraphSpacing = GetPropertyQuiet(componentType, "paragraphSpacing")?.GetValue(component);
+			object richText = GetPropertyQuiet(componentType, "richText")?.GetValue(component);
+			object preferredWidth = GetPropertyQuiet(componentType, "preferredWidth")?.GetValue(component);
+			object renderedWidth = GetPropertyQuiet(componentType, "renderedWidth")?.GetValue(component);
+			object textInfo = GetPropertyQuiet(componentType, "textInfo")?.GetValue(component);
+			object generatedCharacters = textInfo == null ? null : GetPropertyQuiet(textInfo.GetType(), "characterCount")?.GetValue(textInfo);
+			Texture mainTexture = (Object)(object)fontMaterial == (Object)null || !fontMaterial.HasProperty("_MainTex") ? null : fontMaterial.GetTexture("_MainTex");
+			bool hasInlineParagraphAlignment = Regex.IsMatch(text ?? string.Empty, @"<\s*align\s*=", RegexOptions.IgnoreCase);
+			base.Logger.LogWarning($"[CJK-RENDER-DIAG] renderer={componentType.FullName} path={GetComponentLogPath(component)} rect={rect} preferred/rendered={preferredWidth ?? "<null>"}/{renderedWidth ?? "<null>"} textLength={visibleText.Length} font='{((fontAsset as Object)?.name ?? "<null>")}' material='{(((Object)(object)fontMaterial == (Object)null) ? "<null>" : ((Object)fontMaterial).name)}' texture='{(((Object)(object)mainTexture == (Object)null) ? "<null>" : ((Object)mainTexture).name)}' alignment={alignment ?? "<null>"} spacing={characterSpacing ?? "<null>"}/{wordSpacing ?? "<null>"}/{lineSpacing ?? "<null>"}/{paragraphSpacing ?? "<null>"} richText={richText ?? "<null>"} inlineAlign={hasInlineParagraphAlignment} overflow={overflowMode ?? "<null>"} maxVisible={maxVisibleCharacters ?? "<null>"}/{maxVisibleWords ?? "<null>"}/{maxVisibleLines ?? "<null>"} generatedCharacters={generatedCharacters ?? "<null>"} text='{preview}'");
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=CJK diagnostic path=" + GetComponentLogPath(component));
+		}
+	}
+
 	private bool ShouldUseTmpOverlay()
 	{
 		if (!IsFontModeNone() && (IsTmpOverlayMode() || IsAutoFontMode()) && !HasUsableTmpFont())
@@ -9053,7 +11796,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					if ((Object)(object)component2 != (Object)null)
 					{
 						Material material = component2.GetMaterial();
-						text5 = string.Format("alpha={0:0.00} matCount={1} mat0='{2}'", component2.GetAlpha(), component2.materialCount, ((Object)(object)material != (Object)null) ? ((Object)material).name : "<null>");
+						text5 = string.Format("alpha={0:0.00} matCount={1} mat0='{2}'", GetCanvasRendererAlphaSafe(component2, 1f), component2.materialCount, ((Object)(object)material != (Object)null) ? ((Object)material).name : "<null>");
 					}
 				}
 			}
@@ -9205,7 +11948,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			};
 			if (val3.HasProperty("_MainTex"))
 			{
-				val3.SetTexture("_MainTex", (Texture)(object)val);
+				SetMaterialTextureSafe(val3, "_MainTex", (Texture)(object)val);
 			}
 			int num = TryReadIntMember(_chineseTMPFont, type, "atlasWidth", "m_AtlasWidth");
 			int num2 = TryReadIntMember(_chineseTMPFont, type, "atlasHeight", "m_AtlasHeight");
@@ -9417,7 +12160,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					{
 						int num7 = ((Texture)val).width / 2;
 						int num8 = ((Texture)val).height / 2;
-						Color pixel = val.GetPixel(num7, num8);
+						Color pixel = GetTexturePixelSafe(val, num7, num8);
 						base.Logger.LogWarning($"[FONT-DEEP] atlas center pixel rgba=({pixel.r:0.00},{pixel.g:0.00},{pixel.b:0.00},{pixel.a:0.00})");
 					}
 					else
@@ -9569,7 +12312,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		try
 		{
-			Object[] array = Resources.FindObjectsOfTypeAll(tmpFontAssetType);
+			Object[] array = FindObjectsOfTypeAllSafe(tmpFontAssetType);
 			foreach (Object val in array)
 			{
 				if (val != (Object)null && LooksLikeCjkFontAsset(val))
@@ -9603,6 +12346,46 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return obj;
 	}
 
+	private string GetUnityVersionSafe()
+	{
+		if (_unityVersionResolved)
+		{
+			return _resolvedUnityVersion;
+		}
+		_unityVersionResolved = true;
+		try
+		{
+			PropertyInfo unityVersion = typeof(Application).GetProperty("unityVersion", BindingFlags.Public | BindingFlags.Static);
+			if (unityVersion != null)
+			{
+				_resolvedUnityVersion = unityVersion.GetValue(null, null) as string ?? string.Empty;
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono property=Application.unityVersion", "GetUnityVersionSafe");
+		}
+		if (!string.IsNullOrWhiteSpace(_resolvedUnityVersion))
+		{
+			return _resolvedUnityVersion;
+		}
+		try
+		{
+			string unityPlayerPath = Path.Combine(Paths.GameRootPath, "UnityPlayer.dll");
+			if (File.Exists(unityPlayerPath))
+			{
+				System.Diagnostics.FileVersionInfo versionInfo = System.Diagnostics.FileVersionInfo.GetVersionInfo(unityPlayerPath);
+				_resolvedUnityVersion = versionInfo.ProductVersion ?? versionInfo.FileVersion ?? string.Empty;
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono file=UnityPlayer.dll", "GetUnityVersionSafe");
+		}
+		base.Logger.LogWarning("Application.unityVersion is unavailable; using UnityPlayer file version '" + _resolvedUnityVersion + "' for renderer-local font selection.");
+		return _resolvedUnityVersion;
+	}
+
 	private IEnumerable<string> GetTmpFontBundleCandidates()
 	{
 		string pluginDir = Path.GetDirectoryName(base.Info.Location);
@@ -9610,7 +12393,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			yield break;
 		}
-		string text = Application.unityVersion ?? string.Empty;
+		string text = GetUnityVersionSafe();
 		string[] array = text.Split(new char[] { '.' }, StringSplitOptions.None);
 		List<string> list = new List<string>();
 		if (!string.IsNullOrWhiteSpace(text))
@@ -9696,6 +12479,35 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	/* Unity modules are loaded on demand. A stripped game may ship the retained
+	   AssetBundle module without referencing it from gameplay assemblies, leaving
+	   AccessTools unable to see the type. Loading that shipped module by assembly
+	   identity is the upstream-safe boundary; failure only disables the packaged
+	   renderer font and is recorded without accepting any translation result. */
+	private Type ResolveAssetBundleTypeSafe()
+	{
+		Type type = AccessTools.TypeByName("UnityEngine.AssetBundle");
+		if (type != null)
+		{
+			return type;
+		}
+		try
+		{
+			Assembly assembly = Assembly.Load("UnityEngine.AssetBundleModule");
+			type = assembly?.GetType("UnityEngine.AssetBundle", throwOnError: false);
+			if (type != null)
+			{
+				base.Logger.LogInfo("[FONT-PACK] Loaded optional UnityEngine.AssetBundleModule for packaged TMP fonts.");
+			}
+			return type;
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono assembly=UnityEngine.AssetBundleModule", "ResolveAssetBundleTypeSafe");
+			return null;
+		}
+	}
+
 	private object LoadPackagedTmpFontAsset(Type tmpFontAssetType)
 	{
 		if (tmpFontAssetType == null)
@@ -9710,31 +12522,46 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return null;
 		}
+		Type assetBundleType = ResolveAssetBundleTypeSafe();
+		if (assetBundleType == null)
+		{
+			base.Logger.LogWarning("[FONT-PACK] UnityEngine.AssetBundle is unavailable; packaged TMP font bundles will be skipped on this Unity profile.");
+			_tmpFontPackageSearchExhausted = true;
+			return null;
+		}
+		MethodInfo loadFromFile = AccessTools.Method(assetBundleType, "LoadFromFile", new Type[1] { typeof(string) });
+		MethodInfo loadAllAssets = AccessTools.Method(assetBundleType, "LoadAllAssets", new Type[1] { typeof(Type) });
+		if (loadFromFile == null || loadAllAssets == null)
+		{
+			base.Logger.LogWarning("[FONT-PACK] AssetBundle font-loading methods are unavailable; packaged TMP font bundles will be skipped on this Unity profile.");
+			_tmpFontPackageSearchExhausted = true;
+			return null;
+		}
 		foreach (string item in GetTmpFontBundleCandidates().Distinct(StringComparer.OrdinalIgnoreCase))
 		{
 			if (string.IsNullOrWhiteSpace(item) || !File.Exists(item))
 			{
 				continue;
 			}
-			AssetBundle val = null;
+			object val = null;
 			try
 			{
 				base.Logger.LogInfo("[FONT-PACK] Loading TMP font bundle: " + item);
-				val = AssetBundle.LoadFromFile(item);
-				if ((Object)(object)val == (Object)null)
+				val = loadFromFile.Invoke(null, new object[1] { item });
+				if (val == null)
 				{
 					base.Logger.LogWarning("[FONT-PACK] AssetBundle.LoadFromFile returned null: " + item);
 					continue;
 				}
-				Object[] array = val.LoadAllAssets(tmpFontAssetType);
+				Array array = loadAllAssets.Invoke(val, new object[1] { tmpFontAssetType }) as Array;
 				if (array == null || array.Length == 0)
 				{
 					base.Logger.LogWarning("[FONT-PACK] No TMP_FontAsset in bundle: " + item);
 					continue;
 				}
-				Object[] array2 = array;
-				foreach (Object val2 in array2)
+				foreach (object item2 in array)
 				{
+					Object val2 = item2 as Object;
 					if (!(val2 == (Object)null))
 					{
 						if (LooksLikeCjkFontAsset(val2) || TryAddCharactersToTmpFontAsset(val2, "知道任务返回背包"))
@@ -9750,10 +12577,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			catch (Exception ex)
 			{
-				base.Logger.LogWarning("[FONT-PACK] Failed to load font bundle " + item + ": " + (ex.InnerException?.Message ?? ex.Message));
+				ReportCaughtException(ex, "renderer=UnityMono method=AssetBundle reflective-font-load", "LoadPackagedTmpFontAsset");
 			}
 		}
-		base.Logger.LogWarning("[FONT-PACK] No packaged TMP font bundle found for Unity " + Application.unityVersion + "; TMP translation disabled to avoid squares.");
+		base.Logger.LogWarning("[FONT-PACK] No packaged TMP font bundle found for Unity " + GetUnityVersionSafe() + "; TMP translation disabled to avoid squares.");
 		_tmpFontPackageSearchExhausted = true;
 		return null;
 	}
@@ -9786,7 +12613,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				return;
 			}
-			Object[] array = Resources.FindObjectsOfTypeAll(type);
+			Object[] array = FindTmpTextObjectsSafe(type);
 			foreach (Object val in array)
 			{
 				if (IsUnityObjectAlive(val) && IsComponentActive(val))
@@ -9804,7 +12631,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private IEnumerator EnsureTmpFontReadyCoroutine()
 	{
-		yield return (object)new WaitForSeconds(1.5f);
+		yield return (object)WaitForScaledSecondsSafe(1.5f);
 		for (int attempt = 1; attempt <= 6; attempt++)
 		{
 			if (HasUsableTmpFont())
@@ -9838,9 +12665,47 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					yield break;
 				}
 			}
-			yield return (object)new WaitForSeconds(1.5f);
+			yield return (object)WaitForScaledSecondsSafe(1.5f);
 		}
-		base.Logger.LogWarning("TMP CJK font asset is still unavailable; TMP translation remains disabled to avoid squares.");
+		if (ShouldUseTmpOverlay())
+		{
+			base.Logger.LogWarning("TMP CJK font asset remains unavailable; renderer-local UGUI overlay fallback remains active.");
+		}
+		else
+		{
+			base.Logger.LogWarning("TMP CJK font asset is still unavailable; TMP translation remains disabled to avoid squares.");
+		}
+	}
+
+	/* Some external stripped UnityEngine builds retain WaitForSeconds but remove
+	   its float constructor. That assembly cannot be repaired by the plugin. This
+	   scaled-frame iterator preserves the lifecycle delay without hiding failed
+	   translations or creating cache entries; the selected fallback is logged at
+	   startup when the constructor is absent. */
+	private static IEnumerator WaitForScaledSecondsSafe(float seconds)
+	{
+		float startedAt = Time.time;
+		float delay = Mathf.Max(0f, seconds);
+		do
+		{
+			yield return null;
+		}
+		while (Time.time - startedAt < delay);
+	}
+
+	private void LogCoroutineDelayCompatibility()
+	{
+		try
+		{
+			if (typeof(WaitForSeconds).GetConstructor(new Type[1] { typeof(float) }) == null)
+			{
+				base.Logger.LogWarning("[LIFECYCLE] Unity WaitForSeconds(float) is unavailable; using the scaled-frame compatibility iterator.");
+			}
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono method=WaitForSeconds..ctor(float)", "LogCoroutineDelayCompatibility");
+		}
 	}
 
 	private object CreateTmpFontAssetFromFont(Type tmpFontAssetType, Font sourceFont)
@@ -10031,7 +12896,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					Material val2 = new Material(Shader.Find("TextMeshPro/Mobile/Distance Field") ?? Shader.Find("TextMeshPro/Distance Field") ?? Shader.Find("TMPro/Mobile/Distance Field") ?? Shader.Find("GUI/Text Shader") ?? Shader.Find("UI/Default"));
 					if ((Object)(object)val2 != (Object)null)
 					{
-						val2.SetTexture("_MainTex", (Texture)(object)val);
+						SetMaterialTextureSafe(val2, "_MainTex", (Texture)(object)val);
 						fieldInfo7.SetValue(obj, val2);
 						base.Logger.LogInfo("[FONT-MANUAL] Created and set material");
 					}
@@ -10288,25 +13153,178 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		try
 		{
-			Font val = new Font();
-			((Object)val).name = Path.GetFileNameWithoutExtension(path);
 			MethodInfo methodInfo = AccessTools.Method(typeof(Font), "Internal_CreateFontFromPath", new Type[2]
 			{
 				typeof(Font),
 				typeof(string)
 			});
-			if (methodInfo != null)
+			if (methodInfo == null)
 			{
-				methodInfo.Invoke(null, new object[2] { val, path });
-				return val;
+				base.Logger.LogWarning("[FONT-LOAD] Font.Internal_CreateFontFromPath not found; the font file cannot be loaded safely on this Unity profile.");
+				return null;
 			}
-			base.Logger.LogWarning("[FONT-LOAD] Font.Internal_CreateFontFromPath not found; falling back to name-only Font (no usable face data)");
-			return new Font(path);
+			Font val = FormatterServices.GetUninitializedObject(typeof(Font)) as Font;
+			if (ReferenceEquals(val, null))
+			{
+				base.Logger.LogWarning("[FONT-LOAD] Unity Font wrapper could not be allocated without the stripped default constructor; the font file was not loaded.");
+				return null;
+			}
+			methodInfo.Invoke(null, new object[2] { val, path });
+			if ((Object)(object)val == (Object)null)
+			{
+				base.Logger.LogWarning("[FONT-LOAD] Retained Font.Internal_CreateFontFromPath returned without creating a live native font for " + path + ".");
+				return null;
+			}
+			((Object)val).name = Path.GetFileNameWithoutExtension(path);
+			PinRuntimeFont(val, path);
+			return val;
 		}
 		catch (Exception ex)
 		{
 			base.Logger.LogWarning("[FONT-LOAD] Failed to load Font from " + path + ": " + (ex.InnerException?.Message ?? ex.Message));
 			return null;
+		}
+	}
+
+	/* Highly stripped UnityEngine builds can remove the public OS-font factory.
+	   Internal_CreateFont(Font,string) is the Font(string) asset-name constructor;
+	   it does not create a dynamic OS font and must never be treated as one. A
+	   preloader compatibility patch may restore only Internal_CreateDynamicFont's
+	   original internal-call declaration. If neither real factory exists, return
+	   null so TMP keeps its source text instead of hiding it behind a false overlay.
+	   This cannot accept or persist a translation, and every rejection is logged. */
+	private Font CreateDynamicFontFromOSFontSafe(string fontName, int fontSize)
+	{
+		if (!_createDynamicFontFromOsFontResolved)
+		{
+			_createDynamicFontFromOsFontResolved = true;
+			_createDynamicFontFromOsFontMethod = typeof(Font).GetMethod("CreateDynamicFontFromOSFont", BindingFlags.Public | BindingFlags.Static, null, new Type[2]
+			{
+				typeof(string),
+				typeof(int)
+			}, null);
+			if (_createDynamicFontFromOsFontMethod == null)
+			{
+				_internalCreateDynamicFontMethod = typeof(Font).GetMethod("Internal_CreateDynamicFont", BindingFlags.NonPublic | BindingFlags.Static, null, new Type[3]
+				{
+					typeof(Font),
+					typeof(string[]),
+					typeof(int)
+				}, null);
+				if (_internalCreateDynamicFontMethod != null)
+				{
+					base.Logger.LogInfo("[FONT] Optional Unity Font.CreateDynamicFontFromOSFont(string,int) is unavailable; using the restored Font.Internal_CreateDynamicFont(Font,string[],int) boundary.");
+				}
+				else
+				{
+					base.Logger.LogWarning("[FONT] Optional Unity Font.CreateDynamicFontFromOSFont(string,int) is unavailable and the internal dynamic-font factory is unavailable; keeping TMP source text unless another verified font is found.");
+				}
+			}
+		}
+		if ((_createDynamicFontFromOsFontMethod == null && _internalCreateDynamicFontMethod == null) || string.IsNullOrWhiteSpace(fontName))
+		{
+			return null;
+		}
+		try
+		{
+			if (_createDynamicFontFromOsFontMethod != null)
+			{
+				Font font = _createDynamicFontFromOsFontMethod.Invoke(null, new object[2] { fontName, fontSize }) as Font;
+				if (!IsUsableFontForText(font, "简体中文"))
+				{
+					base.Logger.LogWarning("[FONT] Unity OS-font factory returned a font without verified CJK glyph coverage for " + fontName + ".");
+					return null;
+				}
+				PinRuntimeFont(font, fontName);
+				return font;
+			}
+			/* The restored declaration is an internal call, so allocate only the
+			   managed shell and let Unity create its native dynamic-font object once. */
+			Font val = FormatterServices.GetUninitializedObject(typeof(Font)) as Font;
+			if (ReferenceEquals(val, null))
+			{
+				base.Logger.LogWarning("[FONT] Unable to allocate an uninitialized Unity Font wrapper for the internal dynamic-font factory.");
+				return null;
+			}
+			_internalCreateDynamicFontMethod.Invoke(null, new object[3]
+			{
+				val,
+				new string[1] { fontName },
+				fontSize
+			});
+			if ((Object)(object)val == (Object)null)
+			{
+				base.Logger.LogWarning("[FONT] Font.Internal_CreateDynamicFont returned without creating a live native font for " + fontName + ".");
+				return null;
+			}
+			if (!IsUsableFontForText(val, "简体中文"))
+			{
+				base.Logger.LogWarning("[FONT] Font.Internal_CreateDynamicFont produced a font without verified CJK glyph coverage for " + fontName + ".");
+				return null;
+			}
+			PinRuntimeFont(val, fontName);
+			return val;
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono method=Font.CreateDynamicFontFromOSFont", "CreateDynamicFontFromOSFontSafe");
+			return null;
+		}
+	}
+
+	private static bool IsUsableFontForText(Font font, string text)
+	{
+		if (ReferenceEquals(font, null) || (Object)(object)font == (Object)null || string.IsNullOrWhiteSpace(text))
+		{
+			return false;
+		}
+		try
+		{
+			bool dynamicFont = font.dynamic;
+			bool checkedGlyph = false;
+			foreach (char c in GetVisibleText(text))
+			{
+				if (char.IsWhiteSpace(c) || char.IsControl(c))
+				{
+					continue;
+				}
+				checkedGlyph = true;
+				if (!font.HasCharacter(c))
+				{
+					return false;
+				}
+			}
+			return checkedGlyph || dynamicFont;
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono method=Font.HasCharacter", "IsUsableFontForText");
+			return false;
+		}
+	}
+
+	/* Dynamically created Font objects are external Unity resources. Some stripped
+	   players unload their native object during the bootstrap scene transition even
+	   while the managed Font remains referenced. The renderer cannot repair that
+	   resource sweep upstream, so mark only plugin-created fonts as non-unloadable.
+	   A pin failure disables later TMP overlay handling and remains diagnostic; it
+	   never turns a miss, pass-through value, or queued request into cache success. */
+	private void PinRuntimeFont(Font font, string source)
+	{
+		if (ReferenceEquals(font, null))
+		{
+			return;
+		}
+		try
+		{
+			Object obj = (Object)(object)font;
+			obj.hideFlags |= HideFlags.DontUnloadUnusedAsset;
+			Object.DontDestroyOnLoad(obj);
+			LogVerbose("[FONT] Pinned runtime font native lifetime: " + source);
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono method=PinRuntimeFont source=" + source, "PinRuntimeFont");
 		}
 	}
 
@@ -10325,7 +13343,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				try
 				{
-					Font val2 = Font.CreateDynamicFontFromOSFont(item, 18);
+					Font val2 = CreateDynamicFontFromOSFontSafe(item, 18);
 					if ((Object)(object)val2 != (Object)null)
 					{
 						_chineseFont = val2;
@@ -10335,10 +13353,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 				catch (Exception ex)
 				{
-					if (_debugMode.Value)
-					{
-						base.Logger.LogInfo("OS font probe failed for " + item + ": " + ex.Message);
-					}
+					ReportCaughtException(ex, "renderer=UnityMono boundary=os-font-probe font=" + item);
 				}
 			}
 		}
@@ -10363,7 +13378,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			else
 			{
-				base.Logger.LogWarning("[FONT-PACK] No usable TMP font for Unity " + Application.unityVersion + "; TMP translation disabled to avoid squares.");
+				base.Logger.LogWarning("[FONT-PACK] No usable TMP font for Unity " + GetUnityVersionSafe() + "; TMP translation disabled to avoid squares.");
 				_tmpFontPackageSearchExhausted = true;
 			}
 		}
@@ -10372,7 +13387,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			try
 			{
-				Font[] array = Resources.FindObjectsOfTypeAll<Font>();
+				Font[] array = FindObjectsOfTypeAllSafe<Font>();
 				foreach (Font val3 in array)
 				{
 					if ((Object)(object)val3 != (Object)null && (((Object)val3).name == "NotoSansCJKsc-Regular" || ((Object)val3).name == "NotoSansCJKsc"))
@@ -10398,7 +13413,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			try
 			{
-				Font val4 = Font.CreateDynamicFontFromOSFont(text, 12);
+				Font val4 = CreateDynamicFontFromOSFontSafe(text, 12);
 				if ((Object)(object)val4 != (Object)null)
 				{
 					_chineseFont = val4;
@@ -10653,7 +13668,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					continue;
 				}
-				string[] array2 = ((!path.EndsWith(".csv", StringComparison.OrdinalIgnoreCase)) ? text.Split(new char[2] { '\t', '=' }, 2) : text.Split(new char[] { ',' }, StringSplitOptions.None));
+				string[] array2 = ((!path.EndsWith(".csv", StringComparison.OrdinalIgnoreCase)) ? text.Split(new char[2] { '\t', '=' }, 2) : text.Split(new char[] { ',' }, 2, StringSplitOptions.None));
 				if (array2.Length >= 2)
 				{
 					string text2 = array2[0].Trim();
@@ -10725,6 +13740,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				ReportCaughtException(reportedException);
 			}
 		}
+		finally
+		{
+			/* Persistence must never replace an uninspected legacy cache before the
+			   background loader has either imported or safely isolated it. */
+			_bootCacheLoadComplete = true;
+		}
 		if (_shuttingDown)
 		{
 			return;
@@ -10762,27 +13783,39 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		try
 		{
 			string path = Path.Combine(text, "unity_translation_cache.json");
-			if (File.Exists(path))
+			List<KeyValuePair<string, string>> diskEntries = null;
+			/* Cache load/isolation and persistence replace the same file. Serializing all
+			   file-system ownership here prevents a slow oversized-cache quarantine from
+			   racing a live translation snapshot accepted after hooks started. */
+			lock (_cacheFileWriteLock)
 			{
-				if (new FileInfo(path).Length > OversizedLocalCacheFileBytes)
+				if (File.Exists(path))
 				{
-					TryBackupOversizedLocalCache(path, -1);
-				}
-				else
-				{
-					JObject val = JObject.Parse(File.ReadAllText(path));
-					/* 旧版整库落盘会让每轮持久化重新校验数十万条并重写几十 MB...					   表现为周期性卡顿。超大文件跳过导入，之后仅按游戏实际使用键重建...*/
-					bool oversized = val.Count > OversizedLocalCacheEntryLimit;
-					if (oversized)
+					if (new FileInfo(path).Length > OversizedLocalCacheFileBytes)
 					{
-						TryBackupOversizedLocalCache(path, val.Count);
+						TryIsolateOversizedLocalCacheLocked(path, -1);
 					}
 					else
 					{
-						ImportServerCacheEntries(from prop in val.Properties()
-							select new KeyValuePair<string, string>(prop.Name, ((object)prop.Value)?.ToString()), logPromotions: false, "local cache file", persistAfterImport: false, markImportedAsLocal: true, preserveExisting: true);
+						JObject val = JObject.Parse(File.ReadAllText(path));
+						/* A legacy full-server dump can make every persist validate tens of
+						   thousands of unrelated rows. Keep its exact bytes in a uniquely
+						   versioned quarantine instead of truncating or overwriting it. */
+						if (val.Count > OversizedLocalCacheEntryLimit)
+						{
+							TryIsolateOversizedLocalCacheLocked(path, val.Count);
+						}
+						else
+						{
+							diskEntries = (from prop in val.Properties()
+								select new KeyValuePair<string, string>(prop.Name, ((object)prop.Value)?.ToString())).ToList();
+						}
 					}
 				}
+			}
+			if (diskEntries != null)
+			{
+				ImportServerCacheEntries(diskEntries, logPromotions: false, "local cache file", persistAfterImport: false, markImportedAsLocal: true, preserveExisting: true);
 			}
 		}
 		catch (Exception ex)
@@ -10792,22 +13825,34 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		base.Logger.LogInfo($"Cache preloaded: {GetCacheCount()} entries");
 	}
 
-	private void TryBackupOversizedLocalCache(string path, int entryCount)
+	private void TryIsolateOversizedLocalCacheLocked(string path, int entryCount)
 	{
+		/* External incompatibility: old plugin versions could persist a whole server
+		   dump as this per-game cache, making startup and every rewrite unbounded.
+		   The renderer cannot identify ownership row-by-row without paying that cost.
+		   Isolation moves the exact user artifact to a unique sibling, never treats it
+		   as a cache hit, never overwrites an older backup, and logs the retained path. */
 		try
 		{
-			string text = path + ".bak-oversized";
-			if (!File.Exists(text))
+			if (!File.Exists(path))
 			{
-				File.Copy(path, text);
+				return;
 			}
-			File.WriteAllText(path, "{}", Encoding.UTF8);
+			string timestamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff", System.Globalization.CultureInfo.InvariantCulture);
+			string text = path + ".bak-oversized-" + timestamp;
+			int collision = 1;
+			while (File.Exists(text))
+			{
+				text = path + ".bak-oversized-" + timestamp + "-" + collision;
+				collision++;
+			}
+			File.Move(path, text);
 			string text2 = (entryCount >= 0) ? $"{entryCount} entries" : "more than " + OversizedLocalCacheFileBytes + " bytes";
-			base.Logger.LogWarning($"Local cache file holds {text2} (legacy server-dump pollution); skipped import and reset active cache to live usage. Backup: {Path.GetFileName(text)}");
+			base.Logger.LogWarning($"Local cache file holds {text2} (legacy server-dump pollution); skipped import and isolated the exact artifact without overwriting prior backups. Backup: {Path.GetFileName(text)}");
 		}
 		catch (Exception ex)
 		{
-			base.Logger.LogWarning("Oversized local cache backup failed: " + ex.Message);
+			ReportCaughtException(ex, "boundary=oversized-local-cache-isolation file=" + Path.GetFileName(path));
 		}
 	}
 
@@ -10931,6 +13976,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 					break;
 				}
+				if (!_bootCacheLoadComplete)
+				{
+					/* The loader owns the pre-existing user artifact. Retain dirty state
+					   and retry after another bounded debounce rather than overwriting it. */
+					continue;
+				}
 				lock (_cachePersistLock)
 				{
 					if (!_cachePersistDirty)
@@ -10940,37 +13991,37 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 					_cachePersistDirty = false;
 				}
-				/* 快照过滤会对每条缓存运行较重的正则。单条异常最多损失本轮，
-				   不能杀死整局持久化循环。整个快照与写盘放到后台线程，避...await
+				/* 快照过滤会对每条缓存运行较重的正则。单轮异常会保留 dirty
+				   状态并重试，不能杀死整局持久化循环。整个快照与写盘放到后台线程，避...await
 				   回到 Unity SynchronizationContext 后在主线程制造卡顿...*/
+				bool persisted = false;
 				try
 				{
-					await RunBackground(delegate
+					persisted = await RunBackground(delegate
 					{
 						lock (_cacheFileWriteLock)
 						{
 							if (_shuttingDown)
 							{
-								return 0;
+								return true;
 							}
 							Dictionary<string, string> dictionary = SnapshotLocalCacheForPersist();
-							if (dictionary.Count > 0)
-							{
-								WriteLocalCacheSnapshot(dictionary);
-							}
-							return dictionary.Count;
+							return dictionary.Count == 0 || WriteLocalCacheSnapshot(dictionary);
 						}
 					});
 				}
 				catch (Exception ex)
 				{
-					try
+					ReportCaughtException(ex, "boundary=local-cache-persist-cycle [CACHE] Persist cycle failed: " + ex.Message);
+				}
+				if (!persisted && !_shuttingDown)
+				{
+					/* File-system failures are external and cannot be repaired upstream.
+					   Preserve dirty state so the bounded debounce loop retries; the old
+					   atomic snapshot stays intact and the failure is recorded above. */
+					lock (_cachePersistLock)
 					{
-						LogVerbose("[CACHE] Persist cycle failed: " + ex.Message);
-					}
-					catch (Exception reportedException)
-					{
-						ReportCaughtException(reportedException);
+						_cachePersistDirty = true;
 					}
 				}
 				lock (_cachePersistLock)
@@ -10986,44 +14037,56 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		catch (Exception ex2)
 		{
 			/* 活性约束：持久化循环已死时 _cachePersistScheduled 不能继续...true...			   否则直到游戏退出都不会再启动保存任务...*/
+			bool restart;
 			lock (_cachePersistLock)
 			{
 				_cachePersistScheduled = false;
+				restart = !_shuttingDown;
+				if (restart)
+				{
+					_cachePersistDirty = true;
+				}
 			}
-			try
+			ReportCaughtException(ex2, "boundary=local-cache-persist-loop");
+			if (restart)
 			{
-				LogVerbose("[CACHE] Persist loop stopped: " + ex2.Message);
-			}
-			catch (Exception reportedException)
-			{
-				ReportCaughtException(reportedException);
+				ScheduleLocalCachePersist();
 			}
 		}
 	}
 
 	private Dictionary<string, string> SnapshotLocalCacheForPersist()
 	{
+		/* 锁内只做键值浅拷贝；Sanitize/正则校验在锁外对副本执行，
+		   避免全量正则在 _cache 锁内卡住主线程的 TryGetLocalTranslation。 */
+		List<KeyValuePair<string, string>> pairs = new List<KeyValuePair<string, string>>();
 		lock (_cache)
 		{
-			Dictionary<string, string> dictionary = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 			foreach (string localCacheKey in _localCacheKeys)
 			{
-				if (!_cache.TryGetValue(localCacheKey, out var value))
+				if (_cache.TryGetValue(localCacheKey, out var value))
 				{
-					continue;
-				}
-				value = SanitizeTranslationArtifacts(value);
-				if (!LooksLikeTypewriterFragment(localCacheKey) && IsAcceptableTranslation(localCacheKey, value))
-				{
-					dictionary[localCacheKey] = value;
+					pairs.Add(new KeyValuePair<string, string>(localCacheKey, value));
 				}
 			}
-			return dictionary;
 		}
+		Dictionary<string, string> dictionary = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+		foreach (KeyValuePair<string, string> pair in pairs)
+		{
+			string value = SanitizeTranslationArtifacts(pair.Value);
+			if (!LooksLikeTypewriterFragment(pair.Key) && IsAcceptableTranslation(pair.Key, value))
+			{
+				dictionary[pair.Key] = value;
+			}
+		}
+		return dictionary;
 	}
 
-	private void WriteLocalCacheSnapshot(IReadOnlyDictionary<string, string> snapshot)
+	private bool WriteLocalCacheSnapshot(IReadOnlyDictionary<string, string> snapshot)
 	{
+		/* 原子写：先写临时文件再替换，避免写盘中断把整份本地缓存 JSON 报废；
+		   失败走 ReportCaughtException 限速记录，不再仅 debug 模式可见。 */
+		string tempPath = null;
 		try
 		{
 			string localCacheFilePath = GetLocalCacheFilePath();
@@ -11032,19 +14095,50 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				Directory.CreateDirectory(directoryName);
 			}
-			File.WriteAllText(localCacheFilePath, SerializeStringMap(snapshot), Encoding.UTF8);
+			tempPath = localCacheFilePath + ".tmp";
+			File.WriteAllText(tempPath, SerializeStringMap(snapshot), Encoding.UTF8);
+			if (File.Exists(localCacheFilePath))
+			{
+				File.Replace(tempPath, localCacheFilePath, null);
+			}
+			else
+			{
+				File.Move(tempPath, localCacheFilePath);
+			}
+			tempPath = null;
+			return true;
 		}
 		catch (Exception ex)
 		{
-			if (_debugMode.Value)
+			ReportCaughtException(ex, "boundary=local-cache-persist");
+			if (tempPath != null)
 			{
-				base.Logger.LogInfo("Local cache persist failed: " + ex.Message);
+				try
+				{
+					if (File.Exists(tempPath))
+					{
+						File.Delete(tempPath);
+					}
+				}
+				catch (Exception reportedException)
+				{
+					ReportCaughtException(reportedException);
+				}
 			}
+			return false;
 		}
 	}
 
 	private void FlushLocalCacheToDisk()
 	{
+		if (!_bootCacheLoadComplete)
+		{
+			/* A very early process teardown can race the background cache inspection.
+			   Keeping the pre-existing file is safer than replacing unknown user data;
+			   no translation is reported as persisted, and the boundary is visible. */
+			base.Logger.LogWarning("[CACHE] Final local-cache flush skipped because startup cache inspection had not completed; existing user cache was preserved.");
+			return;
+		}
 		lock (_cachePersistLock)
 		{
 			_cachePersistDirty = false;
@@ -11150,11 +14244,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private IEnumerator ScanTextComponentsCoroutine()
 	{
-		yield return (object)new WaitForSeconds(GetSlowScanIntervalSeconds());
+		yield return (object)WaitForScaledSecondsSafe(GetSlowScanIntervalSeconds());
 		LogVerbose("[SCAN] Backup scanner started");
 		while (true)
 		{
-			yield return (object)new WaitForSeconds(GetSlowScanIntervalSeconds());
+			yield return (object)WaitForScaledSecondsSafe(GetSlowScanIntervalSeconds());
 			RunScannerTick((int)(GetSlowScanIntervalSeconds() * 1000f), "COROUTINE");
 		}
 	}
@@ -11168,14 +14262,27 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return;
 			}
 			Type type = comp.GetType();
-			if (!CanTranslateTmp())
+			bool canTranslateTmp = CanTranslateTmp();
+			if (!canTranslateTmp && !ShouldUseTmpOverlay())
 			{
 				return;
 			}
-			TryMarkAppliedCacheKeyForPersist(rawText, translated);
 			RescueStrandedAlpha(comp);
 			translated = ((preserveRichText && ShouldPreserveRichTextForDisplayWithColor(rawText, translated)) ? PrepareTranslatedTextForComponent(comp, translated, rawText) : StripRichTextForPlainText(translated));
 			translated = NormalizeTmpPunctuationForMissingGlyphs(translated);
+			if (!canTranslateTmp)
+			{
+				if (!ApplyTmpOverlay(comp, translated, rawText))
+				{
+					return;
+				}
+				RevealTmpText(comp, translated);
+				MarkProcessed(instId, rawText);
+				TryMarkAppliedCacheKeyForPersist(rawText, translated);
+				LogVerbose($"[TMPro-overlay] cached translated '{translated}' (id={instId})");
+				return;
+			}
+			PrepareTmpTranslatedShortLabelLayout(comp, rawText, translated);
 			bool tmpFontCoversText = EnsureTMPFontCoversText(comp, translated);
 			if ((object)textProp == null)
 			{
@@ -11183,8 +14290,24 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			try
 			{
-				textProp?.SetValue(comp, translated);
-				RevealTmpText(comp, translated);
+				if (textProp != null)
+				{
+					textProp.SetValue(comp, translated);
+					RevealTmpText(comp, translated);
+				}
+				else
+				{
+					/* text 属性不存在时直接尝试 m_text 字段；两者都不可写则早退，
+					   且不能 MarkProcessed，否则未写入的组件会被误记为“已翻译”。 */
+					FieldInfo textField = AccessTools.Field(type, "m_text");
+					if (textField == null)
+					{
+						LogVerbose("[SCAN] No writable text member on " + type.FullName + "; source text left untranslated");
+						return;
+					}
+					textField.SetValue(comp, translated);
+					RevealTmpText(comp, translated);
+				}
 			}
 			catch (Exception ex)
 			{
@@ -11195,10 +14318,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 				fieldInfo.SetValue(comp, translated);
 				RevealTmpText(comp, translated);
-				if (_debugMode.Value)
-				{
-					LogVerbose("[SCAN] Fallback wrote m_text for " + type.FullName + ": " + (ex.InnerException?.Message ?? ex.Message));
-				}
+				ReportCaughtException(ex, "renderer=UnityMono boundary=tmp-text-property-fallback type=" + type.FullName);
 			}
 			ApplyTmpOverlay(comp, translated, rawText, !tmpFontCoversText);
 			if (forceMeshMethod != null)
@@ -11226,6 +14346,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				ApplyTmpOverlay(comp, translated, rawText, force: true);
 			}
 			MarkProcessed(instId, rawText);
+			TryMarkAppliedCacheKeyForPersist(rawText, translated);
 			LogVerbose($"[SCAN] '{rawText}' -> '{translated}' (id={instId})");
 		}
 		catch (Exception ex2)

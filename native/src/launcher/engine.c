@@ -68,6 +68,7 @@ static int ignored_exe_name(const WCHAR *name) {
     return wcsstr(name, L"CrashHandler") ||
            wcsstr(name, L"UnityCrashHandler") ||
            !_wcsicmp(name, L"DeepSeekTranslator.exe") ||
+           !_wcsicmp(name, L"dst_godot_patch.exe") ||
            !_wcsicmp(name, L"dst_server.exe");
 }
 
@@ -98,14 +99,12 @@ static int exe_candidate_score(const WCHAR *dir, const WCHAR *name, const WCHAR 
     exe_stem(name, stem, MAX_PATH * 4);
     int score = 0;
 
-    _snwprintf(marker, MAX_PATH * 4, L"%s_Data", stem);
-    marker[MAX_PATH * 4 - 1] = 0;
+    if (!path_append_suffix(marker, MAX_PATH * 4, stem, L"_Data")) return 0;
     WCHAR candidate[MAX_PATH * 4];
     path_join(candidate, MAX_PATH * 4, dir, marker);
     if (is_dir(candidate)) score += 1000;
 
-    _snwprintf(marker, MAX_PATH * 4, L"%s.pck", stem);
-    marker[MAX_PATH * 4 - 1] = 0;
+    if (!path_append_suffix(marker, MAX_PATH * 4, stem, L".pck")) return score;
     path_join(candidate, MAX_PATH * 4, dir, marker);
     if (exists_path(candidate) && !is_dir(candidate)) score += 900;
 
@@ -165,11 +164,26 @@ int unity_is_il2cpp(const WCHAR *dir) {
     path_join(p, MAX_PATH * 4, dir, L"GameAssembly.dll");
     if (exists_path(p)) return 1;
 
-    path_join(p, MAX_PATH * 4, dir, L"*_Data\\il2cpp_data");
+    /* Win32 通配符只在最后一个路径分量生效，"dir\*_Data\il2cpp_data" 永不匹配。
+       先枚举子目录定位 *_Data，再拼固定路径检查其中的 il2cpp_data。 */
+    WCHAR pat[MAX_PATH * 4];
+    path_join(pat, MAX_PATH * 4, dir, L"*");
     WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(p, &fd);
+    HANDLE h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    int ok = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    int ok = 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        size_t nl = wcslen(fd.cFileName);
+        if (nl < 5 || _wcsicmp(fd.cFileName + nl - 5, L"_Data")) continue;
+        path_join(p, MAX_PATH * 4, dir, fd.cFileName);
+        path_join(p, MAX_PATH * 4, p, L"il2cpp_data");
+        if (is_dir(p)) {
+            ok = 1;
+            break;
+        }
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
     return ok;
 }
@@ -212,15 +226,17 @@ static int pe_has_pck_section(HANDLE h, const LARGE_INTEGER *size) {
     DWORD sig = 0;
     IMAGE_FILE_HEADER fh;
     if (!read_file_at(h, pe, &sig, sizeof(sig)) || sig != IMAGE_NT_SIGNATURE) return 0;
-    if (!read_file_at(h, pe + sizeof(sig), &fh, sizeof(fh))) return 0;
+    if (!read_file_at(h, pe + (LONGLONG)sizeof(sig), &fh, sizeof(fh))) return 0;
     if (fh.NumberOfSections == 0 || fh.NumberOfSections > 128) return 0;
 
-    LONGLONG sections = pe + sizeof(sig) + sizeof(fh) + fh.SizeOfOptionalHeader;
+    LONGLONG sections = pe + (LONGLONG)sizeof(sig) +
+                        (LONGLONG)sizeof(fh) +
+                        (LONGLONG)fh.SizeOfOptionalHeader;
     if (sections < pe || sections > size->QuadPart - (LONGLONG)sizeof(IMAGE_SECTION_HEADER)) return 0;
 
     for (WORD i = 0; i < fh.NumberOfSections; i++) {
         IMAGE_SECTION_HEADER sh;
-        LONGLONG off = sections + (LONGLONG)i * sizeof(sh);
+        LONGLONG off = sections + (LONGLONG)i * (LONGLONG)sizeof(sh);
         if (off > size->QuadPart - (LONGLONG)sizeof(sh)) return 0;
         if (!read_file_at(h, off, &sh, sizeof(sh))) return 0;
         if (sh.Name[0] == 'p' && sh.Name[1] == 'c' && sh.Name[2] == 'k' && sh.Name[3] == 0) {
@@ -279,23 +295,72 @@ static int godot_export_or_project(const WCHAR *dir) {
  *
  * 按优先级顺序依次检查特征文件：
  *   1. Ren'Py：存在 game/ 目录且含 .rpy / .rpyc / .rpa 文件
- *   2. RPG Maker MV/MZ：存在 www/index.html 且 www/js/ 为目录
+ *   2. RPG Maker MV/MZ：支持 www/ 标准布局和根目录扁平布局
  *   3. RPG Maker Legacy：Data/ 目录含 .rxdata / .rvdata / .rvdata2
  *   4. Unity：子目录名以 _Data 结尾，再细分 Mono/IL2CPP
  *   5. Godot：存在 .pck 导出包或 project.godot/.godot 工程标记
  * 都不匹配则返回 ENGINE_UNKNOWN。
  * ---------------------------------------------------------------- */
+static int copy_resolved_root(WCHAR *out, size_t cap, const WCHAR *root) {
+    if (!out || cap == 0 || !root) return 0;
+    size_t len = wcslen(root);
+    if (len >= cap) return 0;
+    wmemcpy(out, root, len + 1);
+    return 1;
+}
+
+static int rpgm_index_or_owned_backup(const WCHAR *content_root) {
+    WCHAR index[MAX_PATH * 4], backup[MAX_PATH * 4];
+    path_join(index, MAX_PATH * 4, content_root, L"index.html");
+    if (exists_path(index)) return 1;
+    path_join(backup, MAX_PATH * 4, content_root, L"index.html.dst-backup");
+    return exists_path(backup);
+}
+
+/* www/ 标准布局与根目录扁平布局共用同一组特征文件校验：
+   index.html（或启动器部署留下的 index.html.dst-backup）、
+   data\System.json、js\main.js，且 MV 的 js\rpg_core.js 与
+   MZ 的 js\rmmz_core.js 至少其一。www 分支强度与扁平分支对齐，
+   避免把只含 www\js + www\index.html 的普通 NW.js 应用误判为 RPG Maker。 */
+static int rpgm_content_markers(const WCHAR *content_root) {
+    if (!rpgm_index_or_owned_backup(content_root)) return 0;
+
+    WCHAR system[MAX_PATH * 4], main_js[MAX_PATH * 4];
+    WCHAR mv_core[MAX_PATH * 4], mz_core[MAX_PATH * 4];
+    path_join(system, MAX_PATH * 4, content_root, L"data\\System.json");
+    path_join(main_js, MAX_PATH * 4, content_root, L"js\\main.js");
+    path_join(mv_core, MAX_PATH * 4, content_root, L"js\\rpg_core.js");
+    path_join(mz_core, MAX_PATH * 4, content_root, L"js\\rmmz_core.js");
+    if (!exists_path(system) || is_dir(system) ||
+        !exists_path(main_js) || is_dir(main_js) ||
+        ((!exists_path(mv_core) || is_dir(mv_core)) &&
+         (!exists_path(mz_core) || is_dir(mz_core)))) {
+        return 0;
+    }
+    return 1;
+}
+
+int rpgm_content_root(const WCHAR *dir, WCHAR *out, size_t cap) {
+    if (!dir || !dir[0]) return 0;
+
+    WCHAR content[MAX_PATH * 4], marker[MAX_PATH * 4];
+    path_join(content, MAX_PATH * 4, dir, L"www");
+    path_join(marker, MAX_PATH * 4, content, L"js");
+    if (is_dir(marker) && rpgm_content_markers(content)) {
+        return copy_resolved_root(out, cap, content);
+    }
+
+    path_join(marker, MAX_PATH * 4, dir, L"js");
+    if (!is_dir(marker) || !rpgm_content_markers(dir)) return 0;
+    return copy_resolved_root(out, cap, dir);
+}
+
 Engine detect_engine(const WCHAR *dir) {
     WCHAR p[MAX_PATH * 4];
     path_join(p, MAX_PATH * 4, dir, L"game");
     if (is_dir(p) && (has_file_pattern(p, L"*.rpy") || has_file_pattern(p, L"*.rpyc") || has_file_pattern(p, L"*.rpa"))) return ENGINE_RENPY;
 
-    path_join(p, MAX_PATH * 4, dir, L"www\\index.html");
-    if (exists_path(p)) {
-        WCHAR js[MAX_PATH * 4];
-        path_join(js, MAX_PATH * 4, dir, L"www\\js");
-        if (is_dir(js)) return ENGINE_RPGM_MV;
-    }
+    if (rpgm_content_root(dir, p, MAX_PATH * 4)) return ENGINE_RPGM_MV;
 
     path_join(p, MAX_PATH * 4, dir, L"Data");
     if (is_dir(p) && (has_file_pattern(p, L"*.rxdata") || has_file_pattern(p, L"*.rvdata") || has_file_pattern(p, L"*.rvdata2"))) return ENGINE_RPGM_LEGACY;

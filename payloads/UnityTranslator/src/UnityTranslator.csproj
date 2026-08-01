@@ -17,6 +17,9 @@
   </PropertyGroup>
   <PropertyGroup />
   <ItemGroup />
+  <ItemGroup>
+    <Compile Remove="FontPatcher\**\*.cs" />
+  </ItemGroup>
   <ItemGroup Condition="'$(BepInExFlavor)' != '6'">
     <Reference Include="BepInEx">
       <HintPath>$(BepInEx5CoreDir)\BepInEx.dll</HintPath>

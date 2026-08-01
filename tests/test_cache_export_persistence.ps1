@@ -75,7 +75,7 @@ try {
     Write-Host ""
     Write-Host "=== Cache export and persisted long rows ===" -ForegroundColor Cyan
 
-    It "Overwritten persisted values survive process restart" {
+    It "Batched and overwritten persisted values survive process restart" {
         $env:PATH = (Split-Path -Parent $gcc) + ";" + $env:PATH
         & $gcc -std=c17 -O2 -D_CRT_SECURE_NO_WARNINGS -I $serverSrc `
             (Join-Path $PSScriptRoot "cache_persistence_probe.c") `

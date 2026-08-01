@@ -16,14 +16,25 @@ typedef struct {
 } ByteBuf;
 
 void path_join(WCHAR *out, size_t cap, const WCHAR *a, const WCHAR *b); /* 路径拼接，自动补 '\' */
+int path_append_suffix(WCHAR *out, size_t cap, const WCHAR *path,
+                       const WCHAR *suffix); /* 追加固定后缀；截断时失败关闭 */
+int wide_format_checked(WCHAR *out, size_t cap, const WCHAR *fmt, ...);
 int exists_path(const WCHAR *p);                    /* 文件或目录是否存在 */
 int is_dir(const WCHAR *p);                        /* 是否为目录 */
+/*
+ * Returns non-zero when an existing component is a reparse point, or when the
+ * path cannot be inspected safely. include_leaf=0 checks parent components.
+ */
+int path_has_reparse_point(const WCHAR *path, int include_leaf);
 int ensure_dir(const WCHAR *path);                  /* 递归创建目录，已存在则跳过 */
 
 int write_text_file_utf8(const WCHAR *path, const char *bytes);   /* 以 UTF-8 写纯文本 */
 int read_file_bytes(const WCHAR *path, char **out, DWORD *size);    /* 读取文件全部字节，*out 新分配 */
 int write_file_bytes(const WCHAR *path, const char *buf, DWORD size); /* 写入原始字节 */
 int copy_file_safe(const WCHAR *from, const WCHAR *to);             /* 复制单个文件，自动创建目标父目录 */
+int copy_file_if_absent_safe(const WCHAR *from, const WCHAR *to);   /* 安全复制且不覆盖已存在文件 */
+int move_file_safe(const WCHAR *from, const WCHAR *to, DWORD flags); /* 拒绝重解析点后移动/替换文件 */
+int delete_file_safe(const WCHAR *path);                            /* 拒绝重解析点后删除普通文件 */
 int copy_tree_safe(const WCHAR *from, const WCHAR *to);            /* 递归复制目录树 */
 
 void bb_add(ByteBuf *b, const char *s, size_t n);  /* 往 ByteBuf 追加字节 */

@@ -23,6 +23,65 @@
 #include <windows.h>
 #include <winhttp.h>
 
+#define API_MAX_RESPONSE_BYTES (2u * 1024u * 1024u)
+
+static int endpoint_host_boundary(char c) {
+    return c == 0 || c == ':' || c == '/' || c == '?' || c == '#';
+}
+
+/*
+ * Authorization headers must not leave the machine over cleartext HTTP.
+ * Loopback HTTP remains supported for local OpenAI-compatible providers and
+ * the test harness; every non-loopback provider must use HTTPS.
+ */
+static int endpoint_transport_allowed(const char *endpoint) {
+    if (!endpoint) return 0;
+    if (!_strnicmp(endpoint, "https://", 8)) return 1;
+    if (_strnicmp(endpoint, "http://", 7)) return 0;
+
+    const char *host = endpoint + 7;
+    static const char localhost[] = "localhost";
+    static const char ipv4[] = "127.0.0.1";
+    static const char ipv6[] = "[::1]";
+    if (!_strnicmp(host, localhost, sizeof localhost - 1) &&
+        endpoint_host_boundary(host[sizeof localhost - 1])) return 1;
+    if (!strncmp(host, ipv4, sizeof ipv4 - 1) &&
+        endpoint_host_boundary(host[sizeof ipv4 - 1])) return 1;
+    return !strncmp(host, ipv6, sizeof ipv6 - 1) &&
+           endpoint_host_boundary(host[sizeof ipv6 - 1]);
+}
+
+static int is_official_deepseek_endpoint(const char *endpoint) {
+    static const char host_name[] = "api.deepseek.com";
+    const char *host;
+    size_t host_len = sizeof host_name - 1;
+    if (!endpoint) return 0;
+    host = strstr(endpoint, "://");
+    host = host ? host + 3 : endpoint;
+    if (_strnicmp(host, host_name, host_len) != 0) return 0;
+    return host[host_len] == 0 || host[host_len] == '/' ||
+           host[host_len] == ':' || host[host_len] == '?';
+}
+
+/* DeepSeek retired the deepseek-chat alias on 2026-07-24. Limit the
+   compatibility migration to its official endpoint so user-defined
+   OpenAI-compatible providers keep full ownership of their model names.
+   This changes only the loaded runtime value and never rewrites api.ini. */
+static void migrate_deprecated_deepseek_model(ApiConfig *cfg) {
+    if (!is_official_deepseek_endpoint(cfg->endpoint)) return;
+    if (strcmp(cfg->model, "deepseek-chat") != 0) return;
+    snprintf(cfg->model, sizeof cfg->model, "%s", "deepseek-v4-flash");
+    fprintf(stderr,
+            "[api] migrated retired official model deepseek-chat to "
+            "deepseek-v4-flash for this process; api.ini was not rewritten\n");
+    fflush(stderr);
+}
+
+static int should_disable_deepseek_thinking(const ApiConfig *cfg) {
+    return cfg && is_official_deepseek_endpoint(cfg->endpoint) &&
+           !strncmp(cfg->model, "deepseek-v4-", strlen("deepseek-v4-"));
+}
+
 /* 安全默认值：15s 超时、并发上限、DeepSeek 官方端点与模型。
    enabled 留给 api_config_load 在读到 key 后再置位。 */
 void api_config_init(ApiConfig *cfg) {
@@ -30,7 +89,7 @@ void api_config_init(ApiConfig *cfg) {
     cfg->timeout_ms = 15000;
     cfg->concurrency = API_CONCURRENCY_MAX;
     snprintf(cfg->endpoint, sizeof cfg->endpoint, "%s", "https://api.deepseek.com/v1/chat/completions");
-    snprintf(cfg->model, sizeof cfg->model, "%s", "deepseek-chat");
+    snprintf(cfg->model, sizeof cfg->model, "%s", "deepseek-v4-flash");
 }
 
 /* 从 ini [api] 段加载配置。GetPrivateProfileString 的默认值传当前字段值，
@@ -42,16 +101,24 @@ int api_config_load(ApiConfig *cfg, const char *path) {
     GetPrivateProfileStringA("api", "endpoint", cfg->endpoint, cfg->endpoint, sizeof cfg->endpoint, path);
     GetPrivateProfileStringA("api", "model", cfg->model, cfg->model, sizeof cfg->model, path);
     GetPrivateProfileStringA("api", "key", "", cfg->key, sizeof cfg->key, path);
-    cfg->timeout_ms = (int)GetPrivateProfileIntA("api", "timeout_ms", (UINT)cfg->timeout_ms, path);
+    cfg->timeout_ms = (int)GetPrivateProfileIntA("api", "timeout_ms", cfg->timeout_ms, path);
     if (cfg->timeout_ms < 3000) cfg->timeout_ms = 3000;
     if (cfg->timeout_ms > 60000) cfg->timeout_ms = 60000;
-    cfg->concurrency = (int)GetPrivateProfileIntA("api", "concurrency", (UINT)cfg->concurrency, path);
+    cfg->concurrency = (int)GetPrivateProfileIntA("api", "concurrency", cfg->concurrency, path);
     if (cfg->concurrency < 1) cfg->concurrency = 1;
     if (cfg->concurrency > API_CONCURRENCY_MAX) cfg->concurrency = API_CONCURRENCY_MAX;
     cfg->endpoint[sizeof cfg->endpoint - 1] = 0;
     cfg->model[sizeof cfg->model - 1] = 0;
     cfg->key[sizeof cfg->key - 1] = 0;
-    cfg->enabled = cfg->endpoint[0] && cfg->model[0] && cfg->key[0];
+    migrate_deprecated_deepseek_model(cfg);
+    cfg->enabled = cfg->endpoint[0] && cfg->model[0] && cfg->key[0] &&
+                   endpoint_transport_allowed(cfg->endpoint);
+    if (cfg->endpoint[0] && cfg->model[0] && cfg->key[0] && !cfg->enabled) {
+        fprintf(stderr,
+                "[api] disabled non-loopback plaintext or malformed endpoint; "
+                "use HTTPS for remote providers or HTTP on loopback\n");
+        fflush(stderr);
+    }
     return cfg->enabled;
 }
 
@@ -137,7 +204,11 @@ static void build_request(ApiConfig *cfg, const char *text, Buf *body) {
              "Game localization to Simplified Chinese. Preserve tags, placeholders, variables, numbers, and line breaks. Already Chinese stays unchanged.");
     buf_add(body, "},{\"role\":\"user\",\"content\":");
     buf_json(body, user.data);
-    buf_add(body, "}],\"temperature\":0}");
+    buf_add(body, "}],\"temperature\":0");
+    if (should_disable_deepseek_thinking(cfg)) {
+        buf_add(body, ",\"thinking\":{\"type\":\"disabled\"}");
+    }
+    buf_ch(body, '}');
     buf_free(&user);
 }
 
@@ -160,7 +231,11 @@ static void build_batch_request(ApiConfig *cfg, char **texts, size_t count, Buf 
              "Translate each game text in the JSON array to Simplified Chinese. Return only a valid JSON array with the same length and order. Preserve tags, placeholders, variables, numbers, and line breaks.");
     buf_add(body, "},{\"role\":\"user\",\"content\":");
     buf_json(body, user.data);
-    buf_add(body, "}],\"temperature\":0}");
+    buf_add(body, "}],\"temperature\":0");
+    if (should_disable_deepseek_thinking(cfg)) {
+        buf_add(body, ",\"thinking\":{\"type\":\"disabled\"}");
+    }
+    buf_ch(body, '}');
     buf_free(&user);
 }
 
@@ -329,7 +404,15 @@ static int read_response(HINTERNET req, char **out) {
             return 0;
         }
         if (!avail) break;
-        char *tmp = (char *)xmalloc(avail + 1);
+        /* WinHTTP reports an unsigned 32-bit byte count. Bound it before both
+           the +1 allocation and WinHttpReadData so a hostile/custom endpoint
+           cannot wrap the allocation size or force an oversized transient. */
+        if ((size_t)avail > API_MAX_RESPONSE_BYTES - b.len) {
+            api_diag(API_DIAG_BODY_TOO_LARGE, 0, 0, "limit=2097152");
+            buf_free(&b);
+            return 0;
+        }
+        char *tmp = (char *)xmalloc((size_t)avail + 1);
         DWORD rd = 0;
         if (!WinHttpReadData(req, tmp, avail, &rd)) {
             api_diag(API_DIAG_READ_BODY, GetLastError(), 0, NULL);
@@ -338,7 +421,7 @@ static int read_response(HINTERNET req, char **out) {
             return 0;
         }
         tmp[rd] = 0;
-        if ((size_t)rd > 2 * 1024 * 1024 - b.len) {
+        if ((size_t)rd > API_MAX_RESPONSE_BYTES - b.len) {
             api_diag(API_DIAG_BODY_TOO_LARGE, 0, 0, "limit=2097152");
             free(tmp);
             buf_free(&b);
@@ -376,7 +459,7 @@ static int send_chat_request(ApiConfig *cfg, Buf *body, char **content_out) {
         return 0;
     }
 
-    DWORD timeout = (DWORD)cfg->timeout_ms;
+    int timeout = cfg->timeout_ms;
     if (!WinHttpSetTimeouts(req, timeout, timeout, timeout, timeout)) {
         api_diag(API_DIAG_SET_TIMEOUTS, GetLastError(), 0, NULL);
         WinHttpCloseHandle(req);

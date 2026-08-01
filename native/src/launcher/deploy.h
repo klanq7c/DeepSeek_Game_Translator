@@ -12,11 +12,13 @@
  * ================================================================ */
 
 #include "globals.h"
+#include "engine.h"
 
 /* 部署 Ren'Py 翻译 hook（game/iron_deepseek.rpy + CJK 字体） */
 int deploy_renpy(const WCHAR *dir);
 
 /* 部署 RPG Maker MV/MZ 翻译 hook（www/js/hook_rpgm_mv.js + CJK 字体 + index.html 注入） */
+/* Supports both the standard www/ content root and flat Windows packages. */
 int deploy_rpgm(const WCHAR *dir);
 
 /* 部署 Unity Mono 翻译插件（BepInEx 5/6 + UnityTranslator.dll + Newtonsoft.Json） */
@@ -27,6 +29,9 @@ int deploy_unity_il2cpp(const WCHAR *dir);
 
 /* Godot 使用资源扫描 + 缓存预热 + 外置 patch pack，不改写原始 pck */
 int deploy_godot(const WCHAR *dir);
+
+/* Remove launcher-owned translation artifacts while preserving user data. */
+int restore_game(const WCHAR *dir, Engine engine);
 
 /* 在 payloads 目录中查找 UnityTranslator.dll 模板文件，成功返回 1 并写入 out */
 int find_unity_template(WCHAR *out, size_t cap);

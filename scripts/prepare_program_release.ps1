@@ -1,10 +1,26 @@
 param(
-    [string]$Version = "preview"
+    [string]$Version = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$versionFileContent = ""
+$versionFile = Join-Path $repo "VERSION"
+if (Test-Path -LiteralPath $versionFile) {
+    $versionFileContent = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+}
+if (-not $Version) {
+    if ($versionFileContent) {
+        $Version = $versionFileContent
+    } else {
+        $Version = "preview"
+    }
+}
+if ($Version -notmatch '\A[0-9A-Za-z][0-9A-Za-z._+-]{0,63}\z' -or
+    $Version -eq "." -or $Version -eq "..") {
+    throw "Invalid release version. Use 1-64 ASCII letters, digits, dot, underscore, plus, or hyphen."
+}
 $distRoot = Join-Path $repo "build\dist"
 $DsName = "ds" + [string][char]0x6e38 + [string][char]0x620f + [string][char]0x7ffb + [string][char]0x8bd1 + [string][char]0x5668
 $UsageName = "README_" + [string][char]0x4f7f + [string][char]0x7528 + [string][char]0x8bf4 + [string][char]0x660e + ".txt"
@@ -15,13 +31,29 @@ $singleExePath = Join-Path $distRoot "$stageName.exe"
 
 function Assert-Under([string]$Path, [string]$Root) {
     $fullPath = [System.IO.Path]::GetFullPath($Path)
-    $fullRoot = [System.IO.Path]::GetFullPath($Root)
+    $fullRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
     if (-not $fullPath.StartsWith($fullRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to write outside expected directory: $Path"
+    }
+    foreach ($candidate in @([System.IO.Path]::GetFullPath($Root), $fullPath)) {
+        $volumeRoot = [System.IO.Path]::GetPathRoot($candidate)
+        $cursor = $volumeRoot
+        foreach ($part in ($candidate.Substring($volumeRoot.Length) -split '[\\/]')) {
+            if ([string]::IsNullOrWhiteSpace($part)) { continue }
+            $cursor = Join-Path $cursor $part
+            if (-not (Test-Path -LiteralPath $cursor)) { continue }
+            $item = Get-Item -LiteralPath $cursor -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Refusing release output through a filesystem reparse point: $cursor"
+            }
+        }
     }
 }
 
 Assert-Under $distRoot (Join-Path $repo "build")
+Assert-Under $stage $distRoot
+Assert-Under $zipPath $distRoot
+Assert-Under $singleExePath $distRoot
 New-Item -ItemType Directory -Force -Path $distRoot | Out-Null
 
 if (Test-Path -LiteralPath $stage) {
@@ -44,6 +76,16 @@ function Copy-ReleaseFile([string]$SourceRelative, [string]$DestRelative = $Sour
 }
 
 Copy-ReleaseFile "$DsName.exe" "$DsName.exe"
+if ($versionFileContent) {
+    # build_native.bat embeds the VERSION file content into the launcher as a
+    # wide string via DS_TRANSLATOR_VERSION (no VERSIONINFO resource), so a
+    # stale exe can only be detected by scanning the binary as UTF-16LE.
+    $exeText = [System.Text.Encoding]::Unicode.GetString(
+        [System.IO.File]::ReadAllBytes((Join-Path $stage "$DsName.exe")))
+    if (-not $exeText.Contains($versionFileContent)) {
+        Write-Warning "$DsName.exe does not contain the VERSION string '$versionFileContent' embedded by build_native.bat; the staged exe may be stale. Rebuild with build_native.bat before releasing."
+    }
+}
 Copy-ReleaseFile "README.md" "README.md"
 Copy-ReleaseFile "LICENSE" "LICENSE"
 Copy-ReleaseFile "THIRD_PARTY_NOTICES.md" "THIRD_PARTY_NOTICES.md"
@@ -68,7 +110,12 @@ foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) {
         $forbidden += $file.FullName
     }
     if ($file.Extension -notin ".exe", ".dll") {
-        $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
+        try {
+            $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
+        } catch {
+            $secretHits += "$($file.FullName): unreadable or non-text file"
+            continue
+        }
         foreach ($pattern in @(
             "sk-[A-Za-z0-9]{16,}",
             "(?i)api[_-]?key\s*=\s*[^<\s][^\r\n]+",

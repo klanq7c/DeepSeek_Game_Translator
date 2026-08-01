@@ -41,6 +41,10 @@ char *renpy_string_at(const char **pp);
 
 int file_size_at_most(const WCHAR *path, DWORD max_bytes);
 
+/* Scan RPG Maker MV/MZ resources from either the standard www/ content root
+   or a flat Windows distribution whose web content lives at the game root. */
+void warmup_scan_rpgm_resources(const WCHAR *dir, TextList *prefetch);
+
 /* Godot keeps a deliberately narrow interface: scan resources into TextList.
    It does not post HTTP, import cache entries, inject hooks, or rewrite .pck. */
 void warmup_scan_godot_resources(const WCHAR *dir, TextList *prefetch);

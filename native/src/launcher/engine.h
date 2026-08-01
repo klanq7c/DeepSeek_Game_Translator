@@ -13,7 +13,7 @@
 typedef enum {
     ENGINE_UNKNOWN,       /* 未识别 */
     ENGINE_RENPY,         /* Ren'Py (.rpy / .rpyc / .rpa) */
-    ENGINE_RPGM_MV,       /* RPG Maker MV / MZ (www/index.html) */
+    ENGINE_RPGM_MV,       /* RPG Maker MV / MZ (www/ or flat web content) */
     ENGINE_UNITY,         /* Unity Mono (BepInEx) */
     ENGINE_UNITY_IL2CPP,  /* Unity IL2CPP (XUnity) */
     ENGINE_RPGM_LEGACY,   /* RPG Maker XP / VX / VXAce (.rxdata / .rvdata) */
@@ -34,6 +34,10 @@ int find_exe(const WCHAR *dir, WCHAR *out, size_t cap);
 
 /* 判断 Unity 游戏是否使用 IL2CPP 后端（检查 GameAssembly.dll 或 il2cpp_data 目录） */
 int unity_is_il2cpp(const WCHAR *dir);
+
+/* Resolve RPG Maker MV/MZ web content. Standard exports use dir\www, while
+ * some Windows distributions place index.html/js/data directly under dir. */
+int rpgm_content_root(const WCHAR *dir, WCHAR *out, size_t cap);
 
 /* ---------- 主检测入口 ---------- */
 

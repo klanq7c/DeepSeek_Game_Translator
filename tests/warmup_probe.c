@@ -36,9 +36,28 @@ void path_join(WCHAR *out, size_t cap, const WCHAR *a, const WCHAR *b) {
     out[cap - 1] = 0;
 }
 
+int path_append_suffix(WCHAR *out, size_t cap, const WCHAR *path,
+                       const WCHAR *suffix) {
+    if (!out || !cap || !path || !suffix) return 0;
+    out[0] = 0;
+    size_t path_len = wcslen(path);
+    size_t suffix_len = wcslen(suffix);
+    if (path_len >= cap || suffix_len >= cap - path_len) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    memcpy(out, path, path_len * sizeof(*out));
+    memcpy(out + path_len, suffix, (suffix_len + 1) * sizeof(*out));
+    return 1;
+}
+
 int is_dir(const WCHAR *p) {
     DWORD a = GetFileAttributesW(p);
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+int exists_path(const WCHAR *p) {
+    return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
 }
 
 int read_file_bytes(const WCHAR *path, char **out, DWORD *size) {
@@ -80,6 +99,10 @@ int write_file_bytes(const WCHAR *path, const char *buf, DWORD size) {
     int ok = WriteFile(h, buf, size, &written, NULL) && written == size;
     CloseHandle(h);
     return ok;
+}
+
+int copy_file_if_absent_safe(const WCHAR *from, const WCHAR *to) {
+    return CopyFileW(from, to, TRUE);
 }
 
 void append_log(const WCHAR *fmt, ...) {
@@ -307,6 +330,45 @@ static int write_probe_godot_pck_with_unknown_binary(const WCHAR *path) {
     return ok;
 }
 
+static int write_probe_godot_pck_v3(const WCHAR *path) {
+    static const char entry_path[] = "ui/menu.tscn";
+    static const unsigned char payload[] =
+        "[node name=\"Label\" type=\"Label\"]\ntext = \"Format 3 menu text.\"\n";
+    const uint32_t path_len = 16u;
+    const uint32_t payload_size = (uint32_t)(sizeof(payload) - 1u);
+    const uint32_t data_off = 112u;
+    const uint32_t directory_off = data_off + payload_size;
+    const uint32_t pck_size = directory_off + 4u + 4u + path_len + 8u + 8u + 16u + 4u;
+    unsigned char *pck = (unsigned char *)calloc(pck_size, 1);
+    if (!pck) return 0;
+
+    put_u32le(pck, GODOT_PCK_MAGIC);
+    put_u32le(pck + 4, 3u);
+    put_u32le(pck + 8, 4u);
+    put_u32le(pck + 12, 6u);
+    put_u32le(pck + 16, 2u);
+    put_u64le(pck + 24, data_off);
+    put_u64le(pck + 32, directory_off);
+    memcpy(pck + data_off, payload, payload_size);
+
+    unsigned char *e = pck + directory_off;
+    put_u32le(e, 1u);
+    e += 4;
+    put_u32le(e, path_len);
+    e += 4;
+    memcpy(e, entry_path, sizeof(entry_path));
+    e += path_len;
+    put_u64le(e, 0u);
+    e += 8;
+    put_u64le(e, payload_size);
+    e += 8 + 16;
+    put_u32le(e, 0u);
+
+    int ok = write_probe_bytes(path, pck, pck_size);
+    free(pck);
+    return ok;
+}
+
 static int textlist_has(TextList *list, const char *text) {
     for (size_t i = 0; i < list->n; i++) {
         if (!strcmp(list->items[i], text)) return 1;
@@ -320,6 +382,7 @@ static void cleanup_godot_fixture(const WCHAR *root) {
     path_join(p, MAX_PATH * 4, root, L"dialog.po"); DeleteFileW(p);
     path_join(p, MAX_PATH * 4, root, L"strings.csv"); DeleteFileW(p);
     path_join(p, MAX_PATH * 4, root, L"script.gd"); DeleteFileW(p);
+    path_join(p, MAX_PATH * 4, root, L"story.md"); DeleteFileW(p);
     path_join(p, MAX_PATH * 4, root, L"pack.pck"); DeleteFileW(p);
     path_join(p, MAX_PATH * 4, root, L"dst_godot_runtime.gd"); DeleteFileW(p);
     path_join(p, MAX_PATH * 4, root, L"dst_godot_patch.pck"); DeleteFileW(p);
@@ -367,6 +430,15 @@ static int expect_godot_directory_scan(void) {
         "var body = TranslationServer.translate(\"Resume your journey.\")\n"
         "const ID = \"MenuRoot\"\n");
 
+    path_join(p, MAX_PATH * 4, root, L"story.md");
+    ok = ok && write_probe_file(p,
+        "# introduction\n\n"
+        "> Melia\n"
+        "If we're lucky, this is the last time we're crossing the border.\n\n"
+        "[window_opens]\n"
+        "[center]A warm welcome awaits you.[/center]\n"
+        "You can fully customize your character at any time.\n");
+
     static const unsigned char pck[] = "bin\0Caf\xc3\xa9 rendezvous.\0res://icons/start.png\0";
     path_join(p, MAX_PATH * 4, root, L"pack.pck");
     ok = ok && write_probe_bytes(p, pck, (DWORD)(sizeof(pck) - 1));
@@ -394,9 +466,15 @@ static int expect_godot_directory_scan(void) {
              textlist_has(&list, "Options") &&
              textlist_has(&list, "Continue") &&
              textlist_has(&list, "Resume your journey.") &&
+             textlist_has(&list, "If we're lucky, this is the last time we're crossing the border.") &&
+             textlist_has(&list, "A warm welcome awaits you.") &&
+             textlist_has(&list, "You can fully customize your character at any time.") &&
              textlist_has(&list, "Caf\xc3\xa9 rendezvous.") &&
              !textlist_has(&list, "Label") &&
              !textlist_has(&list, "MenuRoot") &&
+             textlist_has(&list, "introduction") &&
+             !textlist_has(&list, "Melia") &&
+             !textlist_has(&list, "window_opens") &&
              !textlist_has(&list, "Generated runtime text.") &&
              !textlist_has(&list, "Generated patch payload.") &&
              !textlist_has(&list, "Should not appear.");
@@ -471,6 +549,29 @@ static int expect_godot_valid_pck_does_not_whole_pack_binary_scan(void) {
         warmup_scan_godot_resources(root, &list);
         ok = textlist_has(&list, "Packed scene dialogue.") &&
              !textlist_has(&list, "Hidden generic blob text.");
+    }
+    textlist_free(&list);
+    cleanup_godot_fixture(root);
+    return ok;
+}
+
+static int expect_godot_pck_v3_scan(void) {
+    WCHAR temp_dir[MAX_PATH];
+    WCHAR root[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, temp_dir)) return 0;
+    if (!GetTempFileNameW(temp_dir, L"ds3", 0, root)) return 0;
+    DeleteFileW(root);
+    if (!CreateDirectoryW(root, NULL)) return 0;
+
+    WCHAR p[MAX_PATH * 4];
+    path_join(p, MAX_PATH * 4, root, L"pack.pck");
+    int ok = write_probe_godot_pck_v3(p);
+
+    TextList list = {0};
+    list.max_items = GODOT_WARMUP_MAX_ITEMS;
+    if (ok) {
+        ok = scan_godot_pck_file(p, &list) &&
+             textlist_has(&list, "Format 3 menu text.");
     }
     textlist_free(&list);
     cleanup_godot_fixture(root);
@@ -660,7 +761,8 @@ static int expect_renpy_launcher_hook_excluded(void) {
     return ok;
 }
 
-int main(void) {
+int wmain(int argc, WCHAR **argv) {
+    if (argc != 2) return 32;
     if (!expect_extract("    e \"Hello, world.\"", "Hello, world.")) return 1;
     if (!expect_extract("    e 'Single quoted choice.'", "Single quoted choice.")) return 2;
     if (!expect_extract("    e \"Hello, \\\"friend\\\".\\nNext\"", "Hello, \"friend\".\nNext")) return 3;
@@ -724,6 +826,16 @@ int main(void) {
     }
     textlist_free(&quests);
     if (!expect_rpgm_message_block_scan()) return 13;
+    TextList flatRpgm = {0};
+    flatRpgm.max_items = RPGM_WARMUP_MAX_ITEMS;
+    warmup_scan_rpgm_resources(argv[1], &flatRpgm);
+    if (!textlist_has(&flatRpgm, "Flat layout dialogue from Map001.") ||
+        !textlist_has(&flatRpgm,
+                      "Localized CSV dialogue must be prefetched before first display.")) {
+        textlist_free(&flatRpgm);
+        return 33;
+    }
+    textlist_free(&flatRpgm);
     if (!expect_backup_once()) return 25;
     if (!should_warm_godot_text("Start your journey.")) return 14;
     if (!should_warm_godot_text("Start")) return 18;
@@ -802,10 +914,23 @@ int main(void) {
         return 22;
     }
     textlist_free(&godotBin);
+    TextList godotRich = {0};
+    const unsigned char godotRichBuf[] =
+        "[center]Pornography was [color=eb3b61]banned[/color].[/center]\0";
+    scan_godot_binary_buffer(godotRichBuf, (DWORD)(sizeof(godotRichBuf) - 1), &godotRich);
+    if (!godot_pack_binary_path(".godot/exported/menu.scn") ||
+        !textlist_has(&godotRich, "Pornography was") ||
+        !textlist_has(&godotRich, "banned") ||
+        textlist_has(&godotRich, "[center]Pornography was [color=eb3b61]banned[/color].[/center]")) {
+        textlist_free(&godotRich);
+        return 31;
+    }
+    textlist_free(&godotRich);
     if (!expect_godot_directory_scan()) return 23;
     if (!expect_godot_embedded_pck_scan()) return 24;
     if (!expect_godot_embedded_pck_v1_scan()) return 26;
     if (!expect_godot_valid_pck_does_not_whole_pack_binary_scan()) return 29;
+    if (!expect_godot_pck_v3_scan()) return 30;
     if (!expect_unity_bundle_stream_scan()) return 28;
     puts("warmup probe passed");
     return 0;

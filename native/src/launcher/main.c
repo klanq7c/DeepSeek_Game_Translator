@@ -32,26 +32,30 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_font_mono_small  = make_font(8,  FW_BOLD,     L"Consolas");
 
         g_brush_page      = CreateSolidBrush(C_PAGE);
+        g_brush_card      = CreateSolidBrush(C_CARD);
         g_brush_edit      = CreateSolidBrush(C_LOG);
         g_brush_log       = CreateSolidBrush(C_LOG);
         g_brush_transparent = (HBRUSH)GetStockObject(HOLLOW_BRUSH);
 
-        g_title    = CreateWindowW(L"STATIC", L"无感翻译控制台",        WS_CHILD | WS_VISIBLE, 0,0,0,0, hwnd, (HMENU)IDC_TITLE,    g_inst, NULL);
-        g_subtitle = CreateWindowW(L"STATIC", L"C native - local cache + live batch API - tags / vars / color safe", WS_CHILD | WS_VISIBLE, 0,0,0,0, hwnd, (HMENU)IDC_SUBTITLE, g_inst, NULL);
-        g_status   = CreateWindowW(L"STATIC", L"STATUS  ·  READY",       WS_CHILD | WS_VISIBLE, 0,0,0,0, hwnd, (HMENU)IDC_STATUS,   g_inst, NULL);
+        DWORD static_style = WS_CHILD | WS_VISIBLE | SS_NOPREFIX | SS_ENDELLIPSIS;
+        g_title    = CreateWindowW(L"STATIC", L"无感翻译控制台",        static_style, 0,0,0,0, hwnd, (HMENU)IDC_TITLE,    g_inst, NULL);
+        g_subtitle = CreateWindowW(L"STATIC", L"C native - local cache + live batch API - tags / vars / color safe", static_style, 0,0,0,0, hwnd, (HMENU)IDC_SUBTITLE, g_inst, NULL);
+        g_status   = CreateWindowW(L"STATIC", L"STATUS  ·  READY",       static_style, 0,0,0,0, hwnd, (HMENU)IDC_STATUS,   g_inst, NULL);
 
-        g_path_label = CreateWindowW(L"STATIC", L"游戏目录",             WS_CHILD | WS_VISIBLE, 0,0,0,0, hwnd, (HMENU)IDC_PATH_LABEL, g_inst, NULL);
+        g_path_label = CreateWindowW(L"STATIC", L"游戏目录",             static_style, 0,0,0,0, hwnd, (HMENU)IDC_PATH_LABEL, g_inst, NULL);
         g_path       = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0,0,0,0, hwnd, (HMENU)IDC_PATH, g_inst, NULL);
 
         CreateWindowW(L"BUTTON", L"浏览",       WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,0,0,0, hwnd, (HMENU)IDC_BROWSE, g_inst, NULL);
         CreateWindowW(L"BUTTON", L"打开目录",   WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,0,0,0, hwnd, (HMENU)IDC_OPEN,   g_inst, NULL);
-        CreateWindowW(L"BUTTON", L"⚡  开始汉化", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,0,0,0, hwnd, (HMENU)IDC_START,  g_inst, NULL);
+        CreateWindowW(L"BUTTON", L"开始汉化", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,0,0,0, hwnd, (HMENU)IDC_START,  g_inst, NULL);
+        g_btn_restore = CreateWindowW(L"BUTTON", L"还原游戏",            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,0,0,0, hwnd, (HMENU)IDC_RESTORE,       g_inst, NULL);
         g_btn_server = CreateWindowW(L"BUTTON", L"启动服务器",          WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,0,0,0, hwnd, (HMENU)IDC_SERVER_TOGGLE, g_inst, NULL);
         g_btn_api    = CreateWindowW(L"BUTTON", L"配置 API",            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,0,0,0, hwnd, (HMENU)IDC_API_CONFIG,    g_inst, NULL);
 
-        g_engine = CreateWindowW(L"STATIC", L"未选择", WS_CHILD | WS_VISIBLE, 0,0,0,0, hwnd, (HMENU)IDC_ENGINE, g_inst, NULL);
-        g_server = CreateWindowW(L"STATIC", L"未启动", WS_CHILD | WS_VISIBLE, 0,0,0,0, hwnd, (HMENU)IDC_SERVER, g_inst, NULL);
-        g_cache  = CreateWindowW(L"STATIC", L"检查中", WS_CHILD | WS_VISIBLE, 0,0,0,0, hwnd, (HMENU)IDC_CACHE,  g_inst, NULL);
+        g_engine = CreateWindowW(L"STATIC", L"未选择", static_style, 0,0,0,0, hwnd, (HMENU)IDC_ENGINE, g_inst, NULL);
+        g_server = CreateWindowW(L"STATIC", L"未启动", static_style, 0,0,0,0, hwnd, (HMENU)IDC_SERVER, g_inst, NULL);
+        g_cache  = CreateWindowW(L"STATIC", L"检查中", static_style, 0,0,0,0, hwnd, (HMENU)IDC_CACHE,  g_inst, NULL);
+        g_btn_clear_cache = CreateWindowW(L"BUTTON", L"清除缓存", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0,0,0,0, hwnd, (HMENU)IDC_CLEAR_CACHE, g_inst, NULL);
 
         g_log = CreateWindowExW(0, L"LISTBOX", L"",
                                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
@@ -59,6 +63,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 0,0,0,0, hwnd, (HMENU)IDC_LOG, g_inst, NULL);
 
         apply_fonts();
+        install_button_hover_tracking(hwnd);
+        apply_window_chrome(hwnd);
         sync_embedded_payloads();
         update_cache_card();
         append_log(L"原生启动器已就绪。");
@@ -67,26 +73,34 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowTextW(g_path, last_game);
             refresh_engine();
             append_log(L"已恢复上次游戏目录：%s", last_game);
-            append_log(L"直接点击 ⚡ 开始汉化即可。");
+            append_log(L"直接点击开始汉化即可。");
         } else {
-            append_log(L"选择游戏目录后点击 ⚡ 开始汉化。");
+            append_log(L"选择游戏目录后点击开始汉化。");
         }
         refresh_server_status();
         layout(hwnd);
+        /* 约 60fps 的动画心跳：驱动数据线光束、呼吸灯与按钮悬停渐变 */
+        SetTimer(hwnd, 2, 16, NULL);
         return 0;
     }
     /* ---- WM_PAINT：绘制深色页面背景 ---- */
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
-        paint_background(hwnd, dc);
+        paint_background_buffered(hwnd, dc, &ps.rcPaint);
         EndPaint(hwnd, &ps);
         return 0;
     }
+    /* PrintWindow, remote desktop capture and accessibility tools need a full
+       client render even when the live window currently owns only a thin
+       animation invalid region. Child controls are printed by DefWindowProc's
+       WM_PRINT traversal after this parent background pass. */
+    case WM_PRINTCLIENT:
+        paint_background(hwnd, (HDC)wp);
+        return 0;
     /* ---- WM_SIZE：窗口尺寸变化时重新布局并重绘 ---- */
     case WM_SIZE:
         layout(hwnd);
-        InvalidateRect(hwnd, NULL, TRUE);
         return 0;
     /* ---- WM_GETMINMAXINFO：限制窗口最小尺寸 ---- */
     case WM_GETMINMAXINFO: {
@@ -100,6 +114,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == 1) {
             KillTimer(hwnd, 1);
             refresh_engine();
+        } else if (wp == 2) {
+            tick_ui_animation(hwnd);
         }
         return 0;
     /* ---- WM_DPICHANGED：DPI 变化时重建字体、重新布局 ---- */
@@ -118,7 +134,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_font_mono_small  = make_font(8,  FW_BOLD,     L"Consolas");
         apply_fonts();
         for (int i = 0; i < 6; i++) DeleteObject(old[i]);
-        InvalidateRect(hwnd, NULL, TRUE);
+        RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_NOERASE);
         return 0;
     }
     /* ---- WM_ERASEBKGND：禁止系统擦除背景（由 WM_PAINT 自绘） ---- */
@@ -140,10 +156,17 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else SetTextColor(dc, C_MUTED);
             return (LRESULT)g_brush_page;
         }
+        if (ctl == g_path_label || ctl == g_engine || ctl == g_server || ctl == g_cache) {
+            /* 卡片内文字底色匹配所在高度的面板渐变，文本框无缝衔接 */
+            COLORREF card_bg;
+            HBRUSH card_brush = card_text_brush(ctl == g_path_label, &card_bg);
+            SetBkMode(dc, OPAQUE);
+            SetBkColor(dc, card_bg);
+            SetTextColor(dc, ctl == g_path_label ? C_MUTED : C_TEXT);
+            return (LRESULT)card_brush;
+        }
         SetBkMode(dc, TRANSPARENT);
-        if (ctl == g_path_label) SetTextColor(dc, C_MUTED);
-        else if (ctl == g_engine || ctl == g_server || ctl == g_cache) SetTextColor(dc, C_TEXT);
-        else SetTextColor(dc, C_TEXT);
+        SetTextColor(dc, C_TEXT);
         return (LRESULT)g_brush_transparent;
     }
     /* ---- WM_CTLCOLOREDIT：路径编辑框颜色主题 ---- */
@@ -168,9 +191,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (LOWORD(wp) == IDC_BROWSE) browse_folder();
         else if (LOWORD(wp) == IDC_START) start_translation();
+        else if (LOWORD(wp) == IDC_RESTORE) restore_selected_game();
+        else if (LOWORD(wp) == IDC_CLEAR_CACHE) clear_translation_cache();
         else if (LOWORD(wp) == IDC_SERVER_TOGGLE) {
             toggle_server();
-            InvalidateRect(hwnd, NULL, TRUE);
+            InvalidateRect(hwnd, NULL, FALSE);
         }
         else if (LOWORD(wp) == IDC_API_CONFIG) show_api_config();
         else if (LOWORD(wp) == IDC_OPEN) {
@@ -189,6 +214,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         /* Keep the local translation server alive after the launcher window
            closes. Games continue to request live translations after launch;
            the explicit server toggle remains the user-controlled stop path. */
+        KillTimer(hwnd, 2);
         DeleteObject(g_font_title);
         DeleteObject(g_font_heading);
         DeleteObject(g_font_body);
@@ -196,8 +222,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DeleteObject(g_font_mono);
         DeleteObject(g_font_mono_small);
         DeleteObject(g_brush_page);
+        DeleteObject(g_brush_card);
         DeleteObject(g_brush_edit);
         DeleteObject(g_brush_log);
+        free_card_text_brushes();
         PostQuitMessage(0);
         return 0;
     }
@@ -286,13 +314,16 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE prev, PWSTR cmd, int show) {
 
     int initW = MulDiv(1200, primary_dpi, 96);
     int initH = MulDiv(780,  primary_dpi, 96);
-    g_main = CreateWindowW(wc.lpszClassName, L"ds游戏翻译器", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    g_main = CreateWindowW(wc.lpszClassName, L"ds游戏翻译器", WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
                            CW_USEDEFAULT, CW_USEDEFAULT, initW, initH, NULL, NULL, h, NULL);
     ShowWindow(g_main, show);
     UpdateWindow(g_main);
 
-    MSG m;
-    while (GetMessageW(&m, NULL, 0, 0)) {
+    MSG m = {0};
+    for (;;) {
+        /* GetMessageW 返回 -1 表示出错（如传入无效句柄），0 为 WM_QUIT，两者都退出循环 */
+        BOOL got = GetMessageW(&m, NULL, 0, 0);
+        if (got <= 0) break;
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }

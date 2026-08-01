@@ -263,10 +263,9 @@ static List json_array_value(const char *p) {
             return l;
         }
         p = json_skipws(p + 1);
-        if (*p == ']') {
-            list_free(&l);
-            return l;
-        }
+        /* 容忍尾逗号：["a","b",] 返回已收集到的部分，与 parse_json_string_array
+           的宽容策略一致，不再丢弃整个数组。 */
+        if (*p == ']') return l;
     }
 }
 

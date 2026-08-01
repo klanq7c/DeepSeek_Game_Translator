@@ -4,6 +4,13 @@
 
 后续更新请继续把最新更新日志放在本节最上方。
 
+### 20260801
+
+1、对于部分unity游戏过度裁剪导致的文本翻译问题进行了优化。
+2、对于部分unity版本的字体编码问题进行了修复，并且对翻译文本阵列优化了一下。
+3、对于godot的通用翻译模块进行了优化，之前的翻译模块存在问题。
+4、对于rpgm游戏进行了更新支持，修复了出现的翻译偏移问题。
+
 ### 20260715（0.3.2.7）
 
 1. 添加了对 Godot 引擎的翻译支持（现在还在优化阶段）。
@@ -54,6 +61,8 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 ```
 
 5. 回到启动器，选择游戏目录，然后点击开始翻译。
+6. 需要撤销部署时，先完全退出游戏，选择同一目录并点击“还原游戏”。启动器只移除能够确认由本程序部署的翻译文件，不会删除翻译缓存、用户模组或已有的 BepInEx；无法确认归属的 Unity 文件会保留并写入日志。
+7. CACHE 状态卡显示共享缓存大小。点击旁边的“清除缓存”可删除 `translation_memory_c.tsv`；程序会先停止本地服务并在完成后恢复原运行状态。正在运行的游戏需要重启才能清除其进程内存缓存。
 
 Ren'Py、RPG Maker 和 Godot 路径不需要下载 BepInEx/XUnity。Unity 路径如果缺少 payload，启动器日志会提示对应的安装命令。Godot 当前走资源文本扫描和本地缓存预热模式，会识别 PO/CSV 翻译表、GDScript `tr()`/`TranslationServer.translate()` 文本、常见场景资源文本以及 `.pck/.translation` 里的 UTF-8 文本；不会改写游戏包。
 
@@ -99,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -U
 ```ini
 [api]
 endpoint=https://api.deepseek.com/v1/chat/completions
-model=deepseek-chat
+model=deepseek-v4-flash
 key=YOUR_API_KEY_HERE
 timeout_ms=15000
 concurrency=4

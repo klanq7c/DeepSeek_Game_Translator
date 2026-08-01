@@ -37,7 +37,9 @@ try {
         "UnityInteropRefs",
         "BepInExRuntime",
         "UnityMonoRuntime",
+        "UnityMonoRuntimeX86",
         "UnityMonoRuntime6",
+        "UnityMonoRuntime6X86",
         "XUnityAutoTranslator",
         "TMPFontAssetBundles",
         "TranslationCache"

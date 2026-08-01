@@ -32,6 +32,7 @@
 #define IDR_PAYLOAD_UNITY_MONO6         202
 #define IDR_PAYLOAD_XUNITY_ENDPOINT     203
 #define IDR_PAYLOAD_TMP_FALLBACK        204
+#define IDR_PAYLOAD_UNITY_FONT_PATCHER  205
 
 typedef struct {
     int id;                       /* 启动器资源表中的 RCDATA ID */
@@ -51,6 +52,7 @@ static const EmbeddedPayload EMBEDDED_PAYLOADS[] = {
     { IDR_PAYLOAD_UNITY_MONO6,      L"payloads\\UnityTranslator\\UnityTranslator.BepInEx6.dll", L"UnityTranslator.BepInEx6.dll", 0 },
     { IDR_PAYLOAD_XUNITY_ENDPOINT,  L"payloads\\UnityIL2CPP\\DeepSeekXUnityTranslator\\DeepSeekTranslate.dll", L"DeepSeekTranslate.dll", 0 },
     { IDR_PAYLOAD_TMP_FALLBACK,     L"payloads\\UnityIL2CPP\\DeepSeekTMPFontFallback\\BepInEx\\plugins\\DeepSeekTMPFontFallback\\DeepSeekTMPFontFallback.dll", L"DeepSeekTMPFontFallback.dll", 0 },
+    { IDR_PAYLOAD_UNITY_FONT_PATCHER, L"payloads\\UnityTranslator\\DeepSeekUnityFontPatcher.dll", L"DeepSeekUnityFontPatcher.dll", 0 },
 };
 
 /* 取得编译进启动器的只读资源视图。data 不转移所有权，调用方不得释放；
@@ -120,36 +122,16 @@ static int write_bytes_atomic(const WCHAR *path, const unsigned char *data, DWOR
     if (!ensure_parent_dir(path)) return 0;
 
     WCHAR tmp[MAX_PATH * 4];
-    _snwprintf(tmp, MAX_PATH * 4, L"%s.dstmp", path);
-    tmp[MAX_PATH * 4 - 1] = 0;
+    if (!path_append_suffix(tmp, MAX_PATH * 4, path, L".dstmp")) return 0;
 
-    HANDLE h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-
-    DWORD written_total = 0;
-    int ok = 1;
-    while (written_total < size) {
-        DWORD want = size - written_total;
-        if (want > 1024 * 1024) want = 1024 * 1024;
-        DWORD written = 0;
-        if (!WriteFile(h, data + written_total, want, &written, NULL) || written != want) {
-            ok = 0;
-            break;
-        }
-        written_total += written;
-    }
-    CloseHandle(h);
-
-    if (!ok) {
-        DeleteFileW(tmp);
-        return 0;
-    }
+    if (!write_file_bytes(tmp, (const char *)data, size)) return 0;
 
     /* 临时文件和目标位于同一目录，正常情况下是原子替换；COPY_ALLOWED
        只为异常卷布局兜底，WRITE_THROUGH 尽量保证返回前内容已落盘。 */
-    if (!MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(tmp);
+    if (!move_file_safe(tmp, path,
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED |
+                        MOVEFILE_WRITE_THROUGH)) {
+        delete_file_safe(tmp);
         return 0;
     }
     return 1;
