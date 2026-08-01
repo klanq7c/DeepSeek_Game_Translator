@@ -85,14 +85,18 @@ function Assert-NoReparseTraversal([string]$Path) {
     }
 }
 
-function Assert-UnderRoot([string]$Path) {
-    $rootFull = (Get-FullPath $Root).TrimEnd('\') + '\'
+function Assert-UnderDirectory([string]$Path, [string]$AllowedRoot, [string]$BoundaryName) {
+    $rootFull = (Get-FullPath $AllowedRoot).TrimEnd('\') + '\'
     $pathFull = Get-FullPath $Path
     if (-not $pathFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to write outside the program directory: $Path"
+        throw "Refusing to write outside the $BoundaryName`: $Path"
     }
-    Assert-NoReparseTraversal $Root
+    Assert-NoReparseTraversal $AllowedRoot
     Assert-NoReparseTraversal $pathFull
+}
+
+function Assert-UnderRoot([string]$Path) {
+    Assert-UnderDirectory $Path $Root "program directory"
 }
 
 function Get-FileSha256([string]$Path) {
@@ -167,20 +171,32 @@ function Expand-WithExternalArchiveTool([string]$ArchivePath, [string]$Destinati
     throw "Could not extract $ArchivePath. Install Windows tar/libarchive or 7-Zip, then rerun this script."
 }
 
-function Expand-MsiAdministrativeImage([string]$MsiPath, [string]$Destination) {
-    Assert-UnderRoot $Destination
+function Expand-MsiAdministrativeImage(
+    [string]$MsiPath,
+    [string]$Destination,
+    [string]$TemporaryRoot,
+    [string]$DiagnosticLog
+) {
+    Assert-UnderDirectory $Destination $TemporaryRoot "owned MSI temporary directory"
+    Assert-UnderRoot $DiagnosticLog
+    if (Test-Path -LiteralPath $DiagnosticLog) {
+        Remove-Item -LiteralPath $DiagnosticLog -Force
+    }
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
     $arguments = @(
         "/a",
         ('"' + $MsiPath + '"'),
         "/qn",
         "/norestart",
-        ('TARGETDIR="' + $Destination + '"')
+        ('TARGETDIR="' + $Destination + '"'),
+        "/L*V",
+        ('"' + $DiagnosticLog + '"')
     )
     $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
     if ($process.ExitCode -ne 0) {
-        throw "Could not extract $MsiPath with msiexec /a (exit code $($process.ExitCode))."
+        throw "Could not extract $MsiPath with msiexec /a (exit code $($process.ExitCode)). See $DiagnosticLog."
     }
+    Remove-Item -LiteralPath $DiagnosticLog -Force -ErrorAction SilentlyContinue
 }
 
 $MonoCorlibAssemblyNames = @(
@@ -222,11 +238,17 @@ function Install-MonoCorlib {
         "mono-6.12.0.206-x64-0.msi" `
         $sourceUrl `
         $sourceSha256
-    $temporary = Join-Path $DownloadCache ("mono_corlib_" + [Guid]::NewGuid().ToString("N"))
-    Assert-UnderRoot $temporary
+    # Windows Installer still applies a legacy path limit while expanding this
+    # MSI's deeply nested portable-framework files. Keep only this owned
+    # administrative image under a short system-temp child, then copy the
+    # fixed corlib allowlist back into the program directory.
+    $temporaryRoot = Get-FullPath ([System.IO.Path]::GetTempPath())
+    $temporary = Join-Path $temporaryRoot ("dst-mono-" + [Guid]::NewGuid().ToString("N").Substring(0, 12))
+    $diagnosticLog = Join-Path $DownloadCache "mono-admin-extract.log"
+    Assert-UnderDirectory $temporary $temporaryRoot "owned MSI temporary directory"
 
     try {
-        Expand-MsiAdministrativeImage $msi $temporary
+        Expand-MsiAdministrativeImage $msi $temporary $temporaryRoot $diagnosticLog
         $source = Join-Path $temporary "Mono\lib\mono\4.5"
         foreach ($name in $MonoCorlibAssemblyNames) {
             if (-not (Test-Path -LiteralPath (Join-Path $source $name))) {
@@ -253,6 +275,7 @@ license=https://www.mono-project.com/docs/faq/licensing/
 "@ | Set-Content -LiteralPath (Join-Path $destination ".dst-installed-by-ds") -Encoding ASCII
         Write-Host "Installed: official Mono 6.12.0.206 corlib payload for highly stripped Unity Mono games"
     } finally {
+        Assert-UnderDirectory $temporary $temporaryRoot "owned MSI temporary directory"
         Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -276,8 +299,8 @@ function Install-BepInEx5Mono {
 
 function Install-BepInEx6Mono {
     $zipX64 = Get-DownloadFile `
-        "BepInEx-Unity.Mono-win-x64-6.0.0-be.755+3fab71a.zip" `
-        "https://builds.bepinex.dev/projects/bepinex_be/755/BepInEx-Unity.Mono-win-x64-6.0.0-be.755+3fab71a.zip"
+        "BepInEx-Unity.Mono-win-x64-6.0.0-be.759+9aedb90.zip" `
+        "https://builds.bepinex.dev/projects/bepinex_be/759/BepInEx-Unity.Mono-win-x64-6.0.0-be.759+9aedb90.zip"
     $zipX86 = Get-DownloadFile `
         "BepInEx-Unity.Mono-win-x86-6.0.0-be.755+3fab71a.zip" `
         "https://builds.bepinex.dev/projects/bepinex_be/755/BepInEx-Unity.Mono-win-x86-6.0.0-be.755+3fab71a.zip" `
