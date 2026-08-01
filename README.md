@@ -4,6 +4,15 @@
 
 后续更新请继续把最新更新日志放在本节最上方。
 
+### 20260801（0.3.3.8）
+
+1、对于部分unity游戏过度裁剪导致的文本翻译问题进行了优化。
+2、对于部分unity版本的字体编码问题进行了修复，并且对翻译文本阵列优化了一下。
+3、对于godot的通用翻译模块进行了优化，之前的翻译模块存在问题。
+4、对于rpgm游戏进行了更新支持，修复了出现的翻译偏移问题。
+
+版本：`0.3.3.8`
+
 ### 20260715（0.3.2.7）
 
 1. 添加了对 Godot 引擎的翻译支持（现在还在优化阶段）。
@@ -28,19 +37,19 @@ ds游戏翻译器是一个本地游戏翻译工具，目标是支持：
 
 最新下载地址：
 
-https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.3.2.7
+https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.3.3.8
 
 推荐下载：
 
-- `ds游戏翻译器_0.3.2.7.exe`：单文件启动器。首次运行会自动释放/更新本项目自有服务端、脚本、示例配置和自有 Unity 插件。
-- `ds游戏翻译器_0.3.2.7.zip`：带说明文档和许可文件的 Windows 程序包，核心仍是 `ds游戏翻译器.exe`。
-- `DeepSeek_Game_Translator_source_0.3.2.7.zip`：源码包，只包含自有源码、测试和文档。
+- `ds游戏翻译器_0.3.3.8.exe`：单文件启动器。首次运行会自动释放/更新本项目自有服务端、脚本、示例配置和自有 Unity 插件。
+- `ds游戏翻译器_0.3.3.8.zip`：带说明文档和许可文件的 Windows 程序包，核心仍是 `ds游戏翻译器.exe`。
+- `DeepSeek_Game_Translator_source_0.3.3.8.zip`：源码包，只包含自有源码、测试和文档。
 
 为了降低侵权和授权风险，下载包不直接内置 BepInEx、XUnity、Unity 官方 DLL、游戏文件、TMP 字体包、翻译记忆或 API key。Unity 第三方运行时和 XUnity TMP 字体 AssetBundle 由用户通过命令行脚本从上游项目下载。
 
 ## 使用方式
 
-1. 下载 `ds游戏翻译器_0.3.2.7.exe`，或解压 `ds游戏翻译器_0.3.2.7.zip` 后运行里面的 `ds游戏翻译器.exe`。
+1. 下载 `ds游戏翻译器_0.3.3.8.exe`，或解压 `ds游戏翻译器_0.3.3.8.zip` 后运行里面的 `ds游戏翻译器.exe`。
 2. 首次运行时，启动器会自动生成/更新这些自有组件：
    - `native\dst_server.exe`
    - `scripts\install_runtime_payloads.ps1`
@@ -54,6 +63,8 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 ```
 
 5. 回到启动器，选择游戏目录，然后点击开始翻译。
+6. 需要撤销部署时，先完全退出游戏，选择同一目录并点击“还原游戏”。启动器只移除能够确认由本程序部署的翻译文件，不会删除翻译缓存、用户模组或已有的 BepInEx；无法确认归属的 Unity 文件会保留并写入日志。
+7. CACHE 状态卡显示共享缓存大小。点击旁边的“清除缓存”可删除 `translation_memory_c.tsv`；程序会先停止本地服务并在完成后恢复原运行状态。正在运行的游戏需要重启才能清除其进程内存缓存。
 
 Ren'Py、RPG Maker 和 Godot 路径不需要下载 BepInEx/XUnity。Unity 路径如果缺少 payload，启动器日志会提示对应的安装命令。Godot 当前走资源文本扫描和本地缓存预热模式，会识别 PO/CSV 翻译表、GDScript `tr()`/`TranslationServer.translate()` 文本、常见场景资源文本以及 `.pck/.translation` 里的 UTF-8 文本；不会改写游戏包。
 
@@ -99,7 +110,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -U
 ```ini
 [api]
 endpoint=https://api.deepseek.com/v1/chat/completions
-model=deepseek-chat
+model=deepseek-v4-flash
 key=YOUR_API_KEY_HERE
 timeout_ms=15000
 concurrency=4
@@ -109,7 +120,7 @@ concurrency=4
 
 ## 当前状态
 
-这是 `0.3.2.7` 预览版。主要源码路径：
+这是 `0.3.3.8` 预览版。主要源码路径：
 
 - `native/src/`：本地 C 服务端和 Windows 启动器。
 - `payloads/UnityTranslator/src/`：Unity Mono/BepInEx 插件源码。
@@ -151,7 +162,7 @@ powershell -ExecutionPolicy Bypass -File tests\run_all.ps1 -SkipEndurance
 发布源码包前运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version 0.3.2.7
+powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version 0.3.3.8
 ```
 
 该脚本会生成 source-only 包，并自动检查是否误带：

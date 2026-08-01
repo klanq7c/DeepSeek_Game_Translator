@@ -26,7 +26,21 @@ typedef struct {
     char *v;
     uint64_t h;
     int used;
+    int persisted; /* current value is known to be present in the TSV */
 } CacheEntry;
+
+typedef enum {
+    CACHE_PERSIST_ALL = 0,
+    CACHE_PERSIST_PARTIAL,
+    CACHE_PERSIST_FAILED
+} CachePersistStatus;
+
+typedef struct {
+    CachePersistStatus status;
+    size_t accepted;  /* valid non-identity entries applied to memory */
+    size_t persisted; /* accepted entries known durable after this call */
+    size_t rejected;  /* empty/invalid or normalized source-echo entries */
+} CachePersistResult;
 
 typedef struct {
     CacheEntry *e;     /* 桶数组，长度为 cap（恒为 2 的幂） */
@@ -45,7 +59,12 @@ typedef struct {
 void cache_init(Cache *c, const char *path);                 /* 初始化空表，绑定持久化文件路径 */
 void cache_set(Cache *c, const char *k, const char *v);      /* 仅写内存 */
 void cache_set_persist(Cache *c, const char *k, const char *v); /* 写内存 + 追加落盘 */
+CachePersistResult cache_set_persist_result(Cache *c, const char *k, const char *v);
 char *cache_get(Cache *c, const char *k);                    /* 命中返回新分配拷贝，未命中返回 NULL */
+void cache_set_many_persist(Cache *c, const char **keys, const char **values,
+                            size_t count); /* one map lock + one disk flush */
+CachePersistResult cache_set_many_persist_result(Cache *c, const char **keys,
+                                                  const char **values, size_t count);
 /* Look up k and emit JSON-escaped value into out (with surrounding quotes).
    Returns 1 on hit, 0 on miss. Saves the malloc+copy+free vs cache_get. */
 int cache_emit_json(Cache *c, const char *k, Buf *out);

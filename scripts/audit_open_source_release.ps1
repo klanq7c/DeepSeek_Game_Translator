@@ -27,6 +27,8 @@ try {
         ".ini"
     )
 
+    $binaryAssetExtensions = @(".ico", ".png")
+
     $forbiddenDirNames = @(
         "artifacts",
         "logs",
@@ -35,7 +37,9 @@ try {
         "UnityInteropRefs",
         "BepInExRuntime",
         "UnityMonoRuntime",
+        "UnityMonoRuntimeX86",
         "UnityMonoRuntime6",
+        "UnityMonoRuntime6X86",
         "XUnityAutoTranslator",
         "TMPFontAssetBundles",
         "TranslationCache"
@@ -85,6 +89,9 @@ try {
                 [void]$errors.Add("Forbidden file name: $($file.FullName)")
                 break
             }
+        }
+        if ($binaryAssetExtensions -contains $ext) {
+            continue
         }
         try {
             $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop

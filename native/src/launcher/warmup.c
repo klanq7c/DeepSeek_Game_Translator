@@ -5,7 +5,7 @@
  *
  *   1. 文本采集：扫描各引擎的数据文件，提取需要翻译的字符串
  *      - Ren'Py：解析 .rpy 脚本中的字符串字面量
- *      - RPG Maker MV/MZ：解析 www/data/ 下 JSON 文件中的对话/名称字段
+ *      - RPG Maker MV/MZ：解析标准 www/data/ 或扁平 data/ 中的 JSON 文本
  *      - Unity：扫描 *_Data/ 下 assets/AssetBundle 二进制文件中的 ASCII 字符串，
  *        以及 XUnity 的 Translation/zh-CN/Text/ 下翻译文件
  *      - Godot：委托 godot_warmup.c 扫描 .pck 和常见工程资源
@@ -50,6 +50,8 @@
 #define UNITY_BUNDLE_SCAN_CHUNK_BYTES (1024u * 1024u)
 #define RENPY_SCRIPT_SCAN_MAX_BYTES (8u * 1024u * 1024u)   /* 单个 .rpy 扫描上限 8MB */
 #define RENPY_SCAN_MAX_DEPTH 12            /* .rpy 目录递归最大深度 */
+#define RPGM_JSON_SCAN_MAX_BYTES (64u * 1024u * 1024u)  /* RPGM 数据 JSON 读前大小上限（含大型地图） */
+#define RPGM_TEXT_SCAN_MAX_BYTES (8u * 1024u * 1024u)   /* RPGM 插件外部 TXT/CSV 读前大小上限 */
 
 /* 键值对列表：用于 XUnity 翻译文件导入（key=原文, value=译文） */
 typedef struct {
@@ -142,7 +144,7 @@ int should_warm_text(const char *s) {
     return signal && !has_cjk_utf8(s);
 }
 
-/* RPG Maker 文本允许 \C[20]、\n[1]、\I[3]、\FS[24] 等显示控制码。
+/* RPG Maker 文本允许 \C[20]、\n[1]、\I[3]、\FS[24]、\\ 等显示控制码。
    通用过滤会把所有反斜杠视为文件路径，因此这里先验证并移除合法控制码，
    再用可见文本做通用判断；未知或类似 C:\Users 的路径仍会被拒绝。 */
 static int should_warm_rpgm_text(const char *s) {
@@ -163,7 +165,7 @@ static int should_warm_rpgm_text(const char *s) {
             free(visible);
             return 0;
         }
-        if (strchr("{}$.|!><^", s[code])) {
+        if (strchr("{}$.|!><^\\", s[code])) {
             visible[out++] = ' ';
             i = code + 1;
             continue;
@@ -525,7 +527,8 @@ static void collect_renpy_string(char *s, TextList *prefetch) {
 /* ----------------------------------------------------------------
  * collect_array_strings — 采集 JSON 数组中的所有字符串元素
  *
- * 遍历 [...] 结构，对每个字符串字面量调用 collect_string。
+ * 遍历 [...] 结构，对每个字符串字面量调用 collect_string；
+ * 后随冒号的对象键名（如 commands 数组里的 code/parameters）跳过。
  * 用于 RPG Maker 的 message1..4、parameters 等数组字段。
  * ---------------------------------------------------------------- */
 static void collect_array_strings(const char **pp, TextList *prefetch) {
@@ -542,7 +545,9 @@ static void collect_array_strings(const char **pp, TextList *prefetch) {
         } else if (*p == '"') {
             char *s = json_string_at(&p);
             if (s) {
-                collect_string(s, prefetch);
+                /* commands 数组里命令对象的键名（code/indent/parameters 等）
+                   后随冒号，是结构元数据而非待译文本，跳过。 */
+                if (*json_ws(p) != ':') collect_string(s, prefetch);
                 free(s);
             }
         } else {
@@ -597,6 +602,7 @@ static void collect_rpgm_command_parameters(int code, const char **pp, TextList 
     if (*p != '[') return;
     int depth = 0;
     int string_index = 0;
+    int elem_index = 0;  /* 顶层数组元素下标（含数字等非字符串元素） */
     do {
         if (*p == '[') {
             depth++;
@@ -604,13 +610,20 @@ static void collect_rpgm_command_parameters(int code, const char **pp, TextList 
         } else if (*p == ']') {
             depth--;
             p++;
+        } else if (*p == ',' && depth == 1) {
+            elem_index++;
+            p++;
         } else if (*p == '"') {
             char *s = json_string_at(&p);
             if (s) {
                 if (code == 401 && depth == 1 && string_index == 0) {
                     rpgm_message_block_append(block, s, prefetch);
                 }
-                collect_string(s, prefetch);
+                /* code 101（Show Text）参数为 [脸图,索引,背景,位置(,说话人名)]，
+                   只有 MZ 的 index 4 说话人名是可译文本；脸图文件名等不采集。 */
+                if (code != 101 || (depth == 1 && elem_index == 4)) {
+                    collect_string(s, prefetch);
+                }
                 string_index++;
                 free(s);
             }
@@ -650,6 +663,20 @@ char *renpy_string_at(const char **pp) {
                 unsigned cp = 0;
                 if (json_u4(p, &cp)) {
                     p += 4;
+                    /* 与 json_string_at 一致合并 UTF-16 代理对，孤立代理记为
+                       U+FFFD，避免 .rpy 中的 emoji 以 CESU-8 形式进入缓存键。 */
+                    if (cp >= 0xd800 && cp <= 0xdbff) {
+                        unsigned lo = 0;
+                        if (p[0] == '\\' && p[1] == 'u' && json_u4(p + 2, &lo) &&
+                            lo >= 0xdc00 && lo <= 0xdfff) {
+                            cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                            p += 6;
+                        } else {
+                            cp = 0xfffd;
+                        }
+                    } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                        cp = 0xfffd;
+                    }
                     bb_utf8(&b, cp);
                 } else {
                     bb_ch(&b, 'u');
@@ -901,6 +928,7 @@ static void pairlist_free(PairList *l) {
 typedef struct {
     HINTERNET ses;
     HINTERNET con;
+    int reject_logged; /* 本次会话是否已记录过服务端拒绝（限流诊断） */
 } LocalHttp;
 
 /* 建立到固定本地服务端的会话和连接；失败时回收已经创建的部分句柄。 */
@@ -920,8 +948,9 @@ static int local_http_open(LocalHttp *h) {
 }
 
 /* 在复用连接上发送一批 JSON。请求句柄仅在本函数内存活；
-   返回值表示请求和响应头是否成功，不代表后台翻译已经完成。 */
-static int local_http_post(LocalHttp *h, const WCHAR *path, const char *body, DWORD timeout) {
+   仅当服务端返回 2xx 时视为接受批次（不代表后台翻译已完成）；
+   4xx/5xx 会计入日志并返回失败，调用方不得把该批计为已排队。 */
+static int local_http_post(LocalHttp *h, const WCHAR *path, const char *body, int timeout) {
     if (!h->con) return 0;
     HINTERNET req = WinHttpOpenRequest(h->con, L"POST", path, NULL, WINHTTP_NO_REFERER,
                                        WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
@@ -929,14 +958,32 @@ static int local_http_post(LocalHttp *h, const WCHAR *path, const char *body, DW
     WinHttpSetTimeouts(req, timeout, timeout, timeout, timeout);
     WCHAR headers[] = L"Content-Type: application/json\r\n";
     DWORD len = (DWORD)strlen(body);
+    DWORD status = 0;
+    DWORD status_len = sizeof status;
     int ok = WinHttpSendRequest(req, headers, (DWORD)-1, (LPVOID)body, len, len, 0) &&
-             WinHttpReceiveResponse(req, NULL);
+             WinHttpReceiveResponse(req, NULL) &&
+             WinHttpQueryHeaders(req,
+                                 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX,
+                                 &status,
+                                 &status_len,
+                                 WINHTTP_NO_HEADER_INDEX);
+    if (ok && (status < 200 || status >= 300)) {
+        /* 4xx/5xx 表示批次实际未入队，不得计为已排队；同一会话只记录一次，
+           避免服务器持续拒绝时刷爆日志。 */
+        if (!h->reject_logged) {
+            h->reject_logged = 1;
+            append_log(L"预热批次被本地服务端拒绝（HTTP %lu），该批次未入队。",
+                       (unsigned long)status);
+        }
+        ok = 0;
+    }
     WinHttpCloseHandle(req);
     return ok;
 }
 
 /* 发送轻量 GET 并读取 HTTP 状态码，供就绪探测使用；不读取响应体。 */
-static int local_http_get_status(LocalHttp *h, const WCHAR *path, DWORD timeout, DWORD *status_out) {
+static int local_http_get_status(LocalHttp *h, const WCHAR *path, int timeout, DWORD *status_out) {
     if (status_out) *status_out = 0;
     if (!h->con) return 0;
     HINTERNET req = WinHttpOpenRequest(h->con, L"GET", path, NULL, WINHTTP_NO_REFERER,
@@ -982,21 +1029,31 @@ static void local_http_close(LocalHttp *h) {
     h->ses = NULL;
 }
 
-/* 读取完整 WinHTTP 响应体。成功返回新分配的 NUL 结尾缓冲，
-   所有权交给调用方；网络中断时返回已经读取到的内容或空缓冲。 */
+/* 读取完整 WinHTTP 响应体。读到正常 EOF 时返回新分配的 NUL 结尾缓冲，
+   所有权交给调用方；读取中途失败（连接中断、查询错误）返回 NULL，
+   调用方不得把截断内容当作完整响应使用。 */
 static char *winhttp_read_all(HINTERNET req) {
     ByteBuf b = {0};
     if (!bb_init(&b, 1024)) return NULL;
 
     for (;;) {
         DWORD avail = 0;
-        if (!WinHttpQueryDataAvailable(req, &avail) || !avail) break;
+        if (!WinHttpQueryDataAvailable(req, &avail)) {
+            free(b.data);
+            return NULL;  /* 无法确认剩余数据，按不完整处理 */
+        }
+        if (!avail) break;  /* 正常 EOF */
         char *tmp = (char *)malloc(avail);
-        if (!tmp) break;
+        if (!tmp) {
+            free(b.data);
+            return NULL;
+        }
         DWORD rd = 0;
         if (!WinHttpReadData(req, tmp, avail, &rd) || !rd) {
+            /* 已报告可读却读失败/读空：连接中断，截断内容不可用 */
             free(tmp);
-            break;
+            free(b.data);
+            return NULL;
         }
         bb_add(&b, tmp, rd);
         free(tmp);
@@ -1042,6 +1099,8 @@ static WCHAR *utf8_to_wide_dup(const char *s) {
 }
 
 /* 通过 cache_only GET 查询一条现有译文，不等待远程 API。
+   仅接受 HTTP 200 且完整读取的响应体；非 200（如代理错误页）与截断
+   响应一律视为未命中，避免把错误内容写回翻译文件或共享缓存。
    成功时 *out 接管响应体，即使内容等于原文也由上层按缓存语义判断。 */
 static int localhost_get_cached_translate(const char *text, char **out) {
     *out = NULL;
@@ -1082,11 +1141,20 @@ static int localhost_get_cached_translate(const char *text, char **out) {
         WinHttpCloseHandle(ses);
         return 0;
     }
-    DWORD timeout = 350;
+    int timeout = 350;
     WinHttpSetTimeouts(req, timeout, timeout, timeout, timeout);
+    DWORD status = 0;
+    DWORD status_len = sizeof status;
     int ok = WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-             WinHttpReceiveResponse(req, NULL);
+             WinHttpReceiveResponse(req, NULL) &&
+             WinHttpQueryHeaders(req,
+                                 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX,
+                                 &status,
+                                 &status_len,
+                                 WINHTTP_NO_HEADER_INDEX) &&
+             status == 200;
     char *body = ok ? winhttp_read_all(req) : NULL;
     WinHttpCloseHandle(req);
     WinHttpCloseHandle(con);
@@ -1151,11 +1219,19 @@ static void xunity_escape_to(ByteBuf *b, const char *s) {
 }
 
 /* 首次修改翻译文件前保留一份固定后缀备份；已有备份不会被覆盖。 */
-static void backup_once(const WCHAR *path) {
+static int backup_once(const WCHAR *path) {
     WCHAR bak[MAX_PATH * 4];
-    _snwprintf(bak, MAX_PATH * 4, L"%s.deepseek.bak", path);
-    bak[MAX_PATH * 4 - 1] = 0;
-    CopyFileW(path, bak, TRUE);
+    if (!path_append_suffix(bak, MAX_PATH * 4, path, L".deepseek.bak")) {
+        append_log(L"Unity warmup: backup path is too long; translation file was not modified.");
+        return 0;
+    }
+    if (copy_file_if_absent_safe(path, bak) ||
+        GetLastError() == ERROR_FILE_EXISTS) {
+        return 1;
+    }
+    append_log(L"Unity warmup: could not create translation-file backup (Windows error %lu).",
+               GetLastError());
+    return 0;
 }
 
 /* 把待翻译文本序列化后提交到 /prefetch。成功只表示服务端接受批次，
@@ -1200,7 +1276,8 @@ static int post_import_batch(LocalHttp *http, PairList *l, size_t start, size_t 
 }
 
 /* 解析并按需修补一个 XUnity 翻译文件：
-   已有译文进入 imports，空译文进入 prefetch；写回前先创建一次备份。 */
+   已有译文进入 imports，空译文/恒等条目进入 prefetch 且原行保留写回；
+   写回前先创建一次备份。 */
 static void parse_translation_file(const WCHAR *path, PairList *imports, TextList *prefetch) {
     char *buf = NULL;
     DWORD size = 0;
@@ -1257,9 +1334,10 @@ static void parse_translation_file(const WCHAR *path, PairList *imports, TextLis
                             keep_original = 0;
                             changed = 1;
                         } else {
+                            /* 缓存未命中：只排队待译。空值条目（key=）与恒等
+                               标记（key=key，用户/工具常用的“保持原文”标记）
+                               的原行必须原样写回，不能从翻译文件中删除。 */
                             textlist_add(prefetch, key);
-                            keep_original = 0;
-                            changed = 1;
                         }
                         free(cached);
                     }
@@ -1278,8 +1356,11 @@ static void parse_translation_file(const WCHAR *path, PairList *imports, TextLis
     }
 
     if (changed) {
-        backup_once(path);
-        write_file_bytes(path, out.data, (DWORD)out.len);
+        if (backup_once(path) &&
+            !write_file_bytes(path, out.data, (DWORD)out.len)) {
+            append_log(L"Unity warmup: could not update translation file (Windows error %lu).",
+                       GetLastError());
+        }
     }
     free(out.data);
     free(buf);
@@ -1712,6 +1793,17 @@ static void scan_unity_assets(const WCHAR *dir, TextList *prefetch) {
 
 /* ======================== RPG Maker MV/MZ 数据解析 ======================== */
 
+/* MapXXX.json（Map 后随纯数字编号）中的 "name" 是事件/地图的编辑器内部
+   标签，不是玩家可见文本；数据库类 JSON（Actors/Classes/Items/Skills 等）
+   与 MapInfos.json 的 "name" 仍按可译文本采集。 */
+static int rpgm_map_data_file_name(const WCHAR *name) {
+    if (!name || _wcsnicmp(name, L"Map", 3)) return 0;
+    const WCHAR *p = name + 3;
+    if (*p < L'0' || *p > L'9') return 0;
+    while (*p >= L'0' && *p <= L'9') p++;
+    return !_wcsicmp(p, L".json");
+}
+
 /* ----------------------------------------------------------------
  * parse_rpgm_json_file — 解析 RPG Maker 数据 JSON 文件
  *
@@ -1721,9 +1813,15 @@ static void scan_unity_assets(const WCHAR *dir, TextList *prefetch) {
  *   - 文本字段（name/nickname/description/profile/displayName/message1-4）
  * ---------------------------------------------------------------- */
 static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
+    if (!file_size_at_most(path, RPGM_JSON_SCAN_MAX_BYTES)) return;
     char *buf = NULL;
     DWORD size = 0;
     if (!read_file_bytes(path, &buf, &size)) return;
+    const WCHAR *base = path;
+    for (const WCHAR *q = path; *q; q++) {
+        if (*q == L'\\' || *q == L'/') base = q + 1;
+    }
+    int is_map_data = rpgm_map_data_file_name(base);
     const char *p = buf;
     if (size >= 3 && (unsigned char)p[0] == 0xef && (unsigned char)p[1] == 0xbb && (unsigned char)p[2] == 0xbf) p += 3;
     int last_code = -1;
@@ -1760,7 +1858,10 @@ static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
             last_code = -1;
         } else if (rpgm_text_key(key)) {
             rpgm_message_block_flush(&message_block, prefetch);
-            if (*v == '"') {
+            if (is_map_data && !strcmp(key, "name")) {
+                /* 地图事件名是编辑器内部标签：消费掉字符串值但不采集。 */
+                if (*v == '"') free(json_string_at(&v));
+            } else if (*v == '"') {
                 char *s = json_string_at(&v);
                 if (s) {
                     collect_string(s, prefetch);
@@ -1780,9 +1881,9 @@ static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
 }
 
 /* 扫描 www/data/ 目录下的所有 .json 数据文件 */
-static void scan_rpgm_data_dir(const WCHAR *dir, TextList *prefetch) {
+static void scan_rpgm_data_dir(const WCHAR *content_root, TextList *prefetch) {
     WCHAR data[MAX_PATH * 4], pat[MAX_PATH * 4];
-    path_join(data, MAX_PATH * 4, dir, L"www\\data");
+    path_join(data, MAX_PATH * 4, content_root, L"data");
     if (!is_dir(data)) return;
     path_join(pat, MAX_PATH * 4, data, L"*.json");
     WIN32_FIND_DATAW fd;
@@ -1824,16 +1925,13 @@ static void collect_rpgm_text_line(char *line, TextList *prefetch) {
     collect_string(text, prefetch);
 }
 
-/* 读取一个插件外部 .txt 文件并逐行采集。限制 8 MiB，防止把异常大文件
+/* 读取一个插件外部 .txt 文件并逐行采集。读前限制 8 MiB，防止把异常大文件
    当成本地化资源；只读扫描，不回写用户文件。 */
 static void scan_rpgm_text_file(const WCHAR *path, TextList *prefetch) {
+    if (!file_size_at_most(path, RPGM_TEXT_SCAN_MAX_BYTES)) return;
     char *buf = NULL;
     DWORD size = 0;
     if (!read_file_bytes(path, &buf, &size)) return;
-    if (size > 8u * 1024u * 1024u) {
-        free(buf);
-        return;
-    }
     char *line = buf;
     if (size >= 3 &&
         (unsigned char)line[0] == 0xef &&
@@ -1850,6 +1948,165 @@ static void scan_rpgm_text_file(const WCHAR *path, TextList *prefetch) {
         if (separator == '\r' && p[1] == '\n') p++;
         line = p + 1;
     }
+    free(buf);
+}
+
+/* RPG Maker localization plugins commonly keep every language in a root-level
+   CSV (for example game_messages.csv). Detect the delimiter from the first
+   logical record, then collect individual fields so separators and quoted
+   newlines never become part of a translation key. The header row selects the
+   source/English column (same rules as the Godot side); unrecognized layouts
+   fall back to all fields except short ID forms. This is a read-only warmup
+   path bounded to 8 MiB before read and never imports existing translations. */
+static char rpgm_csv_delimiter(const char *buf) {
+    size_t counts[3] = {0, 0, 0};
+    int quoted = 0;
+    if (!buf) return 0;
+    for (const char *p = buf; *p; p++) {
+        if (*p == '"') {
+            if (quoted && p[1] == '"') {
+                p++;
+            } else {
+                quoted = !quoted;
+            }
+            continue;
+        }
+        if (quoted) continue;
+        if (*p == '\r' || *p == '\n') break;
+        if (*p == ';') counts[0]++;
+        else if (*p == ',') counts[1]++;
+        else if (*p == '\t') counts[2]++;
+    }
+    size_t best = 0;
+    for (size_t i = 1; i < 3; i++) {
+        if (counts[i] > counts[best]) best = i;
+    }
+    if (counts[best] == 0) return 0;
+    return best == 0 ? ';' : (best == 1 ? ',' : '\t');
+}
+
+/* 无空格无标点的短标识符（ID/key 列形态）；表头无法识别时的回退路径不采集。 */
+static int rpgm_csv_short_id(const char *s) {
+    size_t len = strlen(s);
+    if (!len || len > 32) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+              (*p >= '0' && *p <= '9') || *p == '_')) return 0;
+    }
+    return 1;
+}
+
+/* en / en_US / en-US 等英语地域标记（表头列打分用）。 */
+static int rpgm_csv_en_locale(const char *t) {
+    size_t n = strlen(t);
+    if (n < 2 || n > 8 || _strnicmp(t, "en", 2)) return 0;
+    if (n == 2) return 1;
+    if (t[2] != '_' && t[2] != '-') return 0;
+    for (size_t i = 3; i < n; i++) {
+        char c = t[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-')) return 0;
+    }
+    return 1;
+}
+
+/* 表头列打分：识别 RPGM 本地化 CSV 的源文本/英语列（参照 Godot 侧规则；
+   English 与 en 地域标记同列最高分，避免把其他译文列当源文本）。 */
+static int rpgm_csv_source_column_score(char *cell) {
+    char *t = trim_ascii(cell);
+    if (!*t) return 0;
+    if (rpgm_csv_en_locale(t) || !_stricmp(t, "english")) return 100;
+    if (!_stricmp(t, "source") || !_stricmp(t, "source_text") ||
+        !_stricmp(t, "original") || !_stricmp(t, "msgid")) return 90;
+    if (!_stricmp(t, "text") || !_stricmp(t, "display_text") ||
+        !_stricmp(t, "body")) return 80;
+    return 0;
+}
+
+/* 单个 CSV 字段：表头行只做源列识别打分；数据行在已识别源列时只采集该列，
+   否则回退采集全部字段（跳过无空格无标点的短 ID 形态）。 */
+static void rpgm_csv_collect_field(char *field, size_t row, size_t col,
+                                   int *source_col, int *best_score, TextList *prefetch) {
+    if (row == 0) {
+        int score = rpgm_csv_source_column_score(field);
+        if (score > *best_score) {
+            *best_score = score;
+            *source_col = (int)col;
+        }
+        return;
+    }
+    if (*source_col >= 0) {
+        if (col == (size_t)*source_col) collect_string(field, prefetch);
+    } else if (!rpgm_csv_short_id(trim_ascii(field))) {
+        collect_string(field, prefetch);
+    }
+}
+
+static void scan_rpgm_csv_file(const WCHAR *path, TextList *prefetch) {
+    if (!file_size_at_most(path, RPGM_TEXT_SCAN_MAX_BYTES)) return;
+    char *buf = NULL;
+    DWORD size = 0;
+    if (!read_file_bytes(path, &buf, &size)) return;
+    char *start = buf;
+    if (size >= 3 &&
+        (unsigned char)start[0] == 0xef &&
+        (unsigned char)start[1] == 0xbb &&
+        (unsigned char)start[2] == 0xbf) {
+        start += 3;
+    }
+    char delimiter = rpgm_csv_delimiter(start);
+    if (!delimiter) {
+        free(buf);
+        return;
+    }
+    char *field = (char *)malloc((size_t)size + 1);
+    if (!field) {
+        free(buf);
+        return;
+    }
+    size_t out = 0;
+    int quoted = 0;
+    size_t row = 0, col = 0;
+    int source_col = -1;
+    int best_score = 0;
+    for (char *p = start;; p++) {
+        char ch = *p;
+        if (quoted) {
+            if (ch == '"' && p[1] == '"') {
+                field[out++] = '"';
+                p++;
+            } else if (ch == '"') {
+                quoted = 0;
+            } else if (ch == 0) {
+                field[out] = 0;
+                rpgm_csv_collect_field(field, row, col, &source_col, &best_score, prefetch);
+                break;
+            } else {
+                field[out++] = ch;
+            }
+            continue;
+        }
+        if (ch == '"' && out == 0) {
+            quoted = 1;
+            continue;
+        }
+        if (ch == delimiter || ch == '\r' || ch == '\n' || ch == 0) {
+            field[out] = 0;
+            rpgm_csv_collect_field(field, row, col, &source_col, &best_score, prefetch);
+            out = 0;
+            if (ch == delimiter) {
+                col++;
+            } else {
+                row++;
+                col = 0;
+            }
+            if (ch == '\r' && p[1] == '\n') p++;
+            if (ch == 0 || prefetch->n >= textlist_limit(prefetch)) break;
+            continue;
+        }
+        field[out++] = ch;
+    }
+    free(field);
     free(buf);
 }
 
@@ -1882,16 +2139,26 @@ static void scan_rpgm_external_text_dir(const WCHAR *dir, TextList *prefetch, in
             }
         } else if (wide_ends_with_i(fd.cFileName, L".txt")) {
             scan_rpgm_text_file(path, prefetch);
+        } else if (wide_ends_with_i(fd.cFileName, L".csv")) {
+            scan_rpgm_csv_file(path, prefetch);
         }
         if (prefetch->n >= textlist_limit(prefetch)) break;
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
 
-static void scan_rpgm_external_texts(const WCHAR *dir, TextList *prefetch) {
-    WCHAR www[MAX_PATH * 4];
-    path_join(www, MAX_PATH * 4, dir, L"www");
-    scan_rpgm_external_text_dir(www, prefetch, 0);
+static void scan_rpgm_external_texts(const WCHAR *content_root, TextList *prefetch) {
+    scan_rpgm_external_text_dir(content_root, prefetch, 0);
+}
+
+void warmup_scan_rpgm_resources(const WCHAR *dir, TextList *prefetch) {
+    WCHAR content_root[MAX_PATH * 4];
+    if (!dir || !prefetch ||
+        !rpgm_content_root(dir, content_root, MAX_PATH * 4)) {
+        return;
+    }
+    scan_rpgm_external_texts(content_root, prefetch);
+    scan_rpgm_data_dir(content_root, prefetch);
 }
 
 /* ======================== 各引擎预热入口 ======================== */
@@ -2036,8 +2303,7 @@ static void scan_renpy_script_dir(const WCHAR *dir, TextList *prefetch, int dept
 static void warmup_rpgm(const WCHAR *dir) {
     TextList prefetch = {0};
     prefetch.max_items = RPGM_WARMUP_MAX_ITEMS;
-    scan_rpgm_external_texts(dir, &prefetch);
-    scan_rpgm_data_dir(dir, &prefetch);
+    warmup_scan_rpgm_resources(dir, &prefetch);
     size_t queued = post_prefetch_all(&prefetch);
     if (queued) append_log(L"RPGM 预热翻译缓存：后台排队 %zu 条。", queued);
     textlist_free(&prefetch);
@@ -2046,8 +2312,8 @@ static void warmup_rpgm(const WCHAR *dir) {
 static void warmup_godot(const WCHAR *dir) {
     TextList prefetch = {0};
     prefetch.max_items = GODOT_WARMUP_MAX_ITEMS;
-    /* Godot currently has no generic runtime hook here. We only scan resources
-       and queue cache warmup; .pck/.translation files remain read-only inputs. */
+    /* Scan resources for the generic runtime sidecar and external patch pack.
+       Original .pck and compiled resources remain read-only inputs. */
     warmup_scan_godot_resources(dir, &prefetch);
     size_t queued = post_prefetch_all(&prefetch);
     if (queued) append_log(L"Godot preheated translation cache: queued %zu texts.", queued);

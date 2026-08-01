@@ -15,6 +15,7 @@ $utilSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptR
 $bufSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\buf.c") -Raw
 $jsonSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\json.c") -Raw
 $apiSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\api.c") -Raw
+$cacheSource = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "native\src\server\cache.c") -Raw
 
 function It([string]$name, [scriptblock]$body) {
     try {
@@ -46,9 +47,65 @@ function Send-Json([string]$path, [string]$method = "GET", $body = $null, [int]$
     }
 }
 
+It "Malformed port arguments are rejected instead of partially parsed" {
+    $invalidProcess = Start-Process -FilePath $Exe `
+        -ArgumentList @("--port", "${Port}junk", "--cache", $Cache) `
+        -PassThru -WindowStyle Hidden
+    try {
+        if (-not $invalidProcess.WaitForExit(1500)) {
+            throw "server accepted a port with a trailing non-numeric suffix"
+        }
+        if ($invalidProcess.ExitCode -eq 0) {
+            throw "malformed port exited successfully"
+        }
+    } finally {
+        if (-not $invalidProcess.HasExited) {
+            Stop-Process -Id $invalidProcess.Id -Force -ErrorAction SilentlyContinue
+            $invalidProcess.WaitForExit()
+        }
+    }
+}
+
+It "Oversized cache paths are rejected instead of silently truncated" {
+    $oversizedCache = "C:\" + ("x" * 1200) + "\cache.tsv"
+    $invalidProcess = Start-Process -FilePath $Exe `
+        -ArgumentList @("--port", ($Port + 10), "--cache", $oversizedCache) `
+        -PassThru -WindowStyle Hidden
+    try {
+        if (-not $invalidProcess.WaitForExit(1500)) {
+            throw "server continued after truncating an oversized cache path"
+        }
+        if ($invalidProcess.ExitCode -eq 0) {
+            throw "oversized cache path exited successfully"
+        }
+    } finally {
+        if (-not $invalidProcess.HasExited) {
+            Stop-Process -Id $invalidProcess.Id -Force -ErrorAction SilentlyContinue
+            $invalidProcess.WaitForExit()
+        }
+    }
+}
+
 Write-Host "Starting server on port $Port..." -ForegroundColor Cyan
 $p = Start-Process -FilePath $Exe -ArgumentList @("--port", $Port, "--cache", $Cache) -PassThru -WindowStyle Hidden
-Start-Sleep -Milliseconds 1500
+$startupDeadline = [DateTime]::UtcNow.AddSeconds(15)
+$startupReady = $false
+$startupError = $null
+do {
+    if ($p.HasExited) {
+        throw "server exited before readiness with code $($p.ExitCode)"
+    }
+    try {
+        $probe = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 1 -UseBasicParsing
+        $startupReady = $probe.StatusCode -eq 200
+    } catch {
+        $startupError = $_
+    }
+    if (-not $startupReady) { Start-Sleep -Milliseconds 100 }
+} while (-not $startupReady -and [DateTime]::UtcNow -lt $startupDeadline)
+if (-not $startupReady) {
+    throw "server readiness timeout: $startupError"
+}
 
 $testKey1 = "__test_e2e_key1_$(Get-Random)"
 $testKey2 = "__test_e2e_key2_$(Get-Random)"
@@ -68,10 +125,26 @@ try {
         if ($healthFields -notcontains "request_buffer_pool_limit") { throw "request buffer pool limit missing" }
         if ($healthFields -notcontains "request_buffer_pool_hits") { throw "request buffer pool hit count missing" }
         if ($healthFields -notcontains "request_buffer_pool_misses") { throw "request buffer pool miss count missing" }
+        if ($healthFields -notcontains "active_connections") { throw "active connection count missing" }
+        if ($healthFields -notcontains "connection_limit") { throw "connection limit missing" }
+        if ($healthFields -notcontains "connection_thread_failures") { throw "connection worker failure count missing" }
+        if ($healthFields -notcontains "worker_start_failures") { throw "translation worker failure count missing" }
+        if ($healthFields -notcontains "async_memory_bytes") { throw "async queue memory count missing" }
+        if ($healthFields -notcontains "async_memory_limit") { throw "async queue memory limit missing" }
+        if ($healthFields -notcontains "live_memory_bytes") { throw "live queue memory count missing" }
+        if ($healthFields -notcontains "live_memory_limit") { throw "live queue memory limit missing" }
         if ($r.Json.request_buffer_pool_limit -le 0 -or $r.Json.request_buffer_pool_limit -gt 64) { throw "request buffer pool limit outside bounded range" }
         if ($r.Json.request_buffer_pool_cached -lt 0 -or $r.Json.request_buffer_pool_cached -gt $r.Json.request_buffer_pool_limit) { throw "request buffer pool cached count outside bounded range" }
         if ($r.Json.request_buffer_pool_hits -lt 0) { throw "request buffer pool hits negative" }
         if ($r.Json.request_buffer_pool_misses -lt 0) { throw "request buffer pool misses negative" }
+        if ($r.Json.connection_limit -le 0 -or $r.Json.connection_limit -gt 256) { throw "connection limit outside bounded range" }
+        if ($r.Json.connection_thread_failures -lt 0) { throw "connection worker failure count negative" }
+        if ($r.Json.worker_start_failures -lt 0) { throw "translation worker failure count negative" }
+        if ($r.Json.active_connections -lt 1 -or $r.Json.active_connections -gt $r.Json.connection_limit) { throw "active connection count outside bounded range" }
+        if ($r.Json.async_memory_limit -le 0 -or $r.Json.async_memory_limit -gt 67108864) { throw "async queue memory limit outside bounded range" }
+        if ($r.Json.async_memory_bytes -lt 0 -or $r.Json.async_memory_bytes -gt $r.Json.async_memory_limit) { throw "async queue memory count outside bounded range" }
+        if ($r.Json.live_memory_limit -le 0 -or $r.Json.live_memory_limit -gt 67108864) { throw "live queue memory limit outside bounded range" }
+        if ($r.Json.live_memory_bytes -lt 0 -or $r.Json.live_memory_bytes -gt $r.Json.live_memory_limit) { throw "live queue memory count outside bounded range" }
     }
 
     It "GET /capabilities returns batch+cache_only" {
@@ -91,6 +164,30 @@ try {
         }
         if ($httpSource -notmatch '#define HTTP_REQUEST_BUFFER_POOL_LIMIT\s+\d+') {
             throw "request buffer pool must have a compile-time hard cap"
+        }
+    }
+
+    It "Asynchronous warmup queue is bounded by both item count and bytes" {
+        if ($httpSource -notmatch '#define ASYNC_QUEUE_BYTE_LIMIT\s+\(') {
+            throw "async queue byte limit missing"
+        }
+        if ($httpSource -notmatch 'g_async_memory_bytes\s*>\s*ASYNC_QUEUE_BYTE_LIMIT\s*-\s*memory_bytes') {
+            throw "async queue must check byte ownership before allocating a job"
+        }
+        if ($httpSource -notmatch 'g_async_memory_bytes\s*-=\s*jobs\[i\]->memory_bytes') {
+            throw "async queue must release byte ownership when jobs finish"
+        }
+    }
+
+    It "Synchronous translation work is bounded by an aggregate byte budget" {
+        if ($httpSource -notmatch '#define LIVE_QUEUE_BYTE_LIMIT\s+\(') {
+            throw "live queue byte limit missing"
+        }
+        if ($httpSource -notmatch 'g_live_memory_bytes\s*>\s*LIVE_QUEUE_BYTE_LIMIT\s*-\s*memory_bytes') {
+            throw "live group must check aggregate byte ownership before enqueueing"
+        }
+        if ($httpSource -notmatch 'g_live_memory_bytes\s*-=\s*memory_bytes') {
+            throw "live group must release aggregate byte ownership after completion"
         }
     }
 
@@ -130,6 +227,18 @@ try {
         if ($apiSource -notmatch 'API_DIAG_BATCH_SHAPE' -or
             $apiSource -notmatch 'API_DIAG_HTTP_STATUS') {
             throw "provider HTTP and batch-shape failures need distinct diagnostics"
+        }
+        if ($apiSource -notmatch '\(size_t\)avail\s*>\s*API_MAX_RESPONSE_BYTES\s*-\s*b\.len') {
+            throw "WinHTTP availability must be bounded before allocating or reading provider bytes"
+        }
+    }
+
+    It "Persistent cache input has a per-record memory bound" {
+        if ($cacheSource -notmatch '#define CACHE_MAX_ENCODED_LINE_BYTES\s+\(') {
+            throw "cache loader needs a compile-time encoded-line limit"
+        }
+        if ($cacheSource -notmatch 'CACHE_DIAG_LOAD_LINE_TOO_LARGE') {
+            throw "oversized cache rows need a distinct diagnostic"
         }
     }
 
@@ -267,6 +376,34 @@ try {
         if ($resp -notmatch "Access-Control-Allow-Origin") { throw "CORS header missing" }
     }
 
+    It "Browser origins are restricted without breaking file-origin game hooks" {
+        $blocked = $false
+        try {
+            Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" `
+                -Headers @{ Origin = "https://example.invalid" } `
+                -TimeoutSec 3 -UseBasicParsing | Out-Null
+        } catch [System.Net.WebException] {
+            $blocked = [int]$_.Exception.Response.StatusCode -eq 403
+        }
+        if (-not $blocked) { throw "untrusted browser origin was not rejected" }
+
+        $allowed = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" `
+            -Headers @{ Origin = "null" } -TimeoutSec 3 -UseBasicParsing
+        Assert-Eq $allowed.StatusCode 200 "file-origin health status"
+        Assert-Eq $allowed.Headers["Access-Control-Allow-Origin"] "null" "file-origin CORS response"
+    }
+
+    It "Browser-origin requests cannot reach cache administration routes" {
+        $blocked = $false
+        try {
+            Invoke-WebRequest -Uri "http://127.0.0.1:$Port/cache/dump" `
+                -Headers @{ Origin = "null" } -TimeoutSec 3 -UseBasicParsing | Out-Null
+        } catch [System.Net.WebException] {
+            $blocked = [int]$_.Exception.Response.StatusCode -eq 403
+        }
+        if (-not $blocked) { throw "browser-origin cache dump was not rejected" }
+    }
+
     It "Huge Content-Length is rejected without crashing" {
         $cli = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $Port)
         $st = $cli.GetStream()
@@ -350,7 +487,9 @@ try {
         $r = Send-Json "/health"
         if ($r.Json.request_buffer_pool_hits -le 0) { throw "request buffer pool never recorded a reuse hit" }
         if ($r.Json.request_buffer_pool_misses -le 0) { throw "request buffer pool never recorded an allocation miss" }
-        if ($r.Json.request_buffer_pool_cached -le 0) { throw "request buffer pool retained no reusable initial blocks" }
+        # /health has already checked out its own request block when this snapshot is built.
+        # A zero cached count is valid when that is the last reusable block; hits prove retention and reuse.
+        if ($r.Json.request_buffer_pool_cached -lt 0) { throw "request buffer pool cached count became negative" }
         if ($r.Json.request_buffer_pool_cached -gt $r.Json.request_buffer_pool_limit) { throw "request buffer pool exceeded its hard cap" }
     }
 
@@ -358,7 +497,16 @@ try {
     Write-Host "=== Shutdown ===" -ForegroundColor Cyan
 
     It "POST /shutdown causes process to exit with code 0" {
-        try { Send-Json "/shutdown" "POST" $null 2 | Out-Null } catch { }
+        $idle = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $Port)
+        try {
+            try { Send-Json "/shutdown" "POST" $null 2 | Out-Null } catch { }
+            Start-Sleep -Milliseconds 150
+            if ($p.HasExited) {
+                throw "server exited before its accepted connection workers drained"
+            }
+        } finally {
+            $idle.Close()
+        }
         $p | Wait-Process -Timeout 5
         Assert-Eq $p.ExitCode 0 "exit code"
     }

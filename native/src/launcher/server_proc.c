@@ -27,7 +27,7 @@ static int g_server_owned = 0;
  * 向 127.0.0.1:19999/health 发送 GET 请求，超时由调用者指定。
  * 作为进程句柄检查的补充：进程可能已被外部启动。
  * ---------------------------------------------------------------- */
-static int server_http_alive(DWORD timeout) {
+static int server_http_alive(int timeout) {
     int ok = 0;
     HINTERNET ses = WinHttpOpen(L"ds-game-translator Launcher/3.1",
                                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -63,14 +63,28 @@ static int server_http_alive(DWORD timeout) {
     return ok;
 }
 
+/* 真实时钟记账：server_http_alive 自身的超时也消耗等待预算，只累加
+   Sleep 的轮询间隔会让实际等待远超 timeout_ms。GetTickCount 无符号
+   差值对 49 天回绕安全。 */
 static int wait_for_server_ready(DWORD timeout_ms) {
-    DWORD waited = 0;
+    DWORD start = GetTickCount();
     for (;;) {
         if (server_http_alive(200)) return 1;
         if (g_server_pi.hProcess &&
             WaitForSingleObject(g_server_pi.hProcess, 0) != WAIT_TIMEOUT) {
             return 0;
         }
+        if (GetTickCount() - start >= timeout_ms) return 0;
+        Sleep(SERVER_READY_POLL_MS);
+    }
+}
+
+/* Poll only after an explicit shutdown request so cache maintenance does not
+   race an adopted server that is still releasing its persistent file. */
+static int wait_for_server_stopped(DWORD timeout_ms) {
+    DWORD waited = 0;
+    for (;;) {
+        if (!server_http_alive(120)) return 1;
         if (waited >= timeout_ms) return 0;
         Sleep(SERVER_READY_POLL_MS);
         waited += SERVER_READY_POLL_MS;
@@ -125,7 +139,7 @@ void refresh_server_status(void) {
     if (g_server_started && server_alive()) {
         set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
         set_btn_label(L"\u505C\u6B62\u670D\u52A1\u5668");
-        if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
+        if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, FALSE);
         return;
     }
 
@@ -142,7 +156,7 @@ void refresh_server_status(void) {
         set_btn_label(L"\u542F\u52A8\u670D\u52A1\u5668");
     }
 
-    if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
+    if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, FALSE);
 }
 
 /* ----------------------------------------------------------------
@@ -173,7 +187,7 @@ static int request_server_shutdown(void) {
                                        WINHTTP_NO_REFERER,
                                        WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
     if (req) {
-        DWORD timeout = 500;
+        int timeout = 500;
         WinHttpSetTimeouts(req, timeout, timeout, timeout, timeout);
         if (WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
@@ -228,7 +242,7 @@ int start_server(void) {
         set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
         set_btn_label(L"\u505C\u6B62\u670D\u52A1\u5668");
         append_log(L"\u68C0\u6D4B\u5230\u5DF2\u8FD0\u884C\u7684 C \u670D\u52A1\u7AEF\uFF1A127.0.0.1:19999");
-        if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
+        if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, FALSE);
         return 1;
     }
 
@@ -241,10 +255,13 @@ int start_server(void) {
         append_log(L"\u627E\u4E0D\u5230 C \u670D\u52A1\u7AEF\uFF1A%s", exe);
         return 0;
     }
-    _snwprintf(cmd, MAX_PATH * 12,
-               L"\"%s\" --port 19999 --cache \"%s\" --api-config \"%s\"",
-               exe, cache, api_cfg);
-    cmd[MAX_PATH * 12 - 1] = 0;
+    if (!wide_format_checked(
+            cmd, MAX_PATH * 12,
+            L"\"%s\" --port 19999 --cache \"%s\" --api-config \"%s\"",
+            exe, cache, api_cfg)) {
+        append_log(L"Server startup command is too long; no process was started.");
+        return 0;
+    }
 
     /* 以隐藏窗口启动服务器进程 */
     STARTUPINFOW si;
@@ -285,12 +302,12 @@ int start_server(void) {
         reset_server_handle();
         set_server_label(L"\u672A\u542F\u52A8");
         set_btn_label(L"\u542F\u52A8\u670D\u52A1\u5668");
-        if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
+        if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, FALSE);
         return 0;
     }
     set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
     append_log(L"C \u670D\u52A1\u7AEF\u5065\u5EB7\u68C0\u67E5\u901A\u8FC7\uFF1A127.0.0.1:19999");
-    if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
+    if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, FALSE);
     return 1;
 }
 
@@ -308,12 +325,23 @@ void stop_server(void) {
         return;
     }
     if (server_alive() || server_http_alive(200)) {
-        (void)request_server_shutdown();
+        int shutdown_requested = request_server_shutdown();
         if (g_server_pi.hProcess &&
             WaitForSingleObject(g_server_pi.hProcess, 1500) == WAIT_TIMEOUT) {
             append_log(L"\u670D\u52A1\u7AEF\u672A\u5728\u4F18\u96C5\u5173\u95ED\u671F\u9650\u5185\u9000\u51FA\uFF0C\u6B63\u5728\u7EC8\u6B62\u542F\u52A8\u5668\u521B\u5EFA\u7684\u8FDB\u7A0B\u3002");
             TerminateProcess(g_server_pi.hProcess, 1);
             WaitForSingleObject(g_server_pi.hProcess, 500);
+        } else if (!g_server_pi.hProcess && shutdown_requested &&
+                   !wait_for_server_stopped(1500)) {
+            append_log(L"External C server still owns 127.0.0.1:19999 after the shutdown deadline; cache maintenance may need a retry.");
+        }
+        if (!g_server_pi.hProcess && !shutdown_requested) {
+            /* 关停请求未送达外部服务端：保留接管状态，避免 UI 误报“已停止”。 */
+            set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
+            set_btn_label(L"\u505C\u6B62\u670D\u52A1\u5668");
+            append_log(L"\u5411\u5916\u90E8 C \u670D\u52A1\u7AEF\u53D1\u9001\u505C\u6B62\u8BF7\u6C42\u5931\u8D25\uFF0C\u670D\u52A1\u7AEF\u53EF\u80FD\u4ECD\u5728\u8FD0\u884C\u3002");
+            if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, FALSE);
+            return;
         }
     }
     reset_server_handle();
@@ -321,7 +349,7 @@ void stop_server(void) {
     set_btn_label(L"\u542F\u52A8\u670D\u52A1\u5668");
     append_log(owned ? L"C \u670D\u52A1\u7AEF\u5DF2\u505C\u6B62\u3002" :
                        L"\u5DF2\u5411\u5916\u90E8 C \u670D\u52A1\u7AEF\u53D1\u9001\u505C\u6B62\u8BF7\u6C42\u3002");
-    if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, TRUE);
+    if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, FALSE);
 }
 
 /* ----------------------------------------------------------------
@@ -330,6 +358,12 @@ void stop_server(void) {
  * 服务器按钮的回调：运行中则停止，否则启动。
  * ---------------------------------------------------------------- */
 void toggle_server(void) {
+    /* 一键翻译流程的工作线程正在执行 start_server/deploy 期间，拒绝并发
+       切换，避免与后台线程争抢 g_server_pi / g_server_started。 */
+    if (translation_flow_running()) {
+        set_status(L"\u72B6\u6001\uFF1A\u7FFB\u8BD1\u6D41\u7A0B\u6B63\u5728\u8FDB\u884C\uFF0C\u8BF7\u7A0D\u5019\u518D\u64CD\u4F5C\u670D\u52A1\u5668");
+        return;
+    }
     if (g_server_started && server_alive()) {
         stop_server();
         if (g_server_started && server_alive()) {

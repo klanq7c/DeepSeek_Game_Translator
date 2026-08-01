@@ -14,12 +14,14 @@
 #define GODOT_PCK_MAGIC 0x43504447u
 #define GODOT_PCK_V1_HEADER_SIZE 88u
 #define GODOT_PCK_V2_HEADER_SIZE 100u
+#define GODOT_PCK_V3_HEADER_SIZE 112u
 #define GODOT_PATCH_MAX_FILES 200000u
 #define GODOT_PATCH_MAX_PATH 4096u
 #define GODOT_PATCH_MAX_ENTRY_BYTES (2u * 1024u * 1024u)
 #define GODOT_PATCH_MAX_FONT_BYTES (32u * 1024u * 1024u)
 #define GODOT_PATCH_MAX_FONT_REPLACEMENTS 16u
 #define GODOT_PATCH_LOOSE_FONT_MIN_PRIORITY 20
+#define GODOT_PATCH_LOOSE_MAX_DEPTH 32u
 #define GODOT_PATCH_MAX_STRINGS_PER_RESOURCE 1800u
 #define GODOT_PATCH_MAX_SOURCE_TEXT_BYTES 2400u
 #define GODOT_PATCH_MAX_TRANSLATION_TEXT_BYTES 4096u
@@ -31,6 +33,15 @@
 #define GODOT_PATCH_NEXT_NAME L"dst_godot_patch.next.pck"
 #define GODOT_PATCH_BUILDING_NAME L"dst_godot_patch.building"
 #define GODOT_RUNTIME_SCRIPT_NAME L"dst_godot_runtime.gd"
+#define GODOT_RUNTIME_SCRIPT_PATH "dst_godot_runtime.gd"
+#define GODOT_AUTOLOAD_SCRIPT_PATH "dst_godot_autoload.gd"
+#define GODOT_AUTOLOAD_OVERRIDE_PATH "override.cfg"
+#define GODOT_AUTOLOAD_OVERRIDE_SECTION "[autoload_prepend]"
+#define GODOT_AUTOLOAD_OVERRIDE_KEY "DeepSeekTranslator"
+#define GODOT_AUTOLOAD_OVERRIDE_VALUE "*res://dst_godot_autoload.gd"
+#define GODOT_PATCH_LAUNCHER_NAME L"dst_godot_patch.exe"
+#define GODOT_PATCH_LAUNCHER_MARKER L"dst_godot_patch.exe.dst-owned"
+#define GODOT_PATCH_LAUNCHER_MARKER_TEXT "DS_GODOT_PATCH_LAUNCHER_V1\n"
 
 typedef struct {
     char **v;
@@ -46,12 +57,19 @@ typedef struct {
 
 typedef struct {
     uint32_t format;
+    uint32_t engine_major;
+    uint32_t engine_minor;
     uint32_t header_size;
     uint32_t entry_meta_size;
     uint64_t file_base;
+    uint64_t directory_offset;
+    uint64_t entries_offset;
     uint32_t file_count;
     int offsets_are_absolute;
 } PckInfo;
+
+static char *trim_pack_path(char *path, size_t n);
+static const char *godot_pack_entry_name(const char *path);
 
 typedef struct {
     char *path;
@@ -73,6 +91,7 @@ typedef struct {
     uint32_t start;
     uint32_t end;
     int source_index;
+    int raw_text;
 } TextPatch;
 
 typedef struct {
@@ -141,11 +160,15 @@ static int parse_pck_info(const unsigned char *header, DWORD header_bytes, uint6
     if (header_bytes < GODOT_PCK_V1_HEADER_SIZE || pck_size < GODOT_PCK_V1_HEADER_SIZE) return 0;
     if (read_u32le(header) != GODOT_PCK_MAGIC) return 0;
     uint32_t format = read_u32le(header + 4);
+    info->engine_major = read_u32le(header + 8);
+    info->engine_minor = read_u32le(header + 12);
     if (format == 1) {
         info->format = format;
         info->header_size = GODOT_PCK_V1_HEADER_SIZE;
         info->entry_meta_size = 8u + 8u + 16u;
         info->file_base = 0;
+        info->directory_offset = info->header_size;
+        info->entries_offset = info->directory_offset;
         info->file_count = read_u32le(header + 84);
         info->offsets_are_absolute = 1;
     } else if (format == 2) {
@@ -154,12 +177,24 @@ static int parse_pck_info(const unsigned char *header, DWORD header_bytes, uint6
         info->header_size = GODOT_PCK_V2_HEADER_SIZE;
         info->entry_meta_size = 8u + 8u + 16u + 4u;
         info->file_base = read_u64le(header + 24);
+        info->directory_offset = info->header_size;
+        info->entries_offset = info->directory_offset;
         info->file_count = read_u32le(header + 96);
+        info->offsets_are_absolute = 0;
+    } else if (format == 3) {
+        if (header_bytes < GODOT_PCK_V3_HEADER_SIZE || pck_size < GODOT_PCK_V3_HEADER_SIZE) return 0;
+        info->format = format;
+        info->header_size = GODOT_PCK_V3_HEADER_SIZE;
+        info->entry_meta_size = 8u + 8u + 16u + 4u;
+        info->file_base = read_u64le(header + 24);
+        info->directory_offset = read_u64le(header + 32);
+        if (info->directory_offset > pck_size - 4u) return 0;
+        info->entries_offset = info->directory_offset + 4u;
         info->offsets_are_absolute = 0;
     } else {
         return 0;
     }
-    if (info->file_count == 0 || info->file_count > GODOT_PATCH_MAX_FILES || info->file_base > pck_size) return 0;
+    if (info->file_base > pck_size) return 0;
     return 1;
 }
 
@@ -208,7 +243,7 @@ static int godot_smaz_decompress(const char *in, int inlen, char *out, int outle
             if (inlen < 2) return original_outlen + 1;
             int len = ((int)c[1]) + 1;
             if (inlen < 2 + len || outlen < len) return original_outlen + 1;
-            memcpy(out, c + 2, len);
+            memcpy(out, c + 2, (size_t)len);
             out += len;
             outlen -= len;
             c += 2 + len;
@@ -217,7 +252,7 @@ static int godot_smaz_decompress(const char *in, int inlen, char *out, int outle
             const char *s = GODOT_SMAZ_RCB[*c];
             int len = (int)strlen(s);
             if (outlen < len) return original_outlen + 1;
-            memcpy(out, s, len);
+            memcpy(out, s, (size_t)len);
             out += len;
             outlen -= len;
             c++;
@@ -253,6 +288,27 @@ static int read_at_exact(HANDLE h, uint64_t offset, void *buf, DWORD size) {
     return 1;
 }
 
+static int read_pck_info(HANDLE h, uint64_t base_offset, uint64_t pck_size, PckInfo *info) {
+    if (h == INVALID_HANDLE_VALUE || pck_size < GODOT_PCK_V1_HEADER_SIZE || !info) return 0;
+    unsigned char header[GODOT_PCK_V3_HEADER_SIZE] = {0};
+    DWORD header_bytes = pck_size >= GODOT_PCK_V3_HEADER_SIZE
+        ? GODOT_PCK_V3_HEADER_SIZE
+        : (pck_size >= GODOT_PCK_V2_HEADER_SIZE ? GODOT_PCK_V2_HEADER_SIZE : GODOT_PCK_V1_HEADER_SIZE);
+    if (!read_at_exact(h, base_offset, header, header_bytes) ||
+        !parse_pck_info(header, header_bytes, pck_size, info)) {
+        return 0;
+    }
+    if (info->format == 3) {
+        unsigned char count[4];
+        if (base_offset > UINT64_MAX - info->directory_offset ||
+            !read_at_exact(h, base_offset + info->directory_offset, count, sizeof count)) {
+            return 0;
+        }
+        info->file_count = read_u32le(count);
+    }
+    return info->file_count > 0 && info->file_count <= GODOT_PATCH_MAX_FILES;
+}
+
 static int append_file_bytes(HANDLE h, const char *buf, DWORD size, uint64_t *offset) {
     LARGE_INTEGER zero, end;
     zero.QuadPart = 0;
@@ -263,6 +319,24 @@ static int append_file_bytes(HANDLE h, const char *buf, DWORD size, uint64_t *of
         DWORD wrote = 0;
         if (!WriteFile(h, buf + done, size - done, &wrote, NULL) || wrote == 0) return 0;
         done += wrote;
+    }
+    return 1;
+}
+
+static int append_file_range(HANDLE h, uint64_t source_offset, uint64_t size, uint64_t *dest_offset) {
+    LARGE_INTEGER zero, end;
+    zero.QuadPart = 0;
+    if (!SetFilePointerEx(h, zero, &end, FILE_END)) return 0;
+    if (dest_offset) *dest_offset = (uint64_t)end.QuadPart;
+    char buf[64 * 1024];
+    uint64_t copied = 0;
+    while (copied < size) {
+        DWORD chunk = size - copied > sizeof buf ? (DWORD)sizeof buf : (DWORD)(size - copied);
+        if (!read_at_exact(h, source_offset + copied, buf, chunk) ||
+            !write_at_exact(h, (uint64_t)end.QuadPart + copied, buf, chunk)) {
+            return 0;
+        }
+        copied += chunk;
     }
     return 1;
 }
@@ -328,12 +402,25 @@ static int godot_english_translation_path(const char *path) {
 
 static int ascii_contains_i(const char *s, const char *needle);
 
+static int godot_patch_markdown_resource_path(const char *path) {
+    if (!path || !ascii_ends_with_i(path, ".md")) return 0;
+    return ascii_contains_i(path, "lang/") ||
+           ascii_contains_i(path, "locale/") ||
+           ascii_contains_i(path, "localization/") ||
+           ascii_contains_i(path, "dialog") ||
+           ascii_contains_i(path, "story") ||
+           ascii_contains_i(path, "scenario") ||
+           ascii_contains_i(path, "conversation") ||
+           ascii_contains_i(path, "narrative");
+}
+
 static int godot_patch_text_resource_path(const char *path) {
     if (!path) return 0;
     if (ascii_contains_i(path, "/.import/") || ascii_contains_i(path, "res://.import/")) return 0;
     return ascii_ends_with_i(path, ".tscn") ||
            ascii_ends_with_i(path, ".tres") ||
-           ascii_ends_with_i(path, ".json");
+           ascii_ends_with_i(path, ".json") ||
+           godot_patch_markdown_resource_path(path);
 }
 
 static int godot_patch_gdscript_bytecode_path(const char *path) {
@@ -394,9 +481,11 @@ static int find_system_cjk_font(WCHAR *out, size_t cap) {
     WCHAR windir[MAX_PATH];
     if (!out || !cap || !GetWindowsDirectoryW(windir, MAX_PATH)) return 0;
     const WCHAR *names[] = { L"simhei.ttf", L"msyh.ttf", L"msyh.ttc", L"simsun.ttc" };
+    WCHAR font_dir[MAX_PATH * 4];
+    path_join(font_dir, MAX_PATH * 4, windir, L"Fonts");
+    if (!font_dir[0]) return 0;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        _snwprintf(out, cap, L"%s\\Fonts\\%s", windir, names[i]);
-        out[cap - 1] = 0;
+        path_join(out, cap, font_dir, names[i]);
         if (exists_path(out)) return 1;
     }
     out[0] = 0;
@@ -463,10 +552,14 @@ static int godot_patch_entry_priority(const char *path, uint64_t size) {
     int dialogic = ascii_contains_i(path, "localization_dialogic/");
     int small_dialogic = dialogic && size <= GODOT_PATCH_SMALL_DIALOGIC_BYTES;
     int json = ascii_ends_with_i(path, ".json");
+    int markdown = godot_patch_markdown_resource_path(path);
     int scene_text = ascii_ends_with_i(path, ".tscn") || ascii_ends_with_i(path, ".tres");
     int gdscript_bytecode = ascii_ends_with_i(path, ".gdc");
     int p = 50;
-    if (gdscript_bytecode && ascii_contains_i(path, "/scripts/menus/")) p = 4;
+    if (markdown && (ascii_contains_i(path, "lang/en/") ||
+                     ascii_contains_i(path, "locale/en/") ||
+                     ascii_contains_i(path, "localization/en/"))) p = 3;
+    else if (gdscript_bytecode && ascii_contains_i(path, "/scripts/menus/")) p = 4;
     else if (gdscript_bytecode && ascii_contains_i(path, "/scripts/scenario/")) p = 4;
     else if (gdscript_bytecode && ascii_contains_i(path, "scenario_action_data.gdc")) p = 4;
     else if (gdscript_bytecode && ascii_contains_i(path, "target_type.gdc")) p = 4;
@@ -475,6 +568,7 @@ static int godot_patch_entry_priority(const char *path, uint64_t size) {
     else if ((json || scene_text) && godot_patch_startup_text_path(path)) p = json ? 6 : 16;
     else if (dialogic) p = small_dialogic ? 8 : 10;
     else if (ascii_contains_i(path, "localization/")) p = 20;
+    else if (markdown) p = godot_patch_story_text_path(path) ? 22 : 32;
     else if (json) p = godot_patch_story_text_path(path) ? 24 : 34;
     else if (scene_text) p = godot_patch_story_text_path(path) ? 38 : 62;
 
@@ -536,6 +630,10 @@ static int strlist_push_unique_index(StrList *l, const char *s) {
     for (size_t i = 0; i < l->n; i++) {
         if (!strcmp(l->v[i], s)) return (int)i;
     }
+    /* strlist_push_unique also reports success when the per-resource cap
+       rejected the insert; l->n - 1 would then point at an unrelated string
+       and reuse its translation, so a full list must report no index. */
+    if (l->n >= GODOT_PATCH_MAX_STRINGS_PER_RESOURCE) return -1;
     if (!strlist_push_unique(l, s)) return -1;
     return (int)(l->n - 1);
 }
@@ -665,11 +763,17 @@ static void bb_utf8_codepoint(ByteBuf *b, unsigned cp) {
         out[0] = (char)(0xc0 | (cp >> 6));
         out[1] = (char)(0x80 | (cp & 0x3f));
         bb_add(b, out, 2);
-    } else {
+    } else if (cp < 0x10000) {
         out[0] = (char)(0xe0 | (cp >> 12));
         out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
         out[2] = (char)(0x80 | (cp & 0x3f));
         bb_add(b, out, 3);
+    } else {
+        out[0] = (char)(0xf0 | (cp >> 18));
+        out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+        out[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        out[3] = (char)(0x80 | (cp & 0x3f));
+        bb_add(b, out, 4);
     }
 }
 
@@ -692,8 +796,31 @@ static char *json_parse_string(const char **pp) {
                                          (hex_val(p[2]) << 8) |
                                          (hex_val(p[3]) << 4) |
                                          hex_val(p[4]));
-                bb_utf8_codepoint(&b, cp);
                 p += 5;
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    /* A high surrogate only combines with a directly following
+                       low surrogate; a lone surrogate encodes as U+FFFD. */
+                    unsigned lo = 0;
+                    if (p[0] == '\\' && p[1] == 'u' &&
+                        hex_val(p[2]) >= 0 && hex_val(p[3]) >= 0 &&
+                        hex_val(p[4]) >= 0 && hex_val(p[5]) >= 0) {
+                        lo = (unsigned)((hex_val(p[2]) << 12) |
+                                        (hex_val(p[3]) << 8) |
+                                        (hex_val(p[4]) << 4) |
+                                        hex_val(p[5]));
+                    }
+                    if (lo >= 0xdc00 && lo <= 0xdfff) {
+                        cp = 0x10000u + ((cp - 0xd800u) << 10) + (lo - 0xdc00u);
+                        p += 6;
+                        bb_utf8_codepoint(&b, cp);
+                    } else {
+                        bb_utf8_codepoint(&b, 0xfffdu);
+                    }
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                    bb_utf8_codepoint(&b, 0xfffdu);
+                } else {
+                    bb_utf8_codepoint(&b, cp);
+                }
             } else {
                 p++;
             }
@@ -739,6 +866,7 @@ static size_t parse_results_array(const char *json, char **out, size_t cap) {
 
 static void translate_strings(PatchHttp *http, StrList *texts, char **translations, size_t *live_used);
 static int gdscript_exact(const char *s, const char **values, size_t n);
+static int godot_text_translation_preserves_format(const char *source, const char *translated);
 
 static void textpatch_free(TextPatchList *l) {
     free(l->v);
@@ -757,8 +885,24 @@ static int textpatch_push(TextPatchList *l, uint32_t start, uint32_t end, int so
     l->v[l->n].start = start;
     l->v[l->n].end = end;
     l->v[l->n].source_index = source_index;
+    l->v[l->n].raw_text = 0;
     l->n++;
     return 1;
+}
+
+static int textpatch_push_raw(TextPatchList *l, uint32_t start, uint32_t end, int source_index) {
+    size_t before = l->n;
+    if (!textpatch_push(l, start, end, source_index)) return 0;
+    if (l->n > before) l->v[l->n - 1].raw_text = 1;
+    return 1;
+}
+
+static char *dup_text_range(const char *start, size_t len) {
+    char *value = (char *)malloc(len + 1u);
+    if (!value) return NULL;
+    memcpy(value, start, len);
+    value[len] = 0;
+    return value;
 }
 
 static int key_norm_char(char c) {
@@ -941,9 +1085,58 @@ static int collect_scene_text_patches(const char *buf, DWORD size, StrList *text
     return 1;
 }
 
+/* Dialogue-oriented Markdown uses structural lines for sections, speakers and
+   lifecycle commands. Patch only plain body lines and preserve the surrounding
+   file byte-for-byte so the game parser sees the same control structure. */
+static int collect_markdown_text_patches(const char *buf, DWORD size, StrList *texts,
+                                         TextPatchList *patches) {
+    const char *line = buf;
+    const char *end_buf = buf + size;
+    int fenced = 0;
+    if (size >= 3u && (unsigned char)line[0] == 0xef &&
+        (unsigned char)line[1] == 0xbb && (unsigned char)line[2] == 0xbf) {
+        line += 3;
+    }
+    while (line < end_buf) {
+        const char *line_end = line;
+        while (line_end < end_buf && *line_end != '\r' && *line_end != '\n') line_end++;
+        const char *start = line;
+        const char *end = line_end;
+        while (start < end && (*start == ' ' || *start == '\t')) start++;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        size_t len = (size_t)(end - start);
+        int fence_line = len >= 3u &&
+            ((!memcmp(start, "```", 3u)) || (!memcmp(start, "~~~", 3u)));
+        if (fence_line) {
+            fenced = !fenced;
+        } else if (!fenced && len > 0 && *start != '#' && *start != '>' &&
+                   !(start[0] == '[' && len > 1u && end[-1] == ']') &&
+                   !(len == 3u && (!memcmp(start, "---", 3u) ||
+                                   !memcmp(start, "***", 3u) ||
+                                   !memcmp(start, "___", 3u))) &&
+                   !memchr(start, '`', len) && !memchr(start, '[', len)) {
+            char *value = dup_text_range(start, len);
+            if (!value) return 0;
+            if (wanted_source_text(value)) {
+                int idx = strlist_push_unique_index(texts, value);
+                if (!textpatch_push_raw(patches, (uint32_t)(start - buf),
+                                        (uint32_t)(end - buf), idx)) {
+                    free(value);
+                    return 0;
+                }
+            }
+            free(value);
+        }
+        if (line_end >= end_buf) break;
+        line = line_end + 1;
+        if (*line_end == '\r' && line < end_buf && *line == '\n') line++;
+    }
+    return 1;
+}
+
 static char *build_text_resource_override(const unsigned char *buf, DWORD size,
                                           TextPatchList *patches, char **translations,
-                                          size_t *patched_strings, DWORD *out_size) {
+                                          StrList *texts, size_t *patched_strings, DWORD *out_size) {
     *patched_strings = 0;
     ByteBuf out = {0};
     uint32_t last = 0;
@@ -954,11 +1147,15 @@ static char *build_text_resource_override(const unsigned char *buf, DWORD size,
             return NULL;
         }
         bb_add(&out, (const char *)buf + last, p->start - last);
+        const char *source = p->source_index >= 0 ? texts->v[p->source_index] : NULL;
         const char *translated = p->source_index >= 0 ? translations[p->source_index] : NULL;
-        if (translated && wanted_translation_text(translated)) {
+        if (translated && wanted_translation_text(translated) &&
+            godot_text_translation_preserves_format(source, translated) &&
+            (!p->raw_text || (!strchr(translated, '\r') && !strchr(translated, '\n')))) {
             char *wrapped = godot_wrap_cjk_translation(translated);
             const char *final_text = wrapped ? wrapped : translated;
-            bb_json_string(&out, final_text);
+            if (p->raw_text) bb_add(&out, final_text, strlen(final_text));
+            else bb_json_string(&out, final_text);
             free(wrapped);
             (*patched_strings)++;
         } else {
@@ -985,6 +1182,8 @@ static char *build_text_resource_patch(const char *path, const unsigned char *bu
     int ok = 0;
     if (ascii_ends_with_i(path, ".json")) {
         ok = collect_json_text_patches((const char *)buf, size, &texts, &patches);
+    } else if (ascii_ends_with_i(path, ".md")) {
+        ok = collect_markdown_text_patches((const char *)buf, size, &texts, &patches);
     } else {
         ok = collect_scene_text_patches((const char *)buf, size, &texts, &patches);
     }
@@ -1001,7 +1200,7 @@ static char *build_text_resource_patch(const char *path, const unsigned char *bu
         return NULL;
     }
     translate_strings(http, &texts, translations, live_used);
-    char *resource = build_text_resource_override(buf, size, &patches, translations, patched_strings, out_size);
+    char *resource = build_text_resource_override(buf, size, &patches, translations, &texts, patched_strings, out_size);
     for (size_t i = 0; i < texts.n; i++) free(translations[i]);
     free(translations);
     strlist_free(&texts);
@@ -1036,6 +1235,24 @@ static int gdscript_translation_preserves_format_tokens(const char *source, cons
     for (size_t i = 0; i < sizeof tokens / sizeof tokens[0]; i++) {
         if (count_substr(source, tokens[i]) != count_substr(translated, tokens[i])) return 0;
     }
+    return 1;
+}
+
+/* Static text resources feed the same BBCode and format renderers as GDScript
+   constants, so gate translations the same way: brackets must stay balanced
+   and printf-style tokens must match the source. On mismatch the original
+   string is kept. */
+static int godot_text_translation_preserves_format(const char *source, const char *translated) {
+    if (!source || !translated) return 0;
+    int brackets = 0;
+    for (const char *p = translated; *p; p++) {
+        if (*p == '[') brackets++;
+        else if (*p == ']') brackets--;
+        if (brackets < 0) return 0;
+    }
+    if (brackets != 0) return 0;
+    if (count_substr(source, "%s") != count_substr(translated, "%s")) return 0;
+    if (count_substr(source, "%d") != count_substr(translated, "%d")) return 0;
     return 1;
 }
 
@@ -1491,7 +1708,9 @@ static int collect_optimized_translation_items(const unsigned char *buf, DWORD s
             uint32_t str_off = read_u32le(buf + rec + 4);
             uint32_t comp_size = read_u32le(buf + rec + 8);
             uint32_t uncomp_size = read_u32le(buf + rec + 12);
-            if (comp_size > *strings_len || str_off > *strings_len - comp_size) continue;
+            /* A skipped record would keep pointing into the old string heap
+               after the rebuild; abandon this resource instead. */
+            if (comp_size > *strings_len || str_off > *strings_len - comp_size) return 0;
             OptItem item;
             item.rec_off = rec;
             item.old_offset = str_off;
@@ -1588,7 +1807,7 @@ static char *build_optimized_translation_resource(const unsigned char *buf, DWOR
     }
     memcpy(out, work, strings_data_off);
     memcpy(out + strings_data_off, strings.data, strings.len);
-    if (new_pad) out[strings_data_off + strings.len] = 0;
+    if (new_pad) memset(out + strings_data_off + strings.len, 0, new_pad);
     memcpy(out + strings_data_off + strings.len + new_pad, work + old_tail, size - old_tail);
     *out_size = (DWORD)total;
     free(work);
@@ -1597,6 +1816,11 @@ static char *build_optimized_translation_resource(const unsigned char *buf, DWOR
 }
 
 static int copy_range_to_file(const WCHAR *src_path, uint64_t offset, uint64_t size, const WCHAR *dst_path) {
+    if (path_has_reparse_point(src_path, 1) ||
+        path_has_reparse_point(dst_path, 1)) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return 0;
+    }
     HANDLE src = CreateFileW(src_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (src == INVALID_HANDLE_VALUE) return 0;
@@ -1632,6 +1856,7 @@ static int copy_range_to_file(const WCHAR *src_path, uint64_t offset, uint64_t s
 
 static int normalize_embedded_pck_v1_offsets(const WCHAR *pack_path, uint64_t original_base) {
     if (!original_base) return 1;
+    if (path_has_reparse_point(pack_path, 1)) return 0;
     HANDLE h = CreateFileW(pack_path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
@@ -1640,17 +1865,30 @@ static int normalize_embedded_pck_v1_offsets(const WCHAR *pack_path, uint64_t or
     LARGE_INTEGER li;
     if (!GetFileSizeEx(h, &li) || li.QuadPart < 0) goto done;
     uint64_t pack_size = (uint64_t)li.QuadPart;
-    unsigned char header[GODOT_PCK_V2_HEADER_SIZE];
-    DWORD header_bytes = pack_size >= GODOT_PCK_V2_HEADER_SIZE ? GODOT_PCK_V2_HEADER_SIZE : GODOT_PCK_V1_HEADER_SIZE;
+
+    /* Embedded format 2 packs (Godot 4.0-4.5 single-exe exports) keep file_base
+       relative to the executable start. read_pck_info would reject that value as
+       out of range, so relocate the header field directly before any parsing. */
+    unsigned char v2_header[GODOT_PCK_V2_HEADER_SIZE];
+    if (pack_size >= sizeof v2_header && read_at_exact(h, 0, v2_header, sizeof v2_header) &&
+        read_u32le(v2_header) == GODOT_PCK_MAGIC && read_u32le(v2_header + 4) == 2u) {
+        uint64_t file_base = read_u64le(v2_header + 24);
+        if (file_base >= original_base) {
+            write_u64le(v2_header + 24, file_base - original_base);
+            if (!write_at_exact(h, 24, v2_header + 24, 8)) goto done;
+        }
+        ok = 1;
+        goto done;
+    }
+
     PckInfo info;
-    if (!read_at_exact(h, 0, header, header_bytes) ||
-        !parse_pck_info(header, header_bytes, pack_size, &info)) goto done;
+    if (!read_pck_info(h, 0, pack_size, &info)) goto done;
     if (info.format != 1 || !info.offsets_are_absolute) {
         ok = 1;
         goto done;
     }
 
-    uint64_t pos = info.header_size;
+    uint64_t pos = info.entries_offset;
     for (uint32_t i = 0; i < info.file_count; i++) {
         unsigned char lenbuf[4];
         if (!read_at_exact(h, pos, lenbuf, sizeof lenbuf)) goto done;
@@ -1746,11 +1984,13 @@ static int loose_project_text_path(const char *path) {
     if (ascii_contains_i(path, "/.import/") || ascii_contains_i(path, "res://.import/")) return 0;
     return ascii_ends_with_i(path, ".tscn") ||
            ascii_ends_with_i(path, ".tres") ||
-           ascii_ends_with_i(path, ".json");
+           ascii_ends_with_i(path, ".json") ||
+           godot_patch_markdown_resource_path(path);
 }
 
 static int write_loose_patch_pack(const WCHAR *pack_path, LoosePatchList *items) {
     if (!pack_path || !items || !items->n || items->n > UINT32_MAX) return 0;
+    if (path_has_reparse_point(pack_path, 1)) return 0;
     uint64_t table_size = 0;
     for (size_t i = 0; i < items->n; i++) {
         size_t path_len = strlen(items->v[i].path) + 1u;
@@ -1799,7 +2039,8 @@ static int collect_loose_project_overrides(const WCHAR *root, const WCHAR *rel_d
                                            PatchHttp *http, size_t *live_used,
                                            size_t *patched_resources, size_t *patched_strings,
                                            const WCHAR *cjk_font, int has_cjk_font,
-                                           size_t *font_replacements) {
+                                           size_t *font_replacements, unsigned depth) {
+    if (depth > GODOT_PATCH_LOOSE_MAX_DEPTH) return 1;
     WCHAR dir[MAX_PATH * 4];
     if (rel_dir && rel_dir[0]) path_join(dir, MAX_PATH * 4, root, rel_dir);
     else wcsncpy(dir, root, MAX_PATH * 4 - 1);
@@ -1819,9 +2060,11 @@ static int collect_loose_project_overrides(const WCHAR *root, const WCHAR *rel_d
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (loose_skip_dir_name(fd.cFileName)) continue;
+            /* Junctions and symlinks could loop the walk back into the tree. */
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
             if (!collect_loose_project_overrides(root, child_rel, items, http, live_used,
                                                  patched_resources, patched_strings,
-                                                 cjk_font, has_cjk_font, font_replacements)) {
+                                                 cjk_font, has_cjk_font, font_replacements, depth + 1u)) {
                 ok = 0;
                 break;
             }
@@ -1903,7 +2146,7 @@ static int build_loose_project_patch_pack(const WCHAR *dir, const WCHAR *build_p
     size_t font_replacements = 0;
     if (!collect_loose_project_overrides(dir, L"", &items, &http, &live_used,
                                          patched_resources, patched_strings,
-                                         cjk_font, has_cjk_font, &font_replacements)) {
+                                         cjk_font, has_cjk_font, &font_replacements, 0u)) {
         goto done;
     }
     if (*patched_resources == 0 || *patched_strings == 0) goto done;
@@ -1946,14 +2189,10 @@ static int find_sidecar_pck(const WCHAR *dir, PckSource *src) {
         LARGE_INTEGER sz;
         HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        unsigned char header[GODOT_PCK_V2_HEADER_SIZE] = {0};
         PckInfo info;
         if (f != INVALID_HANDLE_VALUE && GetFileSizeEx(f, &sz) &&
             sz.QuadPart >= GODOT_PCK_V1_HEADER_SIZE) {
-            DWORD want = sz.QuadPart >= GODOT_PCK_V2_HEADER_SIZE
-                ? GODOT_PCK_V2_HEADER_SIZE : GODOT_PCK_V1_HEADER_SIZE;
-            if (read_at_exact(f, 0, header, want) &&
-                parse_pck_info(header, want, (uint64_t)sz.QuadPart, &info)) {
+            if (read_pck_info(f, 0, (uint64_t)sz.QuadPart, &info)) {
                 int score = preferred[0] && !_wcsicmp(fd.cFileName, preferred) ? 100 : 0;
                 if (!ok || score > best_score ||
                     (score == best_score && _wcsicmp(path, best_path) < 0)) {
@@ -2023,6 +2262,109 @@ static int find_embedded_pck(const WCHAR *dir, PckSource *src) {
     return ok;
 }
 
+int godot_prepare_patch_launcher(const WCHAR *dir, WCHAR *out_exe, size_t cap) {
+    if (!dir || !out_exe || cap == 0 || path_has_reparse_point(dir, 1)) return 0;
+    out_exe[0] = 0;
+
+    PckSource sidecar;
+    PckSource embedded;
+    memset(&sidecar, 0, sizeof sidecar);
+    memset(&embedded, 0, sizeof embedded);
+    if (!find_sidecar_pck(dir, &sidecar) || find_embedded_pck(dir, &embedded)) return 0;
+
+    WCHAR source_exe[MAX_PATH * 4];
+    WCHAR launcher[MAX_PATH * 4];
+    WCHAR marker[MAX_PATH * 4];
+    if (!find_exe(dir, source_exe, MAX_PATH * 4)) return 0;
+    path_join(launcher, MAX_PATH * 4, dir, GODOT_PATCH_LAUNCHER_NAME);
+    path_join(marker, MAX_PATH * 4, dir, GODOT_PATCH_LAUNCHER_MARKER);
+
+    if (exists_path(launcher)) {
+        if (!exists_path(marker)) {
+            append_log(L"Godot: preserved an existing dst_godot_patch.exe without a launcher ownership marker.");
+            return 0;
+        }
+        wcsncpy(out_exe, launcher, cap - 1);
+        out_exe[cap - 1] = 0;
+        return 1;
+    }
+    if (exists_path(marker) && !delete_file_safe(marker)) return 0;
+
+    int paths_safe = !path_has_reparse_point(source_exe, 1) &&
+                     !path_has_reparse_point(launcher, 1);
+    if (!paths_safe ||
+        (!CreateHardLinkW(launcher, source_exe, NULL) &&
+         !copy_file_if_absent_safe(source_exe, launcher))) {
+        append_log(L"Godot: could not create the patch-pack launcher copy. Windows error: %lu", GetLastError());
+        return 0;
+    }
+    if (!write_file_bytes(marker, GODOT_PATCH_LAUNCHER_MARKER_TEXT,
+                          (DWORD)strlen(GODOT_PATCH_LAUNCHER_MARKER_TEXT))) {
+        DWORD marker_err = GetLastError();
+        delete_file_safe(launcher);
+        append_log(L"Godot: could not record patch-launcher ownership. Windows error: %lu", marker_err);
+        return 0;
+    }
+
+    wcsncpy(out_exe, launcher, cap - 1);
+    out_exe[cap - 1] = 0;
+    append_log(L"Godot: prepared a launcher-owned executable for exports that disable --main-pack.");
+    return 1;
+}
+
+static int godot_patch_pack_has_entry(const WCHAR *pack_path, const char *entry_path) {
+    if (!pack_path || !pack_path[0] || !entry_path || !entry_path[0]) return 0;
+    HANDLE h = CreateFileW(pack_path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER size_li;
+    PckInfo info;
+    int found = 0;
+    if (!GetFileSizeEx(h, &size_li) || size_li.QuadPart < 0 ||
+        !read_pck_info(h, 0, (uint64_t)size_li.QuadPart, &info)) {
+        CloseHandle(h);
+        return 0;
+    }
+    uint64_t pack_size = (uint64_t)size_li.QuadPart;
+    uint64_t pos = info.entries_offset;
+    for (uint32_t i = 0; i < info.file_count; i++) {
+        unsigned char lenbuf[4];
+        if (!read_at_exact(h, pos, lenbuf, sizeof lenbuf)) break;
+        pos += 4;
+        uint32_t path_len = read_u32le(lenbuf);
+        if (!path_len || path_len > GODOT_PATCH_MAX_PATH ||
+            pos > pack_size || path_len > pack_size - pos) {
+            break;
+        }
+        char *path = (char *)malloc((size_t)path_len + 1u);
+        if (!path) break;
+        if (!read_at_exact(h, pos, path, path_len)) {
+            free(path);
+            break;
+        }
+        path[path_len] = 0;
+        trim_pack_path(path, (size_t)path_len + 1u);
+        found = !_stricmp(godot_pack_entry_name(path), entry_path);
+        free(path);
+        pos += path_len;
+        if (found) break;
+        if (pos > pack_size || info.entry_meta_size > pack_size - pos) break;
+        pos += info.entry_meta_size;
+    }
+    CloseHandle(h);
+    return found;
+}
+
+int godot_patch_pack_has_runtime_sidecar(const WCHAR *pack_path) {
+    return godot_patch_pack_has_entry(pack_path, GODOT_RUNTIME_SCRIPT_PATH);
+}
+
+int godot_patch_pack_has_runtime_autoload(const WCHAR *pack_path) {
+    return godot_patch_pack_has_entry(pack_path, GODOT_AUTOLOAD_SCRIPT_PATH) &&
+           godot_patch_pack_has_entry(pack_path, GODOT_AUTOLOAD_OVERRIDE_PATH);
+}
+
 int godot_is_loose_project(const WCHAR *dir) {
     if (!dir || !dir[0]) return 0;
     WCHAR project[MAX_PATH * 4];
@@ -2057,6 +2399,7 @@ static const char GODOT_RUNTIME_SIDECAR_G3[] =
 "var _dst_cache_order = []\n"
 "var _dst_pending = {}\n"
 "var _dst_queue = []\n"
+"var _dst_queue_head = 0\n"
 "var _dst_http_pool = []\n"
 "var _dst_busy = {}\n"
 "var _dst_miss_until = {}\n"
@@ -2064,6 +2407,7 @@ static const char GODOT_RUNTIME_SIDECAR_G3[] =
 "var _dst_timer = null\n"
 "var _dst_seen_this_scan = 0\n"
 "var _dst_font = null\n"
+"var _dst_font_warned = false\n"
 "var _dst_error_counts = {}\n"
 "\n"
 "func _dst_report_error(context, detail):\n"
@@ -2073,6 +2417,9 @@ static const char GODOT_RUNTIME_SIDECAR_G3[] =
 "		push_warning(\"[DeepSeek Godot] %s failed #%d: %s\" % [context, count, str(detail)])\n"
 "\n"
 "func _initialize():\n"
+"	if OS.get_cmdline_args().has(\"--dst-preflight\"):\n"
+"		quit(0)\n"
+"		return\n"
 "	call_deferred(\"_dst_start\")\n"
 "\n"
 "func _dst_start():\n"
@@ -2152,23 +2499,25 @@ static const char GODOT_RUNTIME_SIDECAR_G3[] =
 "		var query = str(part.text).strip_edges()\n"
 "		if not _dst_plain_wanted(query):\n"
 "			continue\n"
-"		if _dst_cache.has(query) or _dst_pending.has(query) or _dst_recent_miss(query) or _dst_queue.size() >= DST_MAX_QUEUE:\n"
+"		if _dst_cache.has(query) or _dst_pending.has(query) or _dst_recent_miss(query) or _dst_queue_count() >= DST_MAX_QUEUE:\n"
 "			continue\n"
 "		_dst_pending[query] = true\n"
 "		_dst_queue.append(query)\n"
 "\n"
 "func _dst_pump():\n"
-"	if _dst_queue.empty():\n"
+"	if _dst_queue_count() <= 0:\n"
 "		return\n"
 "	for req in _dst_http_pool:\n"
-"		if _dst_queue.empty():\n"
+"		if _dst_queue_count() <= 0:\n"
 "			return\n"
 "		var id = req.get_instance_id()\n"
 "		if _dst_busy.has(id):\n"
 "			continue\n"
 "		var batch = []\n"
-"		while not _dst_queue.empty() and batch.size() < DST_BATCH_SIZE:\n"
-"			batch.append(_dst_queue.pop_front())\n"
+"		while _dst_queue_head < _dst_queue.size() and batch.size() < DST_BATCH_SIZE:\n"
+"			batch.append(_dst_queue[_dst_queue_head])\n"
+"			_dst_queue_head += 1\n"
+"		_dst_compact_queue()\n"
 "		if batch.empty():\n"
 "			continue\n"
 "		_dst_busy[id] = batch\n"
@@ -2180,6 +2529,24 @@ static const char GODOT_RUNTIME_SIDECAR_G3[] =
 "				_dst_pending.erase(source)\n"
 "			_dst_busy.erase(id)\n"
 "			_dst_backoff_batch(batch)\n"
+"\n"
+"func _dst_queue_count():\n"
+"	return _dst_queue.size() - _dst_queue_head\n"
+"\n"
+"func _dst_compact_queue():\n"
+"	if _dst_queue_head <= 0:\n"
+"		return\n"
+"	if _dst_queue_head >= _dst_queue.size():\n"
+"		_dst_queue.clear()\n"
+"		_dst_queue_head = 0\n"
+"		return\n"
+"	if _dst_queue_head < 256:\n"
+"		return\n"
+"	var remaining = []\n"
+"	for i in range(_dst_queue_head, _dst_queue.size()):\n"
+"		remaining.append(_dst_queue[i])\n"
+"	_dst_queue = remaining\n"
+"	_dst_queue_head = 0\n"
 "\n"
 "func _dst_http_done(result, response_code, headers, body, request_id):\n"
 "	if not _dst_busy.has(request_id):\n"
@@ -2312,6 +2679,9 @@ static const char GODOT_RUNTIME_SIDECAR_G3[] =
 "			font.size = 22\n"
 "			_dst_font = font\n"
 "			return _dst_font\n"
+"	if not _dst_font_warned:\n"
+"		_dst_font_warned = true\n"
+"		push_warning(\"[DeepSeek Godot] no usable CJK font found in DST_FONT_PATHS; Chinese glyphs may render as boxes.\")\n"
 "	return null\n"
 "\n"
 "func _dst_wanted(text):\n"
@@ -2346,6 +2716,7 @@ static const char GODOT_RUNTIME_SIDECAR_G4[] =
 "const DST_BATCH_SIZE = 48\n"
 "const DST_MAX_CACHE = 4096\n"
 "const DST_MAX_MISS = 4096\n"
+"const DST_MAX_TRACKED_CONTROLS = 4096\n"
 "const DST_MISS_BACKOFF_MS = 8000\n"
 "const DST_FONT_PATHS = [\"C:/Windows/Fonts/simhei.ttf\", \"C:/Windows/Fonts/msyh.ttf\", \"C:/Windows/Fonts/simsun.ttc\"]\n"
 "\n"
@@ -2355,10 +2726,15 @@ static const char GODOT_RUNTIME_SIDECAR_G4[] =
 "var _dst_miss_order = []\n"
 "var _dst_pending = {}\n"
 "var _dst_queue = []\n"
+"var _dst_queue_head = 0\n"
 "var _dst_busy = {}\n"
 "var _dst_requests = []\n"
 "var _dst_font = null\n"
+"var _dst_font_warned = false\n"
 "var _dst_seen = 0\n"
+"var _dst_controls = {}\n"
+"var _dst_control_order = []\n"
+"var _dst_control_cursor = -1\n"
 "var _dst_error_counts = {}\n"
 "\n"
 "func _dst_report_error(context, detail):\n"
@@ -2368,15 +2744,22 @@ static const char GODOT_RUNTIME_SIDECAR_G4[] =
 "		push_warning(\"[DeepSeek Godot] %s failed #%d: %s\" % [context, count, str(detail)])\n"
 "\n"
 "func _initialize():\n"
+"\tif OS.get_cmdline_args().has(\"--dst-preflight\") or OS.get_cmdline_user_args().has(\"--dst-preflight\"):\n"
+"\t\tquit(0)\n"
+"\t\treturn\n"
 "\tcall_deferred(\"_dst_start\")\n"
 "\n"
 "func _dst_start():\n"
+"\tget_root().get_tree().node_added.connect(Callable(self, \"_dst_track_control\"))\n"
+"\t_dst_track_controls(get_root())\n"
 "\tfor i in range(4):\n"
 "\t\tvar req = HTTPRequest.new()\n"
+"\t\treq.process_mode = Node.PROCESS_MODE_ALWAYS\n"
 "\t\tget_root().add_child(req)\n"
 "\t\t_dst_requests.append(req)\n"
 "\t\treq.request_completed.connect(Callable(self, \"_dst_done\").bind(req.get_instance_id()))\n"
 "\tvar timer = Timer.new()\n"
+"\ttimer.process_mode = Node.PROCESS_MODE_ALWAYS\n"
 "\ttimer.wait_time = 0.15\n"
 "\ttimer.one_shot = false\n"
 "\tget_root().add_child(timer)\n"
@@ -2386,8 +2769,65 @@ static const char GODOT_RUNTIME_SIDECAR_G4[] =
 "\tif scene != \"\":\n"
 "\t\tchange_scene_to_file(scene)\n"
 "\n"
+"func _dst_track_control(node):\n"
+"\tif not (node is Control):\n"
+"\t\treturn\n"
+"\tvar id = node.get_instance_id()\n"
+"\tif _dst_controls.has(id):\n"
+"\t\tvar current = _dst_controls[id].get_ref()\n"
+"\t\tif current != null:\n"
+"\t\t\treturn\n"
+"\t\t_dst_controls.erase(id)\n"
+"\t\t_dst_control_order.erase(id)\n"
+"\twhile _dst_control_order.size() >= DST_MAX_TRACKED_CONTROLS:\n"
+"\t\t_dst_controls.erase(_dst_control_order.pop_front())\n"
+"\t_dst_controls[id] = weakref(node)\n"
+"\t_dst_control_order.append(id)\n"
+"\tif _dst_control_cursor < 0:\n"
+"\t\t_dst_control_cursor = _dst_control_order.size() - 1\n"
+"\n"
+"func _dst_track_controls(node):\n"
+"\tif node == null:\n"
+"\t\treturn\n"
+"\t_dst_track_control(node)\n"
+"\tfor child in node.get_children():\n"
+"\t\t_dst_track_controls(child)\n"
+"\n"
+"func _dst_scan_controls():\n"
+"\tvar stale = []\n"
+"\tvar count = _dst_control_order.size()\n"
+"\tif count == 0:\n"
+"\t\t_dst_control_cursor = -1\n"
+"\t\treturn\n"
+"\tif _dst_control_cursor < 0 or _dst_control_cursor >= count:\n"
+"\t\t_dst_control_cursor = count - 1\n"
+"\tvar index = _dst_control_cursor\n"
+"\tvar scanned = 0\n"
+"\twhile scanned < count and _dst_seen < DST_SCAN_LIMIT:\n"
+"\t\tvar id = _dst_control_order[index]\n"
+"\t\tindex -= 1\n"
+"\t\tif index < 0:\n"
+"\t\t\tindex = count - 1\n"
+"\t\tscanned += 1\n"
+"\t\tvar holder = _dst_controls.get(id)\n"
+"\t\tvar node = holder.get_ref() if holder != null else null\n"
+"\t\tif node == null:\n"
+"\t\t\tstale.append(id)\n"
+"\t\t\tcontinue\n"
+"\t\tif not node.is_visible_in_tree():\n"
+"\t\t\tcontinue\n"
+"\t\t_dst_apply(node, \"text\")\n"
+"\t\tif node.has_method(\"get_item_count\") and node.has_method(\"get_item_text\") and node.has_method(\"set_item_text\"):\n"
+"\t\t\tfor item_index in range(node.get_item_count()):\n"
+"\t\t\t\t_dst_apply_item(node, item_index)\n"
+"\tfor id in stale:\n"
+"\t\t_dst_controls.erase(id)\n"
+"\t\t_dst_control_order.erase(id)\n"
+"\t_dst_control_cursor = min(index, _dst_control_order.size() - 1)\n"
+"\n"
 "func _dst_scan():\n"
 "\t_dst_seen = 0\n"
+"\t_dst_scan_controls()\n"
 "\t_dst_scan_node(get_root())\n"
 "\t_dst_pump()\n"
 "\n"
@@ -2396,11 +2836,8 @@ static const char GODOT_RUNTIME_SIDECAR_G4[] =
 "\t\treturn\n"
 "\tif node is CanvasItem and not node.is_visible_in_tree():\n"
 "\t\treturn\n"
-"\tif node.get(\"bbcode_enabled\") == true:\n"
-"\t\t_dst_apply(node, \"bbcode_text\")\n"
-"\telse:\n"
-"\t\t_dst_apply(node, \"text\")\n"
-"\t\t_dst_apply(node, \"bbcode_text\")\n"
+"\t# Godot 4 RichTextLabel stores its BBCode source in the text property.\n"
+"\t_dst_apply(node, \"text\")\n"
 "\tif node.has_method(\"get_item_count\") and node.has_method(\"get_item_text\") and node.has_method(\"set_item_text\"):\n"
 "\t\tfor i in range(node.get_item_count()):\n"
 "\t\t\t_dst_apply_item(node, i)\n"
@@ -2438,21 +2875,23 @@ static const char GODOT_RUNTIME_SIDECAR_G4[] =
 "\t\tif part.tag:\n"
 "\t\t\tcontinue\n"
 "\t\tvar query = str(part.text).strip_edges()\n"
-"\t\tif not _dst_plain_wanted(query) or _dst_cache.has(query) or _dst_pending.has(query) or _dst_recent_miss(query) or _dst_queue.size() >= DST_QUEUE_LIMIT:\n"
+"\t\tif not _dst_plain_wanted(query) or _dst_cache.has(query) or _dst_pending.has(query) or _dst_recent_miss(query) or _dst_queue_count() >= DST_QUEUE_LIMIT:\n"
 "\t\t\tcontinue\n"
 "\t\t_dst_pending[query] = true\n"
 "\t\t_dst_queue.append(query)\n"
 "\n"
 "func _dst_pump():\n"
 "\tfor req in _dst_requests:\n"
-"\t\tif _dst_queue.is_empty():\n"
+"\t\tif _dst_queue_count() <= 0:\n"
 "\t\t\treturn\n"
 "\t\tvar id = req.get_instance_id()\n"
 "\t\tif _dst_busy.has(id):\n"
 "\t\t\tcontinue\n"
 "\t\tvar batch = []\n"
-"\t\twhile not _dst_queue.is_empty() and batch.size() < DST_BATCH_SIZE:\n"
-"\t\t\tbatch.append(_dst_queue.pop_front())\n"
+"\t\twhile _dst_queue_head < _dst_queue.size() and batch.size() < DST_BATCH_SIZE:\n"
+"\t\t\tbatch.append(_dst_queue[_dst_queue_head])\n"
+"\t\t\t_dst_queue_head += 1\n"
+"\t\t_dst_compact_queue()\n"
 "\t\t_dst_busy[id] = batch\n"
 "\t\tvar err = req.request(DST_URL, [\"Content-Type: application/json\"], HTTPClient.METHOD_POST, JSON.stringify({\"texts\": batch}))\n"
 "\t\tif err != OK:\n"
@@ -2461,6 +2900,24 @@ static const char GODOT_RUNTIME_SIDECAR_G4[] =
 "\t\t\tfor query in batch:\n"
 "\t\t\t\t_dst_pending.erase(query)\n"
 "\t\t\t\t_dst_mark_miss(query)\n"
+"\n"
+"func _dst_queue_count():\n"
+"\treturn _dst_queue.size() - _dst_queue_head\n"
+"\n"
+"func _dst_compact_queue():\n"
+"\tif _dst_queue_head <= 0:\n"
+"\t\treturn\n"
+"\tif _dst_queue_head >= _dst_queue.size():\n"
+"\t\t_dst_queue.clear()\n"
+"\t\t_dst_queue_head = 0\n"
+"\t\treturn\n"
+"\tif _dst_queue_head < 256:\n"
+"\t\treturn\n"
+"\tvar remaining = []\n"
+"\tfor i in range(_dst_queue_head, _dst_queue.size()):\n"
+"\t\tremaining.append(_dst_queue[i])\n"
+"\t_dst_queue = remaining\n"
+"\t_dst_queue_head = 0\n"
 "\n"
 "func _dst_done(result, response_code, headers, body, request_id):\n"
 "\tif not _dst_busy.has(request_id):\n"
@@ -2559,6 +3016,9 @@ static const char GODOT_RUNTIME_SIDECAR_G4[] =
 "\t\t\t\tif font.load_dynamic_font(path) == OK:\n"
 "\t\t\t\t\t_dst_font = font\n"
 "\t\t\t\t\tbreak\n"
+"\t\tif _dst_font == null and not _dst_font_warned:\n"
+"\t\t\t_dst_font_warned = true\n"
+"\t\t\tpush_warning(\"[DeepSeek Godot] no usable CJK font found in DST_FONT_PATHS; Chinese glyphs may render as boxes.\")\n"
 "\tif _dst_font != null and node.has_method(\"add_theme_font_override\"):\n"
 "\t\tnode.add_theme_font_override(\"font\", _dst_font)\n"
 "\t\tnode.add_theme_font_override(\"normal_font\", _dst_font)\n"
@@ -2581,18 +3041,284 @@ static const char GODOT_RUNTIME_SIDECAR_G4[] =
 "\t\t\tlatin = true\n"
 "\treturn latin\n";
 
+static char *replace_all_text(const char *source, const char *needle, const char *replacement) {
+    if (!source || !needle || !needle[0] || !replacement) return NULL;
+    size_t source_len = strlen(source);
+    size_t needle_len = strlen(needle);
+    size_t replacement_len = strlen(replacement);
+    size_t count = 0;
+    for (const char *p = source; (p = strstr(p, needle)) != NULL; p += needle_len) count++;
+    if (!count) return _strdup(source);
+
+    size_t result_len = source_len;
+    if (replacement_len >= needle_len) {
+        size_t growth = replacement_len - needle_len;
+        if (growth && count > (SIZE_MAX - source_len) / growth) return NULL;
+        result_len += count * growth;
+    } else {
+        result_len -= count * (needle_len - replacement_len);
+    }
+    char *result = (char *)malloc(result_len + 1u);
+    if (!result) return NULL;
+
+    const char *read = source;
+    char *write = result;
+    for (;;) {
+        const char *match = strstr(read, needle);
+        if (!match) break;
+        size_t prefix = (size_t)(match - read);
+        memcpy(write, read, prefix);
+        write += prefix;
+        memcpy(write, replacement, replacement_len);
+        write += replacement_len;
+        read = match + needle_len;
+    }
+    memcpy(write, read, strlen(read) + 1u);
+    return result;
+}
+
+/* The runtime templates list default Windows font paths. Swap the first
+   candidate for the CJK font actually resolved on this machine so hosts with a
+   different Windows directory still load a usable font. Without a system CJK
+   font the default list is kept and the script warns once at runtime. */
+static char *godot_runtime_script_with_font(const char *source) {
+    if (!source) return NULL;
+    WCHAR font_w[MAX_PATH * 4];
+    if (!find_system_cjk_font(font_w, MAX_PATH * 4)) return _strdup(source);
+    char font_utf8[MAX_PATH * 4];
+    if (WideCharToMultiByte(CP_UTF8, 0, font_w, -1, font_utf8, (int)sizeof font_utf8,
+                            NULL, NULL) <= 0) {
+        return _strdup(source);
+    }
+    for (char *p = font_utf8; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+    return replace_all_text(source, "C:/Windows/Fonts/simhei.ttf", font_utf8);
+}
+
+static char *build_godot_runtime_autoload(uint32_t engine_major) {
+    const char *source = engine_major == 3 ? GODOT_RUNTIME_SIDECAR_G3 : GODOT_RUNTIME_SIDECAR_G4;
+    const char *scene_start = engine_major == 3
+        ? "\tvar scene = str(ProjectSettings.get_setting(\"application/run/main_scene\"))\n"
+          "\tif scene != \"\":\n"
+          "\t\tchange_scene(scene)\n"
+        : "\tvar scene = str(ProjectSettings.get_setting(\"application/run/main_scene\"))\n"
+          "\tif scene != \"\":\n"
+          "\t\tchange_scene_to_file(scene)\n";
+    char *step = replace_all_text(source, "extends SceneTree\n", "extends Node\n");
+    char *next = step ? replace_all_text(step, "func _initialize():\n", "func _ready():\n") : NULL;
+    free(step);
+    step = next ? replace_all_text(next, "\t\tquit(0)\n", "\t\tget_tree().quit(0)\n") : NULL;
+    free(next);
+    next = step ? replace_all_text(step, "get_root()", "get_tree().root") : NULL;
+    free(step);
+    step = next ? replace_all_text(next, scene_start, "") : NULL;
+    free(next);
+    if (!step || strstr(step, "extends SceneTree") || strstr(step, "change_scene")) {
+        free(step);
+        return NULL;
+    }
+    char *with_font = godot_runtime_script_with_font(step);
+    free(step);
+    return with_font;
+}
+
+static size_t find_text_token(const char *text, size_t text_size,
+                              const char *token) {
+    size_t token_size = strlen(token);
+    if (!token_size || token_size > text_size) return SIZE_MAX;
+    for (size_t i = 0; i <= text_size - token_size; i++) {
+        if (!memcmp(text + i, token, token_size)) return i;
+    }
+    return SIZE_MAX;
+}
+
+/* An existing autoload key only counts when it starts a line as a real key;
+   a substring inside a comment or a longer key must not suppress insertion. */
+static int runtime_override_has_key(const char *source, size_t source_size) {
+    size_t key_len = strlen(GODOT_AUTOLOAD_OVERRIDE_KEY);
+    size_t pos = 0;
+    while (pos + key_len <= source_size) {
+        if ((pos == 0 || source[pos - 1] == '\n') &&
+            !memcmp(source + pos, GODOT_AUTOLOAD_OVERRIDE_KEY, key_len)) {
+            char next = pos + key_len < source_size ? source[pos + key_len] : '\n';
+            if (next == '=' || next == ' ' || next == '\t') return 1;
+        }
+        const char *nl = (const char *)memchr(source + pos, '\n', source_size - pos);
+        if (!nl) break;
+        pos = (size_t)(nl - source) + 1u;
+    }
+    return 0;
+}
+
+static int build_runtime_override(const char *source, size_t source_size,
+                                  char **out, DWORD *out_size) {
+    static const char entry[] = GODOT_AUTOLOAD_OVERRIDE_KEY "=\""
+                                GODOT_AUTOLOAD_OVERRIDE_VALUE "\"\n";
+    *out = NULL;
+    *out_size = 0;
+    if (source_size > UINT32_MAX || (source_size && !source)) return 0;
+
+    if (runtime_override_has_key(source, source_size)) {
+        char *copy = (char *)malloc(source_size + 1u);
+        if (!copy) return 0;
+        memcpy(copy, source, source_size);
+        copy[source_size] = 0;
+        *out = copy;
+        *out_size = (DWORD)source_size;
+        return 1;
+    }
+
+    size_t section_pos = find_text_token(source, source_size,
+                                         GODOT_AUTOLOAD_OVERRIDE_SECTION);
+    size_t insert = source_size;
+    size_t prefix_size = 0;
+    const char *prefix = NULL;
+    if (section_pos != SIZE_MAX) {
+        insert = section_pos + strlen(GODOT_AUTOLOAD_OVERRIDE_SECTION);
+        while (insert < source_size && source[insert] != '\n') insert++;
+        if (insert < source_size) insert++;
+    } else {
+        prefix = source_size && source[source_size - 1u] != '\n'
+            ? "\n\n" GODOT_AUTOLOAD_OVERRIDE_SECTION "\n"
+            : "\n" GODOT_AUTOLOAD_OVERRIDE_SECTION "\n";
+        prefix_size = strlen(prefix);
+    }
+
+    /* The section header may be the last line without a trailing newline;
+       the inserted entry must still start on its own line. */
+    const char *entry_lead = "";
+    size_t entry_lead_size = 0;
+    if (!prefix_size && insert > 0 && source[insert - 1] != '\n') {
+        entry_lead = "\n";
+        entry_lead_size = 1;
+    }
+    size_t entry_size = strlen(entry);
+    uint64_t total = (uint64_t)source_size + prefix_size + entry_lead_size + entry_size;
+    if (total > UINT32_MAX) return 0;
+    char *result = (char *)malloc((size_t)total + 1u);
+    if (!result) return 0;
+    memcpy(result, source, insert);
+    size_t write = insert;
+    if (prefix_size) {
+        memcpy(result + write, prefix, prefix_size);
+        write += prefix_size;
+    }
+    if (entry_lead_size) {
+        memcpy(result + write, entry_lead, entry_lead_size);
+        write += entry_lead_size;
+    }
+    memcpy(result + write, entry, entry_size);
+    write += entry_size;
+    memcpy(result + write, source + insert, source_size - insert);
+    result[total] = 0;
+    *out = result;
+    *out_size = (DWORD)total;
+    return 1;
+}
+
+static int append_pck_directory_entry(HANDLE h, const char *path,
+                                      const unsigned char *meta, uint32_t meta_size) {
+    size_t raw_path_size = strlen(path) + 1u;
+    uint32_t path_size = (uint32_t)((raw_path_size + 3u) & ~3u);
+    unsigned char path_len[4];
+    unsigned char path_buf[64] = {0};
+    if (path_size > sizeof path_buf) return 0;
+    write_u32le(path_len, path_size);
+    memcpy(path_buf, path, raw_path_size);
+    return append_file_bytes(h, (const char *)path_len, sizeof path_len, NULL) &&
+           append_file_bytes(h, (const char *)path_buf, path_size, NULL) &&
+           append_file_bytes(h, (const char *)meta, meta_size, NULL);
+}
+
+static int append_runtime_script(HANDLE h, const PckInfo *info, const char *script,
+                                 uint64_t existing_meta_pos,
+                                 unsigned char meta[8 + 8 + 16 + 4]) {
+    size_t script_size = strlen(script);
+    uint64_t script_abs = 0;
+    memset(meta, 0, 8 + 8 + 16 + 4);
+    if (!script_size || script_size > UINT32_MAX ||
+        !append_file_bytes(h, script, (DWORD)script_size, &script_abs) ||
+        script_abs < info->file_base) {
+        return 0;
+    }
+    write_u64le(meta, info->offsets_are_absolute ? script_abs : script_abs - info->file_base);
+    write_u64le(meta + 8, script_size);
+    return !existing_meta_pos || write_at_exact(h, existing_meta_pos, meta, info->entry_meta_size);
+}
+
+static int embed_format3_runtime_scripts(HANDLE h, const PckInfo *info,
+                                         uint64_t directory_end,
+                                         uint64_t runtime_meta_pos,
+                                         uint64_t autoload_meta_pos,
+                                         uint64_t override_meta_pos,
+                                         const char *autoload_script,
+                                         const char *override_config) {
+    uint32_t additions = (runtime_meta_pos ? 0u : 1u) +
+                         (autoload_script && !autoload_meta_pos ? 1u : 0u) +
+                         (override_config && !override_meta_pos ? 1u : 0u);
+    if (h == INVALID_HANDLE_VALUE || !info || info->format != 3 ||
+        info->file_count > GODOT_PATCH_MAX_FILES - additions ||
+        directory_end < info->entries_offset) {
+        return 0;
+    }
+    int ok = 0;
+    char *runtime_script = godot_runtime_script_with_font(
+        info->engine_major == 3 ? GODOT_RUNTIME_SIDECAR_G3 : GODOT_RUNTIME_SIDECAR_G4);
+    if (!runtime_script) return 0;
+    unsigned char runtime_meta[8 + 8 + 16 + 4];
+    unsigned char autoload_meta[8 + 8 + 16 + 4];
+    unsigned char override_meta[8 + 8 + 16 + 4];
+    if (!append_runtime_script(h, info, runtime_script, runtime_meta_pos, runtime_meta) ||
+        (autoload_script &&
+         !append_runtime_script(h, info, autoload_script, autoload_meta_pos, autoload_meta)) ||
+        (override_config &&
+         !append_runtime_script(h, info, override_config, override_meta_pos, override_meta))) {
+        goto done;
+    }
+
+    unsigned char count[4];
+    write_u32le(count, info->file_count + additions);
+    uint64_t new_directory = 0;
+    if (!append_file_bytes(h, (const char *)count, sizeof count, &new_directory) ||
+        !append_file_range(h, info->entries_offset,
+                           directory_end - info->entries_offset, NULL)) {
+        goto done;
+    }
+    if (!runtime_meta_pos &&
+        !append_pck_directory_entry(h, "res://" GODOT_RUNTIME_SCRIPT_PATH,
+                                    runtime_meta, info->entry_meta_size)) {
+        goto done;
+    }
+    if (autoload_script && !autoload_meta_pos &&
+        !append_pck_directory_entry(h, "res://" GODOT_AUTOLOAD_SCRIPT_PATH,
+                                    autoload_meta, info->entry_meta_size)) {
+        goto done;
+    }
+    if (override_config && !override_meta_pos &&
+        !append_pck_directory_entry(h, "res://" GODOT_AUTOLOAD_OVERRIDE_PATH,
+                                    override_meta, info->entry_meta_size)) {
+        goto done;
+    }
+    unsigned char directory_offset[8];
+    write_u64le(directory_offset, new_directory);
+    ok = write_at_exact(h, 32, directory_offset, sizeof directory_offset);
+
+done:
+    free(runtime_script);
+    return ok;
+}
+
 static int godot_runtime_major_from_source(const PckSource *src) {
     if (!src || !src->path[0] || src->size < GODOT_PCK_V1_HEADER_SIZE) return 0;
     HANDLE h = CreateFileW(src->path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    unsigned char header[GODOT_PCK_V2_HEADER_SIZE] = {0};
-    DWORD want = src->size >= GODOT_PCK_V2_HEADER_SIZE ? GODOT_PCK_V2_HEADER_SIZE : GODOT_PCK_V1_HEADER_SIZE;
     PckInfo info;
-    int ok = read_at_exact(h, src->offset, header, want) &&
-             parse_pck_info(header, want, src->size, &info);
+    int ok = read_pck_info(h, src->offset, src->size, &info);
     CloseHandle(h);
     if (!ok) return 0;
+    if (info.engine_major == 3 || info.engine_major == 4) return (int)info.engine_major;
     return info.format == 1 ? 3 : 4;
 }
 
@@ -2639,12 +3365,19 @@ static int write_godot_runtime_sidecar_if_changed(const WCHAR *script, const cha
 }
 
 int godot_prepare_runtime_sidecar(const WCHAR *dir) {
-    if (!dir || !dir[0]) return 0;
+    if (!dir || !dir[0] || path_has_reparse_point(dir, 1)) return 0;
     WCHAR script[MAX_PATH * 4];
     path_join(script, MAX_PATH * 4, dir, GODOT_RUNTIME_SCRIPT_NAME);
     int major = godot_runtime_major(dir);
-    const char *sidecar = major >= 4 ? GODOT_RUNTIME_SIDECAR_G4 : GODOT_RUNTIME_SIDECAR_G3;
-    if (!write_godot_runtime_sidecar_if_changed(script, sidecar)) {
+    char *sidecar = godot_runtime_script_with_font(
+        major >= 4 ? GODOT_RUNTIME_SIDECAR_G4 : GODOT_RUNTIME_SIDECAR_G3);
+    if (!sidecar) {
+        append_log(L"Godot: failed to build the runtime translation sidecar script.");
+        return 0;
+    }
+    int ok = write_godot_runtime_sidecar_if_changed(script, sidecar);
+    free(sidecar);
+    if (!ok) {
         append_log(L"Godot: failed to write runtime translation sidecar.");
         return 0;
     }
@@ -2661,6 +3394,13 @@ static char *trim_pack_path(char *path, size_t n) {
     return path;
 }
 
+/* PCK entry paths conventionally carry a res:// prefix; compare without it so
+   game-shipped entries and launcher entries written by older builds both match. */
+static const char *godot_pack_entry_name(const char *path) {
+    if (!path) return "";
+    return !strncmp(path, "res://", 6) ? path + 6 : path;
+}
+
 static void free_entries(PckEntry *entries, size_t n) {
     for (size_t i = 0; i < n; i++) free(entries[i].path);
     free(entries);
@@ -2669,6 +3409,7 @@ static void free_entries(PckEntry *entries, size_t n) {
 static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, size_t *patched_strings) {
     *patched_resources = 0;
     *patched_strings = 0;
+    if (path_has_reparse_point(pack_path, 1)) return 0;
     HANDLE h = CreateFileW(pack_path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
@@ -2676,16 +3417,19 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
     LARGE_INTEGER pack_size_li;
     if (!GetFileSizeEx(h, &pack_size_li) || pack_size_li.QuadPart < 0) goto done;
     uint64_t pack_size = (uint64_t)pack_size_li.QuadPart;
-    unsigned char header[GODOT_PCK_V2_HEADER_SIZE];
-    DWORD header_bytes = pack_size >= GODOT_PCK_V2_HEADER_SIZE ? GODOT_PCK_V2_HEADER_SIZE : GODOT_PCK_V1_HEADER_SIZE;
     PckInfo info;
-    if (!read_at_exact(h, 0, header, header_bytes) ||
-        !parse_pck_info(header, header_bytes, pack_size, &info)) goto done;
+    if (!read_pck_info(h, 0, pack_size, &info)) goto done;
 
     PckEntry *entries = (PckEntry *)calloc(info.file_count, sizeof *entries);
     if (!entries) goto done;
     size_t entry_n = 0;
-    uint64_t pos = info.header_size;
+    uint32_t parsed_entries = 0;
+    uint64_t runtime_meta_pos = 0;
+    uint64_t autoload_meta_pos = 0;
+    uint64_t override_meta_pos = 0;
+    uint64_t override_rel = 0;
+    uint64_t override_size = 0;
+    uint64_t pos = info.entries_offset;
     for (uint32_t i = 0; i < info.file_count; i++) {
         unsigned char lenbuf[4];
         if (!read_at_exact(h, pos, lenbuf, sizeof lenbuf)) break;
@@ -2708,6 +3452,15 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
             break;
         }
         pos += info.entry_meta_size;
+        parsed_entries++;
+        const char *entry_name = godot_pack_entry_name(path);
+        if (!_stricmp(entry_name, GODOT_RUNTIME_SCRIPT_PATH)) runtime_meta_pos = meta_pos;
+        if (!_stricmp(entry_name, GODOT_AUTOLOAD_SCRIPT_PATH)) autoload_meta_pos = meta_pos;
+        if (!_stricmp(entry_name, GODOT_AUTOLOAD_OVERRIDE_PATH)) {
+            override_meta_pos = meta_pos;
+            override_rel = read_u64le(meta);
+            override_size = read_u64le(meta + 8);
+        }
         int kind = 0;
         int font_priority = 0;
         if (godot_english_translation_path(path)) {
@@ -2731,14 +3484,19 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
             free(path);
         }
     }
+    if (parsed_entries != info.file_count) {
+        append_log(L"Godot: PCK directory ended before all declared entries were parsed.");
+        free_entries(entries, entry_n);
+        goto done;
+    }
+    uint64_t directory_end = pos;
 
     if (entry_n > 1) qsort(entries, entry_n, sizeof *entries, compare_pck_entries_for_patch);
 
-    PatchHttp http;
-    if (!http_open(&http)) {
-        append_log(L"Godot: local server was not reachable while building patch pack.");
-        free_entries(entries, entry_n);
-        goto done;
+    PatchHttp http = {0};
+    int http_available = http_open(&http);
+    if (!http_available && entry_n) {
+        append_log(L"Godot: local server was not reachable; building a runtime-only format 3 patch when possible.");
     }
 
     WCHAR cjk_font[MAX_PATH * 4] = {0};
@@ -2771,6 +3529,7 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
             }
             continue;
         }
+        if (!http_available) continue;
         if (entries[i].size == 0 || entries[i].size > GODOT_PATCH_MAX_ENTRY_BYTES) continue;
         uint64_t abs = info.offsets_are_absolute ? entries[i].rel : info.file_base + entries[i].rel;
         if (entries[i].size > UINT32_MAX || abs > pack_size || entries[i].size > pack_size - abs) continue;
@@ -2845,6 +3604,64 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
         free(buf);
     }
     http_close(&http);
+    if (info.format == 3) {
+        int supports_autoload_prepend = info.engine_major > 4u ||
+                                        (info.engine_major == 4u && info.engine_minor >= 6u);
+        char *override_source = NULL;
+        char *override_config = NULL;
+        DWORD override_config_size = 0;
+        int autoload_configured = 0;
+        if (supports_autoload_prepend) {
+            if (override_meta_pos) {
+                uint64_t override_abs = info.offsets_are_absolute
+                    ? override_rel : info.file_base + override_rel;
+                if (override_size > GODOT_PATCH_MAX_ENTRY_BYTES ||
+                    override_size > UINT32_MAX || override_abs > pack_size ||
+                    override_size > pack_size - override_abs) {
+                    append_log(L"Godot: existing override.cfg is unreadable; keeping script-launch compatibility only.");
+                } else {
+                    override_source = (char *)malloc((size_t)override_size + 1u);
+                    if (override_source &&
+                        read_at_exact(h, override_abs, override_source, (DWORD)override_size)) {
+                        override_source[override_size] = 0;
+                    } else {
+                        free(override_source);
+                        override_source = NULL;
+                        append_log(L"Godot: existing override.cfg could not be read; keeping script-launch compatibility only.");
+                    }
+                }
+            }
+            if ((!override_meta_pos || override_source) &&
+                build_runtime_override(override_source, (size_t)override_size,
+                                       &override_config, &override_config_size)) {
+                autoload_configured = 1;
+            } else if (!override_config) {
+                append_log(L"Godot: override.cfg could not accept the runtime autoload; keeping script-launch compatibility only.");
+            }
+        }
+        free(override_source);
+        char *autoload_script = autoload_configured
+            ? build_godot_runtime_autoload(info.engine_major) : NULL;
+        if (autoload_configured && !autoload_script) {
+            append_log(L"Godot: failed to construct the engine-compatible runtime autoload script.");
+            free(override_config);
+            override_config = NULL;
+            autoload_configured = 0;
+        }
+        if (!embed_format3_runtime_scripts(h, &info, directory_end,
+                                           runtime_meta_pos, autoload_meta_pos,
+                                           override_meta_pos, autoload_script,
+                                           override_config)) {
+            free(autoload_script);
+            free(override_config);
+            append_log(L"Godot: failed to embed the runtime translator and rebuild the format 3 PCK directory.");
+            free_entries(entries, entry_n);
+            goto done;
+        }
+        free(autoload_script);
+        free(override_config);
+        (*patched_resources) += 1u + (autoload_configured ? 2u : 0u);
+    }
     free_entries(entries, entry_n);
     ok = 1;
 
@@ -2854,7 +3671,7 @@ done:
 }
 
 int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
-    if (!dir || !out_pack || cap == 0) return 0;
+    if (!dir || !out_pack || cap == 0 || path_has_reparse_point(dir, 1)) return 0;
     WCHAR final_pack[MAX_PATH * 4];
     WCHAR build_pack[MAX_PATH * 4];
     WCHAR next_pack[MAX_PATH * 4];
@@ -2863,11 +3680,11 @@ int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
     path_join(next_pack, MAX_PATH * 4, dir, GODOT_PATCH_NEXT_NAME);
     wcsncpy(out_pack, final_pack, cap - 1);
     out_pack[cap - 1] = 0;
-    DeleteFileW(build_pack);
+    if (exists_path(build_pack) && !delete_file_safe(build_pack)) return 0;
 
     if (godot_is_loose_project(dir)) {
-        DeleteFileW(final_pack);
-        DeleteFileW(next_pack);
+        if (exists_path(final_pack) && !delete_file_safe(final_pack)) return 0;
+        if (exists_path(next_pack) && !delete_file_safe(next_pack)) return 0;
         if (!godot_prepare_runtime_sidecar(dir)) return 0;
         path_join(out_pack, cap, dir, GODOT_RUNTIME_SCRIPT_NAME);
         append_log(L"Godot: loose project detected; prepared runtime sidecar instead of a --main-pack overlay.");
@@ -2882,42 +3699,57 @@ int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
     int should_try_loose_project = 0;
     if (has_pck_source) {
         if (!copy_range_to_file(src.path, src.offset, src.size, build_pack)) {
-            DeleteFileW(build_pack);
+            delete_file_safe(build_pack);
             should_try_loose_project = 1;
             append_log(L"Godot: failed to copy original pack into patch pack; trying loose project overrides.");
         } else if (!normalize_embedded_pck_v1_offsets(build_pack, src.offset)) {
-            DeleteFileW(build_pack);
+            delete_file_safe(build_pack);
             should_try_loose_project = 1;
             append_log(L"Godot: failed to normalize embedded PCK v1 offsets; trying loose project overrides.");
         } else if (!patch_pack_file(build_pack, &patched_resources, &patched_strings) || !patched_resources) {
-            DeleteFileW(build_pack);
+            delete_file_safe(build_pack);
             should_try_loose_project = 1;
             append_log(L"Godot: PCK source had no translated overrides; trying loose project overrides.");
         }
         if (should_try_loose_project) {
+            /* A minimal loose override pack replaces the whole game pack, so it
+               is only valid for a complete loose project. Installed over a
+               packaged game it would leave the game unbootable (Godot 4 rejects
+               format 1 packs outright). */
+            if (!godot_is_loose_project(dir)) {
+                append_log(L"Godot: no patch output for the packaged game; not installing a loose minimal pack.");
+                return 0;
+            }
             patched_resources = 0;
             patched_strings = 0;
             if (!build_loose_project_patch_pack(dir, build_pack, &patched_resources, &patched_strings)) {
                 append_log(L"Godot: PCK source and loose project overrides had no translated resource overrides yet.");
+                delete_file_safe(build_pack);
                 return 0;
             }
             append_log(L"Godot: using loose project override pack.");
         }
     } else {
         if (!build_loose_project_patch_pack(dir, build_pack, &patched_resources, &patched_strings)) {
-            DeleteFileW(build_pack);
+            delete_file_safe(build_pack);
             append_log(L"Godot: no readable PCK source or loose project text overrides found for runtime patch pack.");
             return 0;
         }
     }
 
-    if (MoveFileExW(build_pack, final_pack, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (move_file_safe(build_pack, final_pack, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (exists_path(next_pack) && !delete_file_safe(next_pack)) {
+            DWORD cleanup_err = GetLastError();
+            if (cleanup_err != ERROR_FILE_NOT_FOUND) {
+                append_log(L"Godot: installed refreshed patch pack but could not remove stale staged pack. Windows error: %lu", cleanup_err);
+            }
+        }
         append_log(L"Godot: patch pack ready: %s", final_pack);
     } else {
         DWORD replace_err = GetLastError();
-        if (!MoveFileExW(build_pack, next_pack, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (!move_file_safe(build_pack, next_pack, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             DWORD stage_err = GetLastError();
-            DeleteFileW(build_pack);
+            delete_file_safe(build_pack);
             append_log(L"Godot: failed to install refreshed patch pack (replace error %lu, stage error %lu).", replace_err, stage_err);
             return 0;
         }
@@ -2930,13 +3762,13 @@ int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
 }
 
 int godot_promote_staged_patch_pack(const WCHAR *dir) {
-    if (!dir) return 0;
+    if (!dir || path_has_reparse_point(dir, 1)) return 0;
     WCHAR final_pack[MAX_PATH * 4];
     WCHAR next_pack[MAX_PATH * 4];
     path_join(final_pack, MAX_PATH * 4, dir, GODOT_PATCH_PACK_NAME);
     path_join(next_pack, MAX_PATH * 4, dir, GODOT_PATCH_NEXT_NAME);
     if (!exists_path(next_pack)) return 0;
-    if (MoveFileExW(next_pack, final_pack, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (move_file_safe(next_pack, final_pack, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         append_log(L"Godot: promoted refreshed patch pack from previous run.");
         return 1;
     }

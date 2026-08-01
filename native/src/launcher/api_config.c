@@ -7,6 +7,7 @@
 
 #include "api_config.h"
 #include "fsutil.h"
+#include "resource.h"
 #include "ui.h"
 
 #include <string.h>
@@ -37,7 +38,7 @@ static LRESULT CALLBACK api_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         get_api_config_path(cfg, MAX_PATH * 4);
         WCHAR endpoint[1024], model[256], key[1024];
         GetPrivateProfileStringW(L"api", L"endpoint", L"https://api.deepseek.com/v1/chat/completions", endpoint, 1024, cfg);
-        GetPrivateProfileStringW(L"api", L"model", L"deepseek-chat", model, 256, cfg);
+        GetPrivateProfileStringW(L"api", L"model", L"deepseek-v4-flash", model, 256, cfg);
         GetPrivateProfileStringW(L"api", L"key", L"", key, 1024, cfg);
 
         /* 创建标签 + 编辑框 + 按钮 */
@@ -68,9 +69,19 @@ static LRESULT CALLBACK api_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetWindowTextW(d->endpoint, endpoint, 1024);
             GetWindowTextW(d->model, model, 256);
             GetWindowTextW(d->key, key, 1024);
-            WritePrivateProfileStringW(L"api", L"endpoint", endpoint, cfg);
-            WritePrivateProfileStringW(L"api", L"model", model, cfg);
-            WritePrivateProfileStringW(L"api", L"key", key, cfg);
+            /* 三个键都尝试写入（与原有行为一致）；任一失败则记录日志并提示，
+               对话框保持打开以便用户修正后重试。 */
+            int ok_endpoint = WritePrivateProfileStringW(L"api", L"endpoint", endpoint, cfg);
+            int ok_model = WritePrivateProfileStringW(L"api", L"model", model, cfg);
+            int ok_key = WritePrivateProfileStringW(L"api", L"key", key, cfg);
+            if (!ok_endpoint || !ok_model || !ok_key) {
+                DWORD err = GetLastError();
+                append_log(L"API 配置保存失败：%s（Windows 错误：%lu）", cfg, err);
+                set_status(L"API 配置保存失败");
+                MessageBoxW(hwnd, L"API 配置写入失败，请检查配置文件目录的写入权限后重试。",
+                            L"配置 API", MB_ICONWARNING);
+                return 0;
+            }
             append_log(L"API 配置已保存：%s", cfg);
             set_status(L"API 配置已保存");
             d->done = 1;
@@ -101,14 +112,19 @@ static LRESULT CALLBACK api_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 void show_api_config(void) {
     static int registered = 0;
     if (!registered) {
-        WNDCLASSW wc;
+        WNDCLASSEXW wc;
         ZeroMemory(&wc, sizeof wc);
+        wc.cbSize = sizeof wc;
         wc.lpfnWndProc = api_wndproc;
         wc.hInstance = g_inst;
+        wc.hIcon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                    GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+        wc.hIconSm = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                      GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         wc.lpszClassName = L"DSTApiConfigDialog";
-        RegisterClassW(&wc);
+        RegisterClassExW(&wc);
         registered = 1;
     }
     ApiDialog d;

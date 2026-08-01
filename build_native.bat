@@ -5,6 +5,12 @@ set "APP_VERSION=dev"
 if exist "%ROOT%VERSION" (
     set /p APP_VERSION=<"%ROOT%VERSION"
 )
+set "APP_VERSION_COMMA=0,0,0,0"
+for /f "tokens=1-5 delims=." %%a in ("%APP_VERSION%") do (
+    if not "%%a"=="" if not "%%b"=="" if not "%%c"=="" if not "%%d"=="" if "%%e"=="" (
+        set "APP_VERSION_COMMA=%%a,%%b,%%c,%%d"
+    )
+)
 set "BIN=%ROOT%native\toolchain\w64devkit\bin"
 if exist "%BIN%\gcc.exe" (
     set "PATH=%BIN%;%PATH%"
@@ -156,11 +162,48 @@ if exist "%UT%" (
     )
 )
 
+set "UT_FONT_PATCHER_PROJECT=%ROOT%payloads\UnityTranslator\src\FontPatcher\DeepSeekUnityFontPatcher.csproj"
+set "UT_FONT_PATCHER_PAYLOAD=%ROOT%payloads\UnityTranslator\DeepSeekUnityFontPatcher.dll"
+set "UT_BEPINEX5_CORE=%ROOT%payloads\UnityMonoRuntime\BepInEx\core"
+if exist "%UT_FONT_PATCHER_PROJECT%" (
+    if exist "%UT_BEPINEX5_CORE%\Mono.Cecil.dll" (
+        dotnet build "%UT_FONT_PATCHER_PROJECT%" -c Release --nologo -p:BepInEx5CoreDir="%UT_BEPINEX5_CORE%"
+        if errorlevel 1 exit /b 1
+        if not exist "%ROOT%payloads\UnityTranslator\src\FontPatcher\bin\Release\net472\DeepSeekUnityFontPatcher.dll" (
+            echo DeepSeekUnityFontPatcher build succeeded but output DLL was not found.
+            exit /b 1
+        )
+        copy /Y "%ROOT%payloads\UnityTranslator\src\FontPatcher\bin\Release\net472\DeepSeekUnityFontPatcher.dll" "%UT_FONT_PATCHER_PAYLOAD%" >nul
+        echo Built stripped Unity Mono font metadata patcher.
+    ) else (
+        echo Skipping DeepSeekUnityFontPatcher source build: BepInEx 5 Mono.Cecil.dll was not found.
+        if exist "%UT_FONT_PATCHER_PAYLOAD%" (
+            echo Existing payloads\UnityTranslator\DeepSeekUnityFontPatcher.dll will be used.
+        ) else (
+            echo Missing BepInEx 5 Mono.Cecil.dll needed to build DeepSeekUnityFontPatcher.
+            exit /b 1
+        )
+    )
+)
+if not exist "%UT_FONT_PATCHER_PAYLOAD%" (
+    echo Missing DeepSeekUnityFontPatcher.dll payload.
+    exit /b 1
+)
+
 set "UT_JSON=%ROOT%payloads\UnityIL2CPP\XUnityAutoTranslator\BepInEx\plugins\XUnity.AutoTranslator\Translators\FullNET\Newtonsoft.Json.dll"
 if exist "%UT_JSON%" (
     copy /Y "%UT_JSON%" "%ROOT%payloads\UnityTranslator\Newtonsoft.Json.dll" >nul
 ) else if not exist "%ROOT%payloads\UnityTranslator\Newtonsoft.Json.dll" (
     echo Missing Newtonsoft.Json.dll needed by UnityTranslator Mono payload.
+    exit /b 1
+)
+
+rem Never embed a managed payload that predates its first-party source.  A
+rem skipped optional build is acceptable only when the existing payload is
+rem already current; otherwise "build succeeded" would package stale code.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\verify_build_artifacts.ps1" -ManagedPayloadsOnly
+if errorlevel 1 (
+    echo Managed payload verification failed. Install the missing build references and rebuild the stale payload.
     exit /b 1
 )
 
@@ -173,27 +216,64 @@ if errorlevel 1 exit /b 1
 set "RES_RC=%ROOT%build\launcher_payloads.rc"
 set "RES_OBJ=%ROOT%build\launcher_payloads.o"
 if not exist "%ROOT%build" mkdir "%ROOT%build"
-> "%RES_RC%" echo 101 RCDATA "native/dst_server.exe"
->> "%RES_RC%" echo 102 RCDATA "scripts/install_runtime_payloads.ps1"
->> "%RES_RC%" echo 103 RCDATA "config/api.ini.example"
->> "%RES_RC%" echo 104 RCDATA "config/launcher.ini.example"
+if not exist "%ROOT%assets\app_icon.ico" (
+    echo Missing application icon: assets\app_icon.ico
+    exit /b 1
+)
+rem Resource paths inside the .rc must be absolute (forward slashes only;
+rem rc treats backslash as escape) so windres works from any caller CWD.
+set "ROOT_RC=%ROOT:\=/%"
+> "%RES_RC%" echo 1 ICON "%ROOT_RC%assets/app_icon.ico"
+>> "%RES_RC%" echo 1 VERSIONINFO
+>> "%RES_RC%" echo FILEVERSION !APP_VERSION_COMMA!
+>> "%RES_RC%" echo PRODUCTVERSION !APP_VERSION_COMMA!
+>> "%RES_RC%" echo FILEFLAGSMASK 0x3fL
+>> "%RES_RC%" echo FILEFLAGS 0x0L
+>> "%RES_RC%" echo FILEOS 0x40004L
+>> "%RES_RC%" echo FILETYPE 0x1L
+>> "%RES_RC%" echo FILESUBTYPE 0x0L
+>> "%RES_RC%" echo BEGIN
+>> "%RES_RC%" echo BLOCK "StringFileInfo"
+>> "%RES_RC%" echo BEGIN
+>> "%RES_RC%" echo BLOCK "040904b0"
+>> "%RES_RC%" echo BEGIN
+>> "%RES_RC%" echo VALUE "FileDescription", "ds Game Translator"
+>> "%RES_RC%" echo VALUE "FileVersion", "%APP_VERSION%"
+>> "%RES_RC%" echo VALUE "InternalName", "ds-game-translator"
+>> "%RES_RC%" echo VALUE "OriginalFilename", "ds-game-translator.exe"
+>> "%RES_RC%" echo VALUE "ProductName", "ds Game Translator"
+>> "%RES_RC%" echo VALUE "ProductVersion", "%APP_VERSION%"
+>> "%RES_RC%" echo END
+>> "%RES_RC%" echo END
+>> "%RES_RC%" echo BLOCK "VarFileInfo"
+>> "%RES_RC%" echo BEGIN
+>> "%RES_RC%" echo VALUE "Translation", 0x409, 1200
+>> "%RES_RC%" echo END
+>> "%RES_RC%" echo END
+>> "%RES_RC%" echo 101 RCDATA "%ROOT_RC%native/dst_server.exe"
+>> "%RES_RC%" echo 102 RCDATA "%ROOT_RC%scripts/install_runtime_payloads.ps1"
+>> "%RES_RC%" echo 103 RCDATA "%ROOT_RC%config/api.ini.example"
+>> "%RES_RC%" echo 104 RCDATA "%ROOT_RC%config/launcher.ini.example"
 if exist "%ROOT%payloads\UnityTranslator\UnityTranslator.dll" (
-    >> "%RES_RC%" echo 201 RCDATA "payloads/UnityTranslator/UnityTranslator.dll"
+    >> "%RES_RC%" echo 201 RCDATA "%ROOT_RC%payloads/UnityTranslator/UnityTranslator.dll"
 )
 if exist "%ROOT%payloads\UnityTranslator\UnityTranslator.BepInEx6.dll" (
-    >> "%RES_RC%" echo 202 RCDATA "payloads/UnityTranslator/UnityTranslator.BepInEx6.dll"
+    >> "%RES_RC%" echo 202 RCDATA "%ROOT_RC%payloads/UnityTranslator/UnityTranslator.BepInEx6.dll"
 )
 if exist "%ROOT%payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll" (
-    >> "%RES_RC%" echo 203 RCDATA "payloads/UnityIL2CPP/DeepSeekXUnityTranslator/DeepSeekTranslate.dll"
+    >> "%RES_RC%" echo 203 RCDATA "%ROOT_RC%payloads/UnityIL2CPP/DeepSeekXUnityTranslator/DeepSeekTranslate.dll"
 )
 if exist "%ROOT%payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll" (
-    >> "%RES_RC%" echo 204 RCDATA "payloads/UnityIL2CPP/DeepSeekTMPFontFallback/BepInEx/plugins/DeepSeekTMPFontFallback/DeepSeekTMPFontFallback.dll"
+    >> "%RES_RC%" echo 204 RCDATA "%ROOT_RC%payloads/UnityIL2CPP/DeepSeekTMPFontFallback/BepInEx/plugins/DeepSeekTMPFontFallback/DeepSeekTMPFontFallback.dll"
+)
+if exist "%ROOT%payloads\UnityTranslator\DeepSeekUnityFontPatcher.dll" (
+    >> "%RES_RC%" echo 205 RCDATA "%ROOT_RC%payloads/UnityTranslator/DeepSeekUnityFontPatcher.dll"
 )
 windres "%RES_RC%" -O coff -o "%RES_OBJ%"
 if errorlevel 1 exit /b 1
 
 set "LCH=%ROOT%native\src\launcher"
-set "LCH_SRC=%LCH%\main.c %LCH%\globals.c %LCH%\fsutil.c %LCH%\engine.c %LCH%\deploy.c %LCH%\server_proc.c %LCH%\api_config.c %LCH%\warmup.c %LCH%\godot_warmup.c %LCH%\godot_patch.c %LCH%\ui.c %LCH%\self_update.c"
+set "LCH_SRC=%LCH%\main.c %LCH%\globals.c %LCH%\fsutil.c %LCH%\engine.c %LCH%\deploy.c %LCH%\server_proc.c %LCH%\api_config.c %LCH%\warmup.c %LCH%\godot_warmup.c %LCH%\godot_patch.c %LCH%\godot_probe.c %LCH%\ui.c %LCH%\self_update.c"
 set "LAUNCHER_TMP=%ROOT%build\launcher_build.exe"
 
 rem Build to an ASCII temp path first; gcc/binutils handle the final binary
@@ -203,5 +283,11 @@ if errorlevel 1 exit /b 1
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $ds='ds'+[string][char]0x6e38+[string][char]0x620f+[string][char]0x7ffb+[string][char]0x8bd1+[string][char]0x5668; $dest = Join-Path $env:ROOT ($ds + '.exe'); if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force }; Move-Item -LiteralPath $env:LAUNCHER_TMP -Destination $dest -Force; $legacy = Join-Path $env:ROOT 'DeepSeekTranslator.exe'; if (Test-Path -LiteralPath $legacy) { Remove-Item -LiteralPath $legacy -Force }"
 if errorlevel 1 exit /b 1
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\verify_build_artifacts.ps1" -RequireComplete
+if errorlevel 1 (
+    echo Final launcher resource verification failed.
+    exit /b 1
+)
 
 echo Built native server and launcher.

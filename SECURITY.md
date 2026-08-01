@@ -23,3 +23,13 @@ When reporting a bug:
 The translation server is designed for local use. Bind it only to localhost
 unless you have reviewed the network exposure and authentication model for your
 own deployment.
+
+Browser requests are restricted to file/null or explicit loopback origins.
+Browser-origin requests cannot call shutdown or cache import/export/dump
+routes. Native launcher and engine clients omit the `Origin` header and retain
+the existing local API contract.
+
+Remote API endpoints must use HTTPS. Plaintext HTTP is accepted only for exact
+loopback hosts (`localhost`, `127.0.0.1`, or `[::1]`) so local compatible
+providers remain usable without sending bearer credentials or game text over
+the network in cleartext.

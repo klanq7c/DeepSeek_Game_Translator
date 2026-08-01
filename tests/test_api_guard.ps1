@@ -26,8 +26,8 @@ function Assert-Eq($actual, $expected, $msg) {
     if ($actual -ne $expected) { throw "$msg : expected '$expected' got '$actual'" }
 }
 
-function Send-Json([string]$path, [string]$method = "GET", $body = $null, [int]$timeout = 5) {
-    $u = "http://127.0.0.1:$Port$path"
+function Send-Json-OnPort([int]$targetPort, [string]$path, [string]$method = "GET", $body = $null, [int]$timeout = 5) {
+    $u = "http://127.0.0.1:$targetPort$path"
     if ($body) {
         $r = Invoke-WebRequest -Uri $u -Method $method -Body $body -ContentType "application/json" -TimeoutSec $timeout -UseBasicParsing
     } else {
@@ -40,16 +40,24 @@ function Send-Json([string]$path, [string]$method = "GET", $body = $null, [int]$
     }
 }
 
-function Wait-Server {
+function Send-Json([string]$path, [string]$method = "GET", $body = $null, [int]$timeout = 5) {
+    return Send-Json-OnPort $Port $path $method $body $timeout
+}
+
+function Wait-Server-OnPort([int]$targetPort) {
     for ($i = 0; $i -lt 30; $i++) {
         try {
-            $r = Send-Json "/health" "GET" $null 1
+            $r = Send-Json-OnPort $targetPort "/health" "GET" $null 1
             if ($r.Status -eq 200) { return }
         } catch {
             Start-Sleep -Milliseconds 100
         }
     }
     throw "server did not start"
+}
+
+function Wait-Server {
+    Wait-Server-OnPort $Port
 }
 
 function Get-ApiCallCount([string]$path) {
@@ -99,6 +107,10 @@ $apiConfig = Join-Path $tmp "api.ini"
 $callsFile = Join-Path $tmp "fake_api_calls.log"
 $readyFile = Join-Path $tmp "fake_api_ready.txt"
 $stopFile = Join-Path $tmp "fake_api_stop.txt"
+$repo = Split-Path -Parent $PSScriptRoot
+$apiSource = Get-Content -LiteralPath (Join-Path $repo "native\src\server\api.c") -Raw
+$launcherApiSource = Get-Content -LiteralPath (Join-Path $repo "native\src\launcher\api_config.c") -Raw
+$apiExample = Get-Content -LiteralPath (Join-Path $repo "config\api.ini.example") -Raw
 Set-Content -LiteralPath $apiConfig -Encoding ASCII -Value @"
 [api]
 endpoint=http://127.0.0.1:$FakeApiPort/v1/chat/completions
@@ -213,6 +225,65 @@ try {
     Write-Host ""
     Write-Host "=== API original echo guard ===" -ForegroundColor Cyan
 
+    It "current DeepSeek defaults use the supported low-latency V4 model" {
+        if (-not $apiSource.Contains('"deepseek-v4-flash"')) { throw "server default must use deepseek-v4-flash" }
+        if (-not $launcherApiSource.Contains('L"deepseek-v4-flash"')) { throw "launcher API dialog default must use deepseek-v4-flash" }
+        if ($apiExample -notmatch '(?m)^model=deepseek-v4-flash\s*$') { throw "example config must use deepseek-v4-flash" }
+    }
+
+    It "official legacy DeepSeek chat configs migrate in memory without rewriting custom endpoints" {
+        if ($apiSource -notmatch '(?s)is_official_deepseek_endpoint.*?api\.deepseek\.com.*?migrate_deprecated_deepseek_model.*?deepseek-chat.*?deepseek-v4-flash') {
+            throw "official deepseek-chat configs need a bounded runtime migration"
+        }
+        if ($apiSource -notmatch '(?s)migrate_deprecated_deepseek_model\(ApiConfig \*cfg\).*?if \(!is_official_deepseek_endpoint\(cfg->endpoint\)\) return;') {
+            throw "legacy model migration must not rewrite arbitrary OpenAI-compatible endpoints"
+        }
+    }
+
+    It "DeepSeek V4 translation requests explicitly disable reasoning" {
+        if ($apiSource -notmatch '(?s)should_disable_deepseek_thinking.*?deepseek-v4-.*?thinking.*?disabled') {
+            throw "short game translations must retain the retired deepseek-chat non-thinking behavior"
+        }
+        if ($apiSource -notmatch 'endpoint_transport_allowed' -or
+            $apiSource -notmatch 'https://' -or
+            $apiSource -notmatch '127\.0\.0\.1' -or
+            $apiSource -notmatch '\[::1\]' -or
+            $apiSource -notmatch 'disabled non-loopback plaintext') {
+            throw "remote API credentials must not be sent over plaintext HTTP while loopback test/local providers remain supported"
+        }
+        if ($apiSource -notmatch '(?s)build_request.*?should_disable_deepseek_thinking.*?build_batch_request.*?should_disable_deepseek_thinking') {
+            throw "single and batch requests must both disable DeepSeek V4 thinking"
+        }
+    }
+
+    It "cache persistence reports all partial and failed outcomes" {
+        $serverSrc = Join-Path $repo "native\src\server"
+        $toolBin = Join-Path $repo "native\toolchain\w64devkit\bin"
+        $gcc = Join-Path $toolBin "gcc.exe"
+        $probe = Join-Path $tmp "cache_import_result_probe.exe"
+        $probeCache = Join-Path $tmp "cache_import_result_probe.tsv"
+        $probeFault = Join-Path $tmp "cache_import_result_fault"
+        New-Item -ItemType Directory -Path $probeFault | Out-Null
+        $previousPath = $env:PATH
+        try {
+            $env:PATH = $toolBin + ";" + $env:PATH
+            & $gcc -std=c17 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS `
+                -I $serverSrc (Join-Path $PSScriptRoot "cache_import_result_probe.c") `
+                (Join-Path $serverSrc "cache.c") (Join-Path $serverSrc "b64.c") `
+                (Join-Path $serverSrc "buf.c") (Join-Path $serverSrc "util.c") `
+                -o $probe
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $probe)) {
+                throw "cache import result probe build failed"
+            }
+            & $probe $probeCache $probeFault
+            if ($LASTEXITCODE -ne 0) {
+                throw "cache import result probe failed"
+            }
+        } finally {
+            $env:PATH = $previousPath
+        }
+    }
+
     It "disk cache prompt echoes are healed in memory without rewriting the file" {
         $body = '{"texts":["' + $seededKey + '"]}'
         $lookup = Send-Json "/cache/lookup" "POST" $body
@@ -264,6 +335,67 @@ try {
         $lookup = Send-Json "/cache/lookup" "POST" $lookupBody
         Assert-Eq $lookup.Json.hit_count 1 "imported translation should remain a hit"
         Assert-Eq $lookup.Json.hits.$key $expected "shared cache reads must expose only the clean translation"
+    }
+
+    It "cache imports reject exact and cleaned source echoes" {
+        $exact = "__api_guard_import_exact_echo_$(Get-Random)"
+        $cleaned = "__api_guard_import_cleaned_echo_$(Get-Random)"
+        $importBody = '{"entries":[{"key":"' + $exact + '","value":"' + $exact + '"},{"key":"' +
+            $cleaned + '","value":"Simplified Chinese translation: ' + $cleaned + '"}]}'
+        $import = Send-Json "/cache/import" "POST" $importBody
+        Assert-Eq $import.Status 200 "import status"
+        Assert-Eq $import.Json.status "rejected" "source echoes must be explicitly rejected"
+        Assert-Eq $import.Json.imported 0 "source echoes must not be counted as imported"
+        Assert-Eq $import.Json.accepted 0 "source echoes must not enter memory"
+        Assert-Eq $import.Json.rejected 2 "both source echo forms must be rejected"
+        Assert-Eq $import.Json.memory_only 0 "rejected echoes must not become memory-only hits"
+
+        $lookupBody = '{"texts":["' + $exact + '","' + $cleaned + '"]}'
+        $lookup = Send-Json "/cache/lookup" "POST" $lookupBody
+        Assert-Eq $lookup.Json.hit_count 0 "source echoes must not be cache hits"
+        Assert-Eq $lookup.Json.miss_count 2 "source echoes must remain unresolved"
+    }
+
+    It "cache import reports persistence failure without hiding the valid memory-only entry" {
+        $faultPort = Get-FreeTcpPort
+        $faultCache = Join-Path $tmp "cache-path-is-a-directory"
+        New-Item -ItemType Directory -Path $faultCache | Out-Null
+        $faultServer = $null
+        try {
+            $faultServer = Start-Process -FilePath $Exe -ArgumentList @("--port", $faultPort, "--cache", $faultCache) -PassThru -WindowStyle Hidden
+            Wait-Server-OnPort $faultPort
+
+            $key = "__api_guard_import_io_failure_$(Get-Random)"
+            $value = ('"\u6301\u4e45\u5316\u5931\u8d25\u4ecd\u4fdd\u7559\u5185\u5b58\u8bd1\u6587"' | ConvertFrom-Json)
+            $importBody = '{"entries":[{"key":"' + $key +
+                '","value":"\u6301\u4e45\u5316\u5931\u8d25\u4ecd\u4fdd\u7559\u5185\u5b58\u8bd1\u6587"}]}'
+            $import = Send-Json-OnPort $faultPort "/cache/import" "POST" $importBody
+            Assert-Eq $import.Status 200 "import transport status"
+            Assert-Eq $import.Json.status "error" "fopen failure must not report status ok"
+            Assert-Eq $import.Json.imported 0 "unpersisted entries must not be counted as imported"
+            Assert-Eq $import.Json.accepted 1 "valid translations should remain usable in memory"
+            Assert-Eq $import.Json.rejected 0 "valid translation must not be rejected"
+            Assert-Eq $import.Json.memory_only 1 "response must expose restart-loss risk"
+
+            $lookupBody = @{ texts = @($key) } | ConvertTo-Json -Compress
+            $lookup = Send-Json-OnPort $faultPort "/cache/lookup" "POST" $lookupBody
+            Assert-Eq $lookup.Json.hit_count 1 "disk failure must not break local cache-first reads"
+            Assert-Eq $lookup.Json.hits.$key $value "memory-only translation must remain intact"
+        } finally {
+            try {
+                if ($faultServer -and -not $faultServer.HasExited) {
+                    Send-Json-OnPort $faultPort "/shutdown" "POST" "{}" 2 | Out-Null
+                }
+            } catch { }
+            try {
+                if ($faultServer -and -not $faultServer.HasExited) {
+                    $faultServer.WaitForExit(3000) | Out-Null
+                }
+            } catch { }
+            if ($faultServer -and -not $faultServer.HasExited) {
+                Stop-Process -Id $faultServer.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 
     It "cache prompt cleanup preserves normal outer whitespace and line breaks" {

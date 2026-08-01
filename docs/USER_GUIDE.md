@@ -1,10 +1,10 @@
 # ds游戏翻译器使用说明
 
-本文面向直接下载程序的用户。推荐下载 Release 页面里的 `ds游戏翻译器_0.3.2.7.exe`。
+本文面向直接下载程序的用户。推荐下载 Release 页面里的 `ds游戏翻译器_0.3.3.8.exe`。
 
 ## 第一次使用
 
-1. 把 `ds游戏翻译器_0.3.2.7.exe` 放到一个你准备长期使用的目录，例如 `D:\Games\DSTranslator\`。
+1. 把 `ds游戏翻译器_0.3.3.8.exe` 放到一个你准备长期使用的目录，例如 `D:\Games\DSTranslator\`。
 2. 双击运行一次程序。首次运行会自动释放/更新本项目自带组件：
    - `native\dst_server.exe`
    - `scripts\install_runtime_payloads.ps1`
@@ -19,6 +19,20 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 ```
 
 运行完成后回到启动器，或重新运行你下载的同一个 exe，选择游戏目录并部署。
+
+## 还原游戏
+
+1. 完全退出游戏。
+2. 在启动器中选择此前部署过的游戏目录。
+3. 点击“还原游戏”，阅读确认提示后继续。
+
+还原操作按引擎移除本程序明确部署的 hook、插件或 Godot 外置文件，不删除翻译缓存、用户模组、现有 BepInEx/XUnity 运行时或游戏原始资源。Unity 文件与内置版本不一致、或 XUnity 配置已由用户修改时，启动器会保留它们并在日志中说明原因。
+
+## 清除缓存
+
+CACHE 卡显示本机共享翻译缓存 `translation_memory_c.tsv` 的大小。点击卡片内的“清除缓存”并确认后，启动器会暂时停止本地服务、删除该缓存文件，再按原状态重新启动服务。
+
+该操作不会删除 API 配置、日志或游戏目录中的文件。已经运行的游戏可能还持有进程内存缓存，需要完全退出并重新启动游戏后才会完全生效。如果本地服务没有按时退出，启动器会取消删除并保留缓存文件。
 
 ## 按 Unity 类型单独安装
 
@@ -66,7 +80,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 
 ## 常见问题
 
-### 下载的文件名为什么显示成 `ds._0.3.2.7.exe`？
+### 下载的文件名为什么显示成 `ds._0.3.3.8.exe`？
 
 GitHub 会规范化中文资源文件名。Release 页面已经给资产加了中文 label，下载后你可以把文件改名为 `ds游戏翻译器.exe`，功能不受影响。
 

@@ -20,6 +20,7 @@
 #define HTTP_RECV_INITIAL (64 * 1024)          /* 首次接收缓冲大小 */
 #define HTTP_MAX_REQ (2 * 1024 * 1024)         /* 单请求体上限 2MB，防止异常连接耗尽内存 */
 #define HTTP_RECV_TIMEOUT_MS 5000              /* 单次 recv 超时，避免慢连接占线程 */
+#define HTTP_CONNECTION_LIMIT 128              /* 一连接一线程模型的硬上限 */
 
 /* 贯穿连接处理全程的上下文：缓存、停止标志、监听套接字、API 配置、启动时刻。 */
 typedef struct {
@@ -27,6 +28,10 @@ typedef struct {
     volatile LONG *stop;
     SOCKET *server_sock;
     ApiConfig *api;
+    volatile LONG *active_connections;
+    volatile LONG *connection_rejections;
+    volatile LONG *connection_thread_failures;
+    LONG connection_limit;
     time_t started;
 } HttpCtx;
 

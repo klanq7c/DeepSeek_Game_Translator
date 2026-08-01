@@ -33,6 +33,8 @@
 #define IDC_PATH_LABEL 112       /* "游戏路径"标签 */
 #define IDC_API_CONFIG 114       /* API 配置按钮 */
 #define IDC_SERVER_TOGGLE 115    /* 服务器开关 */
+#define IDC_RESTORE 116          /* 还原游戏按钮 */
+#define IDC_CLEAR_CACHE 117      /* 清除共享翻译缓存按钮 */
 
 #define IDC_API_ENDPOINT 201     /* API 设置页：端点 URL */
 #define IDC_API_MODEL 202        /* API 设置页：模型名 */
@@ -56,6 +58,8 @@ extern HWND g_status;           /* 底部状态栏 */
 extern HWND g_log;              /* 日志列表框 */
 extern HWND g_btn_server;
 extern HWND g_btn_api;
+extern HWND g_btn_restore;
+extern HWND g_btn_clear_cache;
 
 /* 路径：g_root = 本工具所在目录，g_root + config\ = 配置目录，g_game = 用户选择的游戏根目录 */
 extern WCHAR g_root[MAX_PATH * 4];
@@ -75,6 +79,7 @@ extern HFONT g_font_mono_small;
 
 /* 预创建的画刷——控件背景色，避免每次 WM_ERASEBKGND 临时创建。 */
 extern HBRUSH g_brush_page;
+extern HBRUSH g_brush_card;
 extern HBRUSH g_brush_edit;
 extern HBRUSH g_brush_log;
 extern HBRUSH g_brush_transparent;
@@ -94,5 +99,8 @@ extern const COLORREF C_ACCENT_DARK;
 extern const COLORREF C_ACCENT_DEEP;
 extern const COLORREF C_GREEN;
 extern const COLORREF C_DANGER;
+extern const COLORREF C_BLUE;
+extern const COLORREF C_VIOLET;
+extern const COLORREF C_AMBER;
 extern const COLORREF C_LOG;
 extern const COLORREF C_LOG_TEXT;

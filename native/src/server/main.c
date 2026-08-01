@@ -23,6 +23,7 @@
 #error Windows-only runtime server.
 #endif
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,10 @@
 static Cache G_CACHE;                 /* 全局唯一缓存实例 */
 static volatile LONG G_STOP = 0;      /* 停止标志，跨线程用 Interlocked 访问 */
 static SOCKET G_SRV = INVALID_SOCKET; /* 监听套接字；shutdown 时被原子替换为 INVALID_SOCKET */
+static volatile LONG G_ACTIVE_CONNECTIONS;
+static volatile LONG G_CONNECTION_REJECTIONS;
+static volatile LONG G_CONNECTION_THREAD_FAILURES;
+static HANDLE G_CONNECTIONS_DRAINED;
 
 /* Winsock 初始化失败时的统一退出路径：关闭套接字、清理 Winsock、die。 */
 static void die_wsa(SOCKET srv, const char *msg) {
@@ -45,15 +50,63 @@ static void die_wsa(SOCKET srv, const char *msg) {
     die(msg);
 }
 
+static int parse_port(const char *value) {
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' ||
+        parsed < 1 || parsed > 65535) {
+        die("invalid port");
+    }
+    return (int)parsed;
+}
+
+static void report_connection_rejection(void) {
+    LONG count = InterlockedIncrement(&G_CONNECTION_REJECTIONS);
+    if (count > 0 && (count == 1 || (count & (count - 1)) == 0)) {
+        fprintf(stderr,
+                "[http] rejected connection: active limit=%d occurrence=%ld\n",
+                HTTP_CONNECTION_LIMIT, (long)count);
+    }
+}
+
+static void report_connection_thread_failure(DWORD error) {
+    LONG count = InterlockedIncrement(&G_CONNECTION_THREAD_FAILURES);
+    if (count <= 3 || (count > 0 && (count & (count - 1)) == 0)) {
+        fprintf(stderr,
+                "[http] connection worker creation failed "
+                "(error=%lu occurrence=%ld)\n",
+                (unsigned long)error, (long)count);
+        fflush(stderr);
+    }
+}
+
+static DWORD WINAPI bounded_http_serve_thread(LPVOID arg) {
+    DWORD result = http_serve_thread(arg);
+    if (InterlockedDecrement(&G_ACTIVE_CONNECTIONS) == 0 && G_CONNECTIONS_DRAINED) {
+        SetEvent(G_CONNECTIONS_DRAINED);
+    }
+    return result;
+}
+
 int main(int argc, char **argv) {
     /* 解析命令行参数，提供合理默认值。 */
     const char *cache = CACHE_DEFAULT;
     const char *api_config = NULL;
     int port = HTTP_PORT_DEFAULT;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--cache") && i + 1 < argc) cache = argv[++i];
-        else if (!strcmp(argv[i], "--api-config") && i + 1 < argc) api_config = argv[++i];
+        if (!strcmp(argv[i], "--port")) {
+            if (i + 1 >= argc) die("missing --port value");
+            port = parse_port(argv[++i]);
+        } else if (!strcmp(argv[i], "--cache")) {
+            if (i + 1 >= argc) die("missing --cache value");
+            cache = argv[++i];
+        } else if (!strcmp(argv[i], "--api-config")) {
+            if (i + 1 >= argc) die("missing --api-config value");
+            api_config = argv[++i];
+        } else {
+            die("unknown argument");
+        }
     }
 
     /* 先加载缓存（启动期全量读盘），再加载 API 配置。
@@ -63,6 +116,8 @@ int main(int argc, char **argv) {
     ApiConfig api;
     api_config_init(&api);
     api_config_load(&api, api_config);
+    G_CONNECTIONS_DRAINED = CreateEventW(NULL, TRUE, TRUE, NULL);
+    if (!G_CONNECTIONS_DRAINED) die("connection drain event failed");
 
     /* 初始化 Winsock 2.2。 */
     WSADATA w;
@@ -91,6 +146,10 @@ int main(int argc, char **argv) {
         .stop = &G_STOP,
         .server_sock = &G_SRV,
         .api = &api,
+        .active_connections = &G_ACTIVE_CONNECTIONS,
+        .connection_rejections = &G_CONNECTION_REJECTIONS,
+        .connection_thread_failures = &G_CONNECTION_THREAD_FAILURES,
+        .connection_limit = HTTP_CONNECTION_LIMIT,
         .started = time(NULL),
     };
     http_set_ctx(&ctx);
@@ -103,16 +162,42 @@ int main(int argc, char **argv) {
     while (!InterlockedCompareExchange(&G_STOP, 0, 0)) {
         SOCKET c = accept(srv, NULL, NULL);
         if (c == INVALID_SOCKET) continue;
-        HANDLE th = CreateThread(NULL, 64 * 1024, http_serve_thread,
+        LONG active = InterlockedIncrement(&G_ACTIVE_CONNECTIONS);
+        if (active == 1) ResetEvent(G_CONNECTIONS_DRAINED);
+        if (active > HTTP_CONNECTION_LIMIT) {
+            InterlockedDecrement(&G_ACTIVE_CONNECTIONS);
+            report_connection_rejection();
+            closesocket(c);
+            continue;
+        }
+        HANDLE th = CreateThread(NULL, 64 * 1024, bounded_http_serve_thread,
                                  (LPVOID)(uintptr_t)c, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
         if (th) CloseHandle(th);
-        else closesocket(c);
+        else {
+            DWORD error = GetLastError();
+            if (InterlockedDecrement(&G_ACTIVE_CONNECTIONS) == 0) {
+                SetEvent(G_CONNECTIONS_DRAINED);
+            }
+            closesocket(c);
+            report_connection_thread_failure(error);
+        }
     }
 
     /* 关停清理：原子取出并关闭监听套接字，清理 Winsock。 */
     SOCKET prev = (SOCKET)(uintptr_t)InterlockedExchangePointer(
         (PVOID volatile *)&G_SRV, (PVOID)(uintptr_t)INVALID_SOCKET);
     if (prev != INVALID_SOCKET) closesocket(prev);
+    DWORD drain = WaitForSingleObject(G_CONNECTIONS_DRAINED,
+                                      HTTP_RECV_TIMEOUT_MS + 2000);
+    if (drain != WAIT_OBJECT_0) {
+        fprintf(stderr,
+                "[http] connection drain incomplete (wait=%lu, active=%ld)\n",
+                (unsigned long)drain,
+                (long)InterlockedCompareExchange(&G_ACTIVE_CONNECTIONS, 0, 0));
+        fflush(stderr);
+    }
+    CloseHandle(G_CONNECTIONS_DRAINED);
+    G_CONNECTIONS_DRAINED = NULL;
     WSACleanup();
     return 0;
 }

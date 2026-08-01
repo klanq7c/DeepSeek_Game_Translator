@@ -5,14 +5,15 @@
  * intentionally small: warmup.c passes a game directory and TextList,
  * then this module scans likely Godot resources and adds candidates.
  *
- * Current Godot support is resource/cache-warmup only:
- *   - no generic runtime hook is injected
+ * This module is resource/cache-warmup only; runtime patching and sidecars
+ * are owned by godot_patch.c and ui.c:
  *   - .pck/.translation files and embedded-PCK exe sections are read-only scan inputs
  *   - misses are only queued through /prefetch by warmup.c later
  * ================================================================ */
 
 #include "warmup_internal.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,7 @@
 #define GODOT_PCK_MAGIC 0x43504447u
 #define GODOT_PCK_V1_HEADER_SIZE 88u
 #define GODOT_PCK_V2_HEADER_SIZE 100u
+#define GODOT_PCK_V3_HEADER_SIZE 112u
 #define GODOT_PCK_MAX_FILES 200000u
 #define GODOT_PCK_MAX_PATH_BYTES 4096u
 
@@ -31,6 +33,7 @@ typedef struct {
     uint32_t header_size;
     uint32_t entry_meta_size;
     uint64_t file_base;
+    uint64_t entries_offset;
     uint32_t file_count;
     int offsets_are_absolute;
 } GodotPckInfo;
@@ -279,6 +282,7 @@ static int godot_text_file_name(const WCHAR *name) {
            wide_ends_with_i(name, L".json") ||
            wide_ends_with_i(name, L".csv") ||
            wide_ends_with_i(name, L".po") ||
+           wide_ends_with_i(name, L".md") ||
            wide_ends_with_i(name, L".txt") ||
            !_wcsicmp(name, L"project.godot");
 }
@@ -302,6 +306,7 @@ static int godot_pack_text_path(const char *path) {
            ascii_ends_with_i(path, ".json") ||
            ascii_ends_with_i(path, ".csv") ||
            ascii_ends_with_i(path, ".po") ||
+           ascii_ends_with_i(path, ".md") ||
            ascii_ends_with_i(path, ".txt") ||
            !_stricmp(path, "project.godot");
 }
@@ -344,7 +349,20 @@ static int godot_pack_translation_path(const char *path) {
 
 static int godot_pack_binary_path(const char *path) {
     return godot_pack_translation_path(path) ||
+           ascii_ends_with_i(path, ".scn") ||
+           ascii_ends_with_i(path, ".res") ||
+           ascii_ends_with_i(path, ".gdc") ||
+           ascii_ends_with_i(path, ".gde") ||
            !_stricmp(path, "godot_project.binary");
+}
+
+/* Text resources are scanned before compiled resources so a large .godot/exported
+   tree cannot consume the warmup cap before story/localization files are read. */
+static int godot_pack_deferred_binary_path(const char *path) {
+    return ascii_ends_with_i(path, ".scn") ||
+           ascii_ends_with_i(path, ".res") ||
+           ascii_ends_with_i(path, ".gdc") ||
+           ascii_ends_with_i(path, ".gde");
 }
 
 /* Skip generated/cache-heavy folders. Godot addons also contain editor/plugin
@@ -408,6 +426,71 @@ static void scan_godot_lines(char *buf, TextList *prefetch) {
             !strchr(text, '=') && !strchr(text, '"') && !strchr(text, '\'') &&
             strncmp(text, "msgid", 5) && strncmp(text, "msgstr", 6) && strncmp(text, "msgctxt", 6)) {
             collect_godot_free_string(text, prefetch);
+        }
+        if (!separator || prefetch->n >= textlist_limit(prefetch)) break;
+        if (separator == '\r' && p[1] == '\n') p++;
+        line = p + 1;
+    }
+}
+
+static size_t godot_bbcode_tag_span(const char *s);
+
+/* 剥离行内 BBCode 标签，返回可见文本（新分配，调用者负责 free）。 */
+static char *godot_strip_bbcode(const char *s) {
+    ByteBuf b = {0};
+    if (!bb_init(&b, strlen(s) + 1)) return NULL;
+    for (const char *p = s; *p;) {
+        size_t tag = godot_bbcode_tag_span(p);
+        if (tag) {
+            p += tag;
+            continue;
+        }
+        bb_ch(&b, *p++);
+    }
+    return b.data;
+}
+
+/* Several Godot dialogue systems store scripts as Markdown. Speaker quote
+   lines (>) and pure-tag lifecycle lines carry no visible prose; # headings
+   and BBCode-wrapped lines are collected by their visible text, which matches
+   the cache keys the runtime assigns to Label/RichTextLabel nodes. */
+static void scan_godot_markdown_strings(char *buf, TextList *prefetch) {
+    char *line = buf;
+    int fenced = 0;
+    if (line[0] && line[1] && line[2] &&
+        (unsigned char)line[0] == 0xef &&
+        (unsigned char)line[1] == 0xbb &&
+        (unsigned char)line[2] == 0xbf) {
+        line += 3;
+    }
+    for (char *p = line;; p++) {
+        if (*p != '\r' && *p != '\n' && *p != 0) continue;
+        char separator = *p;
+        *p = 0;
+        char *text = trim_ascii(line);
+        size_t len = strlen(text);
+        if (!strncmp(text, "```", 3) || !strncmp(text, "~~~", 3)) {
+            fenced = !fenced;
+        } else if (!fenced && *text && *text != '>' &&
+                   strcmp(text, "---") && strcmp(text, "***") && strcmp(text, "___")) {
+            if (*text == '#') {
+                /* Markdown 标题：剥掉 # 标记后按可见文本采集。 */
+                char *heading = text;
+                while (*heading == '#') heading++;
+                heading = trim_ascii(heading);
+                if (*heading) collect_godot_string(heading, prefetch);
+            } else if (text[0] == '[' && len > 1 && text[len - 1] == ']') {
+                /* BBCode 包裹行（如 [center]...[/center]）：剥离标签后按可见
+                   文本采集；无可见文本的纯标签行（如 [window_opens]）跳过。 */
+                char *visible = godot_strip_bbcode(text);
+                if (visible) {
+                    char *v = trim_ascii(visible);
+                    if (*v) collect_godot_string(v, prefetch);
+                    free(visible);
+                }
+            } else {
+                collect_godot_string(text, prefetch);
+            }
         }
         if (!separator || prefetch->n >= textlist_limit(prefetch)) break;
         if (separator == '\r' && p[1] == '\n') p++;
@@ -559,9 +642,21 @@ static int collect_godot_csv_source_cell(const char *line, int source_col, TextL
     return 1;
 }
 
+/* 无空格无标点的短标识符（key/ID 列形态）；未识别表头的回退路径不采集。 */
+static int godot_csv_short_id(const char *s) {
+    size_t len = strlen(s);
+    if (!len || len > 32) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+              (*p >= '0' && *p <= '9') || *p == '_')) return 0;
+    }
+    return 1;
+}
+
 /* Godot CSV translations commonly use key,locale columns. After the header,
    prefer the source/English column when it is labelled. Unknown layouts keep
-   the old first-natural-text fallback so unusual hand-authored CSV still warms. */
+   the old first-natural-text fallback so unusual hand-authored CSV still warms,
+   but short ID-shaped cells that only name the row are skipped. */
 static void scan_godot_csv_strings(char *buf, TextList *prefetch) {
     char *line = buf;
     int row = 0;
@@ -586,7 +681,9 @@ static void scan_godot_csv_strings(char *buf, TextList *prefetch) {
                 while (*cellp && prefetch->n == before) {
                     char *cell = godot_csv_next_cell(&cellp);
                     if (!cell) break;
-                    collect_godot_string(cell, prefetch);
+                    if (!godot_csv_short_id(trim_ascii(cell))) {
+                        collect_godot_string(cell, prefetch);
+                    }
                     free(cell);
                     while (*cellp == ' ' || *cellp == '\t') cellp++;
                 }
@@ -596,6 +693,61 @@ static void scan_godot_csv_strings(char *buf, TextList *prefetch) {
         if (!separator || prefetch->n >= textlist_limit(prefetch)) break;
         if (separator == '\r' && p[1] == '\n') p++;
         line = p + 1;
+    }
+}
+
+static size_t godot_bbcode_tag_span(const char *s) {
+    if (!s || s[0] != '[') return 0;
+    size_t i = 1;
+    if (s[i] == '/') i++;
+    if (!((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z'))) return 0;
+    for (; s[i] && i < 160u; i++) {
+        if (s[i] == '\r' || s[i] == '\n' || s[i] == '[') return 0;
+        if (s[i] == ']') return i + 1u;
+    }
+    return 0;
+}
+
+/* Runtime translation preserves BBCode by querying each visible segment. Warmup
+   must use the same cache keys; queuing the full tagged string would both miss
+   those keys and risk a provider rewriting renderer control tags. */
+static void collect_godot_binary_payload(char *s, TextList *prefetch) {
+    int has_tag = 0;
+    for (const char *p = s; *p; p++) {
+        if (godot_bbcode_tag_span(p)) {
+            has_tag = 1;
+            break;
+        }
+    }
+    if (!has_tag) {
+        collect_godot_binary_string(s, prefetch);
+        return;
+    }
+
+    const char *plain = s;
+    const char *p = s;
+    while (*p && prefetch->n < textlist_limit(prefetch)) {
+        size_t tag_len = godot_bbcode_tag_span(p);
+        if (!tag_len) {
+            p++;
+            continue;
+        }
+        if (p > plain) {
+            char *part = dup_range(plain, (size_t)(p - plain));
+            if (part) {
+                collect_godot_binary_string(part, prefetch);
+                free(part);
+            }
+        }
+        p += tag_len;
+        plain = p;
+    }
+    if (p > plain || *plain) {
+        char *part = _strdup(plain);
+        if (part) {
+            collect_godot_binary_string(part, prefetch);
+            free(part);
+        }
     }
 }
 
@@ -612,7 +764,7 @@ static void scan_godot_binary_buffer(const unsigned char *bytes, DWORD size, Tex
         if (n >= 3 && n <= WARMUP_MAX_TEXT_BYTES && valid_utf8_text_payload(bytes + start, n)) {
             char *s = dup_range((const char *)bytes + start, n);
             if (s) {
-                collect_godot_binary_string(s, prefetch);
+                collect_godot_binary_payload(s, prefetch);
                 free(s);
             }
         }
@@ -636,10 +788,12 @@ static uint64_t read_u64le(const unsigned char *p) {
 static int read_at_exact(HANDLE h, LONGLONG offset, void *buf, DWORD size);
 
 static int read_godot_pck_info(HANDLE h, LONGLONG pck_base, uint64_t pck_size, GodotPckInfo *info) {
-    unsigned char header[GODOT_PCK_V2_HEADER_SIZE];
+    unsigned char header[GODOT_PCK_V3_HEADER_SIZE];
     memset(info, 0, sizeof *info);
     if (pck_size < GODOT_PCK_V1_HEADER_SIZE) return 0;
-    DWORD want = pck_size >= GODOT_PCK_V2_HEADER_SIZE ? GODOT_PCK_V2_HEADER_SIZE : GODOT_PCK_V1_HEADER_SIZE;
+    DWORD want = pck_size >= GODOT_PCK_V3_HEADER_SIZE
+        ? GODOT_PCK_V3_HEADER_SIZE
+        : (pck_size >= GODOT_PCK_V2_HEADER_SIZE ? GODOT_PCK_V2_HEADER_SIZE : GODOT_PCK_V1_HEADER_SIZE);
     if (!read_at_exact(h, pck_base, header, want)) return 0;
     if (read_u32le(header) != GODOT_PCK_MAGIC) return 0;
 
@@ -649,6 +803,7 @@ static int read_godot_pck_info(HANDLE h, LONGLONG pck_base, uint64_t pck_size, G
         info->header_size = GODOT_PCK_V1_HEADER_SIZE;
         info->entry_meta_size = 8u + 8u + 16u;
         info->file_base = 0;
+        info->entries_offset = info->header_size;
         info->file_count = read_u32le(header + 84);
         info->offsets_are_absolute = 1;
     } else if (format == 2) {
@@ -657,7 +812,24 @@ static int read_godot_pck_info(HANDLE h, LONGLONG pck_base, uint64_t pck_size, G
         info->header_size = GODOT_PCK_V2_HEADER_SIZE;
         info->entry_meta_size = 8u + 8u + 16u + 4u;
         info->file_base = read_u64le(header + 24);
+        info->entries_offset = info->header_size;
         info->file_count = read_u32le(header + 96);
+        info->offsets_are_absolute = 0;
+    } else if (format == 3) {
+        if (pck_size < GODOT_PCK_V3_HEADER_SIZE || want < GODOT_PCK_V3_HEADER_SIZE) return 0;
+        uint64_t directory_offset = read_u64le(header + 32);
+        if (directory_offset > pck_size - 4u || directory_offset > (uint64_t)LLONG_MAX) return 0;
+        unsigned char count[4];
+        if (pck_base > LLONG_MAX - (LONGLONG)directory_offset ||
+            !read_at_exact(h, pck_base + (LONGLONG)directory_offset, count, sizeof count)) {
+            return 0;
+        }
+        info->format = format;
+        info->header_size = GODOT_PCK_V3_HEADER_SIZE;
+        info->entry_meta_size = 8u + 8u + 16u + 4u;
+        info->file_base = read_u64le(header + 24);
+        info->entries_offset = directory_offset + 4u;
+        info->file_count = read_u32le(count);
         info->offsets_are_absolute = 0;
     } else {
         return 0;
@@ -706,6 +878,8 @@ static void scan_godot_pack_entry(HANDLE h, LONGLONG data_abs, uint64_t size, co
         scan_godot_po_strings(buf, prefetch);
     } else if (ascii_ends_with_i(path, ".csv")) {
         scan_godot_csv_strings(buf, prefetch);
+    } else if (ascii_ends_with_i(path, ".md")) {
+        scan_godot_markdown_strings(buf, prefetch);
     } else if (godot_pack_text_path(path)) {
         scan_godot_quoted_strings(buf, prefetch);
         scan_godot_lines(buf, prefetch);
@@ -721,9 +895,10 @@ static int scan_godot_pck_at(HANDLE h, LONGLONG pck_base, uint64_t pck_size, Tex
     GodotPckInfo info;
     if (!read_godot_pck_info(h, pck_base, pck_size, &info)) return 0;
 
-    LONGLONG pos = pck_base + (LONGLONG)info.header_size;
     LONGLONG pck_end = pck_base + (LONGLONG)pck_size;
-    for (uint32_t i = 0; i < info.file_count && prefetch->n < textlist_limit(prefetch); i++) {
+    for (int pass = 0; pass < 2 && prefetch->n < textlist_limit(prefetch); pass++) {
+      LONGLONG pos = pck_base + (LONGLONG)info.entries_offset;
+      for (uint32_t i = 0; i < info.file_count && prefetch->n < textlist_limit(prefetch); i++) {
         unsigned char lenbuf[4];
         if (pos > pck_end - 4 || !read_at_exact(h, pos, lenbuf, sizeof(lenbuf))) return 0;
         pos += 4;
@@ -766,10 +941,12 @@ static int scan_godot_pck_at(HANDLE h, LONGLONG pck_base, uint64_t pck_size, Tex
             free(path);
             continue;
         }
-        if (data_in_pack <= pck_size && size <= pck_size - data_in_pack) {
+        int deferred = godot_pack_deferred_binary_path(path);
+        if (deferred == pass && data_in_pack <= pck_size && size <= pck_size - data_in_pack) {
             scan_godot_pack_entry(h, data_abs, size, path, prefetch);
         }
         free(path);
+      }
     }
     return 1;
 }
@@ -792,12 +969,14 @@ static int find_pe_pck_section(const WCHAR *path, LONGLONG *pck_base, uint64_t *
         if (pe <= file_size.QuadPart - (LONGLONG)(sizeof(sig) + sizeof(fh)) &&
             read_at_exact(h, pe, &sig, sizeof(sig)) &&
             sig == IMAGE_NT_SIGNATURE &&
-            read_at_exact(h, pe + sizeof(sig), &fh, sizeof(fh)) &&
+            read_at_exact(h, pe + (LONGLONG)sizeof(sig), &fh, sizeof(fh)) &&
             fh.NumberOfSections > 0 && fh.NumberOfSections <= 128) {
-            LONGLONG sections = pe + sizeof(sig) + sizeof(fh) + fh.SizeOfOptionalHeader;
+            LONGLONG sections = pe + (LONGLONG)sizeof(sig) +
+                                (LONGLONG)sizeof(fh) +
+                                (LONGLONG)fh.SizeOfOptionalHeader;
             for (WORD i = 0; i < fh.NumberOfSections; i++) {
                 IMAGE_SECTION_HEADER sh;
-                LONGLONG off = sections + (LONGLONG)i * sizeof(sh);
+                LONGLONG off = sections + (LONGLONG)i * (LONGLONG)sizeof(sh);
                 if (off > file_size.QuadPart - (LONGLONG)sizeof(sh) ||
                     !read_at_exact(h, off, &sh, sizeof(sh))) break;
                 if (sh.Name[0] == 'p' && sh.Name[1] == 'c' && sh.Name[2] == 'k' && sh.Name[3] == 0 &&
@@ -853,6 +1032,8 @@ static void scan_godot_text_file(const WCHAR *path, TextList *prefetch) {
         scan_godot_po_strings(buf, prefetch);
     } else if (wide_ends_with_i(path, L".csv")) {
         scan_godot_csv_strings(buf, prefetch);
+    } else if (wide_ends_with_i(path, L".md")) {
+        scan_godot_markdown_strings(buf, prefetch);
     } else {
         scan_godot_quoted_strings(buf, prefetch);
         scan_godot_lines(buf, prefetch);

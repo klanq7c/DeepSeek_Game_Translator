@@ -1,35 +1,59 @@
 param(
-    [string]$Version = "preview",
+    [string]$Version = "",
     [switch]$NoZip
 )
 
 $ErrorActionPreference = "Stop"
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+if (-not $Version) {
+    $versionFile = Join-Path $repo "VERSION"
+    if (Test-Path -LiteralPath $versionFile) {
+        $Version = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+    }
+    if (-not $Version) {
+        $Version = "preview"
+    }
+}
+if ($Version -notmatch '\A[0-9A-Za-z][0-9A-Za-z._+-]{0,63}\z' -or
+    $Version -eq "." -or $Version -eq "..") {
+    throw "Invalid release version. Use 1-64 ASCII letters, digits, dot, underscore, plus, or hyphen."
+}
 $outputRoot = Join-Path $repo "build\open_source"
 $stageName = "DeepSeek_Game_Translator_source_$Version"
 $stage = Join-Path $outputRoot $stageName
 
-function Resolve-OrParent([string]$path) {
-    if (Test-Path -LiteralPath $path) {
-        return (Resolve-Path -LiteralPath $path).Path
+function Assert-Under([string]$Path, [string]$Root) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $fullRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+    if (-not $fullPath.StartsWith($fullRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to write outside expected directory: $Path"
     }
-    $parent = Split-Path -Parent $path
-    if (-not (Test-Path -LiteralPath $parent)) {
-        New-Item -ItemType Directory -Path $parent | Out-Null
+    foreach ($candidate in @([System.IO.Path]::GetFullPath($Root), $fullPath)) {
+        $volumeRoot = [System.IO.Path]::GetPathRoot($candidate)
+        $cursor = $volumeRoot
+        foreach ($part in ($candidate.Substring($volumeRoot.Length) -split '[\\/]')) {
+            if ([string]::IsNullOrWhiteSpace($part)) { continue }
+            $cursor = Join-Path $cursor $part
+            if (-not (Test-Path -LiteralPath $cursor)) { continue }
+            $item = Get-Item -LiteralPath $cursor -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Refusing release output through a filesystem reparse point: $cursor"
+            }
+        }
     }
-    return (Resolve-Path -LiteralPath $parent).Path
 }
 
-$resolvedOutputRoot = Resolve-OrParent $outputRoot
-$resolvedBuildRoot = Resolve-OrParent (Join-Path $repo "build")
-if (-not $resolvedOutputRoot.StartsWith($resolvedBuildRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+$resolvedOutputRoot = [System.IO.Path]::GetFullPath($outputRoot)
+$resolvedBuildRoot = [System.IO.Path]::GetFullPath((Join-Path $repo "build"))
+if (-not $resolvedOutputRoot.StartsWith($resolvedBuildRoot.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to write release outside build directory: $resolvedOutputRoot"
 }
+Assert-Under $stage $resolvedOutputRoot
 
 if (Test-Path -LiteralPath $stage) {
     $resolvedStage = (Resolve-Path -LiteralPath $stage).Path
-    if (-not $resolvedStage.StartsWith($resolvedOutputRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $resolvedStage.StartsWith($resolvedOutputRoot.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to clean unexpected release directory: $resolvedStage"
     }
     Remove-Item -LiteralPath $stage -Recurse -Force
@@ -55,6 +79,7 @@ $includeFiles = @(
 )
 
 $includeDirs = @(
+    "assets",
     "native\src",
     "payloads\UnityTranslator\src",
     "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src",
@@ -76,6 +101,8 @@ $excludedExtensions = @(
     ".dll", ".exe", ".pdb", ".mdb", ".otf", ".ttf", ".ttc", ".woff", ".woff2",
     ".zip", ".7z", ".rar", ".tsv", ".log"
 )
+
+$binaryAssetExtensions = @(".ico", ".png")
 
 function Is-SafeSourceFile([System.IO.FileInfo]$file) {
     $relative = $file.FullName.Substring($repo.Length).TrimStart("\", "/")
@@ -148,7 +175,15 @@ $scanPatterns = @(
 )
 
 foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) {
-    $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
+    if ($binaryAssetExtensions -contains $file.Extension.ToLowerInvariant()) {
+        continue
+    }
+    try {
+        $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
+    } catch {
+        $secretHits += "$($file.FullName): unreadable or non-text file"
+        continue
+    }
     foreach ($pattern in $scanPatterns) {
         if ($text -match $pattern) {
             $secretHits += "$($file.FullName): $pattern"
@@ -164,6 +199,7 @@ if ($secretHits.Count -gt 0) {
 
 if (-not $NoZip) {
     $zipPath = Join-Path $outputRoot "$stageName.zip"
+    Assert-Under $zipPath $resolvedOutputRoot
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force
     }

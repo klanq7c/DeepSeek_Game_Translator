@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>DeepSeekUnityFontPatcher</AssemblyName>
+    <GenerateAssemblyInfo>False</GenerateAssemblyInfo>
+    <LangVersion>Latest</LangVersion>
+    <BepInEx5CoreDir Condition="'$(BepInEx5CoreDir)' == ''">$(MSBuildProjectDirectory)\..\..\..\UnityMonoRuntime\BepInEx\core</BepInEx5CoreDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Mono.Cecil">
+      <HintPath>$(BepInEx5CoreDir)\Mono.Cecil.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

@@ -35,8 +35,22 @@ void apply_fonts(void);
 /* 绘制主窗口背景（左侧导航栏 + 主区域卡片） */
 void paint_background(HWND hwnd, HDC dc);
 
+/* 通过脏矩形双缓冲绘制父窗口，避免动画和调整窗口时出现撕裂。 */
+void paint_background_buffered(HWND hwnd, HDC dc, const RECT *dirty);
+
 /* 根据窗口大小重新布局所有子控件 */
 void layout(HWND hwnd);
+
+/* Apply native dark chrome and invalidate the small animated UI regions. */
+void apply_window_chrome(HWND hwnd);
+void tick_ui_animation(HWND hwnd);
+
+/* 为所有自绘按钮安装鼠标悬停跟踪（配合 tick_ui_animation 做渐变过渡） */
+void install_button_hover_tracking(HWND hwnd);
+
+/* 卡片内静态文字的不透明底色画刷（与所在高度的面板渐变一致） */
+HBRUSH card_text_brush(int picker_label, COLORREF *out_color);
+void free_card_text_brushes(void);
 
 /* 自绘按钮的 WM_DRAWITEM 处理（主按钮/服务器按钮/普通按钮） */
 void draw_button(const DRAWITEMSTRUCT *di);
@@ -51,3 +65,13 @@ void launch_game(const WCHAR *dir);
 
 /* 主翻译流程入口：部署 hook + 启动服务器 + 预热 + 启动游戏 */
 void start_translation(void);
+
+/* 一键翻译流程是否正在进行（后台线程执行服务启动/部署/预热期间为 1），
+   用于拒绝并发的开始/还原/清缓存/服务器切换操作 */
+int translation_flow_running(void);
+
+/* Remove only translation files that were deployed by this launcher. */
+void restore_selected_game(void);
+
+/* Delete the shared translation cache after confirmation. */
+void clear_translation_cache(void);
