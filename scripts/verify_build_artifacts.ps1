@@ -211,6 +211,16 @@ if ($RequireComplete -or -not $ManagedPayloadsOnly) {
     $launcher = Join-Path $repo ($launcherBase + ".exe")
     Assert-OutputFresh "native launcher" $launcher @($launcherInputs)
     if (Test-Path -LiteralPath $launcher) {
+        $expectedVersion = (Get-Content -LiteralPath (Join-Path $repo "VERSION") -Raw -Encoding UTF8).Trim()
+        $versionInfo = (Get-Item -LiteralPath $launcher).VersionInfo
+        $fileVersion = ([string]$versionInfo.FileVersion).Trim()
+        $productVersion = ([string]$versionInfo.ProductVersion).Trim()
+        if ($fileVersion -ne $expectedVersion) {
+            $errors.Add("native launcher FileVersion '$($versionInfo.FileVersion)' does not match VERSION '$expectedVersion'")
+        }
+        if ($productVersion -ne $expectedVersion) {
+            $errors.Add("native launcher ProductVersion '$($versionInfo.ProductVersion)' does not match VERSION '$expectedVersion'")
+        }
         Assert-EmbeddedResourceMatches $launcher 101 $server
         Assert-EmbeddedResourceMatches $launcher 102 (Join-Path $repo "scripts\install_runtime_payloads.ps1")
         Assert-EmbeddedResourceMatches $launcher 103 (Join-Path $repo "config\api.ini.example")

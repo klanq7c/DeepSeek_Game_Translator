@@ -77,13 +77,18 @@ function Copy-ReleaseFile([string]$SourceRelative, [string]$DestRelative = $Sour
 
 Copy-ReleaseFile "$DsName.exe" "$DsName.exe"
 if ($versionFileContent) {
-    # build_native.bat embeds the VERSION file content into the launcher as a
-    # wide string via DS_TRANSLATOR_VERSION (no VERSIONINFO resource), so a
-    # stale exe can only be detected by scanning the binary as UTF-16LE.
-    $exeText = [System.Text.Encoding]::Unicode.GetString(
-        [System.IO.File]::ReadAllBytes((Join-Path $stage "$DsName.exe")))
+    $stagedExe = Join-Path $stage "$DsName.exe"
+    $versionInfo = (Get-Item -LiteralPath $stagedExe).VersionInfo
+    $fileVersion = ([string]$versionInfo.FileVersion).Trim()
+    $productVersion = ([string]$versionInfo.ProductVersion).Trim()
+    if ($fileVersion -ne $versionFileContent -or $productVersion -ne $versionFileContent) {
+        throw "$DsName.exe version metadata does not match VERSION '$versionFileContent'; rebuild with build_native.bat before releasing."
+    }
+    # Keep checking the compile-time footer string as a separate guard against
+    # a launcher whose VERSIONINFO was edited without rebuilding the program.
+    $exeText = [System.Text.Encoding]::Unicode.GetString([System.IO.File]::ReadAllBytes($stagedExe))
     if (-not $exeText.Contains($versionFileContent)) {
-        Write-Warning "$DsName.exe does not contain the VERSION string '$versionFileContent' embedded by build_native.bat; the staged exe may be stale. Rebuild with build_native.bat before releasing."
+        throw "$DsName.exe does not contain the compile-time VERSION string '$versionFileContent'; rebuild with build_native.bat before releasing."
     }
 }
 Copy-ReleaseFile "README.md" "README.md"

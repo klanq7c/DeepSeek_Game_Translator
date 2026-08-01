@@ -5,6 +5,12 @@ set "APP_VERSION=dev"
 if exist "%ROOT%VERSION" (
     set /p APP_VERSION=<"%ROOT%VERSION"
 )
+set "APP_VERSION_COMMA=0,0,0,0"
+for /f "tokens=1-5 delims=." %%a in ("%APP_VERSION%") do (
+    if not "%%a"=="" if not "%%b"=="" if not "%%c"=="" if not "%%d"=="" if "%%e"=="" (
+        set "APP_VERSION_COMMA=%%a,%%b,%%c,%%d"
+    )
+)
 set "BIN=%ROOT%native\toolchain\w64devkit\bin"
 if exist "%BIN%\gcc.exe" (
     set "PATH=%BIN%;%PATH%"
@@ -218,6 +224,32 @@ rem Resource paths inside the .rc must be absolute (forward slashes only;
 rem rc treats backslash as escape) so windres works from any caller CWD.
 set "ROOT_RC=%ROOT:\=/%"
 > "%RES_RC%" echo 1 ICON "%ROOT_RC%assets/app_icon.ico"
+>> "%RES_RC%" echo 1 VERSIONINFO
+>> "%RES_RC%" echo FILEVERSION !APP_VERSION_COMMA!
+>> "%RES_RC%" echo PRODUCTVERSION !APP_VERSION_COMMA!
+>> "%RES_RC%" echo FILEFLAGSMASK 0x3fL
+>> "%RES_RC%" echo FILEFLAGS 0x0L
+>> "%RES_RC%" echo FILEOS 0x40004L
+>> "%RES_RC%" echo FILETYPE 0x1L
+>> "%RES_RC%" echo FILESUBTYPE 0x0L
+>> "%RES_RC%" echo BEGIN
+>> "%RES_RC%" echo BLOCK "StringFileInfo"
+>> "%RES_RC%" echo BEGIN
+>> "%RES_RC%" echo BLOCK "040904b0"
+>> "%RES_RC%" echo BEGIN
+>> "%RES_RC%" echo VALUE "FileDescription", "ds Game Translator"
+>> "%RES_RC%" echo VALUE "FileVersion", "%APP_VERSION%"
+>> "%RES_RC%" echo VALUE "InternalName", "ds-game-translator"
+>> "%RES_RC%" echo VALUE "OriginalFilename", "ds-game-translator.exe"
+>> "%RES_RC%" echo VALUE "ProductName", "ds Game Translator"
+>> "%RES_RC%" echo VALUE "ProductVersion", "%APP_VERSION%"
+>> "%RES_RC%" echo END
+>> "%RES_RC%" echo END
+>> "%RES_RC%" echo BLOCK "VarFileInfo"
+>> "%RES_RC%" echo BEGIN
+>> "%RES_RC%" echo VALUE "Translation", 0x409, 1200
+>> "%RES_RC%" echo END
+>> "%RES_RC%" echo END
 >> "%RES_RC%" echo 101 RCDATA "%ROOT_RC%native/dst_server.exe"
 >> "%RES_RC%" echo 102 RCDATA "%ROOT_RC%scripts/install_runtime_payloads.ps1"
 >> "%RES_RC%" echo 103 RCDATA "%ROOT_RC%config/api.ini.example"

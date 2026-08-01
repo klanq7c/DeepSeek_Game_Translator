@@ -955,6 +955,7 @@ if ($deploySrc -notmatch 'content_root,\s*L"fonts"' -or $deploySrc -notmatch 'ds
 $buildSrc = Get-Content -LiteralPath (Join-Path $root "build_native.bat") -Raw
 $sourceReleaseSrc = Get-Content -LiteralPath (Join-Path $root "scripts\prepare_open_source_release.ps1") -Raw
 $programReleaseSrc = Get-Content -LiteralPath (Join-Path $root "scripts\prepare_program_release.ps1") -Raw
+$artifactVerifySrc = Get-Content -LiteralPath (Join-Path $root "scripts\verify_build_artifacts.ps1") -Raw
 $readmeSrc = Get-Content -LiteralPath (Join-Path $root "README.md") -Raw -Encoding UTF8
 $userGuideSrc = Get-Content -LiteralPath (Join-Path $root "docs\USER_GUIDE.md") -Raw -Encoding UTF8
 $openSourceReleaseDoc = Get-Content -LiteralPath (Join-Path $root "OPEN_SOURCE_RELEASE.md") -Raw -Encoding UTF8
@@ -1012,6 +1013,18 @@ foreach ($releaseScript in @($sourceReleaseSrc, $programReleaseSrc)) {
 }
 if ($buildSrc -notmatch 'APP_VERSION' -or $buildSrc -notmatch 'DS_TRANSLATOR_VERSION') {
     throw "build_native.bat must inject VERSION into the launcher footer at compile time"
+}
+if ($buildSrc -notmatch 'APP_VERSION_COMMA' -or
+    $buildSrc -notmatch '1 VERSIONINFO' -or
+    $buildSrc -notmatch 'FILEVERSION' -or
+    $buildSrc -notmatch 'PRODUCTVERSION') {
+    throw "build_native.bat must embed VERSION as Windows FileVersion and ProductVersion metadata"
+}
+if ($artifactVerifySrc -notmatch '\.FileVersion' -or $artifactVerifySrc -notmatch '\.ProductVersion') {
+    throw "build artifact verification must reject launcher Windows version metadata that differs from VERSION"
+}
+if ($programReleaseSrc -notmatch '\.FileVersion' -or $programReleaseSrc -notmatch '\.ProductVersion') {
+    throw "program release packaging must reject launcher Windows version metadata that differs from VERSION"
 }
 if ($buildSrc -notmatch 'godot_warmup\.c' -or $buildSrc -notmatch 'godot_patch\.c') {
     throw "build_native.bat must compile the Godot warmup scanner and patch-pack modules"
