@@ -683,6 +683,7 @@ if ($runtimeInstallerSrc -notmatch 'TMP_Font_AssetBundles_2025-12-08\.7z' -or
     throw "runtime payload installer must install XUnity TMP font asset bundles for public Unity TMP parity"
 }
 if ($runtimeInstallerSrc -notmatch 'BepInEx_win_x86_5\.4\.23\.5\.zip' -or
+    $runtimeInstallerSrc -notmatch 'BepInEx-Unity\.Mono-win-x64-6\.0\.0-be\.759\+9aedb90\.zip' -or
     $runtimeInstallerSrc -notmatch 'BepInEx-Unity\.Mono-win-x86-6\.0\.0-be\.755\+3fab71a\.zip' -or
     $runtimeInstallerSrc -notmatch 'UnityMonoRuntimeX86' -or
     $runtimeInstallerSrc -notmatch 'UnityMonoRuntime6X86') {
@@ -695,6 +696,13 @@ if ($runtimeInstallerSrc -notmatch 'mono-6\.12\.0\.206-x64-0\.msi' -or
     $runtimeInstallerSrc -notmatch '/a' -or
     $runtimeInstallerSrc -notmatch 'payloads\\UnityMonoCorlib') {
     throw "runtime payload installer must reproducibly extract the pinned official Mono corlib payload"
+}
+if ($runtimeInstallerSrc -notmatch '\[System\.IO\.Path\]::GetTempPath\(\)' -or
+    $runtimeInstallerSrc -notmatch '"dst-mono-"' -or
+    $runtimeInstallerSrc -notmatch 'Assert-UnderDirectory \$temporary \$temporaryRoot' -or
+    $runtimeInstallerSrc -notmatch 'mono-admin-extract\.log' -or
+    $runtimeInstallerSrc -notmatch '"/L\*V"') {
+    throw "Mono MSI extraction must use an owned short temp path and retain a verbose diagnostic on failure"
 }
 if ($deploySrc -notmatch 'unity_player_machine' -or
     $deploySrc -notmatch 'loader_machine != machine' -or

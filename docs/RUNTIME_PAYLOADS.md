@@ -65,7 +65,8 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -U
 当前固定版本：
 
 - BepInEx 5.4.23.5 x86/x64，用于旧版 Unity Mono。
-- BepInEx 6.0.0-be.755+3fab71a x86/x64，用于 Unity 6+ Mono；x64 版本也用于 Unity IL2CPP。
+- BepInEx 6.0.0-be.759+9aedb90 x64，用于 Unity 6+ Mono，并包含控制台代码页兼容修复。
+- BepInEx 6.0.0-be.755+3fab71a x86，用于 Unity 6+ Mono；同版本 x64 构建用于 Unity IL2CPP。
 - XUnity.AutoTranslator 5.6.1 IL2CPP。
 - XUnity.ResourceRedirector 2.1.0 IL2CPP。
 - XUnity TMP_Font_AssetBundles_2025-12-08，用于 Unity TMP 中文字体 fallback。
