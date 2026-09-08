@@ -53,6 +53,10 @@ payloads/THIRD_PARTY_DOWNLOADED.md
 payloads/UnityTranslator/src/UnityManagedRefs/
 payloads/UnityIL2CPP/DeepSeekTMPFontFallback/src/UnityInteropRefs/
 
+# First-party managed payload fingerprints are release inputs, not runtime DLLs.
+!payloads/ManagedBuildStamps/
+!payloads/ManagedBuildStamps/*.json
+
 # Fonts are redistributed only with explicit license review
 *.otf
 *.ttf
@@ -65,3 +69,7 @@ payloads/UnityIL2CPP/DeepSeekTMPFontFallback/src/UnityInteropRefs/
 .vscode/
 .cursor/
 .claude/
+
+# dotnet build regenerates this app.config next to the C# server; runtime does not need it
+native/dst_server_cs.exe.config
+

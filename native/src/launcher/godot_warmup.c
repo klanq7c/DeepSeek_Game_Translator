@@ -1,14 +1,13 @@
 /* ================================================================
- * godot_warmup.c — Godot resource cache warmup scanner
+ * godot_warmup.c — Godot 资源缓存预热扫描器
  * ----------------------------------------------------------------
- * This module owns Godot-specific text discovery. The interface is
- * intentionally small: warmup.c passes a game directory and TextList,
- * then this module scans likely Godot resources and adds candidates.
+ * 本模块负责 Godot 专用文本发现。接口刻意保持精简：warmup.c 传入
+ * 游戏目录和 TextList，本模块随后扫描可能的 Godot 资源并加入候选文本。
  *
- * This module is resource/cache-warmup only; runtime patching and sidecars
- * are owned by godot_patch.c and ui.c:
- *   - .pck/.translation files and embedded-PCK exe sections are read-only scan inputs
- *   - misses are only queued through /prefetch by warmup.c later
+ * 本模块只负责资源与缓存预热；运行时修补和 sidecar 由 godot_patch.c
+ * 与 ui.c 负责：
+ *   - .pck/.translation 文件和 EXE 内嵌 PCK 区段仅作为只读扫描输入
+ *   - 缓存未命中项稍后只由 warmup.c 通过 /prefetch 排队
  * ================================================================ */
 
 #include "warmup_internal.h"
@@ -38,9 +37,8 @@ typedef struct {
     int offsets_are_absolute;
 } GodotPckInfo;
 
-/* Godot resources mix player text with paths, node metadata, resource ids, and
-   editor/project settings. This filter keeps the common game-facing text while
-   rejecting strings that would only pollute the shared translation cache. */
+/* Godot 资源会混合玩家文本、路径、节点元数据、资源 ID 以及编辑器或工程设置。
+   此过滤器保留常见的玩家可见文本，并拒绝只会污染共享翻译缓存的字符串。 */
 static int should_warm_godot_text(const char *s) {
     if (!should_warm_text(s)) return 0;
     size_t len = strlen(s);
@@ -80,16 +78,15 @@ static int should_warm_godot_text(const char *s) {
     return 1;
 }
 
-/* Targeted strings come from explicit translation-bearing properties or calls.
-   They may be short labels like "Start", so they are allowed through the base
-   Godot filter without the stricter loose-text punctuation requirement. */
+/* 定向字符串来自明确承载翻译的属性或调用。它们可能是“Start”之类的短标签，
+   因此可通过基础 Godot 过滤器，无需满足更严格的松散文本标点要求。 */
 static void collect_godot_string(char *s, TextList *prefetch) {
     char *t = trim_ascii(s);
     if (should_warm_godot_text(t)) textlist_add(prefetch, t);
 }
 
-/* Loose strings are unlabelled lines or generic quoted literals. They need a
-   stronger signal so node names, constants, and short ids do not flood warmup. */
+/* 松散字符串是无标签行或普通带引号字面量。它们需要更强的文本信号，避免节点
+   名称、常量和短 ID 淹没预热队列。 */
 static void collect_godot_free_string(char *s, TextList *prefetch) {
     char *t = trim_ascii(s);
     if (!should_warm_godot_text(t)) return;
@@ -105,8 +102,8 @@ static int alpha_word_len_at_least(const char *s, size_t min_len) {
     return n >= min_len;
 }
 
-/* Binary exports often contain NUL-separated UTF-8 payloads. Allow compact menu
-   words such as "Start", while still rejecting tiny binary noise like "bin". */
+/* 二进制导出物常含以 NUL 分隔的 UTF-8 载荷。允许“Start”这类紧凑菜单词，
+   同时继续拒绝“bin”之类的微小二进制噪声。 */
 static void collect_godot_binary_string(char *s, TextList *prefetch) {
     char *t = trim_ascii(s);
     if (!should_warm_godot_text(t)) return;
@@ -124,9 +121,8 @@ static int godot_key_equals(const char *start, const char *end, const char *name
     return strlen(name) == len && !_strnicmp(start, name, len);
 }
 
-/* Scene/resource headers carry useful engine metadata but not player-facing
-   prose. Skipping these quotes is what keeps [node name="..."] from becoming
-   translation work. */
+/* 场景或资源头包含有用的引擎元数据，却不含玩家可见正文。跳过这些引号内容，
+   可以避免 [node name="..."] 变成翻译任务。 */
 static int godot_metadata_quote(const char *buf_start, const char *quote) {
     const char *line = quote;
     while (line > buf_start && line[-1] != '\n' && line[-1] != '\r') line--;
@@ -196,9 +192,8 @@ static int godot_call_name_before_quote(const char *line, const char *quote, con
            (len == want || *(end - want - 1) == '.');
 }
 
-/* Classify the quote before parsing it. Targeted contexts get permissive label
-   handling; metadata contexts are skipped; everything else goes through the
-   loose-string collector. */
+/* 解析前先对引号内容分类：定向上下文采用宽松标签规则，元数据上下文跳过，
+   其余内容交给松散字符串收集器。 */
 static int godot_translatable_quote(const char *buf_start, const char *quote) {
     const char *line = quote;
     while (line > buf_start && line[-1] != '\n' && line[-1] != '\r') line--;
@@ -228,9 +223,8 @@ static int godot_translatable_quote(const char *buf_start, const char *quote) {
            godot_call_name_before_quote(line, quote, "RTR");
 }
 
-/* Validate a NUL-delimited binary slice before treating it as UTF-8 text. This
-   keeps arbitrary packed bytes out of the cache while allowing non-ASCII menu
-   text from exported .pck/.translation files. */
+/* 将 NUL 分隔的二进制片段视为 UTF-8 文本前先做校验。这样既能阻止任意打包
+   字节进入缓存，也允许导出 .pck/.translation 文件中的非 ASCII 菜单文本。 */
 static int valid_utf8_text_payload(const unsigned char *p, size_t n) {
     int signal = 0;
     for (size_t i = 0; i < n;) {
@@ -356,8 +350,8 @@ static int godot_pack_binary_path(const char *path) {
            !_stricmp(path, "godot_project.binary");
 }
 
-/* Text resources are scanned before compiled resources so a large .godot/exported
-   tree cannot consume the warmup cap before story/localization files are read. */
+/* 文本资源先于编译资源扫描，避免庞大的 .godot/exported 目录树在读取剧情或
+   本地化文件前耗尽预热上限。 */
 static int godot_pack_deferred_binary_path(const char *path) {
     return ascii_ends_with_i(path, ".scn") ||
            ascii_ends_with_i(path, ".res") ||
@@ -365,8 +359,8 @@ static int godot_pack_deferred_binary_path(const char *path) {
            ascii_ends_with_i(path, ".gde");
 }
 
-/* Skip generated/cache-heavy folders. Godot addons also contain editor/plugin
-   strings that are poor warmup candidates for a translated game session. */
+/* 跳过生成内容或缓存密集目录。Godot addons 还包含编辑器或插件字符串，
+   对已翻译游戏会话而言并不是合适的预热候选。 */
 static int skip_godot_scan_directory(const WCHAR *name) {
     return !_wcsicmp(name, L".godot") ||
            !_wcsicmp(name, L".import") ||
@@ -407,8 +401,8 @@ static void scan_godot_quoted_strings(char *buf, TextList *prefetch) {
     }
 }
 
-/* Plain-line fallback for hand-authored text resources. It ignores assignments,
-   comments, PO directives, and quoted/code-looking lines already handled above. */
+/* 手写文本资源的纯文本行回退路径。它会忽略赋值、注释、PO 指令，以及上方
+   已处理的带引号或疑似代码行。 */
 static void scan_godot_lines(char *buf, TextList *prefetch) {
     char *line = buf;
     if (line[0] && line[1] && line[2] &&
@@ -450,10 +444,9 @@ static char *godot_strip_bbcode(const char *s) {
     return b.data;
 }
 
-/* Several Godot dialogue systems store scripts as Markdown. Speaker quote
-   lines (>) and pure-tag lifecycle lines carry no visible prose; # headings
-   and BBCode-wrapped lines are collected by their visible text, which matches
-   the cache keys the runtime assigns to Label/RichTextLabel nodes. */
+/* 若干 Godot 对话系统以 Markdown 保存脚本。说话人引用行（>）和纯标签生命
+   周期行不含可见正文；# 标题和 BBCode 包裹行按其可见文本收集，以匹配运行时
+   为 Label/RichTextLabel 节点生成的缓存键。 */
 static void scan_godot_markdown_strings(char *buf, TextList *prefetch) {
     char *line = buf;
     int fenced = 0;
@@ -520,8 +513,8 @@ static void godot_po_append_quoted(const char *line, ByteBuf *current) {
     free(s);
 }
 
-/* Godot PO files contain source strings in msgid/msgid_plural. msgstr is an
-   existing target translation and must not be re-queued as an original. */
+/* Godot PO 文件的源字符串位于 msgid/msgid_plural；msgstr 是已有目标译文，
+   不能作为原文重新排队。 */
 static void scan_godot_po_strings(char *buf, TextList *prefetch) {
     ByteBuf current = {0};
     int in_msgid = 0;
@@ -653,10 +646,9 @@ static int godot_csv_short_id(const char *s) {
     return 1;
 }
 
-/* Godot CSV translations commonly use key,locale columns. After the header,
-   prefer the source/English column when it is labelled. Unknown layouts keep
-   the old first-natural-text fallback so unusual hand-authored CSV still warms,
-   but short ID-shaped cells that only name the row are skipped. */
+/* Godot CSV 翻译通常使用 key,locale 列。表头之后，若有标记则优先选择源语言
+   或英语列。未知布局保留原有的首个自然文本回退，使不常见的手写 CSV 仍能
+   预热；只用于命名行的短 ID 形单元格会被跳过。 */
 static void scan_godot_csv_strings(char *buf, TextList *prefetch) {
     char *line = buf;
     int row = 0;
@@ -708,9 +700,8 @@ static size_t godot_bbcode_tag_span(const char *s) {
     return 0;
 }
 
-/* Runtime translation preserves BBCode by querying each visible segment. Warmup
-   must use the same cache keys; queuing the full tagged string would both miss
-   those keys and risk a provider rewriting renderer control tags. */
+/* 运行时翻译通过逐个查询可见片段来保留 BBCode。预热必须使用相同缓存键；
+   将完整带标签字符串排队既无法命中这些键，也可能让提供方改写渲染控制标签。 */
 static void collect_godot_binary_payload(char *s, TextList *prefetch) {
     int has_tag = 0;
     for (const char *p = s; *p; p++) {

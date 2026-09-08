@@ -1,3 +1,29 @@
+; 远程翻译 API 配置：任意 OpenAI 兼容（chat/completions）服务均可使用。
+; 常见提供商 endpoint（模型名以各平台当前模型列表为准）：
+;   DeepSeek          https://api.deepseek.com/v1/chat/completions
+;   硅基流动          https://api.siliconflow.cn/v1/chat/completions
+;   Moonshot Kimi     https://api.moonshot.cn/v1/chat/completions
+;   智谱 GLM          https://open.bigmodel.cn/api/paas/v4/chat/completions
+;   阿里百炼          https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+;   OpenAI            https://api.openai.com/v1/chat/completions
+;   Claude(OpenAI兼容) https://api.anthropic.com/v1/chat/completions
+;   Gemini(OpenAI兼容) https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+;   Ollama(本地)      http://127.0.0.1:11434/v1/chat/completions
+;   LM Studio(本地)   http://127.0.0.1:1234/v1/chat/completions
+; 注意：非本机地址必须使用 HTTPS；本机回环服务（如 Ollama/LM Studio）的 key 可留空。
+;
+; 本地模型（Ollama / LM Studio / llama.cpp 等）建议：
+;   - timeout_ms 未配置时服务器自动按回环端点取 180000（上限 300000），
+;     因为本地推理一批文本可能需要数分钟；远程端点默认仍为 15000（上限 60000）。
+;   - concurrency=1 或 2：本地推理通常只有一个计算槽，并发只会互相排队。
+;   - 建议配合启动器的预热（Ren'Py）在游戏启动前完成批量翻译。
+;
+; 本地模型配置示例（Ollama）：
+;   endpoint=http://127.0.0.1:11434/v1/chat/completions
+;   model=qwen2.5:7b
+;   key=
+;   concurrency=1
+;
 [api]
 endpoint=https://api.deepseek.com/v1/chat/completions
 model=deepseek-v4-flash

@@ -46,9 +46,18 @@ from upstream by the user. Source releases intentionally omit runtime payloads.
 Run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run_all.ps1 -SkipEndurance
-powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version local-check
+build_native.bat
+powershell -ExecutionPolicy Bypass -File tests\server_contract\run_contract_tests.ps1
+powershell -ExecutionPolicy Bypass -File tests\payload_scripts\check_payload_scripts.ps1
+powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -NoZip
 ```
 
+`build_native.bat` already runs `tests\core_tests` and
+`tests\launcher_parity` as build gates; the two explicit test scripts above
+cover the server HTTP contract (both binaries) and the extracted hook scripts.
 The generated source package must pass the release audit with no secrets,
 binary payloads, fonts, caches, or local paths.
+
+The former `tests\run_all.ps1` regression suites were removed on 2026-09-06
+and rebuilt on 2026-09-08 as the guards above (see `AGENTS.md`, "Expected
+Verification", and `docs/MAINTENANCE_MAP.md` for what each guard pins).

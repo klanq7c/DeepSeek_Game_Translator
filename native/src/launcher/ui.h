@@ -9,11 +9,70 @@
  * ================================================================ */
 
 #include "globals.h"
+#include "engine.h"
 
 /* ---- 日志与状态 ---- */
 
 /* 向活动日志列表追加一行（带时间戳），自动裁剪超出行数上限 */
 void append_log(const WCHAR *fmt, ...);
+
+/* 诊断子命令（--detect-and-exit / --deploy-and-exit / --restore-and-exit）置 1：
+   append_log 额外把不带时间戳的正文以 "log=<正文>\n" 写到父进程重定向的 stdout，
+   供 tests/launcher_parity 与 C# 移植逐行对比。set_status 同样以 "status=<文本>"
+   镜像，使一键流程里的状态推进顺序也可比对。 */
+extern int g_log_to_stdout;
+
+/* --launch-flow-and-exit 置 1：一键流程里"真正拉起进程"的三处（游戏 exe 的
+   ShellExecuteW、Godot 的 CreateProcessW、独立补丁工作进程）改为把将要执行的
+   命令以 "spawn=<kind>|<exe>|<cmd>|<cwd>" 打印到 stdout 并按成功返回，其余
+   决策（引擎检测、预检探测、sidecar/补丁包准备、预热扫描）全部照常真跑。
+   预检探测仍然真的启动被测 exe——它的输出正是要比对的判定输入。 */
+extern int g_launch_dry_run;
+
+/* --ui-probe-and-exit 置 1：WM_CREATE 只做"画一帧所必需"的初始化（DPI、字体、
+   画刷、控件、字体应用），跳过 payload 同步、日志、上次目录恢复、服务器探测与
+   动画定时器。这些副作用会让同一台机器上两次渲染不同，而它们各自都已有对应的
+   parity 场景（--sync-payloads / --launch-flow / --server-smoke）覆盖。 */
+extern int g_ui_probe;
+
+/* --ui-probe-and-exit 置 1：侧边栏底部的运行时标签与副标题改用中性文案。
+   两个实现在这两处故意不同（它们就是用来标识"这一帧由哪版启动器画出"的），
+   探针把真实值单独打印成 runtime_tag= / subtitle= 供断言，其余像素仍逐字节比对。 */
+extern int g_ui_probe_neutral;
+
+/* >= 0 时冻结动画时钟（毫秒）。呼吸灯与英雄区光束都按它取相位，
+   取 0 可让 sinf/cosf 落在精确可表示的 -1/1 上，两版结果逐位一致。 */
+extern int g_anim_tick_override;
+
+/* 侧边栏底部的运行时标签与英雄区副标题（探针中性化后的取值也在这里决定）。 */
+const WCHAR *ui_runtime_tag(void);
+const WCHAR *ui_subtitle_text(void);
+
+/* 主窗口过程（main.c 定义）。探针用同一个过程注册自己的窗口类，
+   保证被渲染的这一帧走的就是真实的消息处理路径。 */
+WNDPROC ui_probe_wndproc(void);
+
+/* --ui-probe-and-exit <w> <h> <alive> <out.bmp>：见 ui_probe.c 顶部说明。
+   返回进程退出码（0 成功、1 渲染失败、2 参数错误）。 */
+int run_ui_probe(int width, int height, int alive, const WCHAR *bmp_path);
+
+/* 运行一键流程中"服务器已就绪之后"的部分：按引擎决定启动/预热/补丁刷新的
+   先后顺序。start_translation 的工作线程与 --launch-flow-and-exit 共用。 */
+void run_engine_launch_flow(const WCHAR *dir, Engine engine);
+
+/* 缓存卡片显示的文本（"%.1f MB"，文件不存在时 "0.0 MB"）。
+   返回是否读到了文件属性。 */
+int cache_size_text(WCHAR *out, int cap);
+
+/* 删除共享翻译缓存文件本身，返回是否已确认清除（文件不存在也算已清除）。
+   调用方负责先停掉本地服务：服务还在跑时它的内存缓存会再写回磁盘。 */
+int clear_cache_file(void);
+
+/* 把 UTF-16 文本以 UTF-8（无 BOM）写到 stdout；句柄未重定向/不可用时静默返回。 */
+void write_stdout_utf8(const WCHAR *text);
+
+/* 按引擎部署翻译钩子（ui.c 的一键流程与诊断子命令共用），返回 deploy_* 的结果。 */
+int deploy_for_engine(const WCHAR *dir, Engine e);
 
 /* 更新顶部状态栏文本 */
 void set_status(const WCHAR *text);
@@ -41,7 +100,7 @@ void paint_background_buffered(HWND hwnd, HDC dc, const RECT *dirty);
 /* 根据窗口大小重新布局所有子控件 */
 void layout(HWND hwnd);
 
-/* Apply native dark chrome and invalidate the small animated UI regions. */
+/* 应用原生深色窗口铬框（DWM 暗色标题栏），并刷新小幅动画的失效区域。 */
 void apply_window_chrome(HWND hwnd);
 void tick_ui_animation(HWND hwnd);
 
@@ -70,8 +129,8 @@ void start_translation(void);
    用于拒绝并发的开始/还原/清缓存/服务器切换操作 */
 int translation_flow_running(void);
 
-/* Remove only translation files that were deployed by this launcher. */
+/* 只移除由本启动器部署的翻译文件。 */
 void restore_selected_game(void);
 
-/* Delete the shared translation cache after confirmation. */
+/* 确认后删除共享翻译缓存。 */
 void clear_translation_cache(void);

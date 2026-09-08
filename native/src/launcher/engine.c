@@ -177,8 +177,12 @@ int unity_is_il2cpp(const WCHAR *dir) {
         if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
         size_t nl = wcslen(fd.cFileName);
         if (nl < 5 || _wcsicmp(fd.cFileName + nl - 5, L"_Data")) continue;
-        path_join(p, MAX_PATH * 4, dir, fd.cFileName);
-        path_join(p, MAX_PATH * 4, p, L"il2cpp_data");
+        /* path_join 先清空 out，因此 out 与 a 不能是同一缓冲区：此前写成
+           path_join(p, ..., p, ...) 会把前缀清掉、只剩 "il2cpp_data"，导致该分支
+           永远不成立（由 tests/launcher_parity 与 C# 移植的对比发现）。 */
+        WCHAR data_dir[MAX_PATH * 4];
+        path_join(data_dir, MAX_PATH * 4, dir, fd.cFileName);
+        path_join(p, MAX_PATH * 4, data_dir, L"il2cpp_data");
         if (is_dir(p)) {
             ok = 1;
             break;
@@ -279,11 +283,10 @@ static int has_godot_embedded_exe(const WCHAR *dir) {
     return found;
 }
 
-/* Godot Windows exports commonly ship a sidecar .pck next to the .exe. Source
-   projects use project.godot/.godot instead. Some Godot 4 Windows exports embed
-   the pack in the exe as a pck PE section ending in the GDPC package marker.
-   Godot detection intentionally stays behind Unity: some Unity games/mods may
-   also contain unrelated .pck files. */
+/* Godot Windows 导出物通常在 .exe 旁附带 .pck；源码工程则使用
+   project.godot/.godot。某些 Godot 4 Windows 导出物把包内嵌为 EXE 的 pck PE
+   区段，并以 GDPC 包标记结尾。Godot 检测刻意排在 Unity 之后，因为部分 Unity
+   游戏或模组也可能包含无关的 .pck 文件。 */
 static int godot_export_or_project(const WCHAR *dir) {
     return has_file_pattern(dir, L"*.pck") ||
            godot_project_marker(dir) ||

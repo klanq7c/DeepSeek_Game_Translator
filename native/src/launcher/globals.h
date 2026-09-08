@@ -36,6 +36,7 @@
 #define IDC_RESTORE 116          /* 还原游戏按钮 */
 #define IDC_CLEAR_CACHE 117      /* 清除共享翻译缓存按钮 */
 
+#define IDC_API_PROVIDER 200     /* API 设置页：提供商预设下拉 */
 #define IDC_API_ENDPOINT 201     /* API 设置页：端点 URL */
 #define IDC_API_MODEL 202        /* API 设置页：模型名 */
 #define IDC_API_KEY 203          /* API 设置页：API Key */

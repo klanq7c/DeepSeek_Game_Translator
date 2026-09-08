@@ -150,9 +150,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		public List<Action<string>> Callbacks = new List<Action<string>>();
 	}
 
-	/* One long source fans out to bounded atomic requests. The aggregate remains
-	   unresolved until every segment succeeds, so partial translations never
-	   enter the full-text cache or reach a Unity renderer. */
+	/* 一段长原文拆分为数量受限的原子请求。只有全部分段成功后才解析聚合结果，
+	   因此部分译文绝不会进入全文缓存，也不会送到 Unity 渲染器。 */
 	private sealed class PendingLongTextRequest
 	{
 		public string Key;
@@ -245,11 +244,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static readonly Dictionary<string, int> _caughtExceptionCounts = new Dictionary<string, int>(StringComparer.Ordinal);
 
-	/* Compatibility exception boundary policy:
-	   1. It prevents one version-specific Unity/TMP reflection failure from disabling unrelated renderers.
-	   2. It cannot be fixed in the shared server because the failing member exists only in the loaded game engine.
-	   3. It preserves the existing local fallback but never hides the failure: counts and exception details are logged.
-	   4. BepInEx receives the method, exception type/message, occurrence count, and first full stack trace. */
+	/* 兼容性异常边界策略：
+	   1. 防止某个版本特有的 Unity/TMP 反射故障禁用无关渲染器。
+	   2. 故障成员只存在于已加载的游戏引擎中，无法在共享服务端修复。
+	   3. 保留现有本地降级，但绝不隐藏故障：记录次数和异常详情。
+	   4. BepInEx 会收到方法、异常类型/消息、发生次数和首次完整堆栈。 */
 	private static void ReportCaughtException(Exception exception, string context = null, [System.Runtime.CompilerServices.CallerMemberName] string operation = null)
 	{
 		Exception root = (exception is TargetInvocationException && exception.InnerException != null) ? exception.InnerException : exception;
@@ -460,6 +459,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private float _nextPeriodicCacheApplyRealtime = -999f;
 
+	private int _cacheMutationGeneration;
+
+	private int _lastPeriodicCacheApplyGeneration = -1;
+
+	private int _periodicCacheApplyIdlePasses;
+
 	private float _nextOverlayValidationRealtime = -999f;
 
 	private float _lastUiActivationRealtime = -999f;
@@ -560,7 +565,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int DefaultClientBatchWindowMs = 2;
 
-	private const int MaxClientBatchSize = 16;
+	private const int MaxClientBatchSize = 32;
 
 	/* 与本地服...API 通道池对齐：最...4 个批次并行，避免单次往返串行化...*/
 	private const int MaxConcurrentBatchFlushes = 4;
@@ -616,7 +621,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const float UiActivationThrottleSeconds = 0.12f;
 
-	private const float PeriodicCacheApplyIntervalSeconds = 0.25f;
+	private const float PeriodicCacheApplyActiveIntervalSeconds = 0.25f;
+
+	private const float PeriodicCacheApplyIdleIntervalSeconds = 5f;
+
+	private const int PeriodicCacheApplyIdlePassThreshold = 2;
 
 	private const float OverlayValidationIntervalSeconds = 0.5f;
 
@@ -716,13 +725,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int DeepPrefetchMaxTextsPerScan = 80;
 
-	private const int DeepPrefetchBatchSize = 8;
+	private const int DeepPrefetchBatchSize = 16;
 
 	private const int MaxGameScriptWarmupTexts = 512;
 
-	private const int GameScriptWarmupBatchSize = 16;
+	private const int GameScriptWarmupBatchSize = 32;
 
-	private const int GameScriptWarmupPauseMs = 150;
+	private const int GameScriptWarmupPauseMs = 75;
 
 	private const int WarmupServerReadyWaitMs = 5000;
 
@@ -1138,11 +1147,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			bool ownsRuntime = (Object)(object)currentRoot == (Object)(object)existingRoot;
 			if (!ownsRuntime)
 			{
-				/* A later BepInEx manager instance can be created while the dedicated
-				   runtime root is still alive. It has no configuration/runtime state and
-				   cannot be repaired by the owner instance. Disabling only this duplicate
-				   prevents an empty Update from running every frame; the owner remains
-				   active, and the Update owner guard records the same invariant in code. */
+				/* 专用运行时根仍存活时，BepInEx 可能再次创建管理器实例。该实例没有配置或
+				   运行时状态，所有者实例也无法修复它。只禁用这个重复实例，可以避免空 Update
+				   每帧运行；所有者保持活动，Update 的所有者守卫也在代码中维持同一约束。 */
 				((Behaviour)this).enabled = false;
 				base.Logger.LogWarning("Disabled duplicate Unity Mono translator instance; dedicated runtime owner is already active.");
 			}
@@ -1180,10 +1187,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void PinPluginHostAcrossSceneLoads()
 	{
-		/* A scene transition may destroy the BepInEx manager root in some Unity games.
-		   The game owns that lifecycle, so it cannot be repaired in the shared server.
-		   Pinning only extends the plugin host lifetime; normal quit still reaches OnDestroy.
-		   The startup log records that this compatibility boundary was activated. */
+		/* 某些 Unity 游戏会在切换场景时销毁 BepInEx 管理器根。该生命周期归游戏所有，
+		   无法在共享服务端修复。固定对象只延长插件宿主生命周期；正常退出仍会进入
+		   OnDestroy。启动日志会记录该兼容边界已启用。 */
 		try
 		{
 			GameObject hostRoot = ((Component)this).gameObject;
@@ -1263,11 +1269,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		UnregisterOptionalStaticEvent("Application.onBeforeRender", ref _beforeRenderEvent, ref _beforeRenderCallback);
 	}
 
-	/* Highly stripped Mono players may remove optional Unity event accessors even
-	   though the declaring type remains. The game build owns that incompatibility,
-	   so each event is bound reflectively and its absence is logged. Skipping one
-	   lifecycle callback can reduce scan responsiveness, but it never accepts or
-	   persists a translation and the driver/frame hooks remain active. */
+	/* 高度裁剪的 Mono 播放器可能保留声明类型，却移除可选 Unity 事件访问器。
+	   该不兼容性归游戏构建所有，因此逐个反射绑定事件并记录缺失。跳过一个生命周期
+	   回调可能降低扫描响应速度，但绝不会接受或持久化译文，驱动器和帧钩子仍然活动。 */
 	private void RegisterOptionalStaticEvent(Type ownerType, string eventName, string handlerName, ref EventInfo registeredEvent, ref Delegate registeredCallback)
 	{
 		if (registeredCallback != null)
@@ -1598,6 +1602,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_uiCacheApplyUntilRealtime = Math.Max(_uiCacheApplyUntilRealtime, realtimeSinceStartup + UiActivationCacheApplyWindowSeconds);
 		_nextUiCacheApplyRealtime = Math.Min(_nextUiCacheApplyRealtime, realtimeSinceStartup);
 		_nextPeriodicCacheApplyRealtime = Math.Min(_nextPeriodicCacheApplyRealtime, realtimeSinceStartup);
+		_periodicCacheApplyIdlePasses = 0;
 		try
 		{
 			ApplyCachedVisibleTextPass(MaxUiActivationCacheAppliesPerPass);
@@ -1629,19 +1634,44 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private void RunPeriodicCacheApplyTick()
 	{
 		float realtimeSinceStartup = Time.realtimeSinceStartup;
-		if (realtimeSinceStartup < _nextPeriodicCacheApplyRealtime)
+		int generation = Volatile.Read(ref _cacheMutationGeneration);
+		bool cacheChanged = generation != _lastPeriodicCacheApplyGeneration;
+		if (!cacheChanged && realtimeSinceStartup < _nextPeriodicCacheApplyRealtime)
 		{
 			return;
 		}
-		_nextPeriodicCacheApplyRealtime = realtimeSinceStartup + PeriodicCacheApplyIntervalSeconds;
+		int hitCountBefore = _cacheApplyHitCount;
+		bool completed = false;
 		try
 		{
 			ApplyCachedVisibleTextPass(MaxPeriodicCacheAppliesPerPass);
+			completed = true;
 		}
 		catch (Exception ex)
 		{
 			ReportCaughtException(ex, "phase=periodic");
 		}
+		if (!completed)
+		{
+			_nextPeriodicCacheApplyRealtime = realtimeSinceStartup + PeriodicCacheApplyActiveIntervalSeconds;
+			return;
+		}
+		_lastPeriodicCacheApplyGeneration = generation;
+		int applied = _cacheApplyHitCount - hitCountBefore;
+		if (cacheChanged || applied > 0)
+		{
+			_periodicCacheApplyIdlePasses = 0;
+		}
+		else if (_periodicCacheApplyIdlePasses < PeriodicCacheApplyIdlePassThreshold)
+		{
+			_periodicCacheApplyIdlePasses++;
+		}
+		// 缓存 generation 是后台生产者与主线程渲染器之间的深层接口：有新译文时立即扫，
+		// 连续空闲后仅保留低频兼容兜底，避免稳定场景每秒四次全局枚举 TMP/UGUI。
+		float interval = (_periodicCacheApplyIdlePasses >= PeriodicCacheApplyIdlePassThreshold)
+			? PeriodicCacheApplyIdleIntervalSeconds
+			: PeriodicCacheApplyActiveIntervalSeconds;
+		_nextPeriodicCacheApplyRealtime = realtimeSinceStartup + interval;
 	}
 
 	private void RunOverlayValidationTick()
@@ -2138,7 +2168,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					break;
 				}
-				await WarmupTextsAsync(list, "dialogue");
+				await QueueWarmupTextsAsync(list, "dialogue");
 				await Task.Delay((int)(DeepPrefetchChunkPauseSeconds * 1000f));
 			}
 		}
@@ -2964,7 +2994,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void StartStartupWarmup()
 	{
-		_ = WarmupTextsAsync(StartupHotTexts, "ui");
+		_ = QueueWarmupTextsAsync(StartupHotTexts, "ui");
 		StartGameScriptWarmup();
 		BeginSceneWarmupGeneration();
 	}
@@ -2992,7 +3022,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				return;
 			}
-			int warmed = 0;
+			int queued = 0;
 			for (int i = 0; i < texts.Count; i += GameScriptWarmupBatchSize)
 			{
 				if (HasPendingClientTranslationWork())
@@ -3000,11 +3030,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					await Task.Delay(300);
 				}
 				List<string> batch = texts.GetRange(i, Math.Min(GameScriptWarmupBatchSize, texts.Count - i));
-				Dictionary<string, string> result = await WarmupTextsAsync(batch, "dialogue");
-				warmed += result.Count;
+				queued += await QueueWarmupTextsAsync(batch, "dialogue");
 				await Task.Delay(GameScriptWarmupPauseMs);
 			}
-			base.Logger.LogInfo($"[SCRIPT-PREFETCH] warmed {warmed}/{texts.Count} dialogue strings from game JSON");
+			base.Logger.LogInfo($"[SCRIPT-PREFETCH] queued {queued}/{texts.Count} dialogue strings from game JSON");
 		}
 		catch (Exception ex)
 		{
@@ -3023,15 +3052,29 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			try
 			{
-				JToken token = JToken.Parse(File.ReadAllText(path, Encoding.UTF8));
-				ExtractGameScriptStrings(token, output, maxTexts);
+				// 游戏脚本可能有数百 MB；流式读取只保留当前 token，达到候选预算后立即停，
+				// 避免 ReadAllText 字符串与完整 JToken DOM 同时驻留造成瞬时内存峰值。
+				using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 16384, FileOptions.SequentialScan))
+				using (StreamReader reader = new StreamReader(file, Encoding.UTF8, true, 16384))
+				using (JsonTextReader jsonReader = new JsonTextReader(reader))
+				{
+					jsonReader.DateParseHandling = DateParseHandling.None;
+					jsonReader.MaxDepth = 128;
+					while (jsonReader.Read() && output.Count < maxTexts)
+					{
+						if (jsonReader.TokenType == JsonToken.String)
+						{
+							ExtractDeepPrefetchText(jsonReader.Value as string, output, maxTexts);
+						}
+					}
+				}
 			}
 			catch (Exception reportedException)
 			{
-				ReportCaughtException(reportedException);
+				ReportCaughtException(reportedException, "game-script-json=" + path);
 			}
 		}
-		return output.Distinct(StringComparer.Ordinal).Take(maxTexts).ToList();
+		return output;
 	}
 
 	private IEnumerable<string> GetGameScriptJsonCandidates()
@@ -3069,68 +3112,51 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			string[] patterns = new string[2] { "*dialog*.json", "*script*.json" };
 			foreach (string pattern in patterns)
 			{
-				IEnumerable<string> files = Enumerable.Empty<string>();
+				IEnumerator<string> files = null;
 				try
 				{
-					files = Directory.GetFiles(candidateRoot, pattern, SearchOption.AllDirectories);
+					files = Directory.EnumerateFiles(candidateRoot, pattern, SearchOption.AllDirectories).GetEnumerator();
 				}
 				catch (Exception reportedException)
 				{
-					ReportCaughtException(reportedException);
+					ReportCaughtException(reportedException, "game-script-discovery=" + candidateRoot);
 				}
-				foreach (string path in files)
+				if (files == null)
 				{
-					if (path.IndexOf("\\BepInEx\\", StringComparison.OrdinalIgnoreCase) >= 0 || path.IndexOf("\\Managed\\", StringComparison.OrdinalIgnoreCase) >= 0)
+					continue;
+				}
+				try
+				{
+					while (true)
 					{
-						continue;
+						string path;
+						try
+						{
+							if (!files.MoveNext())
+							{
+								break;
+							}
+							path = files.Current;
+						}
+						catch (Exception reportedException)
+						{
+							ReportCaughtException(reportedException, "game-script-enumeration=" + candidateRoot);
+							break;
+						}
+						if (path.IndexOf("\\BepInEx\\", StringComparison.OrdinalIgnoreCase) >= 0 || path.IndexOf("\\Managed\\", StringComparison.OrdinalIgnoreCase) >= 0)
+						{
+							continue;
+						}
+						if (yielded.Add(path))
+						{
+							yield return path;
+						}
 					}
-					if (yielded.Add(path))
-					{
-						yield return path;
-					}
 				}
-			}
-		}
-	}
-
-	private void ExtractGameScriptStrings(JToken token, List<string> output, int maxTexts)
-	{
-		if (token == null || output.Count >= maxTexts)
-		{
-			return;
-		}
-		JValue value = token as JValue;
-		if (value != null)
-		{
-			if (value.Type == JTokenType.String)
-			{
-				ExtractDeepPrefetchText(((object)value)?.ToString(), output, maxTexts);
-			}
-			return;
-		}
-		JObject obj = token as JObject;
-		if (obj != null)
-		{
-			foreach (JProperty prop in obj.Properties())
-			{
-				if (output.Count >= maxTexts)
+				finally
 				{
-					return;
+					files.Dispose();
 				}
-				ExtractGameScriptStrings(prop.Value, output, maxTexts);
-			}
-			return;
-		}
-		JArray array = token as JArray;
-		if (array != null)
-		{
-			foreach (JToken item in array)
-			{
-				if (output.Count >= maxTexts)
-				{
-					return;
-				}
-				ExtractGameScriptStrings(item, output, maxTexts);
 			}
 		}
 	}
@@ -3224,10 +3250,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void InstallPluginHostLifetimeHooks()
 	{
-		/* Some games explicitly purge persistent roots while replacing their bootstrap
-		   scene. The shared server cannot repair a destroyed in-process adapter. Only the
-		   plugin-owned root is protected, normal application quit is never suppressed, and
-		   every blocked operation is recorded by LogPluginHostLifetimeBlock. */
+		/* 某些游戏在替换引导场景时会明确清理持久根。共享服务无法修复已销毁的进程内
+		   适配器。这里只保护插件自有根，绝不阻止应用正常退出；每次被阻止的操作都由
+		   LogPluginHostLifetimeBlock 记录。 */
 		int patched = 0;
 		HarmonyMethod prefix = new HarmonyMethod(typeof(DeepSeekTranslator), "PluginHostDestroyPrefix");
 		try
@@ -3400,11 +3425,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	/* A stripped player can make both Resources and Object global enumeration return
-	   empty arrays for live TMP objects that were created before plugin hooks. Canvas
-	   rebuild is the retained renderer-owned boundary that still exposes the instance.
-	   It only queues the normal local-first pipeline, cannot manufacture a successful
-	   translation, and hook selection/failures remain visible in BepInEx diagnostics. */
+	/* 裁剪后的播放器可能让 Resources 和 Object 全局枚举都对钩子安装前创建的存活
+	   TMP 对象返回空数组。Canvas 重建是仍能暴露实例的渲染器自有边界。这里只把对象
+	   排入本地优先的正常管线，无法凭空制造成功翻译；钩子选择和故障仍会出现在
+	   BepInEx 诊断中。 */
 	private void TryPatchDeclaredTmpRenderDiscovery(Type tmpType)
 	{
 		if (tmpType == null)
@@ -3779,9 +3803,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		if (obj is string)
 		{
 			string value2 = text;
-			/* TMP SetText(string, ...) overloads do not consistently call the text
-			   property setter. Own a separate boundary for this overload so both the
-			   successful and exceptional paths can close the depth increment. */
+			/* TMP 的 SetText(string, ...) 重载不一定调用 text 属性 setter，因此为该重载
+			   单独建立边界，使成功路径和异常路径都能闭合深度增量。 */
 			__state = true;
 			bool result = TMPSetTextPrefix(__instance, ref value2);
 			__args[0] = value2;
@@ -3813,10 +3836,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_instance.EndTmpExternalTextWrite(__instance, value);
 	}
 
-	/* External TMP SetText overloads may throw before their postfix. That game/TMP
-	   exception cannot be repaired in the renderer or shared server. The finalizer
-	   resets only translator-owned depth state, never suppresses the exception or
-	   accepts a translation, and ReportCaughtException records the exact boundary. */
+	/* 外部 TMP SetText 重载可能在 postfix 前抛出异常。该游戏/TMP 异常无法在渲染器
+	   或共享服务中修复。finalizer 只重置翻译器自有深度状态，绝不抑制异常或接受
+	   译文；ReportCaughtException 会记录准确边界。 */
 	private static void TMPSetTextAnyFinalizer(object __instance, Exception __exception, bool __state)
 	{
 		if (!__state || __exception == null || (Object)(object)_instance == (Object)null)
@@ -4644,10 +4666,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private async Task PrefetchServerTextsAsync(List<string> requestTexts, List<string> sourceKeys, string domain)
 	{
-		/* The optional lookahead can fail when the local server is restarting or an
-		   older server lacks /prefetch. That boundary cannot be repaired inside the
-		   renderer. It never marks a translation successful or suppresses the normal
-		   visible-text request; the adapter and operation are recorded below. */
+		/* 本地服务重启或旧服务缺少 /prefetch 时，可选前瞻可能失败。该边界无法在
+		   渲染器内部修复。它绝不会把翻译标成成功，也不会抑制正常可见文本请求；
+		   下方会记录适配器和操作。 */
 		if (_shuttingDown || requestTexts == null || requestTexts.Count == 0 || IsServerBackoffActive())
 		{
 			ReleaseFungusPrefetchKeys(sourceKeys);
@@ -4655,21 +4676,42 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		try
 		{
-			string body = BuildBatchPayload(requestTexts, domain);
-			string serverUrl = _serverUrl.Value;
-			string response = await RunBackground(() => HttpPost(serverUrl + "/prefetch", body, 3000));
-			if (string.IsNullOrWhiteSpace(response))
-			{
-				throw new IOException("The local server returned an empty prefetch response.");
-			}
-			NoteServerRequestSucceeded();
-			LogVerbose($"[Fungus] queued {requestTexts.Count} protected lookahead texts");
+			int queued = await PostServerPrefetchAsync(requestTexts, domain);
+			LogVerbose($"[Fungus] queued {queued}/{requestTexts.Count} protected lookahead texts");
 		}
 		catch (Exception ex)
 		{
 			ReleaseFungusPrefetchKeys(sourceKeys);
 			ReportCaughtException(ex, $"adapter=Fungus;operation=prefetch;count={requestTexts.Count}");
 		}
+	}
+
+	/* 可选预热只有一个服务器 Adapter：/prefetch 立即接收任务并由后台通道处理。
+	   本方法不把“已排队”解释成成功译文，调用方仍须从正常可见文本路径读取缓存。 */
+	private async Task<int> PostServerPrefetchAsync(IEnumerable<string> requestTexts, string domain)
+	{
+		List<string> texts = requestTexts?.Where((string value) => !string.IsNullOrWhiteSpace(value))
+			.Distinct(StringComparer.Ordinal)
+			.ToList() ?? new List<string>();
+		if (texts.Count == 0)
+		{
+			return 0;
+		}
+		string body = BuildBatchPayload(texts, string.IsNullOrWhiteSpace(domain) ? "dialogue" : domain);
+		string serverUrl = _serverUrl.Value;
+		string response = await RunBackground(() => HttpPost(serverUrl + "/prefetch", body, 3000));
+		if (string.IsNullOrWhiteSpace(response))
+		{
+			throw new IOException("The local server returned an empty prefetch response.");
+		}
+		JObject payload = JObject.Parse(response);
+		if (!string.Equals((string)payload["status"], "queued", StringComparison.OrdinalIgnoreCase))
+		{
+			throw new InvalidDataException("The local server returned an invalid prefetch status.");
+		}
+		NoteServerRequestSucceeded();
+		int accepted = (int?)payload["queued"] ?? texts.Count;
+		return Math.Max(0, Math.Min(texts.Count, accepted));
 	}
 
 	private void ReleaseFungusPrefetchKeys(IEnumerable<string> sourceKeys)
@@ -5420,10 +5462,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				text4 = RestoreProtectedText(text4, protectedPayload);
 				if (!HasRequiredProtectedValues(text4, protectedPayload))
 				{
-					/* A provider/cache result that drops renderer tokens is a content
-					   rejection, not a transport miss. The renderer is the first boundary
-					   that can validate those tokens; bounded rejection prevents a bad
-					   cached value from being requested forever, and abandonment is logged. */
+					/* 丢失渲染器令牌的提供方或缓存结果属于内容拒绝，不是传输未命中。渲染器是
+					   第一个能校验这些令牌的边界；有界拒绝可防止永久请求错误缓存值，并记录放弃。 */
 					MarkRejectedTranslationRetry(text, text4);
 					callback?.Invoke(text);
 				}
@@ -5473,6 +5513,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			MarkLocalCacheKeyLocked(original);
 		}
+		Interlocked.Increment(ref _cacheMutationGeneration);
 		ClearMixedRepairMemo();
 		ClearTranslationRetryState(original);
 		ScheduleLocalCachePersist();
@@ -5670,34 +5711,75 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private async Task<Dictionary<string, string>> WarmupTextsAsync(IEnumerable<string> texts, string domain)
+	private List<(string Original, ProtectedTextPayload Payload)> CollectWarmupRequestItems(
+		IEnumerable<string> texts,
+		IDictionary<string, string> cachedResults)
 	{
-		List<string> list = (from text5 in texts?.Where((string text5) => !string.IsNullOrWhiteSpace(text5) && !ContainsCjk(text5) && !LooksLikeTypewriterFragment(text5) && !ShouldSkipText(text5) && !IsTranslationRetryCoolingDown(text5))
-			select text5.Trim()).Distinct(StringComparer.Ordinal).ToList() ?? new List<string>();
-		Dictionary<string, string> results = new Dictionary<string, string>(StringComparer.Ordinal);
-		if (list.Count == 0)
-		{
-			return results;
-		}
-		if (!await WaitForWarmupServerReadyAsync())
-		{
-			LogVerbose($"[WARMUP] Server not ready; skipped {list.Count} queued warmup texts");
-			return results;
-		}
 		List<(string Original, ProtectedTextPayload Payload)> requestItems = new List<(string, ProtectedTextPayload)>();
-		foreach (string item2 in list)
+		HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+		foreach (string rawText in texts ?? Enumerable.Empty<string>())
 		{
-			if (TryGetLocalTranslation(item2, out var translated))
+			if (string.IsNullOrWhiteSpace(rawText) || ContainsCjk(rawText) || LooksLikeTypewriterFragment(rawText) ||
+				ShouldSkipText(rawText) || IsTranslationRetryCoolingDown(rawText))
 			{
-				results[item2] = translated;
 				continue;
 			}
-			ProtectedTextPayload protectedTextPayload = ProtectTextForTranslation(item2);
-			if (!IsTokenDominatedFragment(protectedTextPayload.RequestText))
+			string text = rawText.Trim();
+			if (!seen.Add(text))
 			{
-				requestItems.Add((item2, protectedTextPayload));
+				continue;
+			}
+			if (TryGetLocalTranslation(text, out var translated))
+			{
+				if (cachedResults != null)
+				{
+					cachedResults[text] = translated;
+				}
+				continue;
+			}
+			ProtectedTextPayload payload = ProtectTextForTranslation(text);
+			if (!IsTokenDominatedFragment(payload.RequestText))
+			{
+				requestItems.Add((text, payload));
 			}
 		}
+		return requestItems;
+	}
+
+	private async Task<int> QueueWarmupTextsAsync(IEnumerable<string> texts, string domain)
+	{
+		if (_shuttingDown || IsServerBackoffActive() || !await WaitForWarmupServerReadyAsync())
+		{
+			return 0;
+		}
+		List<(string Original, ProtectedTextPayload Payload)> requestItems = CollectWarmupRequestItems(texts, null);
+		if (requestItems.Count == 0)
+		{
+			return 0;
+		}
+		try
+		{
+			return await PostServerPrefetchAsync(
+				requestItems.Select(((string Original, ProtectedTextPayload Payload) item) => item.Payload.RequestText),
+				domain);
+		}
+		catch (Exception ex)
+		{
+			NoteServerRequestFailed(ex);
+			ReportCaughtException(ex, $"adapter=UnityWarmup;operation=prefetch;count={requestItems.Count}");
+			return 0;
+		}
+	}
+
+	private async Task<Dictionary<string, string>> FetchWarmupTranslationsAsync(IEnumerable<string> texts, string domain)
+	{
+		Dictionary<string, string> results = new Dictionary<string, string>(StringComparer.Ordinal);
+		if (!await WaitForWarmupServerReadyAsync())
+		{
+			LogVerbose("[WARMUP] Server not ready; skipped visible warmup texts");
+			return results;
+		}
+		List<(string Original, ProtectedTextPayload Payload)> requestItems = CollectWarmupRequestItems(texts, results);
 		if (requestItems.Count == 0)
 		{
 			return results;
@@ -5749,7 +5831,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			NoteServerRequestFailed(ex);
 			if (_debugMode.Value)
 			{
-				base.Logger.LogInfo("WarmupTextsAsync error: " + ex);
+				base.Logger.LogInfo("FetchWarmupTranslationsAsync error: " + ex);
 			}
 		}
 		return results;
@@ -5888,9 +5970,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 				catch (Exception ex)
 				{
-					/* A renderer callback is external to the batch dispatcher. One callback
-					   must not abort its peers, but normal DebugMode=false still records the
-					   failed request boundary and never turns it into a successful result. */
+					/* 渲染器回调位于批分发器之外。单个回调不能中止同批其他回调；即使正常设置
+					   DebugMode=false，仍会记录失败请求边界，且绝不把它转成成功结果。 */
 					ReportCaughtException(ex, "boundary=batch-callback Callback failed for '" + PreviewForLog(request.OriginalText) + "'");
 				}
 			}
@@ -5915,10 +5996,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			callback?.Invoke(translated);
 			return;
 		}
-		/* Every caller, including long-text segment fan-out, must honor the shared
-		   transient/abandoned state. Call-site-only checks let rejected segments
-		   bypass their retry budget. This returns no successful value, preserves
-		   source display, and the rejection owner logs terminal abandonment. */
+		/* 所有调用者（包括长文本分段扇出）都必须遵守共享的瞬态/已放弃状态。只在
+		   调用点检查会让被拒分段绕过重试预算。此处不返回成功值、保留原文显示，
+		   并由拒绝状态所有者记录终态放弃。 */
 		if (IsTranslationRetryCoolingDown(text))
 		{
 			callback?.Invoke(null);
@@ -6336,9 +6416,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 					else if (!HasRequiredProtectedValues(text2, pendingBatchRequest.Payload))
 					{
-						/* Missing renderer tokens are provider/content rejection. They
-						   cannot be repaired by the server transport boundary and must
-						   consume the finite rejection budget instead of polling forever. */
+						/* 缺少渲染器令牌属于提供方或内容拒绝，无法由服务端传输边界修复；必须消耗
+						   有限拒绝预算，而不是永久轮询。 */
 						MarkRejectedTranslationRetry(pendingBatchRequest.OriginalText, text2);
 						LogVerbose("[BATCH] MISSING-TOKENS: '" + pendingBatchRequest.OriginalText?.Substring(0, Math.Min(pendingBatchRequest.OriginalText?.Length ?? 0, 30)) + "' -> '" + text2?.Substring(0, Math.Min(text2?.Length ?? 0, 30)) + "'");
 					}
@@ -6561,7 +6640,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		Dictionary<string, string> translations = new Dictionary<string, string>(StringComparer.Ordinal);
 		foreach (KeyValuePair<string, HashSet<string>> bucket in warmupTextsByDomain)
 		{
-			Dictionary<string, string> bucketTranslations = await WarmupTextsAsync(bucket.Value, bucket.Key);
+			Dictionary<string, string> bucketTranslations = await FetchWarmupTranslationsAsync(bucket.Value, bucket.Key);
 			foreach (KeyValuePair<string, string> pair in bucketTranslations)
 			{
 				translations[pair.Key] = pair.Value;
@@ -9088,8 +9167,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			});
 			if (method != null)
 			{
-				// This is an own-atlas check. TMP fallback coverage can be true even
-				// when the host material cannot render the fallback glyphs.
+				// 这里只检查自有图集；即使宿主材质无法渲染回退字形，TMP 回退覆盖仍可能返回真。
 				object[] array = new object[4] { text2, null, false, false };
 				object obj = method.Invoke(fontAsset, array);
 				bool flag = default(bool);
@@ -9308,8 +9386,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					base.Logger.LogInfo("[FONT-APPLY] Attached CJK fallback to " + GetComponentLogPath(tmpComponent));
 				}
 			}
-			// Some packed TMP atlases still miss punctuation after a fallback is attached.
-			// The caller validates glyph coverage against the current text.
+			// 某些打包 TMP 图集即使附加回退后仍缺少标点；调用方会按当前文本验证字形覆盖。
 		}
 		catch (Exception ex)
 		{
@@ -9398,11 +9475,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	/* Some aggressively stripped Unity players retain Resources.FindObjectsOfTypeAll(Type)
-	   but return an empty array even while live TMP/UGUI components are rendering. The
-	   player owns that native enumeration mismatch, so use the retained Object scan as
-	   an include-inactive fallback. A real empty scene remains empty, and choosing or
-	   invoking the fallback is recorded instead of being treated as translation success. */
+	/* 某些重度裁剪 Unity 播放器保留 Resources.FindObjectsOfTypeAll(Type)，却在存活
+	   TMP/UGUI 组件正在渲染时返回空数组。该原生枚举不匹配归播放器所有，因此用保留的
+	   Object 扫描作为包含非活动对象的降级。真正的空场景仍保持为空；选择或调用降级
+	   会被记录，而不会当成翻译成功。 */
 	private static Object[] FindObjectsOfTypeAllSafe(Type componentType)
 	{
 		if (componentType == null)
@@ -9461,22 +9537,29 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private static T[] FindObjectsOfTypeAllSafe<T>() where T : Object
 	{
 		Object[] array = FindObjectsOfTypeAllSafe(typeof(T));
-		List<T> list = new List<T>(array.Length);
+		int count = 0;
 		foreach (Object val in array)
 		{
 			if (val is T)
 			{
-				list.Add((T)val);
+				count++;
 			}
 		}
-		return list.ToArray();
+		T[] result = new T[count];
+		int index = 0;
+		foreach (Object val in array)
+		{
+			if (val is T item)
+			{
+				result[index++] = item;
+			}
+		}
+		return result;
 	}
 
-	/* On some stripped TMP players both Unity global enumeration APIs stay empty even
-	   while text is rendering. TMP_UpdateManager owns a persistent active-text queue,
-	   so it is the closest renderer boundary that can recover those instances without
-	   game-specific type names. Discovery alone never creates a cache success, and the
-	   selected fallback or reflection failure is recorded. */
+	/* 某些裁剪 TMP 播放器在文本渲染时，两个 Unity 全局枚举 API 仍为空。
+	   TMP_UpdateManager 拥有持久活动文本队列，是无需游戏特定类型名即可恢复这些实例的
+	   最近渲染器边界。仅发现对象绝不会产生缓存成功；所选降级或反射故障都会被记录。 */
 	private static Object[] FindTmpTextObjectsSafe(Type tmpTextType)
 	{
 		Object[] array = FindObjectsOfTypeAllSafe(tmpTextType);
@@ -9639,11 +9722,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	/* Stripped UnityEngine profiles can remove the runtime-Type hierarchy overload
-	   while retaining the equivalent generic overload. The external assembly owns
-	   that mismatch. Reflection preserves hierarchy scanning without converting a
-	   miss into a translation/cache success; selection and invocation failures are
-	   recorded once through BepInEx and ReportCaughtException. */
+	/* 裁剪后的 UnityEngine 配置可能移除运行时 Type 层级重载，却保留等价泛型重载。
+	   该不匹配归外部程序集所有。反射用于保留层级扫描，不会把未命中变成翻译或缓存成功；
+	   选择和调用故障通过 BepInEx 与 ReportCaughtException 记录一次。 */
 	private static Component[] GetComponentsInChildrenByTypeSafe(object owner, Type componentType, bool includeInactive)
 	{
 		if (owner == null || componentType == null)
@@ -11187,8 +11268,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static void RestoreTmpSourceVisibility(object tmpComponent, TmpOverlayState state)
 	{
-		// The overlay owns only alpha and enabled. RGB remains game-owned because
-		// games commonly recolor a reusable TMP label while the overlay is active.
+		// 覆盖层只拥有 alpha 和 enabled。RGB 仍归游戏所有，因为覆盖层活动时，
+		// 游戏经常会重新着色可复用 TMP 标签。
 		if (state != null && state.hasOriginalColor)
 		{
 			SetTmpAlpha(tmpComponent, state.originalColor.a);
@@ -11455,8 +11536,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static Color GetTmpOverlayDisplayColor(object tmpComponent, Color currentColor, TmpOverlayState state)
 	{
-		// TMP shaders multiply the component's vertex color by _FaceColor. A UGUI
-		// fallback that copies only TMP_Text.color can turn dark labels white-on-white.
+		// TMP 着色器会把组件顶点颜色乘以 _FaceColor；若 UGUI 降级只复制
+		// TMP_Text.color，可能把深色标签变成白底白字。
 		Color result = currentColor;
 		if (result.a <= 0f && state != null)
 		{
@@ -12479,11 +12560,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	/* Unity modules are loaded on demand. A stripped game may ship the retained
-	   AssetBundle module without referencing it from gameplay assemblies, leaving
-	   AccessTools unable to see the type. Loading that shipped module by assembly
-	   identity is the upstream-safe boundary; failure only disables the packaged
-	   renderer font and is recorded without accepting any translation result. */
+	/* Unity 模块按需加载。裁剪游戏可能附带保留的 AssetBundle 模块，却没有从游戏程序集
+	   引用它，导致 AccessTools 看不到该类型。按程序集标识加载随附模块是上游安全边界；
+	   失败只会禁用打包的渲染器字体，并在不接受任何翻译结果的前提下记录。 */
 	private Type ResolveAssetBundleTypeSafe()
 	{
 		Type type = AccessTools.TypeByName("UnityEngine.AssetBundle");
@@ -12677,11 +12756,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	/* Some external stripped UnityEngine builds retain WaitForSeconds but remove
-	   its float constructor. That assembly cannot be repaired by the plugin. This
-	   scaled-frame iterator preserves the lifecycle delay without hiding failed
-	   translations or creating cache entries; the selected fallback is logged at
-	   startup when the constructor is absent. */
+	/* 某些外部裁剪 UnityEngine 构建保留 WaitForSeconds，却移除其 float 构造函数。
+	   插件无法修复该程序集。这个缩放帧迭代器保留生命周期延迟，不隐藏翻译失败，
+	   也不创建缓存条目；构造函数缺失时，启动阶段会记录所选降级。 */
 	private static IEnumerator WaitForScaledSecondsSafe(float seconds)
 	{
 		float startedAt = Time.time;
@@ -13186,13 +13263,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	/* Highly stripped UnityEngine builds can remove the public OS-font factory.
-	   Internal_CreateFont(Font,string) is the Font(string) asset-name constructor;
-	   it does not create a dynamic OS font and must never be treated as one. A
-	   preloader compatibility patch may restore only Internal_CreateDynamicFont's
-	   original internal-call declaration. If neither real factory exists, return
-	   null so TMP keeps its source text instead of hiding it behind a false overlay.
-	   This cannot accept or persist a translation, and every rejection is logged. */
+	/* 高度裁剪的 UnityEngine 构建可能移除公开系统字体工厂。
+	   Internal_CreateFont(Font,string) 是 Font(string) 的资源名构造函数，不会创建动态
+	   系统字体，绝不能误用。预加载器兼容补丁只能还原 Internal_CreateDynamicFont 原始
+	   内部调用声明。若两个真实工厂都不存在，则返回 null，让 TMP 保留原文而不是藏在
+	   虚假覆盖层后。此路径不能接受或持久化译文，每次拒绝都会记录。 */
 	private Font CreateDynamicFontFromOSFontSafe(string fontName, int fontSize)
 	{
 		if (!_createDynamicFontFromOsFontResolved)
@@ -13238,8 +13313,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				PinRuntimeFont(font, fontName);
 				return font;
 			}
-			/* The restored declaration is an internal call, so allocate only the
-			   managed shell and let Unity create its native dynamic-font object once. */
+			/* 还原的声明是内部调用，因此只分配托管外壳，再让 Unity 创建一次原生动态字体对象。 */
 			Font val = FormatterServices.GetUninitializedObject(typeof(Font)) as Font;
 			if (ReferenceEquals(val, null))
 			{
@@ -13303,12 +13377,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	/* Dynamically created Font objects are external Unity resources. Some stripped
-	   players unload their native object during the bootstrap scene transition even
-	   while the managed Font remains referenced. The renderer cannot repair that
-	   resource sweep upstream, so mark only plugin-created fonts as non-unloadable.
-	   A pin failure disables later TMP overlay handling and remains diagnostic; it
-	   never turns a miss, pass-through value, or queued request into cache success. */
+	/* 动态创建的 Font 对象属于外部 Unity 资源。某些裁剪播放器在引导场景切换时会卸载
+	   其原生对象，即使托管 Font 仍被引用。渲染器无法从上游修复该资源清理，因此只把
+	   插件创建的字体标为不可卸载。固定失败会禁用后续 TMP 覆盖处理并保留诊断；绝不会
+	   把未命中、透传值或排队请求变成缓存成功。 */
 	private void PinRuntimeFont(Font font, string source)
 	{
 		if (ReferenceEquals(font, null))
@@ -13688,9 +13760,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void PrimeSmallLocalCacheForFirstFrame()
 	{
-		/* A small per-game cache is cheap enough to validate before hooks are installed.
-		   This keeps known text out of the first rendered frame; large or polluted caches
-		   retain the background path below so startup cannot stall on a full dump. */
+		/* 小型单游戏缓存可以在安装钩子前低成本校验，使已知文本不会出现在首个渲染帧；
+		   大型或污染缓存仍走下方后台路径，避免启动被完整转储阻塞。 */
 		try
 		{
 			string path = GetLocalCacheFilePath();
@@ -13742,8 +13813,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		finally
 		{
-			/* Persistence must never replace an uninspected legacy cache before the
-			   background loader has either imported or safely isolated it. */
+			/* 后台加载器导入或安全隔离旧缓存前，持久化绝不能替换未经检查的旧缓存。 */
 			_bootCacheLoadComplete = true;
 		}
 		if (_shuttingDown)
@@ -13769,8 +13839,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void LoadServerCache()
 	{
-		/* Hooks are already active while this background import runs. Merge the
-		   disk snapshot so a faster live response cannot be erased by startup IO. */
+		/* 后台导入运行时钩子已经活动。必须合并磁盘快照，防止更快的实时响应被启动 IO 擦除。 */
 		if (_shuttingDown)
 		{
 			return;
@@ -13784,9 +13853,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			string path = Path.Combine(text, "unity_translation_cache.json");
 			List<KeyValuePair<string, string>> diskEntries = null;
-			/* Cache load/isolation and persistence replace the same file. Serializing all
-			   file-system ownership here prevents a slow oversized-cache quarantine from
-			   racing a live translation snapshot accepted after hooks started. */
+			/* 缓存加载/隔离和持久化会替换同一文件。这里串行化全部文件系统所有权，防止
+			   缓慢的超大缓存隔离与钩子启动后接受的实时翻译快照发生竞争。 */
 			lock (_cacheFileWriteLock)
 			{
 				if (File.Exists(path))
@@ -13798,9 +13866,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					else
 					{
 						JObject val = JObject.Parse(File.ReadAllText(path));
-						/* A legacy full-server dump can make every persist validate tens of
-						   thousands of unrelated rows. Keep its exact bytes in a uniquely
-						   versioned quarantine instead of truncating or overwriting it. */
+						/* 旧版全服务转储会让每次持久化校验数万条无关记录。应把原始字节保存在
+						   唯一版本的隔离文件中，而不是截断或覆盖。 */
 						if (val.Count > OversizedLocalCacheEntryLimit)
 						{
 							TryIsolateOversizedLocalCacheLocked(path, val.Count);
@@ -13827,11 +13894,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void TryIsolateOversizedLocalCacheLocked(string path, int entryCount)
 	{
-		/* External incompatibility: old plugin versions could persist a whole server
-		   dump as this per-game cache, making startup and every rewrite unbounded.
-		   The renderer cannot identify ownership row-by-row without paying that cost.
-		   Isolation moves the exact user artifact to a unique sibling, never treats it
-		   as a cache hit, never overwrites an older backup, and logs the retained path. */
+		/* 外部不兼容：旧插件版本可能把完整服务转储保存为单游戏缓存，使启动和每次重写
+		   都无界增长。渲染器无法在不付出该成本的情况下逐行识别所有权。隔离会把用户
+		   原始文件移到唯一同级文件，绝不把它当作缓存命中，不覆盖旧备份，并记录保留路径。 */
 		try
 		{
 			if (!File.Exists(path))
@@ -13920,6 +13985,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		if (num > 0)
 		{
+			// 批量导入只发布一次 generation；主线程据此立即应用新译文，
+			// 不需要让每个条目分别制造同步和全局扫描压力。
+			Interlocked.Increment(ref _cacheMutationGeneration);
 			ClearMixedRepairMemo();
 			if (logPromotions)
 			{
@@ -13978,8 +14046,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 				if (!_bootCacheLoadComplete)
 				{
-					/* The loader owns the pre-existing user artifact. Retain dirty state
-					   and retry after another bounded debounce rather than overwriting it. */
+					/* 预先存在的用户文件归加载器所有。保留脏状态，并在下一次有界去抖后重试，
+					   而不是覆盖该文件。 */
 					continue;
 				}
 				lock (_cachePersistLock)
@@ -14016,9 +14084,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 				if (!persisted && !_shuttingDown)
 				{
-					/* File-system failures are external and cannot be repaired upstream.
-					   Preserve dirty state so the bounded debounce loop retries; the old
-					   atomic snapshot stays intact and the failure is recorded above. */
+					/* 文件系统故障属于外部边界，无法从上游修复。保留脏状态，使有界去抖循环
+					   可以重试；旧原子快照保持完整，故障已在上方记录。 */
 					lock (_cachePersistLock)
 					{
 						_cachePersistDirty = true;
@@ -14133,9 +14200,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		if (!_bootCacheLoadComplete)
 		{
-			/* A very early process teardown can race the background cache inspection.
-			   Keeping the pre-existing file is safer than replacing unknown user data;
-			   no translation is reported as persisted, and the boundary is visible. */
+			/* 进程过早退出可能与后台缓存检查竞争。保留现有文件比替换未知用户数据更安全；
+			   此时不会把任何译文报告为已持久化，并保持边界可见。 */
 			base.Logger.LogWarning("[CACHE] Final local-cache flush skipped because startup cache inspection had not completed; existing user cache was preserved.");
 			return;
 		}

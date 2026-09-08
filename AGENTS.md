@@ -91,24 +91,71 @@ warmup, rich text/tag handling, font fallback, concurrency, or persistence.
 
 For code changes, run the closest practical verification before finishing:
 
-- `build_native.bat`
-- `powershell -File tests\run_all.ps1 -SkipEndurance`
-- Targeted tests under `tests\` when the change is narrow
-- UI screenshot/manual verification for launcher layout changes
-- Endurance or stress tests when touching server lifetime, HTTP, cache, or
-  concurrency behavior
+- `build_native.bat` — builds the C server, C# server, launcher, and the C#
+ launcher port; runs `tests\core_tests` (shared-core golden parity) and
+ `tests\launcher_parity` (C vs C# launcher detection/deploy/restore/warmup/
+ payload sync/Godot patch pack/api.ini/Godot preflight/one-click launch flow/
+ window rendering) as gates. The Godot patch scenarios bind
+ 127.0.0.1:19999 for a fake `/batch` server and are skipped with a printed
+ note when the port is already taken. Keep the batch file ASCII-only
+ (cmd.exe misparses multibyte bytes).
+- For launcher layout changes: the `ui` scenarios in `tests\launcher_parity`
+  compare the layout report and a client-area bitmap between the two launchers
+  at three window sizes and both server states. They pin C↔C# identity, not
+  correctness, so still take a screenshot of the real window at your own DPI —
+  the probe runs at a fixed 96 DPI with a frozen animation clock.
+- For server/translation changes: `tests\server_contract\run_contract_tests.ps1`
+  (fake provider, 50 checks per binary; runs both servers by default, or pass
+  `-Exe native\dst_server_cs.exe` for one). Both servers must pass; they share
+  one contract.
+- For payload script changes (`payloads\RenPy`, `payloads\RPGMaker`,
+  `payloads\Godot`): `tests\payload_scripts\check_payload_scripts.ps1`.
+- For launcher server-lifecycle changes:
+  `tests\launcher_parity\run_launcher_parity.ps1 -ServerSmoke` (needs port
+  19999 free; it will stop a server it finds running, so do not run it against
+  a user's live session).
+
+The former `tests\` regression suites were removed at the owner's request on
+2026-09-06 after a final full-suite pass; the suites above were rebuilt on
+2026-09-08 during the language migration. Historical guard names in
+`docs/MAINTENANCE_MAP.md` remain as references only.
 
 If a verification step cannot be run, report that clearly and explain why.
 
 ## Modification Guidance
 
 - Prefer small, engine-aware changes over broad rewrites.
+- 翻译核心运行模块的说明性代码注释统一使用中文；技术标识、协议字段以及
+  第三方版权或许可证原文保持原样，不要为了注释语言改动外部接口与测试名称。
 - Keep engine-specific behavior isolated when possible.
 - Add or update regression tests when fixing a bug that could return.
 - Preserve public API response fields and launcher workflows unless there is a
   deliberate migration plan.
 - When unsure whether a change affects original functionality, stop and inspect
   the relevant Ren'Py, RPG Maker, Unity, and Godot paths first.
+- Language migration (C → C#) rules: shared text/JSON/cache/contract logic
+  lives once in `native/src/core` (`DstCore`) and is source-linked, never
+  copied. A behavior change in a C launcher module that already has a C#
+  mirror (`engine.c`, `deploy.c` for all engines, `fsutil.c`, `embedded.c`,
+  `server_proc.c`, `warmup.c`, `godot_warmup.c`, `self_update.c`,
+  `godot_patch.c`, `api_config.c` including its dialog, `godot_probe.c`,
+  `godot_preflight_cache.c`, and all of `ui.c` + `main.c`: the one-click launch
+  flow, the Godot launch/preflight decisions, the cache card/clear, and the
+  Win32 window's painting, layout, controls and message loop — every launcher
+  module now has a mirror) must be applied to `native/src/launcher_cs` in the
+  same change, or `build_native.bat` fails at the parity gate. Adding an
+  embedded payload means adding it to both `launcher_payloads.rc` (via
+  `build_native.bat`) and the csproj `EmbeddedResource` list with the same
+  macro name. The translator version is another shared input: `build_native.bat`
+  passes it to C as `-DDS_TRANSLATOR_VERSION` and the csproj generates
+  `DsBuildInfo.g.cs` from the same `VERSION` file, because the Godot preflight
+  cache key contains it. The parity gate compares rendered pixels, so a change
+  to the window must keep `Theme.Sc`/`Theme.Mix` for every pixel and blend, read
+  the freezable `anim_tick()`/`Theme.AnimTick()` instead of `GetTickCount`, and
+  register any new control in both probe reports; see "Change The Launcher
+  Window" in `docs/MAINTENANCE_MAP.md`. Any module that is added later and not
+  mirrored must return `Deploy.NotPorted`-style explicit results, never a
+  fabricated success.
 
 ## Failure Transparency
 

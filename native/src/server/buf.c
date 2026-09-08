@@ -40,12 +40,26 @@ void buf_grow(Buf *b, size_t n) {
     b->data = xrealloc(b->data, b->cap);
 }
 
-/* 追加定长 n 字节并补 '\0'。 */
-void buf_addn(Buf *b, const char *s, size_t n) {
+/* 为外部读取器开放当前尾部的可写区域。调用方写完后必须用 buf_commit 提交实际字节数。 */
+char *buf_reserve(Buf *b, size_t n) {
     buf_grow(b, n);
-    memcpy(b->data + b->len, s, n);
+    return b->data + b->len;
+}
+
+/* 提交此前预留区域中实际写入的字节。越过已分配区域属于调用契约错误，立即终止。 */
+void buf_commit(Buf *b, size_t n) {
+    if (!b || !b->data || b->len >= b->cap || n > b->cap - b->len - 1) {
+        die("buffer commit exceeds reservation");
+    }
     b->len += n;
     b->data[b->len] = 0;
+}
+
+/* 追加定长 n 字节并补 '\0'。 */
+void buf_addn(Buf *b, const char *s, size_t n) {
+    char *tail = buf_reserve(b, n);
+    memcpy(tail, s, n);
+    buf_commit(b, n);
 }
 
 /* 追加以 '\0' 结尾的字符串。 */

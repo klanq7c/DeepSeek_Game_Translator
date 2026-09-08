@@ -12,12 +12,12 @@
 /* 支持的引擎类型枚举 */
 typedef enum {
     ENGINE_UNKNOWN,       /* 未识别 */
-    ENGINE_RENPY,         /* Ren'Py (.rpy / .rpyc / .rpa) */
-    ENGINE_RPGM_MV,       /* RPG Maker MV / MZ (www/ or flat web content) */
-    ENGINE_UNITY,         /* Unity Mono (BepInEx) */
-    ENGINE_UNITY_IL2CPP,  /* Unity IL2CPP (XUnity) */
-    ENGINE_RPGM_LEGACY,   /* RPG Maker XP / VX / VXAce (.rxdata / .rvdata) */
-    ENGINE_GODOT          /* Godot export/project (.pck / project.godot) */
+    ENGINE_RENPY,         /* Ren'Py（.rpy / .rpyc / .rpa） */
+    ENGINE_RPGM_MV,       /* RPG Maker MV/MZ（www/ 或扁平网页内容） */
+    ENGINE_UNITY,         /* Unity Mono（BepInEx） */
+    ENGINE_UNITY_IL2CPP,  /* Unity IL2CPP（XUnity） */
+    ENGINE_RPGM_LEGACY,   /* RPG Maker XP/VX/VXAce（.rxdata / .rvdata） */
+    ENGINE_GODOT          /* Godot 导出物或工程（.pck / project.godot） */
 } Engine;
 
 /* ---------- 目录探测辅助函数 ---------- */
@@ -35,8 +35,8 @@ int find_exe(const WCHAR *dir, WCHAR *out, size_t cap);
 /* 判断 Unity 游戏是否使用 IL2CPP 后端（检查 GameAssembly.dll 或 il2cpp_data 目录） */
 int unity_is_il2cpp(const WCHAR *dir);
 
-/* Resolve RPG Maker MV/MZ web content. Standard exports use dir\www, while
- * some Windows distributions place index.html/js/data directly under dir. */
+/* 定位 RPG Maker MV/MZ 网页内容。标准导出物使用 dir\www，部分 Windows
+ * 发行版则把 index.html/js/data 直接放在 dir 下。 */
 int rpgm_content_root(const WCHAR *dir, WCHAR *out, size_t cap);
 
 /* ---------- 主检测入口 ---------- */

@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Reflection;
 using System.Text;
+using DstCore;
 using XUnity.AutoTranslator.Plugin.Core.Endpoints;
 using XUnity.AutoTranslator.Plugin.Core.Endpoints.Http;
 using XUnity.AutoTranslator.Plugin.Core.Web;
@@ -28,11 +29,15 @@ namespace DeepSeekTranslate;
  */
 public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
 {
-    private string _baseUrl = "http://127.0.0.1:19999";
+    private const float DefaultQueueWaitSeconds = 30f;
+    private const float DefaultQueuePollIntervalSeconds = 0.2f;
+    private const float DefaultTranslationDelaySeconds = 0.1f;
+
+    private string _baseUrl = Contract.DefaultBaseUrl;
     private int _maxBatch = 16;
     private int _maxConcurrency = 8;
-    private float _queueWaitSeconds = 30f;
-    private float _queuePollIntervalSeconds = 0.2f;
+    private float _queueWaitSeconds = DefaultQueueWaitSeconds;
+    private float _queuePollIntervalSeconds = DefaultQueuePollIntervalSeconds;
     private bool _displaySafePunctuation = true;
 
     public override string Id => "DeepSeekTranslate";
@@ -55,23 +60,21 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
     }
 
     /*
-     * XUnity counts Fail calls as endpoint errors and disables an endpoint after a
-     * short consecutive run. The local server intentionally returns queued/miss
-     * immediately, so reporting that normal asynchronous state as an error races
-     * the cache fill and can shut translation down before the first result arrives.
+     * XUnity 会把 Fail 调用计为端点错误，连续少量失败后便会禁用端点。本地服务
+     * 会刻意立即返回 queued/miss；若把这种正常异步状态报告成错误，就会与缓存
+     * 回填竞争，并可能在首条译文完成前关闭翻译。
      *
-     * Keep the XUnity job alive in its coroutine. The first cache-only request
-     * queues missing work, later requests read /cache/lookup only, and the normal
-     * extraction path still performs the final source allow-list and source-echo
-     * checks. Wall-clock and polling bounds keep provider failures visible instead
-     * of turning them into permanently pending successes.
+     * 因此让 XUnity 任务在协程中保持存活。首次仅缓存请求负责排入缺失任务，
+     * 后续请求只读取 /cache/lookup；正常提取路径仍负责最终的 source 白名单和
+     * 原文回显检查。总等待时间和轮询间隔都有上限，使提供方故障保持可见，
+     * 而不会变成永久挂起的成功状态。
      */
     public override IEnumerator OnBeforeTranslate(IHttpTranslationContext context)
     {
         string[] texts = GetUntranslatedTexts(context);
         string[] requestTexts = ProtectMixedCjkTextsForRequest(texts);
         bool batch = texts.Length > 1;
-        string translateUrl = _baseUrl + (batch ? "/batch" : "/translate");
+        string translateUrl = _baseUrl + (batch ? Contract.PathBatch : Contract.PathTranslate);
         string translatePayload = BuildPayload(requestTexts, !batch);
 
         var client = new XUnityWebClient();
@@ -93,10 +96,11 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
             yield break;
         }
 
-        string lookupUrl = _baseUrl + "/cache/lookup";
+        string lookupUrl = _baseUrl + Contract.PathCacheLookup;
         string lookupPayload = BuildLookupPayload(pendingTexts);
         Stopwatch stopwatch = Stopwatch.StartNew();
         double nextPollAt = 0.0;
+        int consecutiveMisses = 0;
 
         while (stopwatch.Elapsed.TotalSeconds < _queueWaitSeconds)
         {
@@ -121,7 +125,9 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
                 yield break;
             }
 
-            nextPollAt = stopwatch.Elapsed.TotalSeconds + _queuePollIntervalSeconds;
+            consecutiveMisses++;
+            nextPollAt = stopwatch.Elapsed.TotalSeconds
+                + GetQueuePollDelaySeconds(consecutiveMisses, _queuePollIntervalSeconds);
         }
     }
 
@@ -133,7 +139,7 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         /* 单条和批量必须走与 C 服务公开契约一致的两个路由。请求创建阶段
            不等待远程模型；是否命中缓存由本地服务立即回答。 */
         bool batch = texts.Length > 1;
-        string url = _baseUrl + (batch ? "/batch" : "/translate");
+        string url = _baseUrl + (batch ? Contract.PathBatch : Contract.PathTranslate);
         string payload = BuildPayload(requestTexts, !batch);
         context.Complete(CreateRequest(url, payload));
     }
@@ -165,18 +171,14 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
                     return;
                 }
                 /*
-                 * XUnity 5.6.1 treats every Complete call as a successful
-                 * translation and normally persists it to its generated text
-                 * cache, even when source == translation. Its public endpoint
-                 * context has no "complete without persistence" operation, so
-                 * mark this job session-only at the closest XUnity boundary
-                 * before completing the identity result.
+                 * XUnity 5.6.1 会把每次 Complete 都视为翻译成功，并通常写入其生成的
+                 * 文本缓存，即使 source 与 translation 完全相同。公开端点上下文没有
+                 * “完成但不持久化”操作，所以必须在最接近 XUnity 的边界把当前任务标为
+                 * 仅会话结果，再完成这个恒等结果。
                  *
-                 * A future incompatible XUnity context layout cannot be fixed
-                 * by the local server. In that case this path fails closed:
-                 * the original remains visible, no identity mapping is
-                 * reported as a successful translation, and context.Fail
-                 * records the concrete compatibility diagnostic.
+                 * 未来若 XUnity 上下文布局不兼容，本地服务无法从上游修复。此时必须
+                 * 失败关闭：继续显示原文，不把恒等映射报告为成功翻译，并由 context.Fail
+                 * 记录具体的兼容性诊断。
                  */
                 if (!TryKeepIdentityResultsSessionOnly(context, new[] { true }, out string identityError))
                 {
@@ -312,51 +314,12 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         return _displaySafePunctuation ? NormalizeForTmpDisplay(value) : value;
     }
 
-    private static readonly string[] TranslationPromptEchoPrefixes =
-    {
-        "\u7ffb\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587",
-        "\u7ffb\u8bd1\u4e3a\u7b80\u4f53\u4e2d\u6587",
-        "\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587",
-        "\u7b80\u4f53\u4e2d\u6587\u7ffb\u8bd1",
-        "\u7b80\u4f53\u4e2d\u6587\u8bd1\u6587",
-        "Simplified Chinese translation",
-        "Translation to Simplified Chinese",
-        "Translate to Simplified Chinese",
-        "Translated into Simplified Chinese",
-        "Translate this exact game text to Simplified Chinese. Return only the translation."
-    };
-
+    /* 提示词回显剥离：与服务器（util.c / DstCore.TextRules）同一份规则。
+       服务器返回前已经剥过一次，这里是端点侧的防御性复查，规则必须一致，
+       否则端点会对同一条缓存值得出与服务器不同的结论。 */
     private static string StripTranslationPromptEchoPrefix(string text)
     {
-        if (string.IsNullOrWhiteSpace(text)) return text;
-        string candidate = text.TrimStart();
-        bool changed = false;
-        for (int pass = 0; pass < 3; pass++)
-        {
-            bool stripped = false;
-            foreach (string prefix in TranslationPromptEchoPrefixes)
-            {
-                if (!candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
-                int index = prefix.Length;
-                while (index < candidate.Length && (candidate[index] == ' ' || candidate[index] == '\t')) index++;
-                if (index < candidate.Length && (candidate[index] == ':' || candidate[index] == '\uff1a'))
-                {
-                    index++;
-                }
-                else if (index >= candidate.Length || (candidate[index] != '\r' && candidate[index] != '\n'))
-                {
-                    continue;
-                }
-                while (index < candidate.Length && char.IsWhiteSpace(candidate[index])) index++;
-                if (index >= candidate.Length) continue;
-                candidate = candidate.Substring(index).TrimEnd();
-                changed = true;
-                stripped = true;
-                break;
-            }
-            if (!stripped) break;
-        }
-        return changed ? candidate : text;
+        return TextRules.NormalizeTranslationResult(text);
     }
 
     private static string BuildPayload(string[] texts, bool single)
@@ -395,17 +358,14 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
     }
 
     /*
-     * Some Unity games progressively append English to a TMP component whose
-     * prefix XUnity already replaced with Chinese. The shared server correctly
-     * treats ordinary CJK text as terminal pass-through, so sending that mixed
-     * component unchanged would strand the new English suffix.
+     * 某些 Unity 游戏会向 TMP 组件逐步追加英文，而前缀已经被 XUnity 替换成中文。
+     * 共享服务会正确地把普通 CJK 文本视为终态透传；若原样发送这种混合文本，
+     * 新追加的英文后缀便会永远得不到翻译。
      *
-     * Protect existing Han runs with stable ASCII variables only for text that
-     * also contains a meaningful untranslated Latin passage. The local server
-     * can then translate the suffix without weakening the cross-engine CJK
-     * heuristic. Every protected CJK token must survive exactly once; missing
-     * or duplicated tokens fail closed in TryRestoreMixedCjk and are reported
-     * through XUnity's context.Fail boundary.
+     * 仅当文本还包含有意义的未翻译拉丁文段落时，才用稳定 ASCII 变量保护已有
+     * 汉字段。这样本地服务可以翻译后缀，同时不削弱跨引擎 CJK 启发式规则。
+     * 每个受保护的 CJK 令牌必须恰好保留一次；缺失或重复都会在
+     * TryRestoreMixedCjk 中失败关闭，并通过 XUnity 的 context.Fail 边界报告。
      */
     private static string[] ProtectMixedCjkTextsForRequest(string[] texts)
     {
@@ -544,6 +504,7 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         return letters >= 16 && words >= 3;
     }
 
+    /* 与 TextRules.HasCjk 同一码位范围（U+4E00..U+9FFF）。 */
     private static bool IsBasicCjk(char ch)
     {
         return ch >= '\u4e00' && ch <= '\u9fff';
@@ -565,9 +526,9 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
     private static string TrimSlash(string value)
     {
         string trimmed = value?.Trim();
-        if (string.IsNullOrEmpty(trimmed)) return "http://127.0.0.1:19999";
+        if (string.IsNullOrEmpty(trimmed)) return Contract.DefaultBaseUrl;
         trimmed = trimmed.TrimEnd('/');
-        return string.IsNullOrEmpty(trimmed) ? "http://127.0.0.1:19999" : trimmed;
+        return string.IsNullOrEmpty(trimmed) ? Contract.DefaultBaseUrl : trimmed;
     }
 
     private static int Clamp(int value, int min, int max)
@@ -579,23 +540,39 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
 
     private static float ClampDelay(float value)
     {
-        if (value < 0.1f) return 0.1f;
-        if (value > 1.0f) return 1.0f;
-        return value;
+        return ClampFinite(value, 0.1f, 1.0f, DefaultTranslationDelaySeconds);
     }
 
     private static float ClampQueueWait(float value)
     {
-        if (value < 2f) return 2f;
-        if (value > 60f) return 60f;
-        return value;
+        return ClampFinite(value, 2f, 60f, DefaultQueueWaitSeconds);
     }
 
     private static float ClampQueuePollInterval(float value)
     {
-        if (value < 0.1f) return 0.1f;
-        if (value > 1f) return 1f;
+        return ClampFinite(value, 0.1f, 1f, DefaultQueuePollIntervalSeconds);
+    }
+
+    /* 配置文件可合法解析出 NaN/Infinity，但这些值会绕过普通大小比较并污染
+       协程时钟。统一在这个深层 Module 内恢复有限默认值，使所有调用方共享同一
+       不变量；有限但越界的值仍按原契约钳制。 */
+    private static float ClampFinite(float value, float min, float max, float fallback)
+    {
+        if (float.IsNaN(value) || float.IsInfinity(value)) return fallback;
+        if (value < min) return min;
+        if (value > max) return max;
         return value;
+    }
+
+    /* queued 是本地服务的正常状态，不是端点故障。初始重试窗口快速轮询本机缓存，
+       以便及时取得刚完成的可见译文；随后恢复配置的稳定节奏。稳定间隔下限仍会
+       阻止故障提供方制造无界热循环。 */
+    private static double GetQueuePollDelaySeconds(int consecutiveMisses, float steadyIntervalSeconds)
+    {
+        double steady = ClampQueuePollInterval(steadyIntervalSeconds);
+        if (consecutiveMisses <= 4) return Math.Min(0.05d, steady);
+        if (consecutiveMisses <= 8) return Math.Min(0.10d, steady);
+        return steady;
     }
 
     private static string NormalizeForTmpDisplay(string text)
@@ -632,12 +609,7 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
 
     private static bool ContainsCjk(string text)
     {
-        for (int i = 0; i < text.Length; i++)
-        {
-            char ch = text[i];
-            if (ch >= '\u4e00' && ch <= '\u9fff') return true;
-        }
-        return false;
+        return TextRules.HasCjk(text);
     }
 
     private static bool ContainsAlwaysSafePunctuation(string text)
@@ -769,11 +741,9 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
     }
 
     /*
-     * Build the exact subset that can still enter the shared cache. pass is a
-     * terminal identity result and must never be included in /cache/lookup;
-     * resolved entries already hit the cache. Unknown or malformed source
-     * metadata returns false so the normal extraction path can fail closed
-     * without spending the queue wait budget on an invalid response.
+     * 精确构造仍可能进入共享缓存的子集。pass 是恒等终态，绝不能加入
+     * /cache/lookup；已解析条目则已经命中缓存。未知或畸形的 source 元数据
+     * 返回 false，使正常提取路径可以失败关闭，而不在无效响应上消耗队列等待预算。
      */
     private static bool TryCollectPendingTexts(string data, string[] texts, out string[] pendingTexts)
     {
@@ -834,13 +804,10 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
     }
 
     /*
-     * XUnity's endpoint API exposes only Complete/Fail. The bundled 5.6.1
-     * implementation stores its TranslationJob in the private completion
-     * callback closure, while SaveResultGlobally is the supported job flag
-     * controlling the generated translation file. Reflection is restricted to
-     * this external compatibility boundary. Any layout mismatch is returned to
-     * OnExtractTranslation and emitted through context.Fail; it is never
-     * converted into a successful identity translation.
+     * XUnity 端点 API 只公开 Complete/Fail。随附的 5.6.1 实现把 TranslationJob
+     * 保存在私有完成回调闭包中，而 SaveResultGlobally 是控制生成翻译文件的受支持
+     * 任务标志。反射只允许出现在这个外部兼容边界。任何布局不匹配都会返回
+     * OnExtractTranslation 并通过 context.Fail 输出，绝不会转换为成功的恒等翻译。
      */
     private static bool TryKeepIdentityResultsSessionOnly(
         IHttpTranslationExtractionContext context,

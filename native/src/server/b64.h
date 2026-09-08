@@ -9,5 +9,8 @@
 
 #include <stddef.h>
 
+#include "buf.h"
+
+void b64enc_append(Buf *out, const char *s); /* 直接追加到复用缓冲，避免逐项分配编码结果 */
+
 char *b64dec(const char *s, size_t n);   /* 解码长度为 n 的输入，返回新分配的 NUL 结尾缓冲 */
-char *b64enc(const char *s);             /* 编码 NUL 结尾字符串，返回新分配的缓冲 */

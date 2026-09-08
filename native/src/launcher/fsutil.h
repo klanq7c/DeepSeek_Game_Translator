@@ -22,8 +22,8 @@ int wide_format_checked(WCHAR *out, size_t cap, const WCHAR *fmt, ...);
 int exists_path(const WCHAR *p);                    /* 文件或目录是否存在 */
 int is_dir(const WCHAR *p);                        /* 是否为目录 */
 /*
- * Returns non-zero when an existing component is a reparse point, or when the
- * path cannot be inspected safely. include_leaf=0 checks parent components.
+ * 当路径中任一已存在的组件是重解析点，或路径无法被安全检查时返回非零。
+ * include_leaf=0 时只检查父级组件、不检查叶子本身。
  */
 int path_has_reparse_point(const WCHAR *path, int include_leaf);
 int ensure_dir(const WCHAR *path);                  /* 递归创建目录，已存在则跳过 */

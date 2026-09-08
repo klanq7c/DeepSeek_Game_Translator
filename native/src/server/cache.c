@@ -16,6 +16,7 @@
 #include <string.h>
 
 #define CACHE_MAX_ENCODED_LINE_BYTES (8 * 1024 * 1024)
+#define CACHE_INITIAL_CAPACITY (1u << 10)
 
 /* 插入/覆盖一个条目，调用者必须已持有 lock。
    接管 k、v 的所有权。persisted 表示传入值已存在于 TSV。
@@ -50,6 +51,17 @@ static int cache_insert_locked(Cache *c, char *k, char *v, int persisted) {
     return 1;
 }
 
+/* 持锁查找并返回桶地址；返回值只在调用方继续持有表锁时有效。 */
+static CacheEntry *cache_find_locked(Cache *c, const char *k, uint64_t h) {
+    size_t m = c->cap - 1;
+    size_t i = (size_t)h & m;
+    while (c->e[i].used) {
+        if (c->e[i].h == h && strcmp(c->e[i].k, k) == 0) return &c->e[i];
+        i = (i + 1) & m;
+    }
+    return NULL;
+}
+
 /* 扩容到 2 倍并重插所有条目（rehash），调用者持锁。
    旧桶数组的 k/v 指针所有权转移给新表，只释放桶数组本身。 */
 static void cache_rehash_locked(Cache *c) {
@@ -67,10 +79,10 @@ static void cache_rehash_locked(Cache *c) {
     free(old);
 }
 
-/* 初始化空表：32768 个桶起步，绑定持久化文件路径。 */
+/* 初始化空表：从小桶表起步并按 70% 负载因子自动扩容，避免小缓存固定占用约 1 MiB。 */
 void cache_init(Cache *c, const char *path) {
     if (!c || !path || !path[0]) die("invalid cache path");
-    c->cap = 1 << 15;
+    c->cap = CACHE_INITIAL_CAPACITY;
     c->len = 0;
     c->e = xcalloc(c->cap, sizeof *c->e);
     InitializeSRWLock(&c->lock);
@@ -141,50 +153,69 @@ void cache_set_many_persist(Cache *c, const char **keys, const char **values, si
     (void)cache_set_many_persist_result(c, keys, values, count);
 }
 
-/* Persist a provider batch as one transaction-sized append. Normalization and
-   Base64 work happen before either lock. The map lock only covers in-memory
-   changes; all TSV writes remain outside it, and one fflush covers the batch.
-   Valid translations remain available in memory if the external filesystem
-   fails; the returned counts make that restart-loss boundary explicit. */
+/* 每项只保留所有权和连续快照偏移，避免为状态、快照和编码结果分别分配。 */
+typedef struct {
+    char *clean;
+    size_t normalized_offset;
+    unsigned char changed;
+    unsigned char written;
+} CacheBatchItem;
+
+/* 把提供方批次作为一次事务大小的追加持久化。归一化在加锁前完成并存入连续快照；
+   Base64 只处理确认发生变更的条目，并复用一块行缓冲。映射锁只覆盖内存修改，
+   所有 TSV 写入都在映射锁外完成，并用一次 fflush 覆盖整批。
+   外部文件系统故障时，有效译文仍保留在内存中；返回计数会明确暴露重启丢失边界。 */
 CachePersistResult cache_set_many_persist_result(Cache *c, const char **keys,
                                                   const char **values, size_t count) {
     CachePersistResult result = {CACHE_PERSIST_ALL, 0, 0, 0};
     if (!c || !keys || !values || !count) return result;
 
-    char **clean = xcalloc(count, sizeof *clean);
-    char **normalized_values = xcalloc(count, sizeof *normalized_values);
-    char **encoded_keys = xcalloc(count, sizeof *encoded_keys);
-    char **encoded_values = xcalloc(count, sizeof *encoded_values);
-    unsigned char *changed = xcalloc(count, sizeof *changed);
-    unsigned char *written = xcalloc(count, sizeof *written);
+    CacheBatchItem *items = xcalloc(count, sizeof *items);
+    Buf normalized_values = {0};
+    Buf journal_line = {0};
+    size_t normalized_bytes = 0;
 
     for (size_t i = 0; i < count; i++) {
         if (!keys[i] || !values[i] || !*keys[i] || !*values[i]) {
             result.rejected++;
             continue;
         }
-        clean[i] = xstrdup(values[i]);
-        normalize_translation_result(clean[i]);
-        if (!*clean[i] || strcmp(keys[i], clean[i]) == 0) {
-            free(clean[i]);
-            clean[i] = NULL;
+        items[i].clean = xstrdup(values[i]);
+        normalize_translation_result(items[i].clean);
+        if (!*items[i].clean || strcmp(keys[i], items[i].clean) == 0) {
+            free(items[i].clean);
+            items[i].clean = NULL;
             result.rejected++;
             continue;
         }
         result.accepted++;
-        normalized_values[i] = xstrdup(clean[i]);
-        encoded_keys[i] = b64enc(keys[i]);
-        encoded_values[i] = b64enc(clean[i]);
+        size_t value_bytes = strlen(items[i].clean) + 1;
+        if (!value_bytes || normalized_bytes > SIZE_MAX - value_bytes) {
+            die("cache batch too large");
+        }
+        normalized_bytes += value_bytes;
+    }
+
+    /* 归一化快照集中存放，写后校验仍按原值比较，但不再为每项复制一块堆内存。 */
+    if (normalized_bytes) {
+        buf_grow(&normalized_values, normalized_bytes);
+        for (size_t i = 0; i < count; i++) {
+            if (!items[i].clean) continue;
+            items[i].normalized_offset = normalized_values.len;
+            buf_add(&normalized_values, items[i].clean);
+            buf_ch(&normalized_values, '\0');
+        }
     }
 
     AcquireSRWLockExclusive(&c->io_lock);
     AcquireSRWLockExclusive(&c->lock);
     for (size_t i = 0; i < count; i++) {
-        if (!clean[i]) continue;
+        if (!items[i].clean) continue;
         if ((c->len + 1) * 10 > c->cap * 7) cache_rehash_locked(c);
-        changed[i] = (unsigned char)cache_insert_locked(c, xstrdup(keys[i]), clean[i], 0);
-        if (!changed[i]) result.persisted++;
-        clean[i] = NULL;
+        items[i].changed = (unsigned char)cache_insert_locked(
+            c, xstrdup(keys[i]), items[i].clean, 0);
+        if (!items[i].changed) result.persisted++;
+        items[i].clean = NULL;
     }
     ReleaseSRWLockExclusive(&c->lock);
 
@@ -192,7 +223,7 @@ CachePersistResult cache_set_many_persist_result(Cache *c, const char **keys,
     size_t wrote = 0;
     int io_failed = 0;
     for (size_t i = 0; i < count; i++) {
-        if (!changed[i]) continue;
+        if (!items[i].changed) continue;
         if (!f) {
             f = fopen(c->path, "ab");
             c->persist_f = f;
@@ -203,39 +234,41 @@ CachePersistResult cache_set_many_persist_result(Cache *c, const char **keys,
                 break;
             }
         }
-        if (fprintf(f, "%s\t%s\n", encoded_keys[i], encoded_values[i]) < 0) {
+        /* 只有确认条目确有变更后才编码，并在整个批次内复用同一行缓冲。 */
+        journal_line.len = 0;
+        if (journal_line.data) journal_line.data[0] = 0;
+        b64enc_append(&journal_line, keys[i]);
+        buf_ch(&journal_line, '\t');
+        b64enc_append(&journal_line,
+                      normalized_values.data + items[i].normalized_offset);
+        buf_ch(&journal_line, '\n');
+        if (fprintf(f, "%s", journal_line.data) < 0) {
             /* 写失败（如磁盘满）：停止本批，截断行之后的行不再写，也不把这次
                写入当作成功；关闭句柄并置 NULL，让下一批重开重试。 */
             cache_diag(CACHE_DIAG_PERSIST_WRITE, errno, c->path);
             io_failed = 1;
             break;
         }
-        written[i] = 1;
+        items[i].written = 1;
         wrote++;
     }
     if (wrote && fflush(f) != 0) {
         cache_diag(CACHE_DIAG_PERSIST_WRITE, errno, c->path);
         io_failed = 1;
     }
-    /* A failed fprintf leaves the stream's buffered/on-disk boundary
-       uncertain even if the following fflush happens to return success.
-       Confirm the batch only when every write and the final flush succeeded;
-       otherwise the entries stay dirty and the next identical update retries. */
+    /* fprintf 失败后，即使随后的 fflush 恰好成功，流缓冲与磁盘之间的边界仍不确定。
+       只有全部写入和最终刷新都成功才确认整批；否则条目保持脏状态，并在下一次相同
+       更新时重试。 */
     if (wrote && !io_failed) {
         AcquireSRWLockExclusive(&c->lock);
         for (size_t i = 0; i < count; i++) {
-            if (!written[i]) continue;
+            if (!items[i].written) continue;
             uint64_t h = h64(keys[i]);
-            size_t m = c->cap - 1;
-            size_t slot = (size_t)h & m;
-            while (c->e[slot].used) {
-                if (c->e[slot].h == h && strcmp(c->e[slot].k, keys[i]) == 0) {
-                    if (strcmp(c->e[slot].v, normalized_values[i]) == 0) {
-                        c->e[slot].persisted = 1;
-                    }
-                    break;
-                }
-                slot = (slot + 1) & m;
+            CacheEntry *entry = cache_find_locked(c, keys[i], h);
+            const char *normalized =
+                normalized_values.data + items[i].normalized_offset;
+            if (entry && strcmp(entry->v, normalized) == 0) {
+                entry->persisted = 1;
             }
         }
         ReleaseSRWLockExclusive(&c->lock);
@@ -248,17 +281,11 @@ CachePersistResult cache_set_many_persist_result(Cache *c, const char **keys,
     ReleaseSRWLockExclusive(&c->io_lock);
 
     for (size_t i = 0; i < count; i++) {
-        free(clean[i]);
-        free(normalized_values[i]);
-        free(encoded_keys[i]);
-        free(encoded_values[i]);
+        free(items[i].clean);
     }
-    free(clean);
-    free(normalized_values);
-    free(encoded_keys);
-    free(encoded_values);
-    free(changed);
-    free(written);
+    buf_free(&normalized_values);
+    buf_free(&journal_line);
+    free(items);
 
     if (result.persisted == result.accepted) {
         result.status = CACHE_PERSIST_ALL;
@@ -276,18 +303,20 @@ char *cache_get(Cache *c, const char *k) {
     if (!k) return NULL;
     uint64_t h = h64(k);
     AcquireSRWLockShared(&c->lock);
-    size_t m = c->cap - 1;
-    size_t i = (size_t)h & m;
-    char *result = NULL;
-    while (c->e[i].used) {
-        if (c->e[i].h == h && strcmp(c->e[i].k, k) == 0) {
-            result = xstrdup(c->e[i].v);
-            break;
-        }
-        i = (i + 1) & m;
-    }
+    CacheEntry *entry = cache_find_locked(c, k, h);
+    char *result = entry ? xstrdup(entry->v) : NULL;
     ReleaseSRWLockShared(&c->lock);
     return result;
+}
+
+/* 只检查键是否存在，不复制译文。供预热去重等只关心命中的热路径使用。 */
+int cache_contains(Cache *c, const char *k) {
+    if (!c || !k) return 0;
+    uint64_t h = h64(k);
+    AcquireSRWLockShared(&c->lock);
+    int found = cache_find_locked(c, k, h) != NULL;
+    ReleaseSRWLockShared(&c->lock);
+    return found;
 }
 
 /* 命中时直接把 JSON 转义后的值写入 out（含引号），省去 malloc+copy+free。
@@ -296,17 +325,9 @@ int cache_emit_json(Cache *c, const char *k, Buf *out) {
     if (!k) return 0;
     uint64_t h = h64(k);
     AcquireSRWLockShared(&c->lock);
-    size_t m = c->cap - 1;
-    size_t i = (size_t)h & m;
-    int hit = 0;
-    while (c->e[i].used) {
-        if (c->e[i].h == h && strcmp(c->e[i].k, k) == 0) {
-            buf_json(out, c->e[i].v);
-            hit = 1;
-            break;
-        }
-        i = (i + 1) & m;
-    }
+    CacheEntry *entry = cache_find_locked(c, k, h);
+    int hit = entry != NULL;
+    if (entry) buf_json(out, entry->v);
     ReleaseSRWLockShared(&c->lock);
     return hit;
 }
@@ -376,8 +397,8 @@ static char *cache_read_line(FILE *f, const char *path) {
         return NULL;
     }
     if (oversized) {
-        /* The remainder was consumed through the record newline above. Return
-           one empty row so cache_load skips it and continues with later rows. */
+        /* 上方已经消费到该记录的换行结尾。返回一条空记录，使 cache_load 跳过它并
+           继续处理后续记录。 */
         buf_free(&b);
         return xstrdup("");
     }
@@ -394,8 +415,8 @@ void cache_load(Cache *c) {
     FILE *f = fopen(c->path, "rb");
     if (!f) return;
     size_t n = 0;
-    /* Exclusive for the whole load: no concurrent readers yet (server hasn't
-       started accepting). Saves N×Acquire/Release vs locking per insert. */
+    /* 整个加载过程独占：服务尚未开始接受连接，因此没有并发读取者。相比逐条插入加锁，
+       可省去 N 次 Acquire/Release。 */
     AcquireSRWLockExclusive(&c->lock);
     char *line;
     while ((line = cache_read_line(f, c->path)) != NULL) {

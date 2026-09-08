@@ -1,7 +1,9 @@
 #include "godot_patch.h"
 
+#include "embedded.h"
 #include "engine.h"
 #include "fsutil.h"
+#include "resource.h"
 #include "ui.h"
 
 #include <stdint.h>
@@ -25,7 +27,7 @@
 #define GODOT_PATCH_MAX_STRINGS_PER_RESOURCE 1800u
 #define GODOT_PATCH_MAX_SOURCE_TEXT_BYTES 2400u
 #define GODOT_PATCH_MAX_TRANSLATION_TEXT_BYTES 4096u
-/* Keep first-run patch refresh bounded; warmup queues the rest for later cache-only rebuilds. */
+/* 限制首次运行补丁刷新的工作量；其余文本由预热排队，供后续仅缓存重建使用。 */
 #define GODOT_PATCH_LIVE_LIMIT 1024u
 #define GODOT_PATCH_BATCH 128u
 #define GODOT_PATCH_SMALL_DIALOGIC_BYTES (16u * 1024u)
@@ -199,10 +201,10 @@ static int parse_pck_info(const unsigned char *header, DWORD header_bytes, uint6
 }
 
 /*
- * Smaz decompression table used by Godot OptimizedTranslation.
+ * Godot OptimizedTranslation 使用的 Smaz 解压表。
  * Copyright (c) 2006-2009, Salvatore Sanfilippo. BSD-3-Clause.
- * Only decompression is needed here: patched translations are written back as
- * uncompressed UTF-8 strings, while untouched compressed entries are copied as-is.
+ * 此处只需要解压：已修补翻译以未压缩 UTF-8 字符串写回，未修改的压缩条目
+ * 则按原样复制。
  */
 static const char *GODOT_SMAZ_RCB[254] = {
     " ", "the", "e", "t", "a", "of", "o", "and", "i", "n", "s", "e ", "r", " th",
@@ -572,8 +574,8 @@ static int godot_patch_entry_priority(const char *path, uint64_t size) {
     else if (json) p = godot_patch_story_text_path(path) ? 24 : 34;
     else if (scene_text) p = godot_patch_story_text_path(path) ? 38 : 62;
 
-    /* Keep small Dialogic scene/combat timelines ahead of large repeatable packs,
-       even when names contain bond/negotation markers. */
+    /* 小型 Dialogic 场景或战斗时间线应优先于大型可重复内容包，即使名称中
+       含有 bond/negotation 标记也一样。 */
     if (!small_dialogic) {
         if (ascii_contains_i(path, "bond")) p += 80;
         if (ascii_contains_i(path, "negotation") || ascii_contains_i(path, "negotiation")) p += 70;
@@ -630,9 +632,8 @@ static int strlist_push_unique_index(StrList *l, const char *s) {
     for (size_t i = 0; i < l->n; i++) {
         if (!strcmp(l->v[i], s)) return (int)i;
     }
-    /* strlist_push_unique also reports success when the per-resource cap
-       rejected the insert; l->n - 1 would then point at an unrelated string
-       and reuse its translation, so a full list must report no index. */
+    /* 达到单资源上限而拒绝插入时，strlist_push_unique 也会报告成功；此时
+       l->n - 1 会指向无关字符串并误用其翻译，所以列表已满时不能返回索引。 */
     if (l->n >= GODOT_PATCH_MAX_STRINGS_PER_RESOURCE) return -1;
     if (!strlist_push_unique(l, s)) return -1;
     return (int)(l->n - 1);
@@ -662,9 +663,8 @@ static int has_cjk_utf8(const char *s) {
     return found;
 }
 
-/* Godot Translation replacement is renderer-local. Do not insert synthetic hard
-   line breaks here: many Godot UI controls already know their text box width,
-   and fixed-column wrapping makes dialogue stack in the wrong part of the box. */
+/* Godot Translation 替换属于渲染器本地行为。此处不要插入人为硬换行：许多
+   Godot UI 控件已经知道文本框宽度，按固定列换行会让对话堆在文本框的错误位置。 */
 static char *godot_wrap_cjk_translation(const char *s) {
     (void)s;
     return NULL;
@@ -798,8 +798,7 @@ static char *json_parse_string(const char **pp) {
                                          hex_val(p[4]));
                 p += 5;
                 if (cp >= 0xd800 && cp <= 0xdbff) {
-                    /* A high surrogate only combines with a directly following
-                       low surrogate; a lone surrogate encodes as U+FFFD. */
+                    /* 高代理项只能与紧随其后的低代理项组合；孤立代理项编码为 U+FFFD。 */
                     unsigned lo = 0;
                     if (p[0] == '\\' && p[1] == 'u' &&
                         hex_val(p[2]) >= 0 && hex_val(p[3]) >= 0 &&
@@ -1085,9 +1084,8 @@ static int collect_scene_text_patches(const char *buf, DWORD size, StrList *text
     return 1;
 }
 
-/* Dialogue-oriented Markdown uses structural lines for sections, speakers and
-   lifecycle commands. Patch only plain body lines and preserve the surrounding
-   file byte-for-byte so the game parser sees the same control structure. */
+/* 面向对话的 Markdown 使用结构行表达章节、说话人和生命周期命令。只修补
+   普通正文行，并逐字节保留周边内容，让游戏解析器看到相同的控制结构。 */
 static int collect_markdown_text_patches(const char *buf, DWORD size, StrList *texts,
                                          TextPatchList *patches) {
     const char *line = buf;
@@ -1238,10 +1236,9 @@ static int gdscript_translation_preserves_format_tokens(const char *source, cons
     return 1;
 }
 
-/* Static text resources feed the same BBCode and format renderers as GDScript
-   constants, so gate translations the same way: brackets must stay balanced
-   and printf-style tokens must match the source. On mismatch the original
-   string is kept. */
+/* 静态文本资源与 GDScript 常量进入相同的 BBCode 和格式化渲染器，因此采用
+   相同的翻译门禁：括号必须保持配对，printf 风格令牌必须与原文一致；不匹配
+   时保留原字符串。 */
 static int godot_text_translation_preserves_format(const char *source, const char *translated) {
     if (!source || !translated) return 0;
     int brackets = 0;
@@ -1708,8 +1705,7 @@ static int collect_optimized_translation_items(const unsigned char *buf, DWORD s
             uint32_t str_off = read_u32le(buf + rec + 4);
             uint32_t comp_size = read_u32le(buf + rec + 8);
             uint32_t uncomp_size = read_u32le(buf + rec + 12);
-            /* A skipped record would keep pointing into the old string heap
-               after the rebuild; abandon this resource instead. */
+            /* 跳过的记录会在重建后继续指向旧字符串堆，因此应放弃整个资源。 */
             if (comp_size > *strings_len || str_off > *strings_len - comp_size) return 0;
             OptItem item;
             item.rec_off = rec;
@@ -1866,9 +1862,8 @@ static int normalize_embedded_pck_v1_offsets(const WCHAR *pack_path, uint64_t or
     if (!GetFileSizeEx(h, &li) || li.QuadPart < 0) goto done;
     uint64_t pack_size = (uint64_t)li.QuadPart;
 
-    /* Embedded format 2 packs (Godot 4.0-4.5 single-exe exports) keep file_base
-       relative to the executable start. read_pck_info would reject that value as
-       out of range, so relocate the header field directly before any parsing. */
+    /* 内嵌格式 2 包（Godot 4.0–4.5 单 EXE 导出）中的 file_base 相对于可执行
+       文件起点。read_pck_info 会把该值判为越界，所以需在解析前直接重定位头字段。 */
     unsigned char v2_header[GODOT_PCK_V2_HEADER_SIZE];
     if (pack_size >= sizeof v2_header && read_at_exact(h, 0, v2_header, sizeof v2_header) &&
         read_u32le(v2_header) == GODOT_PCK_MAGIC && read_u32le(v2_header + 4) == 2u) {
@@ -2060,7 +2055,7 @@ static int collect_loose_project_overrides(const WCHAR *root, const WCHAR *rel_d
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (loose_skip_dir_name(fd.cFileName)) continue;
-            /* Junctions and symlinks could loop the walk back into the tree. */
+        /* 联接和符号链接可能让遍历循环回目录树。 */
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
             if (!collect_loose_project_overrides(root, child_rel, items, http, live_used,
                                                  patched_resources, patched_strings,
@@ -2379,667 +2374,17 @@ int godot_is_loose_project(const WCHAR *dir) {
     return 1;
 }
 
-/* Godot 3 and 4 have incompatible JSON, signal and font APIs. Keep the
-   renderer bridge version-local instead of weakening the shared server API. */
-static const char GODOT_RUNTIME_SIDECAR_G3[] =
-"extends SceneTree\n"
-"\n"
-"const DST_URL = \"http://127.0.0.1:19999/batch\"\n"
-"const DST_MAX_TEXT = 1200\n"
-"const DST_MAX_QUEUE = 1536\n"
-"const DST_PER_SCAN = 900\n"
-"const DST_BATCH_SIZE = 48\n"
-"const DST_MAX_INFLIGHT = 4\n"
-"const DST_MAX_CACHE = 4096\n"
-"const DST_MAX_MISS = 4096\n"
-"const DST_MISS_BACKOFF_MS = 8000\n"
-"const DST_FONT_PATHS = [\"C:/Windows/Fonts/simhei.ttf\", \"C:/Windows/Fonts/msyh.ttf\", \"C:/Windows/Fonts/simsun.ttc\"]\n"
-"\n"
-"var _dst_cache = {}\n"
-"var _dst_cache_order = []\n"
-"var _dst_pending = {}\n"
-"var _dst_queue = []\n"
-"var _dst_queue_head = 0\n"
-"var _dst_http_pool = []\n"
-"var _dst_busy = {}\n"
-"var _dst_miss_until = {}\n"
-"var _dst_miss_order = []\n"
-"var _dst_timer = null\n"
-"var _dst_seen_this_scan = 0\n"
-"var _dst_font = null\n"
-"var _dst_font_warned = false\n"
-"var _dst_error_counts = {}\n"
-"\n"
-"func _dst_report_error(context, detail):\n"
-"	var count = int(_dst_error_counts.get(context, 0)) + 1\n"
-"	_dst_error_counts[context] = count\n"
-"	if count <= 3 or (count & (count - 1)) == 0:\n"
-"		push_warning(\"[DeepSeek Godot] %s failed #%d: %s\" % [context, count, str(detail)])\n"
-"\n"
-"func _initialize():\n"
-"	if OS.get_cmdline_args().has(\"--dst-preflight\"):\n"
-"		quit(0)\n"
-"		return\n"
-"	call_deferred(\"_dst_start\")\n"
-"\n"
-"func _dst_start():\n"
-"	for i in range(DST_MAX_INFLIGHT):\n"
-"		var req = HTTPRequest.new()\n"
-"		get_root().add_child(req)\n"
-"		_dst_http_pool.append(req)\n"
-"		req.connect(\"request_completed\", self, \"_dst_http_done\", [req.get_instance_id()])\n"
-"	_dst_timer = Timer.new()\n"
-"	_dst_timer.wait_time = 0.15\n"
-"	_dst_timer.one_shot = false\n"
-"	get_root().add_child(_dst_timer)\n"
-"	_dst_timer.connect(\"timeout\", self, \"_dst_scan\")\n"
-"	_dst_timer.start()\n"
-"	var scene = str(ProjectSettings.get_setting(\"application/run/main_scene\"))\n"
-"	if scene != \"\":\n"
-"		change_scene(scene)\n"
-"\n"
-"func _dst_scan():\n"
-"	_dst_seen_this_scan = 0\n"
-"	_dst_scan_node(get_root())\n"
-"	_dst_pump()\n"
-"\n"
-"func _dst_scan_node(node):\n"
-"	if node == null or _dst_seen_this_scan >= DST_PER_SCAN:\n"
-"		return\n"
-"	if node is CanvasItem and not node.is_visible_in_tree():\n"
-"		return\n"
-"	if node.get(\"bbcode_enabled\") == true:\n"
-"		_dst_apply_property(node, \"bbcode_text\")\n"
-"	else:\n"
-"		_dst_apply_property(node, \"text\")\n"
-"		_dst_apply_property(node, \"bbcode_text\")\n"
-"	_dst_apply_items(node)\n"
-"	for child in node.get_children():\n"
-"		_dst_scan_node(child)\n"
-"		if _dst_seen_this_scan >= DST_PER_SCAN:\n"
-"			return\n"
-"\n"
-"func _dst_apply_property(node, prop):\n"
-"	var value = node.get(prop)\n"
-"	if typeof(value) != TYPE_STRING:\n"
-"		return\n"
-"	var source = str(value)\n"
-"	if not _dst_wanted(source):\n"
-"		return\n"
-"	_dst_seen_this_scan += 1\n"
-"	var translated = _dst_render_cached(source)\n"
-"	if translated != \"\" and translated != source:\n"
-"		_dst_apply_cjk_font(node)\n"
-"		node.set(prop, translated)\n"
-"	else:\n"
-"		_dst_queue_text(source)\n"
-"\n"
-"func _dst_apply_items(node):\n"
-"	if not node.has_method(\"get_item_count\") or not node.has_method(\"get_item_text\") or not node.has_method(\"set_item_text\"):\n"
-"		return\n"
-"	var count = node.get_item_count()\n"
-"	for i in range(count):\n"
-"		if _dst_seen_this_scan >= DST_PER_SCAN:\n"
-"			return\n"
-"		var source = str(node.get_item_text(i))\n"
-"		if not _dst_wanted(source):\n"
-"			continue\n"
-"		_dst_seen_this_scan += 1\n"
-"		var translated = _dst_render_cached(source)\n"
-"		if translated != \"\" and translated != source:\n"
-"			_dst_apply_cjk_font(node)\n"
-"			node.set_item_text(i, translated)\n"
-"		else:\n"
-"			_dst_queue_text(source)\n"
-"\n"
-"func _dst_queue_text(source):\n"
-"	for part in _dst_split_bbcode(str(source)):\n"
-"		if part.tag:\n"
-"			continue\n"
-"		var query = str(part.text).strip_edges()\n"
-"		if not _dst_plain_wanted(query):\n"
-"			continue\n"
-"		if _dst_cache.has(query) or _dst_pending.has(query) or _dst_recent_miss(query) or _dst_queue_count() >= DST_MAX_QUEUE:\n"
-"			continue\n"
-"		_dst_pending[query] = true\n"
-"		_dst_queue.append(query)\n"
-"\n"
-"func _dst_pump():\n"
-"	if _dst_queue_count() <= 0:\n"
-"		return\n"
-"	for req in _dst_http_pool:\n"
-"		if _dst_queue_count() <= 0:\n"
-"			return\n"
-"		var id = req.get_instance_id()\n"
-"		if _dst_busy.has(id):\n"
-"			continue\n"
-"		var batch = []\n"
-"		while _dst_queue_head < _dst_queue.size() and batch.size() < DST_BATCH_SIZE:\n"
-"			batch.append(_dst_queue[_dst_queue_head])\n"
-"			_dst_queue_head += 1\n"
-"		_dst_compact_queue()\n"
-"		if batch.empty():\n"
-"			continue\n"
-"		_dst_busy[id] = batch\n"
-"		var body = to_json({\"texts\": batch})\n"
-"		var err = req.request(DST_URL, [\"Content-Type: application/json\"], false, HTTPClient.METHOD_POST, body)\n"
-"		if err != OK:\n"
-"			_dst_report_error(\"batch-request\", \"error=%d request_id=%d\" % [err, id])\n"
-"			for source in batch:\n"
-"				_dst_pending.erase(source)\n"
-"			_dst_busy.erase(id)\n"
-"			_dst_backoff_batch(batch)\n"
-"\n"
-"func _dst_queue_count():\n"
-"	return _dst_queue.size() - _dst_queue_head\n"
-"\n"
-"func _dst_compact_queue():\n"
-"	if _dst_queue_head <= 0:\n"
-"		return\n"
-"	if _dst_queue_head >= _dst_queue.size():\n"
-"		_dst_queue.clear()\n"
-"		_dst_queue_head = 0\n"
-"		return\n"
-"	if _dst_queue_head < 256:\n"
-"		return\n"
-"	var remaining = []\n"
-"	for i in range(_dst_queue_head, _dst_queue.size()):\n"
-"		remaining.append(_dst_queue[i])\n"
-"	_dst_queue = remaining\n"
-"	_dst_queue_head = 0\n"
-"\n"
-"func _dst_http_done(result, response_code, headers, body, request_id):\n"
-"	if not _dst_busy.has(request_id):\n"
-"		_dst_report_error(\"unknown-request-callback\", \"request_id=%d result=%d status=%d\" % [request_id, result, response_code])\n"
-"		return\n"
-"	var batch = _dst_busy[request_id]\n"
-"	_dst_busy.erase(request_id)\n"
-"	for source in batch:\n"
-"		_dst_pending.erase(source)\n"
-"	if response_code != 200:\n"
-"		_dst_report_error(\"batch-http\", \"request_id=%d result=%d status=%d\" % [request_id, result, response_code])\n"
-"		_dst_backoff_batch(batch)\n"
-"		_dst_pump()\n"
-"		return\n"
-"	var parsed = JSON.parse(body.get_string_from_utf8())\n"
-"	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:\n"
-"		_dst_report_error(\"batch-json\", \"request_id=%d parse_error=%d\" % [request_id, parsed.error])\n"
-"		_dst_backoff_batch(batch)\n"
-"		_dst_pump()\n"
-"		return\n"
-"	var data = parsed.result\n"
-"	if not data.has(\"translations\") or typeof(data[\"translations\"]) != TYPE_DICTIONARY:\n"
-"		_dst_report_error(\"batch-schema\", \"request_id=%d missing translations dictionary\" % request_id)\n"
-"		_dst_backoff_batch(batch)\n"
-"		_dst_pump()\n"
-"		return\n"
-"	var translations = data[\"translations\"]\n"
-"	for query in batch:\n"
-"		if translations.has(query):\n"
-"			var translated = str(translations[query])\n"
-"			if translated != \"\" and translated != query:\n"
-"				_dst_cache_put(query, translated)\n"
-"			else:\n"
-"				_dst_mark_miss(query)\n"
-"		else:\n"
-"			_dst_mark_miss(query)\n"
-"	_dst_pump()\n"
-"\n"
-"func _dst_backoff_batch(batch):\n"
-"	for query in batch:\n"
-"		_dst_mark_miss(query)\n"
-"\n"
-"func _dst_cache_put(query, translated):\n"
-"	if not _dst_cache.has(query):\n"
-"		_dst_cache_order.append(query)\n"
-"	_dst_cache[query] = translated\n"
-"	while _dst_cache_order.size() > DST_MAX_CACHE:\n"
-"		var old = _dst_cache_order.pop_front()\n"
-"		_dst_cache.erase(old)\n"
-"\n"
-"func _dst_mark_miss(query):\n"
-"	if not _dst_miss_until.has(query):\n"
-"		_dst_miss_order.append(query)\n"
-"	_dst_miss_until[query] = OS.get_ticks_msec() + DST_MISS_BACKOFF_MS\n"
-"	_dst_trim_miss()\n"
-"\n"
-"func _dst_recent_miss(query):\n"
-"	if not _dst_miss_until.has(query):\n"
-"		return false\n"
-"	if OS.get_ticks_msec() < int(_dst_miss_until[query]):\n"
-"		return true\n"
-"	_dst_miss_until.erase(query)\n"
-"	_dst_miss_order.erase(query)\n"
-"	return false\n"
-"\n"
-"func _dst_trim_miss():\n"
-"	while _dst_miss_order.size() > DST_MAX_MISS:\n"
-"		var old = _dst_miss_order.pop_front()\n"
-"		_dst_miss_until.erase(old)\n"
-"\n"
-"func _dst_render_cached(source):\n"
-"	var out = \"\"\n"
-"	var changed = false\n"
-"	for part in _dst_split_bbcode(str(source)):\n"
-"		if part.tag:\n"
-"			out += str(part.text)\n"
-"			continue\n"
-"		var raw = str(part.text)\n"
-"		var query = raw.strip_edges()\n"
-"		if not _dst_plain_wanted(query):\n"
-"			out += raw\n"
-"			continue\n"
-"		if not _dst_cache.has(query):\n"
-"			return \"\"\n"
-"		var translated = str(_dst_cache[query])\n"
-"		out += raw.replace(query, translated)\n"
-"		changed = true\n"
-"	return out if changed else \"\"\n"
-"\n"
-"func _dst_split_bbcode(text):\n"
-"	var parts = []\n"
-"	var rest = str(text)\n"
-"	while rest != \"\":\n"
-"		var start = rest.find(\"[\")\n"
-"		if start < 0:\n"
-"			parts.append({\"tag\": false, \"text\": rest})\n"
-"			break\n"
-"		if start > 0:\n"
-"			parts.append({\"tag\": false, \"text\": rest.substr(0, start)})\n"
-"			rest = rest.substr(start, rest.length() - start)\n"
-"		var end = rest.find(\"]\")\n"
-"		if end < 0:\n"
-"			parts.append({\"tag\": false, \"text\": rest})\n"
-"			break\n"
-"		parts.append({\"tag\": true, \"text\": rest.substr(0, end + 1)})\n"
-"		rest = rest.substr(end + 1, rest.length() - end - 1)\n"
-"	return parts\n"
-"\n"
-"func _dst_apply_cjk_font(node):\n"
-"	var font = _dst_get_font()\n"
-"	if font == null or node == null or not node.has_method(\"add_font_override\"):\n"
-"		return\n"
-"	node.add_font_override(\"font\", font)\n"
-"	node.add_font_override(\"normal_font\", font)\n"
-"	node.add_font_override(\"bold_font\", font)\n"
-"	node.add_font_override(\"italics_font\", font)\n"
-"	node.add_font_override(\"bold_italics_font\", font)\n"
-"	node.add_font_override(\"mono_font\", font)\n"
-"\n"
-"func _dst_get_font():\n"
-"	if _dst_font != null:\n"
-"		return _dst_font\n"
-"	var file = File.new()\n"
-"	for path in DST_FONT_PATHS:\n"
-"		if file.file_exists(path):\n"
-"			var data = DynamicFontData.new()\n"
-"			data.font_path = path\n"
-"			var font = DynamicFont.new()\n"
-"			font.font_data = data\n"
-"			font.size = 22\n"
-"			_dst_font = font\n"
-"			return _dst_font\n"
-"	if not _dst_font_warned:\n"
-"		_dst_font_warned = true\n"
-"		push_warning(\"[DeepSeek Godot] no usable CJK font found in DST_FONT_PATHS; Chinese glyphs may render as boxes.\")\n"
-"	return null\n"
-"\n"
-"func _dst_wanted(text):\n"
-"	if text == null:\n"
-"		return false\n"
-"	for part in _dst_split_bbcode(str(text)):\n"
-"		if not part.tag and _dst_plain_wanted(str(part.text).strip_edges()):\n"
-"			return true\n"
-"	return false\n"
-"\n"
-"func _dst_plain_wanted(s):\n"
-"	if s.length() < 2 or s.length() > DST_MAX_TEXT:\n"
-"		return false\n"
-"	if s.find(\"res://\") >= 0 or s.find(\"user://\") >= 0 or s.find(\"/\") >= 0 or s.find(\"\\\\\") >= 0:\n"
-"		return false\n"
-"	var has_latin = false\n"
-"	for i in range(s.length()):\n"
-"		var c = s.ord_at(i)\n"
-"		if c >= 0x4e00 and c <= 0x9fff:\n"
-"			return false\n"
-"		if (c >= 65 and c <= 90) or (c >= 97 and c <= 122):\n"
-"			has_latin = true\n"
-"	return has_latin\n";
+/* Godot 3 与 4 的 JSON、信号和字体 API 不兼容。渲染桥接应按版本隔离，
+   不要因此削弱共享服务器 API。
+   运行时侧车脚本是 payloads/Godot/dst_godot_runtime_g3.gd 与 _g4.gd，构建时以
+   RCDATA 嵌入（resource.h）。下方的文本替换依赖脚本里的这些锚点：
+   "extends SceneTree\n"、"func _initialize():\n"、"\t\tquit(0)\n"、"get_root()"、
+   main_scene 切换块以及 "C:/Windows/Fonts/simhei.ttf"；改脚本时必须同步。 */
 
-static const char GODOT_RUNTIME_SIDECAR_G4[] =
-"extends SceneTree\n"
-"\n"
-"const DST_URL = \"http://127.0.0.1:19999/batch\"\n"
-"const DST_MAX_TEXT = 1200\n"
-"const DST_QUEUE_LIMIT = 1536\n"
-"const DST_SCAN_LIMIT = 900\n"
-"const DST_BATCH_SIZE = 48\n"
-"const DST_MAX_CACHE = 4096\n"
-"const DST_MAX_MISS = 4096\n"
-"const DST_MAX_TRACKED_CONTROLS = 4096\n"
-"const DST_MISS_BACKOFF_MS = 8000\n"
-"const DST_FONT_PATHS = [\"C:/Windows/Fonts/simhei.ttf\", \"C:/Windows/Fonts/msyh.ttf\", \"C:/Windows/Fonts/simsun.ttc\"]\n"
-"\n"
-"var _dst_cache = {}\n"
-"var _dst_cache_order = []\n"
-"var _dst_miss_until = {}\n"
-"var _dst_miss_order = []\n"
-"var _dst_pending = {}\n"
-"var _dst_queue = []\n"
-"var _dst_queue_head = 0\n"
-"var _dst_busy = {}\n"
-"var _dst_requests = []\n"
-"var _dst_font = null\n"
-"var _dst_font_warned = false\n"
-"var _dst_seen = 0\n"
-"var _dst_controls = {}\n"
-"var _dst_control_order = []\n"
-"var _dst_control_cursor = -1\n"
-"var _dst_error_counts = {}\n"
-"\n"
-"func _dst_report_error(context, detail):\n"
-"	var count = int(_dst_error_counts.get(context, 0)) + 1\n"
-"	_dst_error_counts[context] = count\n"
-"	if count <= 3 or (count & (count - 1)) == 0:\n"
-"		push_warning(\"[DeepSeek Godot] %s failed #%d: %s\" % [context, count, str(detail)])\n"
-"\n"
-"func _initialize():\n"
-"\tif OS.get_cmdline_args().has(\"--dst-preflight\") or OS.get_cmdline_user_args().has(\"--dst-preflight\"):\n"
-"\t\tquit(0)\n"
-"\t\treturn\n"
-"\tcall_deferred(\"_dst_start\")\n"
-"\n"
-"func _dst_start():\n"
-"\tget_root().get_tree().node_added.connect(Callable(self, \"_dst_track_control\"))\n"
-"\t_dst_track_controls(get_root())\n"
-"\tfor i in range(4):\n"
-"\t\tvar req = HTTPRequest.new()\n"
-"\t\treq.process_mode = Node.PROCESS_MODE_ALWAYS\n"
-"\t\tget_root().add_child(req)\n"
-"\t\t_dst_requests.append(req)\n"
-"\t\treq.request_completed.connect(Callable(self, \"_dst_done\").bind(req.get_instance_id()))\n"
-"\tvar timer = Timer.new()\n"
-"\ttimer.process_mode = Node.PROCESS_MODE_ALWAYS\n"
-"\ttimer.wait_time = 0.15\n"
-"\ttimer.one_shot = false\n"
-"\tget_root().add_child(timer)\n"
-"\ttimer.timeout.connect(_dst_scan)\n"
-"\ttimer.start()\n"
-"\tvar scene = str(ProjectSettings.get_setting(\"application/run/main_scene\"))\n"
-"\tif scene != \"\":\n"
-"\t\tchange_scene_to_file(scene)\n"
-"\n"
-"func _dst_track_control(node):\n"
-"\tif not (node is Control):\n"
-"\t\treturn\n"
-"\tvar id = node.get_instance_id()\n"
-"\tif _dst_controls.has(id):\n"
-"\t\tvar current = _dst_controls[id].get_ref()\n"
-"\t\tif current != null:\n"
-"\t\t\treturn\n"
-"\t\t_dst_controls.erase(id)\n"
-"\t\t_dst_control_order.erase(id)\n"
-"\twhile _dst_control_order.size() >= DST_MAX_TRACKED_CONTROLS:\n"
-"\t\t_dst_controls.erase(_dst_control_order.pop_front())\n"
-"\t_dst_controls[id] = weakref(node)\n"
-"\t_dst_control_order.append(id)\n"
-"\tif _dst_control_cursor < 0:\n"
-"\t\t_dst_control_cursor = _dst_control_order.size() - 1\n"
-"\n"
-"func _dst_track_controls(node):\n"
-"\tif node == null:\n"
-"\t\treturn\n"
-"\t_dst_track_control(node)\n"
-"\tfor child in node.get_children():\n"
-"\t\t_dst_track_controls(child)\n"
-"\n"
-"func _dst_scan_controls():\n"
-"\tvar stale = []\n"
-"\tvar count = _dst_control_order.size()\n"
-"\tif count == 0:\n"
-"\t\t_dst_control_cursor = -1\n"
-"\t\treturn\n"
-"\tif _dst_control_cursor < 0 or _dst_control_cursor >= count:\n"
-"\t\t_dst_control_cursor = count - 1\n"
-"\tvar index = _dst_control_cursor\n"
-"\tvar scanned = 0\n"
-"\twhile scanned < count and _dst_seen < DST_SCAN_LIMIT:\n"
-"\t\tvar id = _dst_control_order[index]\n"
-"\t\tindex -= 1\n"
-"\t\tif index < 0:\n"
-"\t\t\tindex = count - 1\n"
-"\t\tscanned += 1\n"
-"\t\tvar holder = _dst_controls.get(id)\n"
-"\t\tvar node = holder.get_ref() if holder != null else null\n"
-"\t\tif node == null:\n"
-"\t\t\tstale.append(id)\n"
-"\t\t\tcontinue\n"
-"\t\tif not node.is_visible_in_tree():\n"
-"\t\t\tcontinue\n"
-"\t\t_dst_apply(node, \"text\")\n"
-"\t\tif node.has_method(\"get_item_count\") and node.has_method(\"get_item_text\") and node.has_method(\"set_item_text\"):\n"
-"\t\t\tfor item_index in range(node.get_item_count()):\n"
-"\t\t\t\t_dst_apply_item(node, item_index)\n"
-"\tfor id in stale:\n"
-"\t\t_dst_controls.erase(id)\n"
-"\t\t_dst_control_order.erase(id)\n"
-"\t_dst_control_cursor = min(index, _dst_control_order.size() - 1)\n"
-"\n"
-"func _dst_scan():\n"
-"\t_dst_seen = 0\n"
-"\t_dst_scan_controls()\n"
-"\t_dst_scan_node(get_root())\n"
-"\t_dst_pump()\n"
-"\n"
-"func _dst_scan_node(node):\n"
-"\tif node == null or _dst_seen >= DST_SCAN_LIMIT:\n"
-"\t\treturn\n"
-"\tif node is CanvasItem and not node.is_visible_in_tree():\n"
-"\t\treturn\n"
-"\t# Godot 4 RichTextLabel stores its BBCode source in the text property.\n"
-"\t_dst_apply(node, \"text\")\n"
-"\tif node.has_method(\"get_item_count\") and node.has_method(\"get_item_text\") and node.has_method(\"set_item_text\"):\n"
-"\t\tfor i in range(node.get_item_count()):\n"
-"\t\t\t_dst_apply_item(node, i)\n"
-"\tfor child in node.get_children():\n"
-"\t\t_dst_scan_node(child)\n"
-"\n"
-"func _dst_apply(node, prop):\n"
-"\tvar source = node.get(prop)\n"
-"\tif typeof(source) != TYPE_STRING or not _dst_wanted(source):\n"
-"\t\treturn\n"
-"\t_dst_seen += 1\n"
-"\tvar translated = _dst_render(source)\n"
-"\tif translated != \"\":\n"
-"\t\t_dst_font_for(node)\n"
-"\t\tnode.set(prop, translated)\n"
-"\telse:\n"
-"\t\t_dst_queue_text(source)\n"
-"\n"
-"func _dst_apply_item(node, index):\n"
-"\tif _dst_seen >= DST_SCAN_LIMIT:\n"
-"\t\treturn\n"
-"\tvar source = str(node.get_item_text(index))\n"
-"\tif not _dst_wanted(source):\n"
-"\t\treturn\n"
-"\t_dst_seen += 1\n"
-"\tvar translated = _dst_render(source)\n"
-"\tif translated != \"\":\n"
-"\t\t_dst_font_for(node)\n"
-"\t\tnode.set_item_text(index, translated)\n"
-"\telse:\n"
-"\t\t_dst_queue_text(source)\n"
-"\n"
-"func _dst_queue_text(source):\n"
-"\tfor part in _dst_split(str(source)):\n"
-"\t\tif part.tag:\n"
-"\t\t\tcontinue\n"
-"\t\tvar query = str(part.text).strip_edges()\n"
-"\t\tif not _dst_plain_wanted(query) or _dst_cache.has(query) or _dst_pending.has(query) or _dst_recent_miss(query) or _dst_queue_count() >= DST_QUEUE_LIMIT:\n"
-"\t\t\tcontinue\n"
-"\t\t_dst_pending[query] = true\n"
-"\t\t_dst_queue.append(query)\n"
-"\n"
-"func _dst_pump():\n"
-"\tfor req in _dst_requests:\n"
-"\t\tif _dst_queue_count() <= 0:\n"
-"\t\t\treturn\n"
-"\t\tvar id = req.get_instance_id()\n"
-"\t\tif _dst_busy.has(id):\n"
-"\t\t\tcontinue\n"
-"\t\tvar batch = []\n"
-"\t\twhile _dst_queue_head < _dst_queue.size() and batch.size() < DST_BATCH_SIZE:\n"
-"\t\t\tbatch.append(_dst_queue[_dst_queue_head])\n"
-"\t\t\t_dst_queue_head += 1\n"
-"\t\t_dst_compact_queue()\n"
-"\t\t_dst_busy[id] = batch\n"
-"\t\tvar err = req.request(DST_URL, [\"Content-Type: application/json\"], HTTPClient.METHOD_POST, JSON.stringify({\"texts\": batch}))\n"
-"\t\tif err != OK:\n"
-"\t\t\t_dst_report_error(\"batch-request\", \"error=%d request_id=%d\" % [err, id])\n"
-"\t\t\t_dst_busy.erase(id)\n"
-"\t\t\tfor query in batch:\n"
-"\t\t\t\t_dst_pending.erase(query)\n"
-"\t\t\t\t_dst_mark_miss(query)\n"
-"\n"
-"func _dst_queue_count():\n"
-"\treturn _dst_queue.size() - _dst_queue_head\n"
-"\n"
-"func _dst_compact_queue():\n"
-"\tif _dst_queue_head <= 0:\n"
-"\t\treturn\n"
-"\tif _dst_queue_head >= _dst_queue.size():\n"
-"\t\t_dst_queue.clear()\n"
-"\t\t_dst_queue_head = 0\n"
-"\t\treturn\n"
-"\tif _dst_queue_head < 256:\n"
-"\t\treturn\n"
-"\tvar remaining = []\n"
-"\tfor i in range(_dst_queue_head, _dst_queue.size()):\n"
-"\t\tremaining.append(_dst_queue[i])\n"
-"\t_dst_queue = remaining\n"
-"\t_dst_queue_head = 0\n"
-"\n"
-"func _dst_done(result, response_code, headers, body, request_id):\n"
-"\tif not _dst_busy.has(request_id):\n"
-"\t\t_dst_report_error(\"unknown-request-callback\", \"request_id=%d result=%d status=%d\" % [request_id, result, response_code])\n"
-"\t\treturn\n"
-"\tvar batch = _dst_busy[request_id]\n"
-"\t_dst_busy.erase(request_id)\n"
-"\tfor query in batch:\n"
-"\t\t_dst_pending.erase(query)\n"
-"\tif response_code != 200:\n"
-"\t\t_dst_report_error(\"batch-http\", \"request_id=%d result=%d status=%d\" % [request_id, result, response_code])\n"
-"\t\tfor query in batch:\n"
-"\t\t\t_dst_mark_miss(query)\n"
-"\t\t_dst_pump()\n"
-"\t\treturn\n"
-"\tvar json = JSON.new()\n"
-"\tif json.parse(body.get_string_from_utf8()) != OK or typeof(json.data) != TYPE_DICTIONARY or not json.data.has(\"translations\"):\n"
-"\t\t_dst_report_error(\"batch-json-schema\", \"request_id=%d parse_error=%s\" % [request_id, json.get_error_message()])\n"
-"\t\tfor query in batch:\n"
-"\t\t\t_dst_mark_miss(query)\n"
-"\t\t_dst_pump()\n"
-"\t\treturn\n"
-"\tvar translations = json.data[\"translations\"]\n"
-"\tfor query in batch:\n"
-"\t\tif translations.has(query) and str(translations[query]) != query and str(translations[query]) != \"\":\n"
-"\t\t\t_dst_cache_put(query, str(translations[query]))\n"
-"\t\telse:\n"
-"\t\t\t_dst_mark_miss(query)\n"
-"\t_dst_pump()\n"
-"\n"
-"func _dst_cache_put(query, translated):\n"
-"\tif not _dst_cache.has(query):\n"
-"\t\t_dst_cache_order.append(query)\n"
-"\t_dst_cache[query] = translated\n"
-"\twhile _dst_cache_order.size() > DST_MAX_CACHE:\n"
-"\t\t_dst_cache.erase(_dst_cache_order.pop_front())\n"
-"\n"
-"func _dst_mark_miss(query):\n"
-"\tif not _dst_miss_until.has(query):\n"
-"\t\t_dst_miss_order.append(query)\n"
-"\t_dst_miss_until[query] = Time.get_ticks_msec() + DST_MISS_BACKOFF_MS\n"
-"\twhile _dst_miss_order.size() > DST_MAX_MISS:\n"
-"\t\t_dst_miss_until.erase(_dst_miss_order.pop_front())\n"
-"\n"
-"func _dst_recent_miss(query):\n"
-"\tif not _dst_miss_until.has(query):\n"
-"\t\treturn false\n"
-"\tif Time.get_ticks_msec() < int(_dst_miss_until[query]):\n"
-"\t\treturn true\n"
-"\t_dst_miss_until.erase(query)\n"
-"\t_dst_miss_order.erase(query)\n"
-"\treturn false\n"
-"\n"
-"func _dst_render(source):\n"
-"\tvar out = \"\"\n"
-"\tvar changed = false\n"
-"\tfor part in _dst_split(str(source)):\n"
-"\t\tif part.tag:\n"
-"\t\t\tout += str(part.text)\n"
-"\t\t\tcontinue\n"
-"\t\tvar raw = str(part.text)\n"
-"\t\tvar query = raw.strip_edges()\n"
-"\t\tif not _dst_plain_wanted(query):\n"
-"\t\t\tout += raw\n"
-"\t\telif not _dst_cache.has(query):\n"
-"\t\t\treturn \"\"\n"
-"\t\telse:\n"
-"\t\t\tout += raw.replace(query, str(_dst_cache[query]))\n"
-"\t\t\tchanged = true\n"
-"\treturn out if changed else \"\"\n"
-"\n"
-"func _dst_split(text):\n"
-"\tvar parts = []\n"
-"\tvar rest = str(text)\n"
-"\twhile rest != \"\":\n"
-"\t\tvar start = rest.find(\"[\")\n"
-"\t\tif start < 0:\n"
-"\t\t\tparts.append({\"tag\": false, \"text\": rest})\n"
-"\t\t\tbreak\n"
-"\t\tif start > 0:\n"
-"\t\t\tparts.append({\"tag\": false, \"text\": rest.substr(0, start)})\n"
-"\t\t\trest = rest.substr(start)\n"
-"\t\tvar end = rest.find(\"]\")\n"
-"\t\tif end < 0:\n"
-"\t\t\tparts.append({\"tag\": false, \"text\": rest})\n"
-"\t\t\tbreak\n"
-"\t\tparts.append({\"tag\": true, \"text\": rest.substr(0, end + 1)})\n"
-"\t\trest = rest.substr(end + 1)\n"
-"\treturn parts\n"
-"\n"
-"func _dst_font_for(node):\n"
-"\tif _dst_font == null:\n"
-"\t\tfor path in DST_FONT_PATHS:\n"
-"\t\t\tif FileAccess.file_exists(path):\n"
-"\t\t\t\tvar font = FontFile.new()\n"
-"\t\t\t\tif font.load_dynamic_font(path) == OK:\n"
-"\t\t\t\t\t_dst_font = font\n"
-"\t\t\t\t\tbreak\n"
-"\t\tif _dst_font == null and not _dst_font_warned:\n"
-"\t\t\t_dst_font_warned = true\n"
-"\t\t\tpush_warning(\"[DeepSeek Godot] no usable CJK font found in DST_FONT_PATHS; Chinese glyphs may render as boxes.\")\n"
-"\tif _dst_font != null and node.has_method(\"add_theme_font_override\"):\n"
-"\t\tnode.add_theme_font_override(\"font\", _dst_font)\n"
-"\t\tnode.add_theme_font_override(\"normal_font\", _dst_font)\n"
-"\n"
-"func _dst_wanted(text):\n"
-"\tfor part in _dst_split(str(text)):\n"
-"\t\tif not part.tag and _dst_plain_wanted(str(part.text).strip_edges()):\n"
-"\t\t\treturn true\n"
-"\treturn false\n"
-"\n"
-"func _dst_plain_wanted(s):\n"
-"\tif s.length() < 2 or s.length() > DST_MAX_TEXT or s.find(\"res://\") >= 0 or s.find(\"user://\") >= 0 or s.find(\"/\") >= 0 or s.find(\"\\\\\") >= 0:\n"
-"\t\treturn false\n"
-"\tvar latin = false\n"
-"\tfor i in range(s.length()):\n"
-"\t\tvar c = s.unicode_at(i)\n"
-"\t\tif c >= 0x4e00 and c <= 0x9fff:\n"
-"\t\t\treturn false\n"
-"\t\tif (c >= 65 and c <= 90) or (c >= 97 and c <= 122):\n"
-"\t\t\tlatin = true\n"
-"\treturn latin\n";
+/* 取内嵌 Godot 运行时脚本。返回 NULL 表示启动器构建不完整（已记录日志）。 */
+static const char *godot_runtime_sidecar_source(int use_godot3) {
+    return embedded_script_text(use_godot3 ? IDR_SCRIPT_GODOT_RUNTIME_G3 : IDR_SCRIPT_GODOT_RUNTIME_G4);
+}
 
 static char *replace_all_text(const char *source, const char *needle, const char *replacement) {
     if (!source || !needle || !needle[0] || !replacement) return NULL;
@@ -3077,10 +2422,9 @@ static char *replace_all_text(const char *source, const char *needle, const char
     return result;
 }
 
-/* The runtime templates list default Windows font paths. Swap the first
-   candidate for the CJK font actually resolved on this machine so hosts with a
-   different Windows directory still load a usable font. Without a system CJK
-   font the default list is kept and the script warns once at runtime. */
+/* 运行时模板列有默认 Windows 字体路径。将首个候选项替换为本机实际解析到的
+   CJK 字体，使 Windows 目录不同的主机也能加载可用字体。若系统没有 CJK
+   字体，则保留默认列表，并由脚本在运行时警告一次。 */
 static char *godot_runtime_script_with_font(const char *source) {
     if (!source) return NULL;
     WCHAR font_w[MAX_PATH * 4];
@@ -3097,7 +2441,8 @@ static char *godot_runtime_script_with_font(const char *source) {
 }
 
 static char *build_godot_runtime_autoload(uint32_t engine_major) {
-    const char *source = engine_major == 3 ? GODOT_RUNTIME_SIDECAR_G3 : GODOT_RUNTIME_SIDECAR_G4;
+    const char *source = godot_runtime_sidecar_source(engine_major == 3);
+    if (!source) return NULL;
     const char *scene_start = engine_major == 3
         ? "\tvar scene = str(ProjectSettings.get_setting(\"application/run/main_scene\"))\n"
           "\tif scene != \"\":\n"
@@ -3133,8 +2478,8 @@ static size_t find_text_token(const char *text, size_t text_size,
     return SIZE_MAX;
 }
 
-/* An existing autoload key only counts when it starts a line as a real key;
-   a substring inside a comment or a longer key must not suppress insertion. */
+/* 现有 autoload 键只有在行首作为真实键出现时才有效；注释内的子串或更长键名
+   都不能阻止插入。 */
 static int runtime_override_has_key(const char *source, size_t source_size) {
     size_t key_len = strlen(GODOT_AUTOLOAD_OVERRIDE_KEY);
     size_t pos = 0;
@@ -3185,8 +2530,7 @@ static int build_runtime_override(const char *source, size_t source_size,
         prefix_size = strlen(prefix);
     }
 
-    /* The section header may be the last line without a trailing newline;
-       the inserted entry must still start on its own line. */
+    /* 节头可能是最后一行且没有尾随换行；插入的条目仍必须从独立新行开始。 */
     const char *entry_lead = "";
     size_t entry_lead_size = 0;
     if (!prefix_size && insert > 0 && source[insert - 1] != '\n') {
@@ -3264,7 +2608,7 @@ static int embed_format3_runtime_scripts(HANDLE h, const PckInfo *info,
     }
     int ok = 0;
     char *runtime_script = godot_runtime_script_with_font(
-        info->engine_major == 3 ? GODOT_RUNTIME_SIDECAR_G3 : GODOT_RUNTIME_SIDECAR_G4);
+        godot_runtime_sidecar_source(info->engine_major == 3));
     if (!runtime_script) return 0;
     unsigned char runtime_meta[8 + 8 + 16 + 4];
     unsigned char autoload_meta[8 + 8 + 16 + 4];
@@ -3370,7 +2714,7 @@ int godot_prepare_runtime_sidecar(const WCHAR *dir) {
     path_join(script, MAX_PATH * 4, dir, GODOT_RUNTIME_SCRIPT_NAME);
     int major = godot_runtime_major(dir);
     char *sidecar = godot_runtime_script_with_font(
-        major >= 4 ? GODOT_RUNTIME_SIDECAR_G4 : GODOT_RUNTIME_SIDECAR_G3);
+        godot_runtime_sidecar_source(major < 4));
     if (!sidecar) {
         append_log(L"Godot: failed to build the runtime translation sidecar script.");
         return 0;
@@ -3394,8 +2738,8 @@ static char *trim_pack_path(char *path, size_t n) {
     return path;
 }
 
-/* PCK entry paths conventionally carry a res:// prefix; compare without it so
-   game-shipped entries and launcher entries written by older builds both match. */
+/* PCK 条目路径通常带有 res:// 前缀；比较时忽略它，使游戏自带条目和旧版
+   启动器写入的条目都能匹配。 */
 static const char *godot_pack_entry_name(const char *path) {
     if (!path) return "";
     return !strncmp(path, "res://", 6) ? path + 6 : path;
@@ -3521,7 +2865,7 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
                 unsigned char meta[8 + 8 + 16 + 4] = {0};
                 write_u64le(meta, new_rel);
                 write_u64le(meta + 8, font_size);
-                /* MD5 is optional for unencrypted packs; leave it zeroed. */
+        /* 未加密包的 MD5 可选，保持全零即可。 */
                 if (write_at_exact(h, entries[i].meta_pos, meta, info.entry_meta_size)) {
                     (*patched_resources)++;
                     font_replacements++;
@@ -3533,12 +2877,15 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
         if (entries[i].size == 0 || entries[i].size > GODOT_PATCH_MAX_ENTRY_BYTES) continue;
         uint64_t abs = info.offsets_are_absolute ? entries[i].rel : info.file_base + entries[i].rel;
         if (entries[i].size > UINT32_MAX || abs > pack_size || entries[i].size > pack_size - abs) continue;
-        unsigned char *buf = (unsigned char *)malloc((size_t)entries[i].size);
+        /* 文本资源的收集器用 C 字符串语义扫描（json_parse_string 只在 NUL 或引号处
+           停止），因此多分配一个字节并置 0，避免最后一个字面量未闭合时越界读。 */
+        unsigned char *buf = (unsigned char *)malloc((size_t)entries[i].size + 1u);
         if (!buf) continue;
         if (!read_at_exact(h, abs, buf, (DWORD)entries[i].size)) {
             free(buf);
             continue;
         }
+        buf[entries[i].size] = 0;
 
         int has_translated = 0;
         DWORD resource_size = 0;
@@ -3593,7 +2940,7 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
                 unsigned char meta[8 + 8 + 16 + 4] = {0};
                 write_u64le(meta, new_rel);
                 write_u64le(meta + 8, resource_size);
-                /* MD5 is optional for unencrypted packs; leave it zeroed. */
+    /* 未加密包的 MD5 可选，保持全零即可。 */
                 if (write_at_exact(h, entries[i].meta_pos, meta, info.entry_meta_size)) {
                     (*patched_resources)++;
                     *patched_strings += resource_patched_strings;
@@ -3712,10 +3059,9 @@ int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
             append_log(L"Godot: PCK source had no translated overrides; trying loose project overrides.");
         }
         if (should_try_loose_project) {
-            /* A minimal loose override pack replaces the whole game pack, so it
-               is only valid for a complete loose project. Installed over a
-               packaged game it would leave the game unbootable (Godot 4 rejects
-               format 1 packs outright). */
+            /* 最小松散覆盖包会替换整个游戏包，因此只适用于完整的松散工程。
+               若安装到已打包游戏上会导致游戏无法启动（Godot 4 会直接拒绝
+               格式 1 的包）。 */
             if (!godot_is_loose_project(dir)) {
                 append_log(L"Godot: no patch output for the packaged game; not installing a loose minimal pack.");
                 return 0;

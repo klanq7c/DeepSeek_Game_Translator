@@ -55,9 +55,9 @@ try {
 
     $contentPatterns = @(
         "sk-[A-Za-z0-9]{16,}",
-        "(?i)api[_-]?key\s*=\s*[^<\s][^\r\n]+",
-        "(?i)password\s*=\s*[^<\s][^\r\n]+",
-        "(?i)secret\s*=\s*[^<\s][^\r\n]+",
+        "(?i)(?<![A-Za-z0-9_])api[_-]?key\s*=\s*[^<\s][^\r\n]+",
+        "(?i)(?<![A-Za-z0-9_])password\s*=\s*[^<\s][^\r\n]+",
+        "(?i)(?<![A-Za-z0-9_])secret\s*=\s*[^<\s][^\r\n]+",
         "(?i)Authorization:\s*Bearer\s+[A-Za-z0-9._-]+",
         "C:\\Users\\[A-Za-z0-9._-]+",
         "E:\\Projects\\[^\\\r\n]+",
@@ -81,7 +81,11 @@ try {
     $files = Get-ChildItem -LiteralPath $root -Recurse -File
     foreach ($file in $files) {
         $ext = $file.Extension.ToLowerInvariant()
-        if ($forbiddenExtensions -contains $ext) {
+        $rel = $file.FullName.Substring($root.Length).TrimStart("\", "/").Replace("/", "\")
+        # Synthetic glossary example only. Real translation_memory*.tsv stays forbidden.
+        $isGlossaryExample = $rel -ieq "config\glossary.example.tsv" -or
+            $rel -like "*\config\glossary.example.tsv"
+        if ($forbiddenExtensions -contains $ext -and -not $isGlossaryExample) {
             [void]$errors.Add("Forbidden file extension: $($file.FullName)")
         }
         foreach ($pattern in $forbiddenFileNamePatterns) {

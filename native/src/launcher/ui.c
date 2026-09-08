@@ -24,6 +24,7 @@
 #include "engine.h"
 #include "fsutil.h"
 #include "godot_patch.h"
+#include "godot_preflight_cache.h"
 #include "godot_probe.h"
 #include "resource.h"
 #include "server_proc.h"
@@ -170,6 +171,42 @@ void invalidate_control_area(HWND ctl, int pad) {
  * 日志列表框不存在时（如 --godot-patch-worker 无窗口模式）回退到
  * OutputDebugStringW，保证后台进程不丢诊断。
  * ---------------------------------------------------------------- */
+int g_log_to_stdout = 0;
+int g_launch_dry_run = 0;
+int g_ui_probe = 0;
+int g_ui_probe_neutral = 0;
+int g_anim_tick_override = -1;
+
+/* 侧边栏底部的运行时标签与英雄区副标题。两版故意不同：它们标识这一帧由哪个
+   实现画出。--ui-probe-and-exit 下改用中性文案，使其余像素可逐字节比对。 */
+const WCHAR *ui_runtime_tag(void) {
+    return g_ui_probe_neutral ? L"runtime" : L"C native runtime";
+}
+
+const WCHAR *ui_subtitle_text(void) {
+    return g_ui_probe_neutral
+        ? L"local cache + live batch API - tags / vars / color safe"
+        : L"C native - local cache + live batch API - tags / vars / color safe";
+}
+
+/* 动画时钟：探针冻结后两版取到同一相位。 */
+static DWORD anim_tick(void) {
+    return g_anim_tick_override >= 0 ? (DWORD)g_anim_tick_override : GetTickCount();
+}
+
+void write_stdout_utf8(const WCHAR *text) {
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!out || out == INVALID_HANDLE_VALUE || !text || !text[0]) return;
+    int need = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
+    if (need <= 1) return;
+    char *buf = (char *)malloc((size_t)need);
+    if (!buf) return;
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, buf, need, NULL, NULL);
+    DWORD written = 0;
+    WriteFile(out, buf, (DWORD)(need - 1), &written, NULL);
+    free(buf);
+}
+
 void append_log(const WCHAR *fmt, ...) {
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -190,6 +227,13 @@ void append_log(const WCHAR *fmt, ...) {
 
     for (WCHAR *p = line; *p; p++) {
         if (*p == L'\r' || *p == L'\n' || *p == L'\t') *p = L' ';
+    }
+
+    if (g_log_to_stdout) {
+        /* 诊断子命令：正文（不含时间戳）逐行镜像到 stdout，格式 log=<正文>。 */
+        write_stdout_utf8(L"log=");
+        write_stdout_utf8(line + wcslen(prefix));
+        write_stdout_utf8(L"\n");
     }
 
     if (!g_log || !IsWindow(g_log)) {
@@ -224,8 +268,27 @@ void append_log(const WCHAR *fmt, ...) {
     }
 }
 
+/* 一键流程里"要拉起的进程"在演练模式下的统一出口，见 ui.h 的 g_launch_dry_run。
+   kind 区分 shell（游戏 exe）/proc（Godot 引擎）/worker（补丁工作进程）。 */
+static void write_spawn_plan(const WCHAR *kind, const WCHAR *exe, const WCHAR *cmd, const WCHAR *cwd) {
+    write_stdout_utf8(L"spawn=");
+    write_stdout_utf8(kind);
+    write_stdout_utf8(L"|");
+    write_stdout_utf8(exe ? exe : L"");
+    write_stdout_utf8(L"|");
+    write_stdout_utf8(cmd ? cmd : L"");
+    write_stdout_utf8(L"|");
+    write_stdout_utf8(cwd ? cwd : L"");
+    write_stdout_utf8(L"\n");
+}
+
 /* 更新顶部状态栏（带 "STATUS · " 前缀） */
 void set_status(const WCHAR *text) {
+    if (g_log_to_stdout) {
+        write_stdout_utf8(L"status=");
+        write_stdout_utf8(text ? text : L"");
+        write_stdout_utf8(L"\n");
+    }
     if (g_status && IsWindow(g_status)) {
         WCHAR buf[512];
         _snwprintf(buf, 512, L"STATUS  ·  %s", text ? text : L"");
@@ -236,25 +299,59 @@ void set_status(const WCHAR *text) {
     }
 }
 
-/* 刷新缓存卡片：读取 translation_memory_c.tsv 文件大小并显示 */
-void update_cache_card(void) {
-    if (!g_cache || !IsWindow(g_cache)) return;
-    invalidate_control_area(g_cache, 4);
+/* 缓存卡片文本：共享缓存文件大小，读不到属性时按 0 显示。
+   返回是否读到了文件属性（调用方据此保持原有的重绘次数）。 */
+int cache_size_text(WCHAR *out, int cap) {
+    if (!out || cap <= 0) return 0;
+    out[0] = 0;
     WCHAR cache_path[MAX_PATH * 4];
     path_join(cache_path, MAX_PATH * 4, g_root, L"translation_memory_c.tsv");
     WIN32_FILE_ATTRIBUTE_DATA data;
     if (GetFileAttributesExW(cache_path, GetFileExInfoStandard, &data)) {
         ULONGLONG bytes = ((ULONGLONG)data.nFileSizeHigh << 32) | data.nFileSizeLow;
-        WCHAR text[128];
-        _snwprintf(text, 128, L"%.1f MB", (double)bytes / 1024.0 / 1024.0);
-        text[127] = 0;
+        _snwprintf(out, cap, L"%.1f MB", (double)bytes / 1024.0 / 1024.0);
+        out[cap - 1] = 0;
+        return 1;
+    }
+    wcsncpy(out, L"0.0 MB", (size_t)cap - 1);
+    out[cap - 1] = 0;
+    return 0;
+}
+
+/* 刷新缓存卡片：读取 translation_memory_c.tsv 文件大小并显示 */
+void update_cache_card(void) {
+    if (!g_cache || !IsWindow(g_cache)) return;
+    invalidate_control_area(g_cache, 4);
+    WCHAR text[128];
+    if (cache_size_text(text, 128)) {
         invalidate_control_area(g_cache, 4);
         SetWindowTextW(g_cache, text);
         invalidate_control_area(g_cache, 4);
     } else {
-        SetWindowTextW(g_cache, L"0.0 MB");
+        SetWindowTextW(g_cache, text);
     }
     invalidate_control_area(g_cache, 4);
+}
+
+/* 删除共享缓存文件本身。文件不存在视为已清除；目标是目录或删除失败时保留原
+   文件并记录 Windows 错误码，绝不把失败当成已清除。 */
+int clear_cache_file(void) {
+    WCHAR cache_path[MAX_PATH * 4];
+    path_join(cache_path, MAX_PATH * 4, g_root, L"translation_memory_c.tsv");
+    DWORD attr = GetFileAttributesW(cache_path);
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return 1;
+        append_log(L"清除缓存：无法检查 %s（Windows 错误 %lu）。", cache_path, error);
+        return 0;
+    }
+    if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+        append_log(L"清除缓存：目标路径是目录，已保留：%s", cache_path);
+        return 0;
+    }
+    if (delete_file_safe(cache_path)) return 1;
+    append_log(L"清除缓存：无法删除 %s（Windows 错误 %lu）。", cache_path, GetLastError());
+    return 0;
 }
 
 void clear_translation_cache(void) {
@@ -287,24 +384,7 @@ void clear_translation_cache(void) {
 
     WCHAR cache_path[MAX_PATH * 4];
     path_join(cache_path, MAX_PATH * 4, g_root, L"translation_memory_c.tsv");
-    int cleared = 0;
-    DWORD attr = server_stopped ? GetFileAttributesW(cache_path) : INVALID_FILE_ATTRIBUTES;
-    if (!server_stopped) {
-        cleared = 0;
-    } else if (attr == INVALID_FILE_ATTRIBUTES) {
-        DWORD error = GetLastError();
-        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
-            cleared = 1;
-        } else {
-            append_log(L"清除缓存：无法检查 %s（Windows 错误 %lu）。", cache_path, error);
-        }
-    } else if (attr & FILE_ATTRIBUTE_DIRECTORY) {
-        append_log(L"清除缓存：目标路径是目录，已保留：%s", cache_path);
-    } else if (delete_file_safe(cache_path)) {
-        cleared = 1;
-    } else {
-        append_log(L"清除缓存：无法删除 %s（Windows 错误 %lu）。", cache_path, GetLastError());
-    }
+    int cleared = server_stopped ? clear_cache_file() : 0;
 
     int restarted = 1;
     if (was_running && server_stopped) {
@@ -530,7 +610,7 @@ void free_card_text_brushes(void) {
 
 /* 0..1 呼吸脉冲（正弦，周期 period_ms 毫秒） */
 static float pulse01(DWORD period_ms) {
-    DWORD now = GetTickCount() % period_ms;
+    DWORD now = anim_tick() % period_ms;
     return 0.5f + 0.5f * sinf((float)now / (float)period_ms * 6.2831853f - 1.5707963f);
 }
 
@@ -628,7 +708,7 @@ static void draw_hero_data_line(HDC dc, int left, int right, int y, COLORREF bas
     if (width <= 0) return;
 
     /* 9 秒一个往返，cos 缓动让光束两端减速，运动平滑 */
-    DWORD now = GetTickCount();
+    DWORD now = anim_tick();
     float phase = (float)(now % 9000u) / 9000.0f;
     float eased = 0.5f - 0.5f * cosf(phase * 6.2831853f);
     int beam_w = sc(96);
@@ -831,10 +911,10 @@ void paint_background(HWND hwnd, HDC dc) {
 
     draw_tech_grid(dc, rail, 0, r.right, r.bottom);
 
-    /* Rail with a restrained graphite gradient. */
+    /* 侧边导航栏：克制的石墨色渐变 */
     draw_vgradient(dc, 0, 0, rail, r.bottom, mix(C_CARD, C_RAIL, 0.35f), C_RAIL);
 
-    /* Rail right divider */
+    /* 侧边栏右侧分隔线 */
     HPEN dvpen = CreatePen(PS_SOLID, 1, C_LINE);
     HGDIOBJ odv = SelectObject(dc, dvpen);
     MoveToEx(dc, rail, 0, NULL);
@@ -844,7 +924,7 @@ void paint_background(HWND hwnd, HDC dc) {
 
     SetBkMode(dc, TRANSPARENT);
 
-    /* Brand plate uses the actual application icon. */
+    /* 品牌铭牌使用实际的应用图标 */
     RECT brand_plate = {sc(18), sc(18), sc(66), sc(66)};
     draw_panel_gradient(dc, brand_plate, C_CARD_ELEV, C_CARD, mix(C_VIOLET, C_LINE, 0.45f), sc(12));
     HICON brand_icon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_APP_ICON),
@@ -853,7 +933,7 @@ void paint_background(HWND hwnd, HDC dc) {
     draw_text_x(dc, L"ds\u6E38\u620F", sc(78), sc(20), rail - sc(92), sc(28), C_TEXT, g_font_heading, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     draw_text_x(dc, L"\u7FFB\u8BD1\u5668", sc(78), sc(46), rail - sc(92), sc(20), C_TEXT_DIM, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    /* Section divider */
+    /* 分区分隔线 */
     HPEN sd = CreatePen(PS_SOLID, 1, C_LINE);
     HGDIOBJ osd = SelectObject(dc, sd);
     MoveToEx(dc, sc(24), sc(90), NULL);
@@ -861,7 +941,7 @@ void paint_background(HWND hwnd, HDC dc) {
     SelectObject(dc, osd);
     DeleteObject(sd);
 
-    /* Active nav item with left accent rail */
+    /* 活动导航项：左侧强调色竖条 */
     int navY = sc(112);
     int navH = sc(42);
     RECT navBg = {sc(16), navY, rail - sc(16), navY + navH};
@@ -872,7 +952,7 @@ void paint_background(HWND hwnd, HDC dc) {
     DeleteObject(ab2);
     draw_text_x(dc, L"运行时汉化", sc(34), navY, rail - sc(50), navH, C_TEXT, g_font_body, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    /* Capability bullets */
+    /* 功能要点列表 */
     int capY = navY + sc(64);
     int capStep = sc(28);
     const WCHAR *caps[] = {L"本地缓存优先", L"运行时不等待 API", L"标签/变量保护"};
@@ -886,15 +966,15 @@ void paint_background(HWND hwnd, HDC dc) {
         draw_text_x(dc, caps[i], sc(40), yy, rail - sc(56), sc(22), C_TEXT_DIM, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     }
 
-    /* Rail footer: version chip + runtime tag */
+    /* 侧边栏底栏：版本徽章 + 运行时标签 */
     int footY = r.bottom - sc(58);
     int footH = sc(26);
     RECT chip = {sc(20), footY, sc(104), footY + footH};
     draw_round(dc, chip, C_CARD_ELEV, mix(C_VIOLET, C_LINE, 0.45f), sc(6));
     draw_text_x(dc, DS_TRANSLATOR_VERSION_W, sc(20), footY, sc(84), footH, C_ACCENT, g_font_mono_small, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-    draw_text_x(dc, L"C native runtime", sc(112), footY, rail - sc(120), footH, C_MUTED, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, ui_runtime_tag(), sc(112), footY, rail - sc(120), footH, C_MUTED, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    /* Main area geometry */
+    /* 主区域几何参数 */
     int x = ui.x;
     int w = ui.w;
 
@@ -918,10 +998,10 @@ void paint_background(HWND hwnd, HDC dc) {
     draw_text_x(dc, alive ? L"ONLINE" : L"OFFLINE", pillX + sc(36), pillY, pillW - sc(46), pillH,
                 alive ? C_GREEN : C_DANGER, g_font_mono_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    /* Picker card */
+    /* 选择器卡片 */
     draw_panel_shell(dc, ui.picker, C_BLUE, 0);
 
-    /* Metric cards */
+    /* 指标卡片 */
     int gap = ui.metric_gap;
     int cardW = ui.metric_w;
     int mY = ui.metric_y;
@@ -940,12 +1020,12 @@ void paint_background(HWND hwnd, HDC dc) {
         draw_text_x(dc, labels[i], cx + sc(24), mY + sc(14), cardW - sc(36), sc(20), C_MUTED, g_font_mono_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     }
 
-    /* Log card with header bar */
+    /* 日志卡片（含标题栏） */
     int logCardTop = ui.log_top;
     RECT log_card = {x, logCardTop, x + w, ui.log_bottom};
     draw_panel_shell(dc, log_card, C_VIOLET, 0);
 
-    /* Log header */
+    /* 日志标题栏 */
     int hdrY = logCardTop + sc(12);
     int hdrH = sc(24);
     draw_text_x(dc, L"ACTIVITY LOG", x + sc(18), hdrY, w - sc(140), hdrH, C_TEXT_DIM, g_font_mono_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
@@ -965,7 +1045,7 @@ void paint_background(HWND hwnd, HDC dc) {
     SelectObject(dc, ohp);
     DeleteObject(hp);
 
-    /* Border around the path EDIT */
+    /* 路径输入框（EDIT）外框 */
     int peX = ui.path_x;
     int peY = ui.path_y;
     int peH = ui.path_h;
@@ -982,10 +1062,9 @@ void paint_background_buffered(HWND hwnd, HDC dc, const RECT *dirty) {
     HDC buffer_dc = CreateCompatibleDC(dc);
     HBITMAP buffer_bitmap = buffer_dc ? CreateCompatibleBitmap(dc, width, height) : NULL;
 
-    /* CreateCompatibleDC/CreateCompatibleBitmap can fail when Windows exhausts
-       process-wide GDI resources. That allocation is owned by the OS and cannot
-       be repaired upstream. Direct paint keeps the launcher usable but may expose
-       the original flicker; the diagnostic remains visible to a debugger. */
+    /* 当 Windows 耗尽进程级 GDI 资源时，CreateCompatibleDC/CreateCompatibleBitmap
+       可能失败。该分配归操作系统所有，无法在上游修复。直接绘制可保持启动器
+       可用，但可能重新暴露原始的闪烁问题；诊断信息对调试器可见。 */
     if (!buffer_dc || !buffer_bitmap) {
         OutputDebugStringW(L"ds launcher: GDI back buffer unavailable; using direct paint.\n");
         if (buffer_bitmap) DeleteObject(buffer_bitmap);
@@ -1025,19 +1104,19 @@ void layout(HWND hwnd) {
 
     const UINT position_flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
 
-    /* Hero band */
+    /* 英雄标题带 */
     int hero_right = ui.hero_right;
     position_control(g_title,    x, sc(18), w - hero_right, sc(44), position_flags);
     position_control(g_subtitle, x, sc(66), w - hero_right, sc(22), position_flags);
     position_control(g_status,   x, sc(94), w - hero_right, sc(22), position_flags);
 
-    /* Picker card content */
+    /* 选择器卡片内容 */
     position_control(g_path_label, ui.path_label_x, ui.path_label_y, ui.path_label_w, ui.path_label_h, position_flags);
     position_control(g_path, ui.path_x, ui.path_y, ui.path_w, ui.path_h, position_flags);
     position_control(GetDlgItem(hwnd, IDC_BROWSE), ui.browse_x, ui.path_y, ui.side_button_w, ui.path_h, position_flags);
     position_control(GetDlgItem(hwnd, IDC_OPEN),   ui.open_x,   ui.path_y, ui.side_button_w, ui.path_h, position_flags);
 
-    /* Action buttons row */
+    /* 操作按钮行 */
     int abY = ui.action_y;
     int abH = ui.action_h;
     position_control(GetDlgItem(hwnd, IDC_START), ui.action_x[0], abY, ui.action_button_w, abH, position_flags);
@@ -1046,7 +1125,7 @@ void layout(HWND hwnd) {
     int api_w = x + w - sc(24) - ui.action_x[3];
     position_control(g_btn_api,                   ui.action_x[3], abY, api_w, abH, position_flags);
 
-    /* Metric cards: position values in the lower half of each card */
+    /* 指标卡片：值定位在每张卡片下半部 */
     int gap = ui.metric_gap;
     int cardW = ui.metric_w;
     int mValY = ui.metric_value_y;
@@ -1058,7 +1137,7 @@ void layout(HWND hwnd) {
     position_control(g_cache, cacheX + sc(18), mValY, cardW - clearW - sc(42), mValH, position_flags);
     position_control(g_btn_clear_cache, cacheX + cardW - clearW - sc(14), mValY + sc(2), clearW, mValH - sc(4), position_flags);
 
-    /* Log content area inside log card (header is painted) */
+    /* 日志卡片内的日志内容区（标题栏由背景绘制） */
     position_control(g_log, x + sc(18), ui.log_edit_top, w - sc(36), ui.log_edit_h, position_flags);
 
     RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_NOERASE);
@@ -1301,6 +1380,10 @@ static void launch_game_with_params(const WCHAR *dir, const WCHAR *params) {
         return;
     }
     append_log(L"启动游戏：%s", exe);
+    if (g_launch_dry_run) {
+        write_spawn_plan(L"shell", exe, params, dir);
+        return;
+    }
     HINSTANCE exec_result = ShellExecuteW(g_main, L"open", exe, params, dir, SW_SHOWNORMAL);
     /* ShellExecuteW 返回值 <=32 表示失败（2=文件未找到、5=拒绝访问等） */
     if ((INT_PTR)exec_result <= 32) {
@@ -1346,9 +1429,9 @@ void restore_selected_game(void) {
         L"还原游戏", ok ? MB_ICONINFORMATION : MB_ICONWARNING);
 }
 
-/* A release template may omit command-line script support or ignore editor-only
-   syntax checks. The bridge owns a private argument that exits immediately once
-   the script has actually loaded, so a short hidden process can verify support. */
+/* 发行版模板可能缺少命令行脚本支持，或忽略编辑器专用的语法检查。
+   桥接脚本持有一个私有参数：脚本真正加载后立即退出，从而让一个短暂的
+   隐藏进程即可验证该支持是否可用。 */
 static int godot_runtime_sidecar_preflight(const WCHAR *dir, const WCHAR *runtime_exe,
                                            const WCHAR *pack,
                                            const WCHAR *script, int loose_project) {
@@ -1359,6 +1442,25 @@ static int godot_runtime_sidecar_preflight(const WCHAR *dir, const WCHAR *runtim
         exe[MAX_PATH * 4 - 1] = 0;
     } else if (!find_exe(dir, exe, MAX_PATH * 4)) {
         return 0;
+    }
+
+    /* 预检结论缓存：引擎/游戏/脚本/补丁任一变化即未命中。
+       只有成功结论入缓存——超时等瞬态失败下次启动会重新预检。 */
+    WCHAR sig[MAX_PATH * 8];
+    godot_preflight_sig_init(sig, MAX_PATH * 8);
+    godot_preflight_sig_add_file(sig, MAX_PATH * 8, exe);
+    godot_preflight_sig_add_text(sig, MAX_PATH * 8, dir);
+    if (pack && pack[0]) godot_preflight_sig_add_file(sig, MAX_PATH * 8, pack);
+    else godot_preflight_sig_add_text(sig, MAX_PATH * 8, L"nopack");
+    if (wcsncmp(script, L"res://", 6) == 0) godot_preflight_sig_add_text(sig, MAX_PATH * 8, script);
+    else godot_preflight_sig_add_file(sig, MAX_PATH * 8, script);
+    godot_preflight_sig_add_text(sig, MAX_PATH * 8, loose_project ? L"loose" : L"export");
+    int cached = godot_preflight_cache_get(L"sidecar", sig);
+    if (cached >= 0) {
+        append_log(cached
+            ? L"Godot: sidecar preflight cache hit (supported)."
+            : L"Godot: sidecar preflight cache hit (not supported).");
+        return cached;
     }
 
     WCHAR cmd[MAX_PATH * 12];
@@ -1407,14 +1509,30 @@ static int godot_runtime_sidecar_preflight(const WCHAR *dir, const WCHAR *runtim
         append_log(L"Godot: runtime sidecar preflight exited with code %lu.", exit_code);
     }
     CloseHandle(pi.hProcess);
+    /* 只有成功结论入缓存；超时/非零退出可能是瞬态或游戏侧问题，不缓存。 */
+    if (ok) godot_preflight_cache_put(L"sidecar", sig, 1);
     return ok;
 }
 
-/* Some exported Godot templates reject both --main-pack and --script. Format 3
-   patch packs register the translator as an autoload, so the matching
-   launcher-owned executable can prove that path using only a private user arg. */
+/* 某些导出的 Godot 模板会同时拒绝 --main-pack 与 --script。Format 3 补丁包
+   把翻译器注册为 autoload，因此匹配的启动器自有可执行文件只需一个私有
+   用户参数即可验证该路径可用。 */
 static int godot_runtime_autoload_preflight(const WCHAR *dir, const WCHAR *runtime_exe) {
     if (!dir || !runtime_exe || !runtime_exe[0]) return 0;
+
+    /* 预检结论缓存（引擎 exe 特征为键；只有成功结论入缓存）。 */
+    WCHAR sig[MAX_PATH * 8];
+    godot_preflight_sig_init(sig, MAX_PATH * 8);
+    godot_preflight_sig_add_file(sig, MAX_PATH * 8, runtime_exe);
+    godot_preflight_sig_add_text(sig, MAX_PATH * 8, dir);
+    int cached = godot_preflight_cache_get(L"autoload", sig);
+    if (cached >= 0) {
+        append_log(cached
+            ? L"Godot: runtime autoload preflight cache hit (supported)."
+            : L"Godot: runtime autoload preflight cache hit (not supported).");
+        return cached;
+    }
+
     WCHAR cmd[MAX_PATH * 12];
     if (!wide_format_checked(cmd, MAX_PATH * 12,
                              L"\"%s\" --headless -- --dst-preflight",
@@ -1450,22 +1568,20 @@ static int godot_runtime_autoload_preflight(const WCHAR *dir, const WCHAR *runti
         append_log(L"Godot: runtime autoload preflight exited with code %lu.", exit_code);
     }
     CloseHandle(pi.hProcess);
+    /* 只有成功结论入缓存；超时/非零退出可能是瞬态或游戏侧问题，不缓存。 */
+    if (ok) godot_preflight_cache_put(L"autoload", sig, 1);
     return ok;
 }
 
-/* A non-zero process exit is not proof that --main-pack is unsupported: an
-   exported game can fail headlessly in its own autoload, DRM, audio or startup
-   code.  Only an explicit command-line parser diagnostic mentioning the option
-   is classified as rejection.  Other failures remain visible in the log and
-   are allowed to reach the real launch path instead of silently disabling
-   translation. */
-/* The static fallback in launch_godot_with_pack can only load the patch pack
-   through --main-pack, and some exported templates reject that argument. A
-   failed sidecar preflight only proves that --main-pack and --script together
-   were refused; this minimal probe isolates --main-pack so the launcher does
-   not spawn a process that exits immediately. A timeout means the engine
-   booted far enough to keep running, which counts as supported (the previous
-   behavior). */
+/* 进程以非零码退出并不足以证明 --main-pack 不受支持：导出的游戏可能在
+   自身的 autoload、DRM、音频或启动代码中无头启动失败。只有明确提及该选项
+   的命令行解析诊断才被归类为"拒绝"。其他失败仍会记录在日志中，并允许
+   走到真实启动路径，而不是被静默禁用翻译。 */
+/* launch_godot_with_pack 中的静态回退只能通过 --main-pack 加载补丁包，而
+   某些导出模板会拒绝该参数。sidecar 预检失败只能证明 --main-pack 与
+   --script 的组合被拒绝；这个最小探测单独隔离 --main-pack，避免启动器
+   拉起一个立即退出的进程。超时意味着引擎已启动到足以继续运行的程度，
+   视为支持（与之前的行为一致）。 */
 static int godot_main_pack_supported(const WCHAR *dir, const WCHAR *runtime_exe, const WCHAR *pack) {
     WCHAR cmd[MAX_PATH * 12];
     if (!wide_format_checked(cmd, MAX_PATH * 12,
@@ -1473,6 +1589,21 @@ static int godot_main_pack_supported(const WCHAR *dir, const WCHAR *runtime_exe,
                              runtime_exe, pack)) {
         append_log(L"Godot: --main-pack probe command is too long.");
         return 0;
+    }
+
+    /* 预检结论缓存：成功（含超时视为支持）与 Godot 明确拒绝都入缓存；
+       非选项性启动错误属于结论不确定，不入缓存，下次仍会重新探测。 */
+    WCHAR sig[MAX_PATH * 8];
+    godot_preflight_sig_init(sig, MAX_PATH * 8);
+    godot_preflight_sig_add_file(sig, MAX_PATH * 8, runtime_exe);
+    godot_preflight_sig_add_file(sig, MAX_PATH * 8, pack);
+    godot_preflight_sig_add_text(sig, MAX_PATH * 8, dir);
+    int cached = godot_preflight_cache_get(L"mainpack", sig);
+    if (cached >= 0) {
+        append_log(cached
+            ? L"Godot: --main-pack probe cache hit (supported)."
+            : L"Godot: --main-pack probe cache hit (explicitly rejected).");
+        return cached;
     }
 
     STARTUPINFOW si;
@@ -1508,7 +1639,7 @@ static int godot_main_pack_supported(const WCHAR *dir, const WCHAR *runtime_exe,
 
     if (!CreateProcessW(runtime_exe, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
                         NULL, dir, &si, &pi)) {
-        /* Inconclusive: let the real launch path attempt and log its own error. */
+        /* 结论不确定：让真实启动路径去尝试并记录它自己的错误。 */
         append_log(L"Godot: --main-pack probe could not start. Windows error: %lu", GetLastError());
         CloseHandle(capture);
         return 1;
@@ -1548,6 +1679,10 @@ static int godot_main_pack_supported(const WCHAR *dir, const WCHAR *runtime_exe,
                    GetLastError());
     }
     CloseHandle(pi.hProcess);
+    /* 确定性结论入缓存：Godot 明确拒绝（不支持）与确认支持（成功/超时保活）。
+       非选项性启动错误 = 结论不确定，不入缓存，下次仍会重新探测。 */
+    if (rejected) godot_preflight_cache_put(L"mainpack", sig, 0);
+    else if (!exited_nonzero) godot_preflight_cache_put(L"mainpack", sig, 1);
     return !rejected;
 }
 
@@ -1630,6 +1765,10 @@ static int launch_godot_with_pack(const WCHAR *dir, const WCHAR *pack) {
     append_log((has_runtime_autoload || has_runtime_bridge)
         ? L"Launching Godot export with patch pack and runtime translator: %s"
         : L"Launching Godot export with static patch pack: %s", runtime_exe);
+    if (g_launch_dry_run) {
+        write_spawn_plan(L"proc", runtime_exe, cmd, dir);
+        return 1;
+    }
     if (!CreateProcessW(runtime_exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
         append_log(L"Godot: failed to launch with patch pack. Windows error: %lu", GetLastError());
         return 0;
@@ -1667,6 +1806,10 @@ static int launch_godot_export_with_runtime_sidecar(const WCHAR *dir) {
     si.cb = sizeof si;
 
     append_log(L"Launching Godot export with runtime translator before static patch is ready: %s", exe);
+    if (g_launch_dry_run) {
+        write_spawn_plan(L"proc", exe, cmd, dir);
+        return 1;
+    }
     if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
         append_log(L"Godot: failed to launch export runtime sidecar. Windows error: %lu", GetLastError());
         return 0;
@@ -1704,6 +1847,10 @@ static int launch_godot_with_runtime_sidecar(const WCHAR *dir) {
     si.cb = sizeof si;
 
     append_log(L"Launching Godot loose project with runtime translator: %s", exe);
+    if (g_launch_dry_run) {
+        write_spawn_plan(L"proc", exe, cmd, dir);
+        return 1;
+    }
     if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
         append_log(L"Godot: failed to launch with runtime sidecar. Windows error: %lu", GetLastError());
         return 0;
@@ -1742,10 +1889,9 @@ static void launch_game_for_engine(const WCHAR *dir, Engine engine) {
     launch_game(dir);
 }
 
-/* The detached patch worker runs without a window, so its append_log calls
-   only reach OutputDebugStringW. The parent additionally waits on the worker
-   here and records its exit code in the launcher log so a failed patch run
-   stays visible (exit codes: 2=bad args, 3=server not ready, 4=pack failed). */
+/* 独立的补丁工作进程没有窗口，其 append_log 只会到达 OutputDebugStringW。
+   父进程在此额外等待该工作进程并把退出码记入启动器日志，使失败的补丁
+   构建保持可见（退出码：2=参数错误，3=服务器未就绪，4=补丁包构建失败）。 */
 static DWORD WINAPI godot_patch_worker_watch_thread(LPVOID p) {
     HANDLE process = (HANDLE)p;
     WaitForSingleObject(process, INFINITE);
@@ -1784,6 +1930,12 @@ static int start_godot_patch_worker(const WCHAR *dir) {
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
 
+    if (g_launch_dry_run) {
+        write_spawn_plan(L"worker", exe, cmd, g_root);
+        append_log(L"Godot: patch refresh worker started.");
+        return 1;
+    }
+
     DWORD flags = CREATE_NO_WINDOW;
     if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, flags, NULL,
                         g_root[0] ? g_root : NULL, &si, &pi)) {
@@ -1809,12 +1961,11 @@ typedef struct {
     Engine engine;
 } WarmupLaunchArgs;
 
-static void run_engine_launch_flow(const WCHAR *dir, Engine engine) {
+void run_engine_launch_flow(const WCHAR *dir, Engine engine) {
     if (engine == ENGINE_RENPY) {
-        /* Ren'Py render callbacks never wait on HTTP; daemon workers handle
-           cache and live lookups, so the game can start while the whole-script
-           prefetch queues behind it. Unity/XUnity keep import-before-launch:
-           their plugins issue live lookups that should hit imported rows. */
+        /* Ren'Py 渲染回调从不等待 HTTP；守护线程负责缓存与实时查询，因此
+           游戏可以在整本剧本预热的后台排队期间先启动。Unity/XUnity 保持
+           先导入后启动：其插件发出的实时查询应当命中已导入的行。 */
         launch_game_for_engine(dir, engine);
         set_status(L"已启动 · 正在后台预热剧本...");
         warmup_translations(dir, engine);
@@ -1831,9 +1982,9 @@ static void run_engine_launch_flow(const WCHAR *dir, Engine engine) {
             launch_game_for_engine(dir, engine);
             set_status(L"Godot: 已启动，正在后台准备翻译补丁...");
         }
-        /* The game is already responsive while this worker thread scans and
-           queues resources. Run warmup before the detached rebuild so Markdown
-           dialogue and compiled-scene BBCode can populate runtime cache keys. */
+        /* 本工作线程扫描并入队资源时游戏已经可以响应。在分离式重建之前
+           先预热，让 Markdown 对话与编译场景的 BBCode 能先填充运行时
+           缓存键。 */
         warmup_translations(dir, engine);
         if (!start_godot_patch_worker(dir)) {
             append_log(had_patch
@@ -1853,8 +2004,9 @@ static void report_server_start_failure(void) {
     set_status(L"状态：服务器启动失败，未启动游戏");
 }
 
-/* 按引擎部署翻译钩子；start_translation 的工作线程与同步回退共用。 */
-static void deploy_for_engine(const WCHAR *dir, Engine e) {
+/* 按引擎部署翻译钩子；start_translation 的工作线程、同步回退与
+   --deploy-and-exit 诊断子命令共用。 */
+int deploy_for_engine(const WCHAR *dir, Engine e) {
     int deployed = 0;
     if (e == ENGINE_RENPY) deployed = deploy_renpy(dir);
     else if (e == ENGINE_RPGM_MV) deployed = deploy_rpgm(dir);
@@ -1864,6 +2016,7 @@ static void deploy_for_engine(const WCHAR *dir, Engine e) {
     else if (e == ENGINE_RPGM_LEGACY) append_log(L"RPGM XP/VX：离线写入器仍待迁移，当前保留本地缓存服务。");
     else append_log(L"未知引擎：只启动服务端和游戏。");
     append_log(deployed ? L"部署完成。" : L"部署跳过或未完成。");
+    return deployed;
 }
 
 /* start_server 的就绪轮询最长 15 秒、deploy 是同步文件 I/O、warmup 扫描
@@ -1909,10 +2062,9 @@ void start_translation(void) {
     set_status(L"正在启动服务并部署...");
     g_start_flow_running = 1;
 
-    /* Offload server startup, deploy, warmup (heavy I/O + sync HTTP) and game
-       launch so the UI thread doesn't freeze. Pass a private copy of the path
-       so a concurrent path-box edit (which rewrites g_game via refresh_engine)
-       can't change it midway. */
+    /* 把服务器启动、部署、预热（重 I/O + 同步 HTTP）和游戏启动全部放到
+       工作线程，避免 UI 冻结。传入路径的私有副本，防止并发的路径框编辑
+       （会经 refresh_engine 重写 g_game）在中途改变它。 */
     WarmupLaunchArgs *args = (WarmupLaunchArgs *)malloc(sizeof *args);
     HANDLE th = NULL;
     if (args) {
@@ -1924,7 +2076,7 @@ void start_translation(void) {
             CloseHandle(th);
             return;
         }
-        free(args); /* CreateThread failed: fall back to the synchronous path */
+        free(args); /* CreateThread 失败：回退到同步路径 */
     }
     if (!start_server()) {
         report_server_start_failure();

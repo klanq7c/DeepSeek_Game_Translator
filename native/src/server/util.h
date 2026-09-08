@@ -9,7 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Normalize wrappers and echoed translation instructions in-place. */
+/* 原地清理译文包装和被回显的翻译指令。 */
 void normalize_translation_result(char *s);
 
 /* 打印错误信息后终止进程。两种声明用于兼容 MSVC 与 C11 的 noreturn 写法。 */
@@ -26,6 +26,11 @@ void *xcalloc(size_t count, size_t size);
 void *xrealloc(void *p, size_t n);
 char *xstrndup(const char *s, size_t n);   /* 复制前 n 字节，自动追加 '\0' */
 char *xstrdup(const char *s);              /* 全串复制，s 为 NULL 时视为空串 */
+
+#ifdef DST_TEST_ALLOC_COUNTERS
+void dst_test_alloc_reset(void);
+size_t dst_test_alloc_count(void);
+#endif
 
 int ieq(const char *a, const char *b);                 /* 不区分大小写比较相等 */
 char *istrstr(char *hay, const char *needle);          /* 不区分大小写子串查找 */

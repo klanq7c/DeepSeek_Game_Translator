@@ -6,18 +6,21 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$versionFile = Join-Path $repo "VERSION"
+if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
+    throw "Missing VERSION file: $versionFile"
+}
+$versionFileContent = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+if (-not $versionFileContent) { throw "Missing VERSION value in $versionFile" }
 if (-not $Version) {
-    $versionFile = Join-Path $repo "VERSION"
-    if (Test-Path -LiteralPath $versionFile) {
-        $Version = (Get-Content -LiteralPath $versionFile -Raw).Trim()
-    }
-    if (-not $Version) {
-        $Version = "preview"
-    }
+    $Version = $versionFileContent
 }
 if ($Version -notmatch '\A[0-9A-Za-z][0-9A-Za-z._+-]{0,63}\z' -or
     $Version -eq "." -or $Version -eq "..") {
     throw "Invalid release version. Use 1-64 ASCII letters, digits, dot, underscore, plus, or hyphen."
+}
+if (-not [string]::Equals($Version, $versionFileContent, [StringComparison]::Ordinal)) {
+    throw "Release version '$Version' must match VERSION '$versionFileContent'."
 }
 $outputRoot = Join-Path $repo "build\open_source"
 $stageName = "DeepSeek_Game_Translator_source_$Version"
@@ -61,6 +64,7 @@ if (Test-Path -LiteralPath $stage) {
 New-Item -ItemType Directory -Path $stage | Out-Null
 
 $includeFiles = @(
+    ".gitattributes",
     ".gitignore",
     "AGENTS.md",
     "CONTEXT.md",
@@ -75,18 +79,26 @@ $includeFiles = @(
     "build_native.bat",
     "start_server.bat",
     "config\api.ini.example",
-    "config\launcher.ini.example"
+    "config\launcher.ini.example",
+    "config\glossary.example.tsv"
 )
 
 $includeDirs = @(
     "assets",
     "native\src",
+    # Engine runtime scripts embedded into the launcher (build_native.bat RCDATA 301-304).
+    "payloads\RenPy",
+    "payloads\RPGMaker",
+    "payloads\Godot",
+    # Managed payload fingerprints: build_native.bat refuses to package stale DLLs without them.
+    "payloads\ManagedBuildStamps",
     "payloads\UnityTranslator\src",
     "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src",
     "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\src",
-    "tests",
     "scripts",
-    "docs"
+    "docs",
+    # build_native.bat runs tests\core_tests; the contract/payload checks live here too.
+    "tests"
 )
 
 $excludedPathParts = @(
@@ -153,7 +165,11 @@ foreach ($dir in $includeDirs) {
     }
 }
 
+$allowedExampleTsv = "config\glossary.example.tsv"
 $forbiddenFiles = Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object {
+    if ($_.FullName.Substring($stage.Length).TrimStart("\", "/") -replace "/", "\" -ieq $allowedExampleTsv) {
+        return $false
+    }
     $excludedExtensions -contains $_.Extension.ToLowerInvariant()
 }
 if ($forbiddenFiles) {
@@ -164,9 +180,9 @@ if ($forbiddenFiles) {
 $secretHits = @()
 $scanPatterns = @(
     "sk-[A-Za-z0-9]{16,}",
-    "(?i)api[_-]?key\s*=\s*[^<\s][^\r\n]+",
-    "(?i)password\s*=\s*[^<\s][^\r\n]+",
-    "(?i)secret\s*=\s*[^<\s][^\r\n]+",
+    "(?i)(?<![A-Za-z0-9_])api[_-]?key\s*=\s*[^<\s][^\r\n]+",
+    "(?i)(?<![A-Za-z0-9_])password\s*=\s*[^<\s][^\r\n]+",
+    "(?i)(?<![A-Za-z0-9_])secret\s*=\s*[^<\s][^\r\n]+",
     "(?i)Authorization:\s*Bearer\s+[A-Za-z0-9._-]+",
     "C:\\Users\\[A-Za-z0-9._-]+",
     "E:\\Projects\\[^\\\r\n]+",

@@ -1,2 +1,8 @@
 [launcher]
 last_game_dir=
+
+[server]
+; Which local translation server binary the launcher starts.
+;   native = native\dst_server.exe (default)
+;   cs     = native\dst_server_cs.exe (C# parallel build, same HTTP contract)
+binary=native
