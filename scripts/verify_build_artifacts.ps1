@@ -1,6 +1,8 @@
 param(
     [switch]$ManagedPayloadsOnly,
-    [switch]$RequireComplete
+    [switch]$RequireComplete,
+    [ValidateSet("UnityMono5", "UnityMono6", "UnityXUnity", "UnityTmpFallback", "UnityFontPatcher")]
+    [string]$RecordManagedPayload = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,6 +27,28 @@ function Get-SourceFiles {
         }
         return $true
     })
+}
+
+# Source files a .csproj pulls in from outside its own directory via
+# <Compile Include="..\..\native\src\core\X.cs" ...>. Wildcards are expanded
+# relative to the project directory; missing files are ignored (the compiler
+# would already have failed on them).
+function Get-LinkedCompileSources {
+    param([Parameter(Mandatory = $true)][string]$Csproj)
+
+    if (-not (Test-Path -LiteralPath $Csproj -PathType Leaf)) { return @() }
+    $projectDir = Split-Path -Parent $Csproj
+    $content = Get-Content -LiteralPath $Csproj -Raw -Encoding UTF8
+    $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($match in [regex]::Matches($content, '<Compile\s+Include="([^"]+)"')) {
+        $pattern = $match.Groups[1].Value
+        if ($pattern -notmatch '[\\/]\.\.[\\/]' -and $pattern -notmatch '^\.\.[\\/]') { continue }
+        $resolved = Join-Path $projectDir $pattern
+        foreach ($item in @(Get-ChildItem -Path $resolved -File -ErrorAction SilentlyContinue)) {
+            $files.Add($item)
+        }
+    }
+    return @($files)
 }
 
 function Assert-OutputFresh {
@@ -55,29 +79,60 @@ function Assert-OutputFresh {
 }
 
 function Assert-ManagedPayloadsFresh {
-    $monoSourceRoot = Join-Path $repo "payloads\UnityTranslator\src"
-    $monoInputs = @(Get-SourceFiles -Root $monoSourceRoot | Where-Object {
+    foreach ($definition in Get-ManagedPayloadDefinitions) {
+        $inputs = @($definition.Inputs)
+        Assert-ManagedPayloadFingerprint $definition $inputs
+    }
+}
+
+function Get-ManagedPayloadDefinitions {
+    $stampRoot = Join-Path $repo "payloads\ManagedBuildStamps"
+    # The managed build recipe lives in its own script so that launcher/server
+    # changes in build_native.bat do not invalidate payload stamps that can only
+    # be re-recorded on a machine with the Unity/BepInEx reference assemblies.
+    $recipeInputs = @(
+        Get-Item -LiteralPath (Join-Path $repo "scripts\build_managed_payloads.bat")
+        Get-Item -LiteralPath (Join-Path $repo "scripts\install_runtime_payloads.ps1")
+    )
+    $monoRoot = Join-Path $repo "payloads\UnityTranslator\src"
+    $monoInputs = @(Get-SourceFiles -Root $monoRoot | Where-Object {
         $_.FullName -notmatch "[\\/]FontPatcher[\\/]"
     })
-    Assert-OutputFresh "Unity Mono BepInEx 5 payload" `
-        (Join-Path $repo "payloads\UnityTranslator\UnityTranslator.dll") $monoInputs
-    Assert-OutputFresh "Unity Mono BepInEx 6 payload" `
-        (Join-Path $repo "payloads\UnityTranslator\UnityTranslator.BepInEx6.dll") $monoInputs
-
     $endpointRoot = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src"
-    Assert-OutputFresh "Unity IL2CPP XUnity endpoint" `
-        (Join-Path $repo "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll") `
-        @(Get-SourceFiles -Root $endpointRoot)
-
+    # The endpoint links shared-core sources from native\src\core (see its .csproj);
+    # a change there must invalidate the payload too, so fingerprint it repo-relative.
+    $endpointInputs = @(Get-SourceFiles -Root $endpointRoot) +
+        @(Get-LinkedCompileSources -Csproj (Join-Path $endpointRoot "DeepSeekXUnityTranslator.csproj"))
     $tmpRoot = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\src"
-    Assert-OutputFresh "Unity IL2CPP TMP fallback payload" `
-        (Join-Path $repo "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll") `
-        @(Get-SourceFiles -Root $tmpRoot)
-
     $fontPatcherRoot = Join-Path $repo "payloads\UnityTranslator\src\FontPatcher"
-    Assert-OutputFresh "Unity Mono stripped-font patcher" `
-        (Join-Path $repo "payloads\UnityTranslator\DeepSeekUnityFontPatcher.dll") `
-        @(Get-SourceFiles -Root $fontPatcherRoot)
+
+    $items = @(
+        [pscustomobject]@{
+            Name = "UnityMono5"; Label = "Unity Mono BepInEx 5 payload"; SourceRoot = $monoRoot
+            Inputs = $monoInputs; Output = Join-Path $repo "payloads\UnityTranslator\UnityTranslator.dll"
+        },
+        [pscustomobject]@{
+            Name = "UnityMono6"; Label = "Unity Mono BepInEx 6 payload"; SourceRoot = $monoRoot
+            Inputs = $monoInputs; Output = Join-Path $repo "payloads\UnityTranslator\UnityTranslator.BepInEx6.dll"
+        },
+        [pscustomobject]@{
+            Name = "UnityXUnity"; Label = "Unity IL2CPP XUnity endpoint"; SourceRoot = $repo
+            Inputs = $endpointInputs; Output = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll"
+        },
+        [pscustomobject]@{
+            Name = "UnityTmpFallback"; Label = "Unity IL2CPP TMP fallback payload"; SourceRoot = $tmpRoot
+            Inputs = @(Get-SourceFiles -Root $tmpRoot); Output = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll"
+        },
+        [pscustomobject]@{
+            Name = "UnityFontPatcher"; Label = "Unity Mono stripped-font patcher"; SourceRoot = $fontPatcherRoot
+            Inputs = @(Get-SourceFiles -Root $fontPatcherRoot); Output = Join-Path $repo "payloads\UnityTranslator\DeepSeekUnityFontPatcher.dll"
+        }
+    )
+    foreach ($item in $items) {
+        $item | Add-Member -NotePropertyName Stamp -NotePropertyValue (Join-Path $stampRoot ($item.Name + ".json"))
+        $item | Add-Member -NotePropertyName RecipeInputs -NotePropertyValue $recipeInputs
+    }
+    return $items
 }
 
 function Add-ResourceReaderType {
@@ -151,6 +206,102 @@ function Get-EmbeddedResourceHash {
     }
 }
 
+function Get-FileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $stream = [IO.File]::OpenRead($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace("-", "")
+    } finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Get-SourceFingerprint {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Inputs
+    )
+
+    $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd([char[]]@('\', '/'))
+    $builder = [Text.StringBuilder]::new()
+    foreach ($file in ($Inputs | Sort-Object FullName)) {
+        $fullPath = [IO.Path]::GetFullPath($file.FullName)
+        if (-not $fullPath.StartsWith($rootPath + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "source '$fullPath' is outside fingerprint root '$rootPath'"
+        }
+        $relative = $fullPath.Substring($rootPath.Length + 1).Replace('\', '/')
+        [void]$builder.Append($relative).Append("`t").Append((Get-FileSha256 $fullPath)).Append("`n")
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($builder.ToString())
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-", "")
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Write-ManagedPayloadStamp {
+    param([Parameter(Mandatory = $true)]$Definition)
+
+    $inputs = @($Definition.Inputs)
+    if ($inputs.Count -eq 0) { throw "$($Definition.Label) has no source inputs to record" }
+    if (-not (Test-Path -LiteralPath $Definition.Output -PathType Leaf)) {
+        throw "$($Definition.Label) is missing: $($Definition.Output)"
+    }
+    $stamp = [ordered]@{
+        schema = 2
+        sourceSha256 = Get-SourceFingerprint $Definition.SourceRoot $inputs
+        recipeSha256 = Get-SourceFingerprint $repo @($Definition.RecipeInputs)
+        outputSha256 = Get-FileSha256 $Definition.Output
+    }
+    $stampDirectory = Split-Path -Parent $Definition.Stamp
+    if (-not (Test-Path -LiteralPath $stampDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $stampDirectory -Force | Out-Null
+    }
+    $utf8NoBom = [Text.UTF8Encoding]::new($false)
+    $json = ($stamp | ConvertTo-Json).Replace("`r`n", "`n")
+    [IO.File]::WriteAllText($Definition.Stamp, ($json + "`n"), $utf8NoBom)
+    Write-Host ("Recorded managed payload fingerprint: " + $Definition.Name) -ForegroundColor Green
+}
+
+function Assert-ManagedPayloadFingerprint {
+    param(
+        [Parameter(Mandatory = $true)]$Definition,
+        [Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Inputs
+    )
+
+    if (-not (Test-Path -LiteralPath $Definition.Stamp -PathType Leaf)) {
+        $script:errors.Add("$($Definition.Label) fingerprint is missing: $($Definition.Stamp)")
+        return
+    }
+    if (-not (Test-Path -LiteralPath $Definition.Output -PathType Leaf) -or $Inputs.Count -eq 0) { return }
+    try {
+        $stamp = Get-Content -LiteralPath $Definition.Stamp -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($stamp.schema -ne 2 -or -not $stamp.sourceSha256 -or
+            -not $stamp.recipeSha256 -or -not $stamp.outputSha256) {
+            throw "unsupported or incomplete fingerprint record"
+        }
+        $sourceHash = Get-SourceFingerprint $Definition.SourceRoot $Inputs
+        if ($sourceHash -ne ([string]$stamp.sourceSha256).ToUpperInvariant()) {
+            $script:errors.Add("$($Definition.Label) source fingerprint does not match its recorded build")
+        }
+        $recipeHash = Get-SourceFingerprint $repo @($Definition.RecipeInputs)
+        if ($recipeHash -ne ([string]$stamp.recipeSha256).ToUpperInvariant()) {
+            $script:errors.Add("$($Definition.Label) build recipe fingerprint does not match its recorded build")
+        }
+        $outputHash = Get-FileSha256 $Definition.Output
+        if ($outputHash -ne ([string]$stamp.outputSha256).ToUpperInvariant()) {
+            $script:errors.Add("$($Definition.Label) output fingerprint does not match its recorded build")
+        }
+    } catch {
+        $script:errors.Add("$($Definition.Label) fingerprint could not be verified: $($_.Exception.Message)")
+    }
+}
+
 function Assert-EmbeddedResourceMatches {
     param(
         [Parameter(Mandatory = $true)][string]$Launcher,
@@ -164,7 +315,7 @@ function Assert-EmbeddedResourceMatches {
     }
     try {
         $embeddedHash = Get-EmbeddedResourceHash $Launcher $ResourceId
-        $payloadHash = (Get-FileHash -LiteralPath $Payload -Algorithm SHA256).Hash
+        $payloadHash = Get-FileSha256 $Payload
         if ($embeddedHash -ne $payloadHash) {
             $script:errors.Add(
                 "launcher resource $ResourceId does not match '$Payload': " +
@@ -175,24 +326,48 @@ function Assert-EmbeddedResourceMatches {
     }
 }
 
+if ($RecordManagedPayload) {
+    if ($ManagedPayloadsOnly -or $RequireComplete) {
+        throw "-RecordManagedPayload cannot be combined with verification modes"
+    }
+    $definition = @(Get-ManagedPayloadDefinitions | Where-Object Name -eq $RecordManagedPayload)
+    if ($definition.Count -ne 1) { throw "unknown managed payload '$RecordManagedPayload'" }
+    Write-ManagedPayloadStamp $definition[0]
+    exit 0
+}
+
 Assert-ManagedPayloadsFresh
 
 if ($RequireComplete -or -not $ManagedPayloadsOnly) {
     $serverInputs = @(Get-SourceFiles -Root (Join-Path $repo "native\src\server"))
+    $serverInputs += Get-Item -LiteralPath (Join-Path $repo "build_native.bat")
     $server = Join-Path $repo "native\dst_server.exe"
     Assert-OutputFresh "native translation server" $server $serverInputs
+
+    # C# server: its own sources plus the shared core it links (native\src\core).
+    $serverCsInputs = @(Get-SourceFiles -Root (Join-Path $repo "native\src\server_cs"))
+    $serverCsInputs += @(Get-SourceFiles -Root (Join-Path $repo "native\src\core"))
+    $serverCs = Join-Path $repo "native\dst_server_cs.exe"
+    Assert-OutputFresh "C# translation server" $serverCs $serverCsInputs
 
     $launcherInputs = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
     foreach ($file in (Get-SourceFiles -Root (Join-Path $repo "native\src\launcher"))) {
         $launcherInputs.Add($file)
     }
+    $launcherInputs.Add((Get-Item -LiteralPath (Join-Path $repo "build_native.bat")))
     $embeddedFiles = @(
         $server,
+        $serverCs,
         (Join-Path $repo "scripts\install_runtime_payloads.ps1"),
         (Join-Path $repo "config\api.ini.example"),
         (Join-Path $repo "config\launcher.ini.example"),
+        (Join-Path $repo "config\glossary.example.tsv"),
         (Join-Path $repo "assets\app_icon.ico"),
         (Join-Path $repo "VERSION"),
+        (Join-Path $repo "payloads\RenPy\iron_deepseek.rpy"),
+        (Join-Path $repo "payloads\RPGMaker\hook_rpgm_mv.js"),
+        (Join-Path $repo "payloads\Godot\dst_godot_runtime_g3.gd"),
+        (Join-Path $repo "payloads\Godot\dst_godot_runtime_g4.gd"),
         (Join-Path $repo "payloads\UnityTranslator\UnityTranslator.dll"),
         (Join-Path $repo "payloads\UnityTranslator\UnityTranslator.BepInEx6.dll"),
         (Join-Path $repo "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll"),
@@ -225,6 +400,13 @@ if ($RequireComplete -or -not $ManagedPayloadsOnly) {
         Assert-EmbeddedResourceMatches $launcher 102 (Join-Path $repo "scripts\install_runtime_payloads.ps1")
         Assert-EmbeddedResourceMatches $launcher 103 (Join-Path $repo "config\api.ini.example")
         Assert-EmbeddedResourceMatches $launcher 104 (Join-Path $repo "config\launcher.ini.example")
+        Assert-EmbeddedResourceMatches $launcher 105 $serverCs
+        Assert-EmbeddedResourceMatches $launcher 106 (Join-Path $repo "config\glossary.example.tsv")
+        # Engine runtime scripts: deployed verbatim by deploy.c/godot_patch.c (resource.h 301-304).
+        Assert-EmbeddedResourceMatches $launcher 301 (Join-Path $repo "payloads\RenPy\iron_deepseek.rpy")
+        Assert-EmbeddedResourceMatches $launcher 302 (Join-Path $repo "payloads\RPGMaker\hook_rpgm_mv.js")
+        Assert-EmbeddedResourceMatches $launcher 303 (Join-Path $repo "payloads\Godot\dst_godot_runtime_g3.gd")
+        Assert-EmbeddedResourceMatches $launcher 304 (Join-Path $repo "payloads\Godot\dst_godot_runtime_g4.gd")
         Assert-EmbeddedResourceMatches $launcher 201 (Join-Path $repo "payloads\UnityTranslator\UnityTranslator.dll")
         Assert-EmbeddedResourceMatches $launcher 202 (Join-Path $repo "payloads\UnityTranslator\UnityTranslator.BepInEx6.dll")
         Assert-EmbeddedResourceMatches $launcher 203 (Join-Path $repo "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll")

@@ -4,6 +4,15 @@
 
 后续更新请继续把最新更新日志放在本节最上方。
 
+### 20260909（0.4.0.0）
+
+1、启动器配置 API 改成了提供商下拉，DeepSeek、硅基流动、Kimi、智谱、阿里百炼都能直接选，也可以接本机的 Ollama / LM Studio。
+2、增加了术语表，人名、武器、技能这些专有名词可以固定成指定译名。
+3、对 Godot 的通用翻译模块做了比较大的更新，导出游戏会生成外部补丁包来汉化，不会改原包。
+4、修复了部分 Unity IL2CPP 游戏被识别成 Mono 的问题，也修了 RPG Maker 扫描长文件时可能漏句的问题。
+
+版本：`0.4.0.0`
+
 ### 20260801（0.3.3.8）
 
 1、对于部分unity游戏过度裁剪导致的文本翻译问题进行了优化。
@@ -37,25 +46,28 @@ ds游戏翻译器是一个本地游戏翻译工具，目标是支持：
 
 最新下载地址：
 
-https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.3.3.8
+https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.4.0.0
 
 推荐下载：
 
-- `ds游戏翻译器_0.3.3.8.exe`：单文件启动器。首次运行会自动释放/更新本项目自有服务端、脚本、示例配置和自有 Unity 插件。
-- `ds游戏翻译器_0.3.3.8.zip`：带说明文档和许可文件的 Windows 程序包，核心仍是 `ds游戏翻译器.exe`。
-- `DeepSeek_Game_Translator_source_0.3.3.8.zip`：源码包，只包含自有源码、测试和文档。
+- `ds游戏翻译器_0.4.0.0.exe`：单文件启动器。首次运行会自动释放/更新本项目自有服务端、脚本、示例配置和自有 Unity 插件。
+- `ds游戏翻译器_0.4.0.0.zip`：带说明文档和许可文件的 Windows 程序包，核心仍是 `ds游戏翻译器.exe`。
+- `DeepSeek_Game_Translator_source_0.4.0.0.zip`：源码包，只包含自有源码、测试和文档。
 
 为了降低侵权和授权风险，下载包不直接内置 BepInEx、XUnity、Unity 官方 DLL、游戏文件、TMP 字体包、翻译记忆或 API key。Unity 第三方运行时和 XUnity TMP 字体 AssetBundle 由用户通过命令行脚本从上游项目下载。
 
 ## 使用方式
 
-1. 下载 `ds游戏翻译器_0.3.3.8.exe`，或解压 `ds游戏翻译器_0.3.3.8.zip` 后运行里面的 `ds游戏翻译器.exe`。
+1. 下载 `ds游戏翻译器_0.4.0.0.exe`，或解压 `ds游戏翻译器_0.4.0.0.zip` 后运行里面的 `ds游戏翻译器.exe`。
 2. 首次运行时，启动器会自动生成/更新这些自有组件：
    - `native\dst_server.exe`
+   - `native\dst_server_cs.exe`
    - `scripts\install_runtime_payloads.ps1`
    - `config\api.ini.example`
+   - `config\launcher.ini.example`
+   - `config\glossary.example.tsv`
    - 本项目自有 Unity 插件 DLL
-3. 在启动器里点击“配置 API”，填写自己的 API key。
+3. 在启动器里点击“配置 API”，选择提供商并填写自己的 API key。支持任意 OpenAI 兼容服务（DeepSeek、硅基流动、Moonshot、智谱、阿里百炼、OpenAI、Claude、Gemini 及本地 Ollama/LM Studio 等），本地回环服务的 key 可留空。
 4. 如需翻译 Unity 游戏，在程序所在目录运行：
 
 ```powershell
@@ -66,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 6. 需要撤销部署时，先完全退出游戏，选择同一目录并点击“还原游戏”。启动器只移除能够确认由本程序部署的翻译文件，不会删除翻译缓存、用户模组或已有的 BepInEx；无法确认归属的 Unity 文件会保留并写入日志。
 7. CACHE 状态卡显示共享缓存大小。点击旁边的“清除缓存”可删除 `translation_memory_c.tsv`；程序会先停止本地服务并在完成后恢复原运行状态。正在运行的游戏需要重启才能清除其进程内存缓存。
 
-Ren'Py、RPG Maker 和 Godot 路径不需要下载 BepInEx/XUnity。Unity 路径如果缺少 payload，启动器日志会提示对应的安装命令。Godot 当前走资源文本扫描和本地缓存预热模式，会识别 PO/CSV 翻译表、GDScript `tr()`/`TranslationServer.translate()` 文本、常见场景资源文本以及 `.pck/.translation` 里的 UTF-8 文本；不会改写游戏包。
+Ren'Py、RPG Maker 和 Godot 路径不需要下载 BepInEx/XUnity。Unity 路径如果缺少 payload，启动器日志会提示对应的安装命令。Godot 会扫描工程/导出包里的可翻译文本做缓存预热，并对导出的 `.pck` 生成外部补丁包（不改原包）。
 
 完整用户说明见 `docs/USER_GUIDE.md`。
 
@@ -96,6 +108,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -U
 从 `0.3.2.7` 起，启动器会把本项目自有组件嵌入 `ds游戏翻译器.exe`。大多数更新只需要替换 `ds游戏翻译器.exe`，再次启动后它会自动同步：
 
 - `native\dst_server.exe`
+- `native\dst_server_cs.exe`
 - `scripts\install_runtime_payloads.ps1`
 - `config\*.example`
 - `payloads\UnityTranslator\UnityTranslator.dll`
@@ -116,17 +129,43 @@ timeout_ms=15000
 concurrency=4
 ```
 
+以上以 DeepSeek 为例；任意 OpenAI 兼容端点均可使用，更多提供商地址见 `config\api.ini.example` 的注释。
+
 真实的 `config/api.ini` 不要提交到仓库，也不要发给别人。
 
 ## 当前状态
 
-这是 `0.3.3.8` 预览版。主要源码路径：
+这是 `0.4.0.0` 预览版。主要源码路径：
 
-- `native/src/`：本地 C 服务端和 Windows 启动器。
+- `native/src/server/`、`native/src/launcher/`：本地 C 服务端和 Windows 启动器（当前发布主线）。
+- `native/src/core/`：`DstCore` 共享核心（文本规则、JSON、缓存编解码、HTTP 契约常量），
+  被 C# 服务端、C# 启动器和 Unity IL2CPP 端点以源文件链接方式复用。
+- `native/src/server_cs/`：C# 平行服务端（与 C 服务端同一 HTTP 契约，可通过
+  `config/launcher.ini` 的 `[server] binary=cs` 启用；已随启动器嵌入分发）。
+- `native/src/launcher_cs/`：C# 启动器移植（功能已齐全，仍非发布主线）。已移植引擎识别、五种引擎
+  （Ren'Py / RPG Maker MV/MZ / Unity Mono / Unity IL2CPP / Godot）的部署与还原、
+  服务端进程管理、五种引擎的预热扫描（Ren'Py 脚本、RPG Maker 数据/外部文本、
+  Unity XUnity 译文文件 + 资源/bundle、Godot 工程资源 + .translation + PCK 1/2/3 +
+  内嵌 pck 的 EXE；两侧通过 `--warmup-and-exit`/`--warmup` 转储模式逐字节比对批次
+  请求体）、内嵌 payload 自更新（同一批十个自有文件以 `EmbeddedResource` 嵌入，
+  `--sync-payloads-and-exit`/`--sync-payloads` 释放出的目录树逐字节一致）、
+  Godot 外部补丁包（`.pck`/内嵌包复制后修补文本资源、GDScript 字节码、
+  OptimizedTranslation 与字体条目，格式 3 追加运行时 autoload；两侧构建出的
+  `dst_godot_patch.pck` 与发往 `/batch` 的请求体逐字节一致）、`api.ini` 读写
+  （供应商预设表与 Profile API 读写，两侧写出的 `api.ini` 逐字节一致）、
+  Godot 启动预检（`--main-pack` 拒绝判定与预检结论缓存，两侧写出的
+  `config\godot_preflight.ini` 逐字节一致）、一键翻译流程（各引擎的启动/预热
+  顺序、Godot 的三条翻译启动路径与三个无头预检、独立补丁刷新进程、缓存卡片与
+  清缓存；两侧的日志、状态推进、预热批次、预检命令行与将要拉起的进程命令行
+  逐字节一致）、Win32 窗口本体（调色板/DPI 缩放/GDI 绘制原语/布局/悬停动画/
+  自绘按钮/消息循环，以及目录选择与 API 配置对话框；全部走 P/Invoke 原生 GDI，
+  不使用 WinForms，两侧渲染出的客户区位图逐像素一致）。启动器移植已无 C 独有
+  模块；今后新增模块若未移植，入口必须明确返回 `NotPorted`，不得伪装成功。
+- `payloads/RenPy/`、`payloads/RPGMaker/`、`payloads/Godot/`：引擎钩子脚本源文件
+  （`.rpy`/`.js`/`.gd`），构建时以 RCDATA 资源嵌入启动器。
 - `payloads/UnityTranslator/src/`：Unity Mono/BepInEx 插件源码。
 - `payloads/UnityIL2CPP/DeepSeekXUnityTranslator/src/`：Unity IL2CPP/XUnity 本地批量端点源码。
 - `payloads/UnityIL2CPP/DeepSeekTMPFontFallback/src/`：Unity IL2CPP TMP 字体兜底源码。
-- `tests/`：回归测试。
 
 ## 构建
 
@@ -153,16 +192,26 @@ build_native.bat
 
 ## 测试
 
-```powershell
-powershell -ExecutionPolicy Bypass -File tests\run_all.ps1 -SkipEndurance
-```
+旧的 `tests/` 回归套件已于 2026-09-06 移除；2026-09-08 起随语言迁移重建为
+以下守卫，前两项由 `build_native.bat` 自动执行：
+
+- `tests/core_tests/`：`DstCore` 与 C 实现的 golden 对拍（文本规则、JSON、
+  缓存编解码、契约常量）。
+- `tests/launcher_parity/run_launcher_parity.ps1`：C 与 C# 启动器在合成游戏
+  目录上的识别/部署/还原输出与目录树哈希逐项比对，另含预热批次、Godot 补丁包、
+  一键流程与窗口渲染（布局报告 + 客户区位图哈希）比对；加 `-ServerSmoke` 可额外
+  验证服务端启动/健康检查/关闭（需 19999 端口空闲）。
+- `tests/server_contract/run_contract_tests.ps1`：以假 provider 对两套服务端
+  （默认 `dst_server.exe` 与 `dst_server_cs.exe`）各跑 50 项 HTTP 契约检查。
+- `tests/payload_scripts/check_payload_scripts.ps1`：钩子脚本的字节卫生、
+  语法、锚点与端点契约检查。
 
 ## 开源发布安全规则
 
 发布源码包前运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version 0.3.3.8
+powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version 0.4.0.0
 ```
 
 该脚本会生成 source-only 包，并自动检查是否误带：

@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    server_cs —— dst_server 的 C# 平行实现（语言迁移第一步）。
+
+    与 native/src/server 的 C 版本共用同一 HTTP 契约、同一 TSV 缓存格式与
+    同一 api.ini 配置，由 tests/server_contract 以 -Exe 参数对两套实现验收。
+    目标框架 net472：与既有 payloads 一致，Windows 10+ 自带运行时，
+    编译产物为单个 dst_server_cs.exe，无需安装额外组件。
+
+    文本规则 / JSON / 缓存编解码 / 契约常量来自 native/src/core（共享核心），
+    以源文件链接方式编译进本程序；Unity payload 与后续 C# 启动器链接同一批文件。
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>dst_server_cs</AssemblyName>
+    <RootNamespace>DstServerCs</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OutputPath>..\..\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <DebugType>none</DebugType>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <NoWarn>CS0219;CS8600;CS8601;CS8602;CS8604;CS8625;CS8632;CS8714</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\core\*.cs" Link="core\%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+
+</Project>

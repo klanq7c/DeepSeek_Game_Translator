@@ -1,0 +1,99 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    launcher_cs —— 启动器的 C# 重写（语言迁移阶段 3，进行中）。
+
+    按模块从 native/src/launcher 移植：engine（已完成）→ fsutil/deploy 全部引擎
+    （已完成，含 Unity Mono/IL2CPP）→ server_proc（已完成）→ warmup + godot_warmup
+    （已完成）→ self_update（已完成）→ godot_patch（已完成）→ api_config 数据层 +
+    godot_probe + godot_preflight_cache（已完成）→ ui 的一键流程与启动决策
+    （已完成：LaunchFlow / GodotLaunch）→ ui 的窗口与绘制（未开始）。
+    每个模块移植后都通过 tests/launcher_parity
+    与 C 版做同一目录、同一输入的逐字节输出对比；在 ui 移植完成前本工程不进入
+    发布产物，也不是 build_native.bat 的产出。
+
+    目标框架 net472：与 dst_server_cs / Unity payload 一致，Windows 10+ 自带运行时。
+    当前是控制台程序（诊断子命令 detect 等，见 Program.cs）；ui 移植后切换为 WinExe，
+    并保留 AttachConsole 的诊断入口。共享核心（native/src/core）以源文件方式链接。
+  -->
+
+  <PropertyGroup>
+    <!--
+      WinExe = GUI 子系统，与 C 版的 gcc -mwindows 一致：正常启动不弹控制台窗口。
+      诊断子命令的 stdout 仍然可用（父进程重定向的句柄照常继承，tests\launcher_parity
+      就是这么读的）；从交互式控制台直接运行时由 Program.Main 的 AttachConsole 补上。
+    -->
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>dst_launcher_cs</AssemblyName>
+    <RootNamespace>DstLauncher</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <DebugType>none</DebugType>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <!--
+      与 C 版同一个图标文件：windres 把它作为 ICON 1 嵌入，csc 的 /win32icon 固定用
+      资源 ID 32512（Theme.IDI_APP_ICON）。paint_background 会把它画进品牌铭牌，
+      ui-probe 的位图比对因此要求两版嵌入的是同一份 .ico。
+    -->
+    <ApplicationIcon>..\..\..\assets\app_icon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\core\*.cs" Link="core\%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!--
+    翻译器版本：C 版由 build_native.bat 以 -DDS_TRANSLATOR_VERSION=<VERSION 文件内容>
+    注入，godot_preflight_cache.c 把它算进缓存键。两版必须取同一个值，否则同一台机器上
+    两个启动器算出的 config\godot_preflight.ini 节名不同（parity 会直接暴露）。
+    VERSION 缺失时回退到 "unknown"，与 C 版的 #ifndef 分支一致。
+  -->
+  <PropertyGroup>
+    <DsVersionFile>$(MSBuildProjectDirectory)\..\..\..\VERSION</DsVersionFile>
+    <DsTranslatorVersion Condition="Exists('$(DsVersionFile)')">$([System.IO.File]::ReadAllText('$(DsVersionFile)').Trim())</DsTranslatorVersion>
+    <DsTranslatorVersion Condition="'$(DsTranslatorVersion)' == ''">unknown</DsTranslatorVersion>
+  </PropertyGroup>
+  <Target Name="GenerateDsBuildInfo" BeforeTargets="BeforeCompile">
+    <PropertyGroup>
+      <DsBuildInfoFile>$(IntermediateOutputPath)DsBuildInfo.g.cs</DsBuildInfoFile>
+    </PropertyGroup>
+    <WriteLinesToFile File="$(DsBuildInfoFile)" Overwrite="true" WriteOnlyWhenDifferent="true"
+                      Lines="namespace DstLauncher { internal static class BuildInfo { internal const string TranslatorVersion = &quot;$(DsTranslatorVersion)&quot;%3B } }" />
+    <ItemGroup>
+      <Compile Include="$(DsBuildInfoFile)" />
+    </ItemGroup>
+  </Target>
+
+  <!-- 与 native/src/launcher/resource.h 的 RCDATA 301..304 一一对应（LogicalName = 资源宏名）。 -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\..\payloads\RenPy\iron_deepseek.rpy" LogicalName="IDR_SCRIPT_RENPY_HOOK" />
+    <EmbeddedResource Include="..\..\..\payloads\RPGMaker\hook_rpgm_mv.js" LogicalName="IDR_SCRIPT_RPGM_HOOK" />
+    <EmbeddedResource Include="..\..\..\payloads\Godot\dst_godot_runtime_g3.gd" LogicalName="IDR_SCRIPT_GODOT_RUNTIME_G3" />
+    <EmbeddedResource Include="..\..\..\payloads\Godot\dst_godot_runtime_g4.gd" LogicalName="IDR_SCRIPT_GODOT_RUNTIME_G4" />
+  </ItemGroup>
+
+  <!--
+    自有运行时 payload（self_update.c 的 RCDATA 101..105 / 201..205，见 build_native.bat 生成的
+    launcher_payloads.rc）。与 C 版同样规则：101..105 是必需组件（缺失时 SelfUpdate 记为
+    "构建不完整"），201..205 的 Unity 程序集是可选组件（本机没有编译引用时允许缺失）。
+    Condition 只是让 dotnet build 在文件缺失时不报错，缺失本身仍由运行时如实报告。
+    build_native.bat 在两个服务端都构建完成后才编译本工程，所以正式构建里 101/105 总是存在。
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\dst_server.exe" LogicalName="IDR_PAYLOAD_DST_SERVER" Condition="Exists('..\..\dst_server.exe')" />
+    <EmbeddedResource Include="..\..\..\scripts\install_runtime_payloads.ps1" LogicalName="IDR_PAYLOAD_INSTALLER" Condition="Exists('..\..\..\scripts\install_runtime_payloads.ps1')" />
+    <EmbeddedResource Include="..\..\..\config\api.ini.example" LogicalName="IDR_PAYLOAD_API_EXAMPLE" Condition="Exists('..\..\..\config\api.ini.example')" />
+    <EmbeddedResource Include="..\..\..\config\launcher.ini.example" LogicalName="IDR_PAYLOAD_LAUNCHER_EXAMPLE" Condition="Exists('..\..\..\config\launcher.ini.example')" />
+    <EmbeddedResource Include="..\..\dst_server_cs.exe" LogicalName="IDR_PAYLOAD_DST_SERVER_CS" Condition="Exists('..\..\dst_server_cs.exe')" />
+    <EmbeddedResource Include="..\..\..\config\glossary.example.tsv" LogicalName="IDR_PAYLOAD_GLOSSARY_EXAMPLE" Condition="Exists('..\..\..\config\glossary.example.tsv')" />
+    <EmbeddedResource Include="..\..\..\payloads\UnityTranslator\UnityTranslator.dll" LogicalName="IDR_PAYLOAD_UNITY_MONO5" Condition="Exists('..\..\..\payloads\UnityTranslator\UnityTranslator.dll')" />
+    <EmbeddedResource Include="..\..\..\payloads\UnityTranslator\UnityTranslator.BepInEx6.dll" LogicalName="IDR_PAYLOAD_UNITY_MONO6" Condition="Exists('..\..\..\payloads\UnityTranslator\UnityTranslator.BepInEx6.dll')" />
+    <EmbeddedResource Include="..\..\..\payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll" LogicalName="IDR_PAYLOAD_XUNITY_ENDPOINT" Condition="Exists('..\..\..\payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll')" />
+    <EmbeddedResource Include="..\..\..\payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll" LogicalName="IDR_PAYLOAD_TMP_FALLBACK" Condition="Exists('..\..\..\payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll')" />
+    <EmbeddedResource Include="..\..\..\payloads\UnityTranslator\DeepSeekUnityFontPatcher.dll" LogicalName="IDR_PAYLOAD_UNITY_FONT_PATCHER" Condition="Exists('..\..\..\payloads\UnityTranslator\DeepSeekUnityFontPatcher.dll')" />
+  </ItemGroup>
+
+</Project>

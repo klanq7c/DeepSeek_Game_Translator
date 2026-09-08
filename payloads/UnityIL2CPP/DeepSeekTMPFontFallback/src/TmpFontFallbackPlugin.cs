@@ -37,11 +37,11 @@ public sealed class TmpFontFallbackPlugin : BasePlugin
     private static readonly object CaughtExceptionLogLock = new();
     private static readonly Dictionary<string, int> CaughtExceptionCounts = new(StringComparer.Ordinal);
 
-    /* Compatibility exception boundary policy:
-       1. It isolates a missing IL2CPP/TMP member so UGUI and other font assets keep working.
-       2. The shared server cannot fix runtime-generated interop/type differences inside the game process.
-       3. The existing local fallback remains, but every distinct failure is counted and reported.
-       4. BepInEx logs method, type/message, count, and the first full stack trace. */
+    /* 兼容性异常边界策略：
+       1. 隔离缺失的 IL2CPP/TMP 成员，让 UGUI 和其他字体资源继续工作。
+       2. 共享服务器无法修复游戏进程内运行时生成的互操作或类型差异。
+       3. 保留现有本地回退，但会统计并报告每一种不同故障。
+       4. BepInEx 记录方法、类型或消息、次数，以及首次完整堆栈。 */
     internal static void ReportCaughtException(Exception exception, string context = null, [System.Runtime.CompilerServices.CallerMemberName] string operation = null)
     {
         Exception root = exception is TargetInvocationException && exception.InnerException != null
@@ -99,6 +99,10 @@ public sealed class TmpFontFallbackBehaviour : MonoBehaviour
 
     private void LateUpdate()
     {
+        if (!TmpFontFallbackInstaller.ShouldRunCompatibilityNormalizeScan)
+        {
+            return;
+        }
         if (Time.unscaledTime < _nextFastNormalize)
         {
             return;
@@ -154,6 +158,13 @@ public sealed class TmpFontFallbackBehaviour : MonoBehaviour
 
 internal static class TmpFontFallbackInstaller
 {
+    private sealed class RendererSnapshot
+    {
+        public List<object> FontAssets { get; } = new();
+        public List<object> TmpTexts { get; } = new();
+        public List<object> UguiTexts { get; } = new();
+    }
+
     private static readonly Dictionary<int, string> FontByMajor = new()
     {
         { 6000, "arialuni_sdf_u6000" },
@@ -271,12 +282,17 @@ internal static class TmpFontFallbackInstaller
         !_textSetterPatchDeferredForFreshInterop &&
         _fallbackAsset != null;
 
+    public static bool ShouldRunCompatibilityNormalizeScan =>
+        _tmpTextType != null && !_textSetterPatchInstalled;
+
     /* 慢速主入口：先处理 UGUI，再解析 TMP 类型、安装 setter 补丁、加载 fallback，
        最后把 fallback 接到已加载字体资产并刷新文本。单步失败会保留后续重试机会。 */
     public static void Apply()
     {
-        int uguiTextCount = PatchUguiTexts();
-        SweepStaleState();
+        RendererSnapshot snapshot = new();
+        _uguiTextType ??= FindType("UnityEngine.UI.Text");
+        CaptureUnityObjects(_uguiTextType, snapshot.UguiTexts);
+        int uguiTextCount = PatchUguiTexts(snapshot.UguiTexts);
         if (uguiTextCount != _lastUguiTextCount)
         {
             _lastUguiTextCount = uguiTextCount;
@@ -286,7 +302,15 @@ internal static class TmpFontFallbackInstaller
             }
         }
 
-        if (!ResolveTmpTypes())
+        bool hasTmp = ResolveTmpTypes();
+        if (hasTmp)
+        {
+            CaptureUnityObjects(_tmpFontAssetType, snapshot.FontAssets);
+            CaptureUnityObjects(_tmpTextType, snapshot.TmpTexts);
+        }
+        // 每个慢周期只跨 IL2CPP 边界枚举一次；字体修复、文本刷新和回收共享同一快照。
+        SweepStaleState(snapshot);
+        if (!hasTmp)
         {
             if (!_reportedNoTmp)
             {
@@ -344,7 +368,7 @@ internal static class TmpFontFallbackInstaller
         bool fontTablesChanged = false;
         try
         {
-            fontCount = PatchLoadedFontAssets(out fontTablesChanged);
+            fontCount = PatchLoadedFontAssets(snapshot.FontAssets, out fontTablesChanged);
         }
         catch (Exception ex)
         {
@@ -353,13 +377,13 @@ internal static class TmpFontFallbackInstaller
 
         if (settingsChanged || fontTablesChanged)
         {
-            /* Games may replace TMP fallback lists after a scene/addressable load. */
+            /* 游戏可能在场景或 Addressables 加载后替换 TMP 回退列表。 */
             DirtiedTexts.Clear();
         }
         int textCount = _lastTextCount;
         try
         {
-            textCount = RefreshLoadedTexts();
+            textCount = RefreshLoadedTexts(snapshot.TmpTexts);
         }
         catch (Exception ex)
         {
@@ -373,7 +397,7 @@ internal static class TmpFontFallbackInstaller
         }
     }
 
-    private static void SweepStaleState()
+    private static void SweepStaleState(RendererSnapshot snapshot)
     {
         if (++_stateSweepTick < StateSweepInterval)
         {
@@ -395,7 +419,7 @@ internal static class TmpFontFallbackInstaller
         {
             if (_tmpFontAssetType != null)
             {
-                foreach (object fontAsset in FindUnityObjects(_tmpFontAssetType))
+                foreach (object fontAsset in snapshot.FontAssets)
                 {
                     LiveFontAssetIds.Add(InstanceId(fontAsset));
                 }
@@ -404,7 +428,7 @@ internal static class TmpFontFallbackInstaller
 
             if (_tmpTextType != null)
             {
-                foreach (object text in FindUnityObjects(_tmpTextType))
+                foreach (object text in snapshot.TmpTexts)
                 {
                     LiveTmpTextIds.Add(InstanceId(text));
                 }
@@ -442,7 +466,7 @@ internal static class TmpFontFallbackInstaller
 
             if (_uguiTextType != null)
             {
-                foreach (object text in FindUnityObjects(_uguiTextType))
+                foreach (object text in snapshot.UguiTexts)
                 {
                     LiveUguiTextIds.Add(InstanceId(text));
                 }
@@ -520,15 +544,14 @@ internal static class TmpFontFallbackInstaller
         }
 
         /*
-         * External boundary policy:
-         * 1. Generated IL2CPP wrappers or Harmony can temporarily omit/reject a
-         *    TMP setter while assemblies are still loading.
-         * 2. The shared server cannot repair methods inside the game process.
-         * 3. A failed hook falls back to the existing two-second renderer scan;
-         *    it never reports translation/cache success and never keeps the
-         *    previous 50 ms full-scene scan running indefinitely.
-         * 4. Failures are rate-limited below and retried after a bounded delay;
-         *    concrete patch exceptions go through ReportCaughtException.
+         * 外部边界策略：
+         * 1. 程序集仍在加载时，生成的 IL2CPP 包装器或 Harmony 可能暂时缺少或
+         *    拒绝某个 TMP setter。
+         * 2. 共享服务器无法修复游戏进程内部的方法。
+         * 3. 钩子失败时回退到现有的两秒渲染器扫描；它不会报告翻译或缓存成功，
+         *    也不会让旧的 50 毫秒全场景扫描无限运行。
+         * 4. 下方会限频记录故障，并在有界延迟后重试；具体补丁异常统一交给
+         *    ReportCaughtException。
          */
         try
         {
@@ -814,11 +837,10 @@ internal static class TmpFontFallbackInstaller
         }
 
         /*
-         * The observed Unity 6000 wrapper throws while marshalling the path,
-         * before LoadFromFile_Internal_Injected reaches native Unity. Its
-         * public async wrapper still uses the retained managed-string invoke
-         * path, so this is not a duplicate native load. Apply polls the request
-         * on Unity's main thread and never blocks gameplay.
+         * 已观察到的 Unity 6000 包装器会在编组路径时抛出异常，此时
+         * LoadFromFile_Internal_Injected 尚未进入原生 Unity。其公开异步包装器
+         * 仍使用保留下来的托管字符串调用路径，所以这不是重复的原生加载。
+         * Apply 在 Unity 主线程轮询请求，不会阻塞游戏运行。
          */
         try
         {
@@ -1497,7 +1519,7 @@ internal static class TmpFontFallbackInstaller
         return 0;
     }
 
-    private static int PatchUguiTexts()
+    private static int PatchUguiTexts(IReadOnlyList<object> texts)
     {
         _uguiTextType ??= FindType("UnityEngine.UI.Text");
         if (_uguiTextType == null)
@@ -1506,7 +1528,7 @@ internal static class TmpFontFallbackInstaller
         }
 
         List<object> cjkTexts = null;
-        foreach (object text in FindUnityObjects(_uguiTextType))
+        foreach (object text in texts)
         {
             string value = GetStringProperty(text, "text");
             if (ContainsCjk(value))
@@ -1543,10 +1565,9 @@ internal static class TmpFontFallbackInstaller
             if (textChanged)
             {
                 /*
-                 * Unity's legacy UGUI renderer may keep a dynamic OS font but
-                 * omit newly translated glyphs from its current atlas. This is
-                 * separate from TMP's atlas and must be warmed at the exact
-                 * text size/style before the component is dirtied.
+                 * Unity 旧版 UGUI 渲染器可能保留动态系统字体，却没有把新译文
+                 * 字形加入当前图集。该图集与 TMP 图集相互独立，必须先按准确的
+                 * 文本字号和样式预热，再将组件标记为脏。
                  */
                 if (!TryWarmUguiGlyphs(font as Font, text, value))
                 {
@@ -1770,11 +1791,11 @@ internal static class TmpFontFallbackInstaller
         return false;
     }
 
-    private static int PatchLoadedFontAssets(out bool fontTablesChanged)
+    private static int PatchLoadedFontAssets(IReadOnlyList<object> fontAssets, out bool fontTablesChanged)
     {
         fontTablesChanged = false;
         int fallbackId = InstanceId(_fallbackAsset);
-        foreach (object fontAsset in FindUnityObjects(_tmpFontAssetType))
+        foreach (object fontAsset in fontAssets)
         {
             int id = InstanceId(fontAsset);
             if (id == fallbackId)
@@ -1849,13 +1870,11 @@ internal static class TmpFontFallbackInstaller
         }
 
         /*
-         * Some IL2CPP players keep serialized TMP_FontAsset objects outside
-         * Resources.FindObjectsOfTypeAll even though live TMP_Text components
-         * still expose them through their font property. The shared server
-         * cannot repair this renderer-owned resource visibility boundary.
-         * Discover the host through the live component, append (never replace)
-         * the process-owned fallback, and report a bounded diagnostic if the
-         * generated wrapper cannot expose its fallback table.
+         * 某些 IL2CPP Player 会把序列化 TMP_FontAsset 对象放在
+         * Resources.FindObjectsOfTypeAll 的可见范围外，但活动 TMP_Text 组件
+         * 仍通过 font 属性暴露它们。共享服务器无法修复由渲染器拥有的资源
+         * 可见性边界。通过活动组件发现宿主，追加（绝不替换）进程自有回退；
+         * 若生成的包装器无法暴露其回退表，则报告有界诊断。
          */
         try
         {
@@ -1921,14 +1940,14 @@ internal static class TmpFontFallbackInstaller
         return true;
     }
 
-    private static int RefreshLoadedTexts()
+    private static int RefreshLoadedTexts(IReadOnlyList<object> texts)
     {
         if (_tmpTextType == null)
         {
             return 0;
         }
 
-        foreach (object text in FindUnityObjects(_tmpTextType))
+        foreach (object text in texts)
         {
             int id = InstanceId(text);
             bool changed = false;
@@ -3091,6 +3110,18 @@ internal static class TmpFontFallbackInstaller
         object t = Il2CppType.From(targetType, false);
         _il2CppTypeCache[targetType] = t;
         return t;
+    }
+
+    private static void CaptureUnityObjects(Type targetType, List<object> destination)
+    {
+        if (targetType == null || destination == null)
+        {
+            return;
+        }
+        foreach (object item in FindUnityObjects(targetType))
+        {
+            destination.Add(item);
+        }
     }
 
     private static IEnumerable<object> FindUnityObjects(Type targetType)

@@ -18,17 +18,20 @@ static int b64v(int c) {
     return -1;
 }
 
-/* 标准 Base64 编码。每 3 字节输入 -> 4 字节输出，不足 3 字节用 '=' 填充。
-   输出长度公式 ((n+2)/3)*4 已含填充，再 +1 给结尾 '\0'。 */
-char *b64enc(const char *s) {
-    static const char tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/* 计算标准 Base64 的有效输出字节数，不含结尾 NUL；分配型接口会再预留 1 字节。 */
+static size_t b64_encoded_size(const char *s, size_t *input_size) {
     size_t n = 0;
     while (s && s[n]) n++;
     if (n > SIZE_MAX - 2) die("base64 input too large");
     size_t groups = (n + 2) / 3;
     if (groups > (SIZE_MAX - 1) / 4) die("base64 output too large");
-    size_t out_n = groups * 4;
-    char *out = xmalloc(out_n + 1);
+    if (input_size) *input_size = n;
+    return groups * 4;
+}
+
+/* 把标准 RFC4648 Base64 写到调用方已预留的区域，不写结尾 NUL。 */
+static void b64_encode_to(char *out, const char *s, size_t n) {
+    static const char tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t j = 0;
     for (size_t i = 0; i < n; i += 3) {
         unsigned a = (unsigned char)s[i];
@@ -39,8 +42,15 @@ char *b64enc(const char *s) {
         out[j++] = (i + 1 < n) ? tab[((b & 15) << 2) | ((c >> 6) & 3)] : '=';
         out[j++] = (i + 2 < n) ? tab[c & 63] : '=';
     }
-    out[j] = 0;
-    return out;
+}
+
+/* 直接追加编码结果；同一批次可以复用一块 Buf。 */
+void b64enc_append(Buf *out, const char *s) {
+    size_t n = 0;
+    size_t out_n = b64_encoded_size(s, &n);
+    char *tail = buf_reserve(out, out_n);
+    b64_encode_to(tail, s, n);
+    buf_commit(out, out_n);
 }
 
 /* 流式解码：把字符值逐个压入 6 位累加器 acc，每凑够 8 位输出一字节。

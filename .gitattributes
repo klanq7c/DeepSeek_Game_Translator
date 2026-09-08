@@ -1,0 +1,6 @@
+# Engine runtime scripts are embedded into the launcher byte-for-byte (RCDATA 301-304)
+# and written verbatim into game directories. Keep them LF so the deployed hooks are
+# identical on every checkout regardless of core.autocrlf.
+payloads/RenPy/*.rpy      text eol=lf
+payloads/RPGMaker/*.js    text eol=lf
+payloads/Godot/*.gd       text eol=lf

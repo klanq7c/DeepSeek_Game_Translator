@@ -21,7 +21,7 @@ publish it directly.
 For the downloadable Windows program package, run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\prepare_program_release.ps1 -Version 0.3.3.8
+powershell -ExecutionPolicy Bypass -File scripts\prepare_program_release.ps1 -Version 0.4.0.0
 ```
 
 The generated program package should contain the launcher and documentation
@@ -60,7 +60,7 @@ Run these before release:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\audit_open_source_release.ps1 -Path build\open_source\DeepSeek_Game_Translator_source_preview
-rg -n "sk-[A-Za-z0-9]{16,}|api[_-]?key\s*=\s*[^<\s][^\r\n]+|Authorization:\s*Bearer\s+[A-Za-z0-9._-]+|password\s*=\s*[^<\s][^\r\n]+|secret\s*=\s*[^<\s][^\r\n]+" build\open_source
+rg -n "sk-[A-Za-z0-9]{16,}|(?<![A-Za-z0-9_])api[_-]?key\s*=\s*[^<\s][^\r\n]+|Authorization:\s*Bearer\s+[A-Za-z0-9._-]+|(?<![A-Za-z0-9_])password\s*=\s*[^<\s][^\r\n]+|(?<![A-Za-z0-9_])secret\s*=\s*[^<\s][^\r\n]+" build\open_source
 rg -n "C:\\Users\\[A-Za-z0-9._-]+|E:\\Projects\\[^\\\r\n]+|/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+" build\open_source
 Get-ChildItem build\open_source -Recurse -Include *.dll,*.exe,*.pdb,*.otf,*.ttf,*.tsv,*.zip,*.7z
 ```

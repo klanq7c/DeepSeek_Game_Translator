@@ -25,9 +25,78 @@ and runtime. The important design shape is:
 
 - **Launcher**: the Win32 UI under `native/src/launcher`. It detects engines,
   deploys hooks/plugins, starts the local server, and triggers cache warmup.
-- **Local server**: `native/src/server/dst_server.exe`. It exposes `/health`,
-  `/translate`, `/batch`, `/prefetch`, `/cache/import`, `/cache/lookup`,
-  `/cache/export`, and `/cache/dump`.
+  It also exposes hidden, window-less **diagnostic modes** for parity testing:
+  `--detect-and-exit <dir>`, `--deploy-and-exit <dir>`, `--restore-and-exit
+  <dir>`, `--warmup-and-exit <dir>`, `--godot-patch-and-exit <dir>`,
+  `--godot-promote-and-exit <dir>` and `--godot-launcher-and-exit <dir>` print
+  deterministic UTF-8 reports (and `log=` mirrored log lines) to the parent's
+  redirected stdout; `--sync-payloads-and-exit` and `--godot-patch-worker` are
+  the pre-existing helper modes.
+- **C# launcher port** (`native/src/launcher_cs`, migration phase 3, feature
+  complete since 2026-09-09): a module-by-module rewrite of the launcher in
+  C#/net472. It is not shipped and is not the `build_native.bat` product; each
+  ported module must produce byte-identical output to the C launcher under
+  `tests/launcher_parity`. Ported: engine detection (`EngineDetector`),
+  filesystem safety layer (`SafeFs`, mirrors `fsutil.c` reparse-point and
+  Win32 error semantics), deploy + restore for all five engines (`Deploy` in
+  `Deploy.cs` for Ren'Py/RPG Maker/Godot and `DeployUnity.cs` for Unity Mono
+  BepInEx 5/6 runtime install/repair, stripped-mscorlib support, and IL2CPP
+  BepInEx + XUnity with config ownership), server lifecycle
+  (`ServerProcess`), and the warmup scanners for all five engines
+  (`Warmup.cs`, `WarmupRenPy.cs`, `WarmupRpgm.cs`, `WarmupUnity.cs`,
+  `WarmupGodot.cs` incl. PCK 1/2/3 directory parsing and embedded-EXE packs;
+  batch bodies compared byte for byte through the `--warmup-and-exit`/
+  `--warmup` dump modes), embedded payload self-update (`SelfUpdate.cs`;
+  the same eleven first-party payloads are embedded as `EmbeddedResource` items
+  named after the RCDATA macros, released trees compared through
+  `--sync-payloads-and-exit`/`--sync-payloads`), and the Godot patch pack
+  (`GodotPatch.cs`/`GodotPatchResources.cs`/`GodotPatchPack.cs`; the built
+  `dst_godot_patch.pck` must be byte-identical and the `/batch` request bodies
+  must match, verified against a fake deterministic local server through
+  `--godot-patch-and-exit`/`--godot-patch`), the `api.ini` data layer
+  (`ApiConfig`: provider presets, Profile-API read/write, byte-identical
+  `api.ini`), the Godot launch preflight (`GodotProbe` `--main-pack` rejection
+  classifier plus `GodotPreflightCache`, byte-identical
+  `config\godot_preflight.ini`), and the one-click launch flow
+  (`LaunchFlow`/`GodotLaunch`: engine-specific launch/warmup ordering, the three
+  Godot headless preflight probes, the three translated launch paths, the
+  detached patch worker, and the cache card/clear), and the Win32 window itself
+  (`Win32`/`Theme`/`UiPaint`/`UiButtons`/`UiLayout`/`MainWindow` plus
+  `ApiConfigDialog`, `FolderPicker`, `LauncherConfig`) — raw GDI through
+  P/Invoke, no WinForms, verified pixel for pixel by the **window render probe**
+  below. The build produces `build\launcher_cs\dst_launcher_cs.exe` as a
+  `WinExe`, so it opens the same window when started with no arguments and
+  attaches to the parent console only for the diagnostic modes.
+- **Window render probe**: `--ui-probe-and-exit <w> <h> <alive> <bmp>` (C) and
+  `--ui-probe <w> <h> <alive> <bmp>` (C#) paint the launcher window off-screen
+  into a 32bpp bitmap and print a layout report (client size, DPI, every control
+  id/rect/text). To make two machines and two languages comparable the probe
+  pins DPI to 96, freezes the animation clock at tick 0, takes the server state
+  from an argument, and skips the `WM_CREATE` side effects (payload sync, saved
+  directory, timers). The rail footer tag and hero subtitle intentionally differ
+  between the two binaries (`C native runtime` vs `C# managed runtime`); the
+  probe renders neutral placeholders for them and `--ui-identity*` asserts the
+  real strings separately.
+- **Local server**: `native/src/server/dst_server.exe` (C) or the parallel
+  `native/dst_server_cs.exe` (C#, selected with `launcher.ini [server]
+  binary=cs`). Both implement the same HTTP contract: `/health`,
+  `/capabilities`, `/translate`, `/batch`, `/prefetch`, `/cache/import`,
+  `/cache/lookup`, `/cache/export`, `/cache/dump`, `/shutdown`. The contract is
+  pinned by `tests/server_contract/run_contract_tests.ps1`, which runs the same
+  50 checks against each binary with a fake OpenAI-compatible provider.
+- **Shared core (`DstCore`)**: `native/src/core/*.cs` — `TextRules` (prompt echo
+  stripping, CJK detection), `Json` (strict parser/escaper), `CacheCodec` (TSV
+  + base64 cache line format), `Contract` (paths, JSON field names, `source`
+  values). Source-linked (not a DLL) into the C# server, the XUnity endpoint
+  payload, the C# launcher port, and `tests/core_tests`, which pins C parity
+  with golden cases.
+- **Embedded engine scripts**: the Ren'Py hook (`payloads/RenPy/iron_deepseek.rpy`),
+  the RPG Maker hook (`payloads/RPGMaker/hook_rpgm_mv.js`) and the Godot 3/4
+  runtime sidecars (`payloads/Godot/dst_godot_runtime_g{3,4}.gd`) are real
+  source files (LF, UTF-8, no BOM — enforced by `.gitattributes` and
+  `tests/payload_scripts`). `build_native.bat` embeds them as RCDATA 301–304;
+  `deploy.c`/`godot_patch.c` read them through `embedded.c` and write them out
+  byte for byte. They are no longer C string literals.
 - **Detection adapter**: `native/src/launcher/engine.c`. It maps a selected
   game directory to `Engine`.
 - **Deploy adapter**: `native/src/launcher/deploy.c`. It writes hooks, copies
@@ -36,7 +105,10 @@ and runtime. The important design shape is:
 - **Warmup scanner**: `native/src/launcher/warmup.c` plus engine scanner
   adapters such as `native/src/launcher/godot_warmup.c`. It reads existing
   game resources and queues likely text through the local server without
-  writing speculative translations as successful cache entries.
+  writing speculative translations as successful cache entries. The C# mirror
+  in `native/src/launcher_cs/Warmup*.cs` treats every `string` as a C byte
+  string (one char per byte) so that filters, limits, and JSON serialization
+  stay byte-identical with the C scanner.
 - **Runtime payload**: engine-specific code used inside a game, such as the
   Ren'Py hook, RPG Maker hook, UnityTranslator plugin, XUnity endpoint, or TMP
   font fallback.
@@ -45,6 +117,13 @@ and runtime. The important design shape is:
   config files.
 - **Program release**: standalone `ds游戏翻译器.exe` package containing the
   launcher, local server, scripts, example config, and first-party plugin DLLs.
+- **Load-test fixture**: an owned temporary cache containing one fixed hot key,
+  a temporary `bench_client` built from current source, and an explicitly
+  disabled API configuration. Endurance and generational-memory tests use this
+  fixture so they measure the local cache/HTTP path without loading, changing,
+  or depending on user translation memory or remote provider latency. The
+  native client writes its request count directly to an owned output file and
+  reports transport-stage failures separately.
 - **Renderer compatibility layer**: the hook or plugin closest to the renderer.
   Keep display fixes here instead of changing shared server/cache text.
 - **Translation prompt echo**: provider output that prepends an instruction such
@@ -77,6 +156,9 @@ and runtime. The important design shape is:
   visible page performs bounded, backoff-based `/cache/lookup` polling; a later
   cache hit restarts that page in Chinese without mutating
   `Game_Message._texts`, while page changes and timeout cancel the poll.
+  The visible-page cache retry starts at 40 ms and backs off to the bounded
+  steady interval, so a completed local-server result is not hidden behind a
+  coarse first refresh.
 - **RPG Maker display acceptance**: renderer-local results must retain ordered
   control tokens and must not contain a copied run of three or more source
   English words inside an otherwise CJK translation. Isolated names, acronyms,
@@ -111,6 +193,9 @@ and runtime. The important design shape is:
   first-miss async writes preserve supported source color tags in the UGUI
   renderer, matching the existing cache-hit path without widening rich-text
   handling to unsupported TMP-only tags.
+  Live client work uses bounded 32-text batches, while script and optional deep
+  prefetch use larger chunks with short yielding gaps; visible work remains
+  ahead of background discovery.
 - **Failure transparency boundary**: a narrow adapter edge where an external
   transport, process, engine version, or optional renderer API may fail while
   the game preserves source text. The boundary must log operation context,
@@ -131,6 +216,8 @@ and runtime. The important design shape is:
   endpoint protects the existing Han runs with validated request-only tokens,
   translates the new passage, then restores the prefix. The shared server CJK
   heuristic remains unchanged, and token loss fails closed.
+  Queued XUnity work polls the localhost cache at 50/100 ms during its initial
+  retry window before returning to the configured steady cadence.
 - **Unity IL2CPP fallback topology**: TMP fallback lists are mutable renderer
   state. Games and Addressables may replace them after startup, so the slow
   fallback pass must verify membership again and dirty loaded text meshes when
@@ -163,6 +250,8 @@ and runtime. The important design shape is:
   lifecycle, compiled-script `Menu` labels are deduplicated from
   `renpy.game.script.namemap` and prefetched before they become visible; the
   live `Menu.execute` hook remains the compatibility fallback.
+  Visible dialogue and menu bursts use a dedicated 16-text live worker batch;
+  background UI text cannot consume that priority queue.
 - **RPG Maker MV/MZ**: JavaScript hook and `www/fonts` deployment live in
   `deploy.c`; JSON and plugin text scanning live in `warmup.c`. RPG Maker MV's
   `plugins.js` may create plugin script tags before the translator tag runs,
@@ -196,5 +285,8 @@ and runtime. The important design shape is:
   them before the whole-tree fallback, and keeps its timer/HTTP nodes in
   `PROCESS_MODE_ALWAYS` so pause menus still translate while game logic remains
   paused. Successful patch replacement removes any stale staged `.next.pck`.
+  Godot 4 scans newly tracked controls in bounded 256-node slices every 80 ms
+  and runs the compatibility whole-tree fallback every 25 ticks, avoiding a
+  duplicate full traversal on every refresh.
   Older exports retain the sidecar command-line path. Original game `.pck` or
   embedded packs are not rewritten.

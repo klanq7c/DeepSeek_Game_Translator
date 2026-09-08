@@ -12,3 +12,7 @@
 
 /* 根据引擎类型，扫描 dir 中的文本数据并预热翻译缓存 */
 void warmup_translations(const WCHAR *dir, Engine engine);
+
+/* 诊断转储模式：为 1 时 warmup_translations 不联网、不查缓存、不回写文件，
+   把每个待提交批次以 "post=<path> <body>" 写到 stdout（--warmup-and-exit）。 */
+extern int g_warmup_dump_stdout;

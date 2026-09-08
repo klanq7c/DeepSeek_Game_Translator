@@ -17,9 +17,8 @@ public sealed class UnityLongTextPart
     }
 }
 
-/* Pure Unity payload helper. The input has already had tags, variables and
-   numbers replaced with __DS_TOKEN_n__ placeholders, so boundaries cannot
-   split renderer control data. Returning null keeps the existing atomic path. */
+/* 纯 Unity 载荷辅助器。输入中的标签、变量和数字已经替换为 __DS_TOKEN_n__
+   占位符，因此分段边界不会切断渲染器控制数据。返回 null 时保留现有原子路径。 */
 public static class UnityLongTextPlanner
 {
     private const int MinimumSegmentChars = 64;

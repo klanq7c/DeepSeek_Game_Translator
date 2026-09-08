@@ -746,9 +746,9 @@ static int renpy_skip_statement(const char *line, const char *first_quote) {
            *line == '#';
 }
 
-/* A valid Ren'Py dialogue/menu line can contain adjacent string literals.
-   Collect each literal from the same accepted line so warmup keys match all
-   text the renderer may expose, while keeping the existing statement filter. */
+/* 有效的 Ren'Py 对话或菜单行可以包含相邻字符串字面量。在保留现有语句过滤
+   规则的同时，收集同一已接受行中的每个字面量，让预热键覆盖渲染器可能显示
+   的全部文本。 */
 static void collect_renpy_line_strings(const char *line, TextList *prefetch) {
     if (!line || !prefetch || prefetch->n >= textlist_limit(prefetch)) return;
     const char *cursor = renpy_first_quote(line);
@@ -833,13 +833,13 @@ static int dedup_contains(const char **slots, size_t cap, const char *s) {
    保持负载率低于 0.5；分配失败时只退化为“无去重”，列表上限仍限制内存。 */
 static void dedup_add(const char ***pslots, size_t *pcap, const char *s, size_t max_items) {
     if (*pcap == 0) {
-        /* Size for load factor < 0.5 at the list's item cap (4096 slots for
-           the default 1200-item lists), so the table never fills. */
+        /* 按列表条目上限将负载因子控制在 0.5 以下（默认 1200 项列表使用
+           4096 个槽位），确保哈希表不会填满。 */
         size_t want = 1u << 12;
         while (want < max_items * 2) want <<= 1;
         *pcap = want;
         *pslots = (const char **)calloc(*pcap, sizeof **pslots);
-        if (!*pslots) { *pcap = 0; return; } /* OOM: dedup degrades, list cap still bounds growth */
+        if (!*pslots) { *pcap = 0; return; } /* 内存不足时去重能力退化，但列表上限仍会限制增长。 */
     }
     const char **slots = *pslots;
     size_t mask = *pcap - 1;
@@ -905,10 +905,12 @@ static void pairlist_add(PairList *l, const char *k, const char *v) {
     }
 }
 
-/* 释放 TextList 拥有的文本、指针数组和只借用这些文本地址的去重表。 */
+/* 释放 TextList 拥有的文本、指针数组和只借用这些文本地址的去重表。
+   prev_items 只存放借用指针，释放指针数组本身即可。 */
 void textlist_free(TextList *l) {
     for (size_t i = 0; i < l->n; i++) free(l->items[i]);
     free(l->items);
+    free(l->prev_items);
     free(l->seen);
 }
 
@@ -931,8 +933,26 @@ typedef struct {
     int reject_logged; /* 本次会话是否已记录过服务端拒绝（限流诊断） */
 } LocalHttp;
 
+/* 诊断转储模式（--warmup-and-exit）：不建立 WinHTTP 会话、不查询本地缓存、
+   不回写翻译文件；每个本应 POST 的批次以 "post=<path> <body>\n" 原样写到
+   stdout。tests/launcher_parity 用它把 C 与 C# 两版扫描器采集到的文本、顺序、
+   上下文（prevs）和请求体字节逐一对比。扫描逻辑本身不感知该标志。 */
+int g_warmup_dump_stdout = 0;
+
+static void warmup_dump_post(const WCHAR *path, const char *body) {
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!out || out == INVALID_HANDLE_VALUE || !body) return;
+    write_stdout_utf8(L"post=");
+    write_stdout_utf8(path);
+    write_stdout_utf8(L" ");
+    DWORD written = 0;
+    WriteFile(out, body, (DWORD)strlen(body), &written, NULL);
+    write_stdout_utf8(L"\n");
+}
+
 /* 建立到固定本地服务端的会话和连接；失败时回收已经创建的部分句柄。 */
 static int local_http_open(LocalHttp *h) {
+    if (g_warmup_dump_stdout) return 1; /* 转储模式：无连接，local_http_post 走 stdout */
     h->ses = WinHttpOpen(L"ds-game-translator Launcher/3.1",
                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                          WINHTTP_NO_PROXY_NAME,
@@ -951,6 +971,10 @@ static int local_http_open(LocalHttp *h) {
    仅当服务端返回 2xx 时视为接受批次（不代表后台翻译已完成）；
    4xx/5xx 会计入日志并返回失败，调用方不得把该批计为已排队。 */
 static int local_http_post(LocalHttp *h, const WCHAR *path, const char *body, int timeout) {
+    if (g_warmup_dump_stdout) {
+        warmup_dump_post(path, body);
+        return 1;
+    }
     if (!h->con) return 0;
     HINTERNET req = WinHttpOpenRequest(h->con, L"POST", path, NULL, WINHTTP_NO_REFERER,
                                        WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
@@ -1008,6 +1032,7 @@ static int local_http_get_status(LocalHttp *h, const WCHAR *path, int timeout, D
 
 /* 在总超时内轮询 /health，只有明确收到 HTTP 200 才允许提交预热批次。 */
 static int local_http_wait_ready(LocalHttp *h, DWORD total_timeout_ms) {
+    if (g_warmup_dump_stdout) return 1;
     DWORD start = GetTickCount();
     for (;;) {
         DWORD status = 0;
@@ -1104,6 +1129,7 @@ static WCHAR *utf8_to_wide_dup(const char *s) {
    成功时 *out 接管响应体，即使内容等于原文也由上层按缓存语义判断。 */
 static int localhost_get_cached_translate(const char *text, char **out) {
     *out = NULL;
+    if (g_warmup_dump_stdout) return 0; /* 转储模式：一律视为未命中，不回写文件 */
     char *enc = url_encode_utf8(text);
     if (!enc) return 0;
 
@@ -1235,8 +1261,18 @@ static int backup_once(const WCHAR *path) {
 }
 
 /* 把待翻译文本序列化后提交到 /prefetch。成功只表示服务端接受批次，
-   实际翻译仍在后台进行，因此不得把原文当作成功译文写回文件。 */
+   实际翻译仍在后台进行，因此不得把原文当作成功译文写回文件。
+   当 l->prev_items 存在且至少一条非空时，额外携带 "prevs" 平行数组
+   （缺失处为空串），让服务器用上下文感知提示词翻译；否则请求体与
+   旧协议字节级相同。 */
 static int post_prefetch_batch(LocalHttp *http, TextList *l, size_t start, size_t count) {
+    int any_prev = 0;
+    if (l->prev_items) {
+        for (size_t i = 0; i < count; i++) {
+            const char *p = l->prev_items[start + i];
+            if (p && p[0]) { any_prev = 1; break; }
+        }
+    }
     ByteBuf b = {0};
     b.cap = 2048;
     b.data = (char *)malloc(b.cap);
@@ -1247,7 +1283,18 @@ static int post_prefetch_batch(LocalHttp *http, TextList *l, size_t start, size_
         if (i) bb_add(&b, ",", 1);
         bb_json(&b, l->items[start + i]);
     }
-    bb_add(&b, "]}", 2);
+    bb_add(&b, "]", 1);
+    if (any_prev) {
+        bb_add(&b, ",\"prevs\":[", 10);
+        for (size_t i = 0; i < count; i++) {
+            if (i) bb_add(&b, ",", 1);
+            const char *p = l->prev_items ? l->prev_items[start + i] : NULL;
+            if (p && p[0]) bb_json(&b, p);
+            else bb_add(&b, "\"\"", 2);
+        }
+        bb_add(&b, "]", 1);
+    }
+    bb_add(&b, "}", 1);
     int ok = local_http_post(http, L"/prefetch", b.data, 1500);
     free(b.data);
     return ok;
@@ -1417,8 +1464,8 @@ static int unity_asset_file_name(const WCHAR *name) {
     return 0;
 }
 
-/* Common AssetBundle extensions used by Unity games and visual-novel tools.
-   They may be much larger than .assets files, so callers must stream them. */
+/* Unity 游戏和视觉小说工具常用的 AssetBundle 扩展名。这些文件可能远大于
+   .assets 文件，因此调用方必须以流式方式处理。 */
 static int unity_bundle_file_name(const WCHAR *name) {
     return wide_ends_with_i(name, L".unity3d") ||
            wide_ends_with_i(name, L".bundle") ||
@@ -1596,10 +1643,9 @@ static int looks_like_unity_bundle_text(const char *text) {
     return 1;
 }
 
-/* AssetBundle custom payloads often surround dialogue with short binary fields
-   instead of Unity's usual u32 string length. Remove only high-confidence
-   serialization residue and feed the result through the existing strict Unity
-   text filter. Shared translation memory remains untouched. */
+/* AssetBundle 自定义载荷常用短二进制字段包围对话，而不是 Unity 常见的 u32
+   字符串长度。只移除高置信度的序列化残留，再将结果交给现有严格 Unity 文本
+   过滤器；共享翻译记忆保持不变。 */
 static void collect_unity_bundle_segment(char *segment, TextList *prefetch) {
     char *text = trim_ascii(segment);
     if (!*text) return;
@@ -1625,16 +1671,15 @@ static void collect_unity_bundle_segment(char *segment, TextList *prefetch) {
     for (size_t i = 0; i < len; i++) {
         if (text[i] == '.' || text[i] == '?' || text[i] == '!') boundary = i;
     }
-    /* A single printable byte directly after sentence punctuation is usually
-       the next serialized field (for example "Hi honey.0" or "What?("). */
+    /* 句末标点后紧跟的单个可打印字节通常是下一个序列化字段，例如
+       “Hi honey.0”或“What?(”。 */
     if (boundary != (size_t)-1 && boundary + 2 == len) {
         text[boundary + 1] = 0;
         len = boundary + 1;
     }
-    /* Bullet/objective text in several bundle serializers is followed by a
-       one-byte field without a delimiter. A trailing backslash is another
-       observed field marker. Restrict this repair to bullet text so legitimate
-       identifiers and ordinary prose are not changed. */
+    /* 若干包序列化器会在项目符号或任务文本后直接追加一个无分隔符的单字节
+       字段；尾随反斜杠也是已观察到的字段标记。此修复只用于项目符号文本，
+       避免改动合法标识符和普通正文。 */
     if (len > 4 && text[0] == '-' && text[1] == ' ' &&
         ((text[len - 1] >= '0' && text[len - 1] <= '9') || text[len - 1] == '\\') &&
         ((text[len - 2] >= 'A' && text[len - 2] <= 'Z') ||
@@ -1657,9 +1702,8 @@ static void collect_unity_bundle_run(char *run, TextList *prefetch) {
     }
 }
 
-/* Stream large AssetBundle containers with bounded memory. Only printable
-   runs up to the normal warmup text limit are retained; oversized runs are
-   discarded until the next binary delimiter. */
+/* 在有限内存内流式扫描大型 AssetBundle 容器。只保留不超过常规预热文本上限
+   的可打印连续片段；超长片段会被丢弃，直到遇到下一个二进制分隔符。 */
 static void scan_unity_bundle_file(const WCHAR *path, TextList *prefetch) {
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1829,6 +1873,7 @@ static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
 
     while (*p) {
         p = json_ws(p);
+        if (!*p) break; /* 尾部空白后即终止符：不能再 p++ 越过缓冲末尾 */
         if (*p != '"') {
             p++;
             continue;
@@ -1951,13 +1996,11 @@ static void scan_rpgm_text_file(const WCHAR *path, TextList *prefetch) {
     free(buf);
 }
 
-/* RPG Maker localization plugins commonly keep every language in a root-level
-   CSV (for example game_messages.csv). Detect the delimiter from the first
-   logical record, then collect individual fields so separators and quoted
-   newlines never become part of a translation key. The header row selects the
-   source/English column (same rules as the Godot side); unrecognized layouts
-   fall back to all fields except short ID forms. This is a read-only warmup
-   path bounded to 8 MiB before read and never imports existing translations. */
+/* RPG Maker 本地化插件常把所有语言保存在根目录 CSV 中（例如
+   game_messages.csv）。先从首条逻辑记录识别分隔符，再逐字段收集，避免分隔符
+   和引号内换行进入翻译键。表头按与 Godot 相同的规则选择源语言或英语列；
+   无法识别的布局回退为除短 ID 形式外的全部字段。该只读预热路径会在读取前
+   按 8 MiB 限制文件大小，且不会导入已有译文。 */
 static char rpgm_csv_delimiter(const char *buf) {
     size_t counts[3] = {0, 0, 0};
     int quoted = 0;
@@ -2248,7 +2291,18 @@ static size_t post_prefetch_all(TextList *prefetch) {
  * 提取对话行中引号内的文本加入 prefetch 列表。
  * depth 控制递归深度（上限 RENPY_SCAN_MAX_DEPTH），
  * 超大的 .rpy 文件（> RENPY_SCRIPT_SCAN_MAX_BYTES）会被跳过。
+ *
+ * 同时维护 prefetch->prev_items 平行数组：记录每条采集文本在同一脚本
+ * 文件内的上一条采集文本（借用指针，可能为 NULL），供预热提示词携带
+ * 对话语境。语境不跨文件延续——不同脚本的剧情没有相邻关系。
  * ---------------------------------------------------------------- */
+
+/* 惰性分配 prev_items 平行数组；分配失败时保持 NULL（仅失去语境，不影响采集）。 */
+static void renpy_prevs_ensure(TextList *prefetch) {
+    if (prefetch->prev_items) return;
+    prefetch->prev_items = (char **)calloc(textlist_limit(prefetch), sizeof *prefetch->prev_items);
+}
+
 static void scan_renpy_script_dir(const WCHAR *dir, TextList *prefetch, int depth) {
     if (depth > RENPY_SCAN_MAX_DEPTH) return;
     if (!is_dir(dir)) return;
@@ -2261,8 +2315,8 @@ static void scan_renpy_script_dir(const WCHAR *dir, TextList *prefetch, int dept
         if (prefetch->n >= textlist_limit(prefetch)) { FindClose(hf); return; }
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         if (!wide_ends_with_i(fd.cFileName, L".rpy")) continue;
-        /* Launcher-owned hook literals are implementation details, not game text.
-           Scanning them can occupy the remote queue before the first real menu. */
+        /* 启动器自带钩子的字面量属于实现细节，不是游戏文本。扫描它们可能在
+           首个真实菜单出现前占满远程队列。 */
         if (!_wcsicmp(fd.cFileName, L"iron_deepseek.rpy")) continue;
         /* 跳过超过大小上限的文件 */
         ULARGE_INTEGER fsz = {0};
@@ -2273,11 +2327,23 @@ static void scan_renpy_script_dir(const WCHAR *dir, TextList *prefetch, int dept
         path_join(full, MAX_PATH * 4, dir, fd.cFileName);
         char *buf = NULL; DWORD size = 0;
         if (!read_file_bytes(full, &buf, &size)) continue;
+        char *prev_last = NULL; /* 上一条采集文本（借用 items 内的字符串，文件内有效） */
         char *line = buf;
         while (*line && prefetch->n < textlist_limit(prefetch)) {
             char *nl = strchr(line, '\n');
             if (nl) { *nl = 0; nl++; } else nl = line + strlen(line);
+            size_t before = prefetch->n;
             collect_renpy_line_strings(line, prefetch);
+            size_t added = prefetch->n - before;
+            if (added) {
+                renpy_prevs_ensure(prefetch);
+                if (prefetch->prev_items) {
+                    for (size_t k = before; k < prefetch->n; k++) {
+                        prefetch->prev_items[k] = prev_last;
+                    }
+                    prev_last = prefetch->items[prefetch->n - 1];
+                }
+            }
             line = nl;
         }
         free(buf);
@@ -2312,8 +2378,8 @@ static void warmup_rpgm(const WCHAR *dir) {
 static void warmup_godot(const WCHAR *dir) {
     TextList prefetch = {0};
     prefetch.max_items = GODOT_WARMUP_MAX_ITEMS;
-    /* Scan resources for the generic runtime sidecar and external patch pack.
-       Original .pck and compiled resources remain read-only inputs. */
+    /* 扫描资源，为通用运行时 sidecar 和外部补丁包准备文本。原始 .pck 与编译
+       资源始终只作为只读输入。 */
     warmup_scan_godot_resources(dir, &prefetch);
     size_t queued = post_prefetch_all(&prefetch);
     if (queued) append_log(L"Godot preheated translation cache: queued %zu texts.", queued);

@@ -169,8 +169,7 @@ char *json_get_str(const char *json, const char *key) {
     return p ? json_str(&p) : NULL;
 }
 
-/* Locate a direct member of the root object. Request bodies use this stricter
-   lookup so an unrelated nested object cannot shadow the public API fields. */
+/* 定位根对象的直接成员。请求体使用这种严格查询，防止无关嵌套对象遮蔽公开 API 字段。 */
 const char *json_top_key(const char *json, const char *key) {
     const char *p = json_skipws(json);
     if (*p != '{') return NULL;
@@ -267,15 +266,6 @@ static List json_array_value(const char *p) {
            的宽容策略一致，不再丢弃整个数组。 */
         if (*p == ']') return l;
     }
-}
-
-/* 取 key 对应的字符串数组。兼容两种形态：
-   - 直接是一个字符串（包装成单元素列表）；
-   - 标准数组 ["a","b",...]。
-   解析中途遇到非法结构即停止，返回已收集到的部分。 */
-List json_array(const char *json, const char *key) {
-    const char *p = json_key(json, key);
-    return json_array_value(p);
 }
 
 List json_top_array(const char *json, const char *key) {

@@ -14,6 +14,7 @@
  */
 #include "self_update.h"
 
+#include "embedded.h"
 #include "fsutil.h"
 #include "globals.h"
 #include "ui.h"
@@ -28,6 +29,8 @@
 #define IDR_PAYLOAD_INSTALLER           102
 #define IDR_PAYLOAD_API_EXAMPLE         103
 #define IDR_PAYLOAD_LAUNCHER_EXAMPLE    104
+#define IDR_PAYLOAD_DST_SERVER_CS       105
+#define IDR_PAYLOAD_GLOSSARY_EXAMPLE    106
 #define IDR_PAYLOAD_UNITY_MONO5         201
 #define IDR_PAYLOAD_UNITY_MONO6         202
 #define IDR_PAYLOAD_XUNITY_ENDPOINT     203
@@ -48,30 +51,16 @@ static const EmbeddedPayload EMBEDDED_PAYLOADS[] = {
     { IDR_PAYLOAD_INSTALLER,        L"scripts\\install_runtime_payloads.ps1", L"install_runtime_payloads.ps1", 1 },
     { IDR_PAYLOAD_API_EXAMPLE,      L"config\\api.ini.example", L"api.ini.example", 1 },
     { IDR_PAYLOAD_LAUNCHER_EXAMPLE, L"config\\launcher.ini.example", L"launcher.ini.example", 1 },
+    /* C# 服务器：与 dst_server.exe 同一 HTTP 契约，launcher.ini [server] binary=cs 时启用。
+       随启动器一起分发，用户不必单独安装。 */
+    { IDR_PAYLOAD_DST_SERVER_CS,    L"native\\dst_server_cs.exe", L"dst_server_cs.exe", 1 },
+    { IDR_PAYLOAD_GLOSSARY_EXAMPLE, L"config\\glossary.example.tsv", L"glossary.example.tsv", 1 },
     { IDR_PAYLOAD_UNITY_MONO5,      L"payloads\\UnityTranslator\\UnityTranslator.dll", L"UnityTranslator.dll", 0 },
     { IDR_PAYLOAD_UNITY_MONO6,      L"payloads\\UnityTranslator\\UnityTranslator.BepInEx6.dll", L"UnityTranslator.BepInEx6.dll", 0 },
     { IDR_PAYLOAD_XUNITY_ENDPOINT,  L"payloads\\UnityIL2CPP\\DeepSeekXUnityTranslator\\DeepSeekTranslate.dll", L"DeepSeekTranslate.dll", 0 },
     { IDR_PAYLOAD_TMP_FALLBACK,     L"payloads\\UnityIL2CPP\\DeepSeekTMPFontFallback\\BepInEx\\plugins\\DeepSeekTMPFontFallback\\DeepSeekTMPFontFallback.dll", L"DeepSeekTMPFontFallback.dll", 0 },
     { IDR_PAYLOAD_UNITY_FONT_PATCHER, L"payloads\\UnityTranslator\\DeepSeekUnityFontPatcher.dll", L"DeepSeekUnityFontPatcher.dll", 0 },
 };
-
-/* 取得编译进启动器的只读资源视图。data 不转移所有权，调用方不得释放；
-   资源内存由 Windows 模块加载器持有，直到进程退出。 */
-static int get_resource_bytes(int id, const unsigned char **data, DWORD *size) {
-    HRSRC res = FindResourceW(g_inst, MAKEINTRESOURCEW(id), RT_RCDATA);
-    if (!res) return 0;
-    DWORD sz = SizeofResource(g_inst, res);
-    if (sz == 0) return 0;
-    HGLOBAL loaded = LoadResource(g_inst, res);
-    if (!loaded) return 0;
-    const void *ptr = LockResource(loaded);
-    if (!ptr) return 0;
-    /* LockResource 返回的内存归模块资源所有，生命周期覆盖整个进程；
-       调用方只能读取，不能 free。 */
-    *data = (const unsigned char *)ptr;
-    *size = sz;
-    return 1;
-}
 
 /* 为目标文件创建父目录；path 本身仍视为文件路径，不会创建最后一段。 */
 static int ensure_parent_dir(const WCHAR *path) {
@@ -139,7 +128,7 @@ static int write_bytes_atomic(const WCHAR *path, const unsigned char *data, DWOR
 
 /* 把单文件启动器中的运行时 payload 同步到工作目录。
    important 资源缺失会被计入失败；可选的引擎 payload 缺失则保持兼容降级。 */
-void sync_embedded_payloads(void) {
+int sync_embedded_payloads(void) {
     int updated = 0;
     int failed = 0;
     int missing_important = 0;
@@ -148,7 +137,7 @@ void sync_embedded_payloads(void) {
         const EmbeddedPayload *p = &EMBEDDED_PAYLOADS[i];
         const unsigned char *data = NULL;
         DWORD size = 0;
-        if (!get_resource_bytes(p->id, &data, &size)) {
+        if (!embedded_resource_bytes(p->id, &data, &size)) {
             if (p->important) missing_important++;
             continue;
         }
@@ -174,4 +163,5 @@ void sync_embedded_payloads(void) {
     if (failed > 0) {
         append_log(L"Warning: %d built-in component(s) could not be updated. Close running games/server and restart the launcher.", failed);
     }
+    return failed == 0 && missing_important == 0;
 }

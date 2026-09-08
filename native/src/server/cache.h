@@ -26,7 +26,7 @@ typedef struct {
     char *v;
     uint64_t h;
     int used;
-    int persisted; /* current value is known to be present in the TSV */
+    int persisted; /* 当前值已确认存在于 TSV 中 */
 } CacheEntry;
 
 typedef enum {
@@ -37,9 +37,9 @@ typedef enum {
 
 typedef struct {
     CachePersistStatus status;
-    size_t accepted;  /* valid non-identity entries applied to memory */
-    size_t persisted; /* accepted entries known durable after this call */
-    size_t rejected;  /* empty/invalid or normalized source-echo entries */
+    size_t accepted;  /* 已应用到内存的有效非同文条目 */
+    size_t persisted; /* 本次调用后已确认落盘的条目数 */
+    size_t rejected;  /* 空值/非法或归一化后的原文回显条目 */
 } CachePersistResult;
 
 typedef struct {
@@ -48,11 +48,11 @@ typedef struct {
     size_t len;        /* 已用条目数 */
 #ifdef _WIN32
     SRWLOCK lock;
-    /* Serializes TSV appends only. Disk IO must never run under `lock`:
-       readers (game-facing lookups) would stall behind every persist. */
+    /* 只串行化 TSV 追加。磁盘 IO 绝不能在 `lock` 下运行，否则面向游戏的查询读取
+       会被每次持久化阻塞。 */
     SRWLOCK io_lock;
 #endif
-    void *persist_f; /* FILE*, lazily opened, lives for the process */
+    void *persist_f; /* FILE*，惰性打开，进程存活期间持有 */
     char path[MAX_PATH * 4];
 } Cache;
 
@@ -61,12 +61,13 @@ void cache_set(Cache *c, const char *k, const char *v);      /* 仅写内存 */
 void cache_set_persist(Cache *c, const char *k, const char *v); /* 写内存 + 追加落盘 */
 CachePersistResult cache_set_persist_result(Cache *c, const char *k, const char *v);
 char *cache_get(Cache *c, const char *k);                    /* 命中返回新分配拷贝，未命中返回 NULL */
+int cache_contains(Cache *c, const char *k);                 /* 仅探测是否命中，不分配值副本 */
 void cache_set_many_persist(Cache *c, const char **keys, const char **values,
-                            size_t count); /* one map lock + one disk flush */
+                            size_t count); /* 一次映射锁 + 一次磁盘刷盘 */
 CachePersistResult cache_set_many_persist_result(Cache *c, const char **keys,
                                                   const char **values, size_t count);
-/* Look up k and emit JSON-escaped value into out (with surrounding quotes).
-   Returns 1 on hit, 0 on miss. Saves the malloc+copy+free vs cache_get. */
+/* 查询 k，并把带引号的 JSON 转义值写入 out。命中返回 1，未命中返回 0；
+   相比 cache_get 可省去 malloc、复制和 free。 */
 int cache_emit_json(Cache *c, const char *k, Buf *out);
 size_t cache_emit_json_map(Cache *c, Buf *out);     /* 导出为 {"k":"v",...} 形式，返回条目数 */
 size_t cache_emit_json_entries(Cache *c, Buf *out); /* 导出为 [{"key":"k","value":"v"},...]，返回条目数 */

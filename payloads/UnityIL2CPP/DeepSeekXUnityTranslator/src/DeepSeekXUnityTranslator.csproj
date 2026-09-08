@@ -13,6 +13,14 @@
     <DebugType>none</DebugType>
   </PropertyGroup>
 
+  <!-- 共享核心（native/src/core）：文本判定/提示词回显剥离与契约常量，与
+       dst_server / dst_server_cs 使用同一份源码，保证端点与服务器判定一致。
+       只链接纯 BCL 文件，不给 payload 增加任何运行时依赖。 -->
+  <ItemGroup>
+    <Compile Include="..\..\..\..\native\src\core\TextRules.cs" Link="core\TextRules.cs" />
+    <Compile Include="..\..\..\..\native\src\core\Contract.cs" Link="core\Contract.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <Reference Include="XUnity.AutoTranslator.Plugin.Core">
       <HintPath>..\..\XUnityAutoTranslator\BepInEx\plugins\XUnity.AutoTranslator\XUnity.AutoTranslator.Plugin.Core.dll</HintPath>

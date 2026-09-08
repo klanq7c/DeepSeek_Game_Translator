@@ -18,6 +18,8 @@ typedef struct {
 void buf_init(Buf *b);                          /* 初始化为 256 字节空缓冲区 */
 void buf_free(Buf *b);                          /* 释放并清零字段 */
 void buf_grow(Buf *b, size_t n);                /* 预留至少 n 字节可用空间（按需扩容） */
+char *buf_reserve(Buf *b, size_t n);            /* 返回尾部至少 n 字节的可写区域，不改变 len */
+void buf_commit(Buf *b, size_t n);              /* 提交刚写入的 n 字节并补 NUL */
 void buf_addn(Buf *b, const char *s, size_t n); /* 追加定长字节 */
 void buf_add(Buf *b, const char *s);            /* 追加以 '\0' 结尾的字符串 */
 void buf_ch(Buf *b, char c);                    /* 追加单个字符 */

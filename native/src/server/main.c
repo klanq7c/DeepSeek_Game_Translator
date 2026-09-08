@@ -12,6 +12,7 @@
  *   --port <n>           监听端口（默认 19999）
  *   --cache <path>       缓存 TSV 文件（默认 translation_memory_c.tsv）
  *   --api-config <path>  API 配置 ini 路径
+ *   --glossary <path>    可选术语表 TSV（默认为缓存同目录的 glossary.tsv）
  *
  * 仅 Windows。仅监听回环地址，不对外暴露。
  */
@@ -89,10 +90,29 @@ static DWORD WINAPI bounded_http_serve_thread(LPVOID arg) {
     return result;
 }
 
+/* 从缓存路径推导默认术语表路径：同目录下的 glossary.tsv。
+   缓存路径无目录成分时落到当前工作目录。结果写入 out（cap 至少 MAX_PATH）。 */
+static void default_glossary_path(const char *cache, char *out, size_t cap) {
+    const char *slash = NULL;
+    for (const char *p = cache; *p; p++) {
+        if (*p == '/' || *p == '\\') slash = p;
+    }
+    if (slash) {
+        size_t dir_len = (size_t)(slash - cache) + 1;
+        if (dir_len >= cap) dir_len = cap - 1;
+        memcpy(out, cache, dir_len);
+        out[dir_len] = 0;
+    } else {
+        out[0] = 0;
+    }
+    strncat(out, "glossary.tsv", cap - strlen(out) - 1);
+}
+
 int main(int argc, char **argv) {
     /* 解析命令行参数，提供合理默认值。 */
     const char *cache = CACHE_DEFAULT;
     const char *api_config = NULL;
+    const char *glossary = NULL;
     int port = HTTP_PORT_DEFAULT;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--port")) {
@@ -104,6 +124,9 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--api-config")) {
             if (i + 1 >= argc) die("missing --api-config value");
             api_config = argv[++i];
+        } else if (!strcmp(argv[i], "--glossary")) {
+            if (i + 1 >= argc) die("missing --glossary value");
+            glossary = argv[++i];
         } else {
             die("unknown argument");
         }
@@ -116,6 +139,14 @@ int main(int argc, char **argv) {
     ApiConfig api;
     api_config_init(&api);
     api_config_load(&api, api_config);
+    /* 术语表在 API 配置之后加载：文件不存在时保持为空，翻译行为不变。 */
+    char glossary_path[MAX_PATH * 2];
+    if (glossary) {
+        api_glossary_load_file(&api, glossary);
+    } else {
+        default_glossary_path(cache, glossary_path, sizeof glossary_path);
+        api_glossary_load_file(&api, glossary_path);
+    }
     G_CONNECTIONS_DRAINED = CreateEventW(NULL, TRUE, TRUE, NULL);
     if (!G_CONNECTIONS_DRAINED) die("connection drain event failed");
 

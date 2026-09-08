@@ -15,6 +15,22 @@
 #include <windows.h>
 #endif
 
+/* 仅测试构建统计受管堆分配次数；正式构建展开为空操作，不增加热路径成本。 */
+#ifdef DST_TEST_ALLOC_COUNTERS
+static size_t g_dst_test_alloc_count;
+#define DST_TEST_COUNT_ALLOCATION() (g_dst_test_alloc_count++)
+
+void dst_test_alloc_reset(void) {
+    g_dst_test_alloc_count = 0;
+}
+
+size_t dst_test_alloc_count(void) {
+    return g_dst_test_alloc_count;
+}
+#else
+#define DST_TEST_COUNT_ALLOCATION() ((void)0)
+#endif
+
 /* 打印错误到 stderr 后终止进程：Windows 用 ExitProcess 避免析构副作用，其他平台用 exit。 */
 void die(const char *m) {
     fputs(m, stderr);
@@ -28,6 +44,7 @@ void die(const char *m) {
 
 /* malloc，OOM 即终止。n 为 0 时分配 1 字节，保证返回非空且可 free 的指针。 */
 void *xmalloc(size_t n) {
+    DST_TEST_COUNT_ALLOCATION();
     void *p = malloc(n ? n : 1);
     if (!p) die("oom");
     return p;
@@ -37,6 +54,7 @@ void *xmalloc(size_t n) {
 void *xcalloc(size_t count, size_t size) {
     if (!count || !size) return xmalloc(1);
     if (count > SIZE_MAX / size) die("allocation too large");
+    DST_TEST_COUNT_ALLOCATION();
     void *p = calloc(count, size);
     if (!p) die("oom");
     return p;
@@ -44,6 +62,7 @@ void *xcalloc(size_t count, size_t size) {
 
 /* realloc，OOM 即终止。同样对 n==0 做归一化。 */
 void *xrealloc(void *p, size_t n) {
+    DST_TEST_COUNT_ALLOCATION();
     void *r = realloc(p, n ? n : 1);
     if (!r) die("oom");
     return r;
@@ -85,8 +104,7 @@ static int translation_prefix_equal(const char *text, const char *prefix) {
     return 1;
 }
 
-/* Require a real separator and non-empty remainder so ordinary translations
-   that merely start with a similar phrase are left untouched. */
+/* 必须存在真实分隔符和非空余文，避免误改仅以相似短语开头的普通译文。 */
 static const char *translation_after_prompt_prefix(const char *text, const char *prefix) {
     if (!translation_prefix_equal(text, prefix)) return NULL;
     const char *p = text + strlen(prefix);
@@ -96,7 +114,7 @@ static const char *translation_after_prompt_prefix(const char *text, const char 
     } else if ((unsigned char)p[0] == 0xef &&
                (unsigned char)p[1] == 0xbc &&
                (unsigned char)p[2] == 0x9a) {
-        p += 3; /* U+FF1A FULLWIDTH COLON */
+        p += 3; /* U+FF1A 全角冒号 */
     } else if (*p != '\r' && *p != '\n') {
         return NULL;
     }
@@ -129,8 +147,8 @@ static int strip_translation_prompt_echo(char *s) {
     return 0;
 }
 
-/* Shared by live API responses and every cache ingress. Normal values remain
-   byte-for-byte unchanged; disk-loaded prompt echoes heal only in memory. */
+/* 实时 API 响应和所有缓存入口共用。正常值逐字节保持不变；从磁盘加载的提示词回显
+   只在内存中修复。 */
 void normalize_translation_result(char *s) {
     if (!s || !*s) return;
     for (int pass = 0; pass < 3 && *s; pass++) {
@@ -161,10 +179,10 @@ char *istrstr(char *hay, const char *needle) {
 /* FNV-1a 64 位哈希，用于缓存键定位桶。
    返回值保证非 0（结果为 0 时归一化为 1），避免与"空槽"标记冲突。 */
 uint64_t h64(const char *s) {
-    uint64_t h = 1469598103934665603ULL;          /* FNV offset basis */
+    uint64_t h = 1469598103934665603ULL;          /* FNV 偏移基数 */
     while (*s) {
         h ^= (unsigned char)*s++;
-        h *= 1099511628211ULL;                     /* FNV prime */
+        h *= 1099511628211ULL;                     /* FNV 质数乘子 */
     }
     return h ? h : 1;
 }

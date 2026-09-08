@@ -42,6 +42,21 @@ static int read_handle_all(HANDLE h, char *buf, DWORD size) {
 /* 拼接两个路径段：a 末尾无 '\' 时自动补上。 */
 void path_join(WCHAR *out, size_t cap, const WCHAR *a, const WCHAR *b) {
     if (!out || cap == 0) return;
+    if (a == out && b) {
+        /* 原地追加：调用方把 out 同时当作 a 传入时不能先清空 out，也不能让
+           _snwprintf 读写重叠缓冲区（C 标准规定为未定义行为）。 */
+        size_t alen = wcslen(out);
+        size_t blen = wcslen(b);
+        int need_sep = alen > 0 && out[alen - 1] != L'\\';
+        if (alen + (size_t)need_sep + blen >= cap) {
+            out[0] = 0;
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return;
+        }
+        if (need_sep) out[alen++] = L'\\';
+        memcpy(out + alen, b, (blen + 1) * sizeof(*out));
+        return;
+    }
     out[0] = 0;
     if (!a || !b) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -56,9 +71,8 @@ void path_join(WCHAR *out, size_t cap, const WCHAR *a, const WCHAR *b) {
 }
 
 /*
- * Backup/ownership marker names are derived from an existing path. CRT wide
- * formatting can leave a truncated buffer, which is unsafe for deploy and
- * restore operations because that name may identify a different file.
+ * 备份/归属标记名由已有路径派生。CRT 宽字符格式化可能留下被截断的缓冲区，
+ * 这对部署与还原操作不安全，因为该名字可能指向另一个文件。
  */
 int path_append_suffix(WCHAR *out, size_t cap, const WCHAR *path,
                        const WCHAR *suffix) {
@@ -82,8 +96,7 @@ int path_append_suffix(WCHAR *out, size_t cap, const WCHAR *path,
     return 1;
 }
 
-/* Format process command lines and other ownership-sensitive values without
- * ever passing a truncated string to Win32. */
+/* 格式化进程命令行等所有权敏感的值，绝不把被截断的字符串交给 Win32。 */
 int wide_format_checked(WCHAR *out, size_t cap, const WCHAR *fmt, ...) {
     if (!out || cap == 0 || !fmt) {
         if (out && cap) out[0] = 0;
@@ -116,14 +129,12 @@ int is_dir(const WCHAR *p) {
 }
 
 /*
- * Deployment paths can be inside a user-selected, untrusted game directory.
- * A junction or directory symlink in that tree must not redirect launcher
- * writes outside the selected directory.  Inspect each existing component,
- * because querying only the final path follows intermediate reparse points.
+ * 部署路径可能位于用户选择、不可信的游戏目录内。该目录树中的 junction 或
+ * 目录符号链接不得把启动器的写入重定向到所选目录之外。逐个检查每一级已存在
+ * 的组件，因为只查询最终路径会跟随中间的重解析点。
  *
- * This check intentionally fails closed when a component cannot be inspected.
- * Callers already record the surrounding deploy/write failure in the launcher
- * log, without exposing the contents of the affected game file.
+ * 当某个组件无法被检查时，本检查有意失败关闭（fail closed）。调用方已经在
+ * 启动器日志中记录相关的部署/写入失败，且不会暴露受影响游戏文件的内容。
  */
 static int full_path_for_safety_check(const WCHAR *path, WCHAR *full, size_t cap,
                                       size_t *root_len_out) {
@@ -138,7 +149,7 @@ static int full_path_for_safety_check(const WCHAR *path, WCHAR *full, size_t cap
     if (len >= 3 && full[1] == L':' && full[2] == L'\\') {
         root_len = 3;
     } else if (len >= 5 && full[0] == L'\\' && full[1] == L'\\') {
-        /* Device namespaces can bypass ordinary Win32 path assumptions. */
+        /* 设备命名空间可以绕过常规的 Win32 路径假设。 */
         if ((full[2] == L'?' || full[2] == L'.') && full[3] == L'\\') return 0;
         WCHAR *server_end = wcschr(full + 2, L'\\');
         if (!server_end || !server_end[1]) return 0;
@@ -290,7 +301,45 @@ int write_file_bytes(const WCHAR *path, const char *buf, DWORD size) {
     return ok;
 }
 
-/* 复制单个文件。自动确保目标父目录已存在。FALSE = 覆盖已有。 */
+/* 用固定缓冲区比较两个普通文件，避免为了跳过重复部署而整文件载入内存。 */
+static int files_equal_streaming(const WCHAR *left, const WCHAR *right) {
+    HANDLE left_file = CreateFileW(left, GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (left_file == INVALID_HANDLE_VALUE) return 0;
+    HANDLE right_file = CreateFileW(right, GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (right_file == INVALID_HANDLE_VALUE) {
+        CloseHandle(left_file);
+        return 0;
+    }
+
+    LARGE_INTEGER left_size, right_size;
+    int equal = GetFileSizeEx(left_file, &left_size) &&
+                GetFileSizeEx(right_file, &right_size) &&
+                left_size.QuadPart == right_size.QuadPart;
+    unsigned char left_buf[32 * 1024], right_buf[32 * 1024];
+    while (equal) {
+        DWORD left_read = 0, right_read = 0;
+        if (!ReadFile(left_file, left_buf, sizeof(left_buf), &left_read, NULL) ||
+            !ReadFile(right_file, right_buf, sizeof(right_buf), &right_read, NULL)) {
+            equal = 0;
+            break;
+        }
+        if (left_read != right_read ||
+            (left_read && memcmp(left_buf, right_buf, left_read) != 0)) {
+            equal = 0;
+            break;
+        }
+        if (!left_read) break;
+    }
+    CloseHandle(right_file);
+    CloseHandle(left_file);
+    return equal;
+}
+
+/* 复制单个文件。自动确保目标父目录已存在；内容相同则不重复写盘。 */
 static int copy_file_checked(const WCHAR *from, const WCHAR *to,
                              int fail_if_exists) {
     if (!from || !to || path_has_reparse_point(from, 1)) {
@@ -312,6 +361,7 @@ static int copy_file_checked(const WCHAR *from, const WCHAR *to,
         if (!ensure_dir(parent)) return 0;
     }
     if (!write_target_is_safe(to)) return 0;
+    if (!fail_if_exists && files_equal_streaming(from, to)) return 1;
     return CopyFileW(from, to, fail_if_exists ? TRUE : FALSE);
 }
 
@@ -364,6 +414,7 @@ int copy_tree_safe(const WCHAR *from, const WCHAR *to) {
     if (h == INVALID_HANDLE_VALUE) return 0;
 
     int ok = 1;
+    DWORD first_error = ERROR_SUCCESS;
     do {
         if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
         WCHAR src[MAX_PATH * 4], dst[MAX_PATH * 4];
@@ -371,15 +422,28 @@ int copy_tree_safe(const WCHAR *from, const WCHAR *to) {
         path_join(dst, MAX_PATH * 4, to, fd.cFileName);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
             ok = 0;
+            if (first_error == ERROR_SUCCESS) first_error = ERROR_ACCESS_DENIED;
             continue;
         }
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!copy_tree_safe(src, dst)) ok = 0;
+            if (!copy_tree_safe(src, dst)) {
+                if (first_error == ERROR_SUCCESS) first_error = GetLastError();
+                ok = 0;
+            }
         } else {
-            if (!copy_file_safe(src, dst)) ok = 0;
+            if (!copy_file_safe(src, dst)) {
+                if (first_error == ERROR_SUCCESS) first_error = GetLastError();
+                ok = 0;
+            }
         }
     } while (FindNextFileW(h, &fd));
+    DWORD enumeration_error = GetLastError();
     FindClose(h);
+    if (enumeration_error != ERROR_NO_MORE_FILES && first_error == ERROR_SUCCESS) {
+        first_error = enumeration_error;
+        ok = 0;
+    }
+    if (!ok) SetLastError(first_error ? first_error : ERROR_GEN_FAILURE);
     return ok;
 }
 
@@ -467,7 +531,7 @@ void dpi_enable_awareness(void) {
     typedef BOOL (WINAPI *PFN_SCTX)(HANDLE);
     PFN_SCTX p = (PFN_SCTX)(void *)GetProcAddress(u, "SetProcessDpiAwarenessContext");
     if (p) {
-        /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4, V1 = -3 */
+        /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4，V1 = -3（API 约定的魔数句柄值） */
         if (p((HANDLE)(LONG_PTR)-4)) return;
         if (p((HANDLE)(LONG_PTR)-3)) return;
     }

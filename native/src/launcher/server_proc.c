@@ -1,8 +1,8 @@
 /* ================================================================
  * server_proc.c — 本地 C 服务器子进程管理实现
  * ----------------------------------------------------------------
- * 通过 CreateProcess 启动 dst_server.exe，使用 WinHTTP 进行
- * 健康检查（GET /health）和优雅关停（POST /shutdown）。
+ * 通过 CreateProcess 启动所选服务器二进制（native 或 C# 平行实现），
+ * 使用 WinHTTP 进行健康检查（GET /health）和优雅关停（POST /shutdown）。
  * 服务器以隐藏窗口运行，用户通过启动器 UI 控制生命周期。
  * ================================================================ */
 
@@ -12,13 +12,13 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <windows.h>
 #include <winhttp.h>
 
 #define SERVER_READY_TIMEOUT_MS 15000
 #define SERVER_READY_POLL_MS 200
 
-/* 1 when the launcher spawned dst_server.exe itself; 0 when it merely adopted
-   a healthy localhost service that was already running. */
+/* 启动器自行创建 dst_server.exe 时为 1；仅接管已在运行且健康的本地服务时为 0。 */
 static int g_server_owned = 0;
 
 /* ----------------------------------------------------------------
@@ -79,8 +79,7 @@ static int wait_for_server_ready(DWORD timeout_ms) {
     }
 }
 
-/* Poll only after an explicit shutdown request so cache maintenance does not
-   race an adopted server that is still releasing its persistent file. */
+/* 仅在明确请求关闭后轮询，避免缓存维护与仍在释放持久化文件的已接管服务器竞争。 */
 static int wait_for_server_stopped(DWORD timeout_ms) {
     DWORD waited = 0;
     for (;;) {
@@ -223,12 +222,35 @@ static int request_server_shutdown(void) {
 }
 
 /* ----------------------------------------------------------------
+ * select_server_binary — 按配置选择要拉起的服务器二进制
+ *
+ * 读取 launcher.ini [server] binary：
+ *   - 缺省 / "native"：native\dst_server.exe（现有行为，默认不变）；
+ *   - "cs"：native\dst_server_cs.exe（C# 平行实现，HTTP 契约相同，
+ *     由同一批服务器测试套件 -Exe 验收）。
+ * 语言迁移开关：两种实现共享同一端口/缓存/配置，可随时改回。
+ * ---------------------------------------------------------------- */
+static void select_server_binary(WCHAR *exe, size_t cap) {
+    WCHAR cfg[MAX_PATH * 4];
+    get_launcher_config_path(cfg, MAX_PATH * 4);
+    WCHAR choice[64];
+    GetPrivateProfileStringW(L"server", L"binary", L"native", choice, 64, cfg);
+    if (_wcsicmp(choice, L"cs") == 0) {
+        path_join(exe, cap, g_root, L"native\\dst_server_cs.exe");
+        append_log(L"\u5DF2\u6309\u914D\u7F6E\u9009\u62E9 C# \u670D\u52A1\u5668\u4E8C\u8FDB\u5236\uFF08server binary=cs\uFF09\u3002");
+    } else {
+        path_join(exe, cap, g_root, L"native\\dst_server.exe");
+    }
+}
+
+/* ----------------------------------------------------------------
  * start_server — 启动本地 C 服务器子进程
  *
  * 流程：
  *   1. 如果已有进程且存活，直接返回
  *   2. 检查端口是否被外部进程占用（HTTP /health 检测）
- *   3. 构造命令行并 CreateProcess 启动 dst_server.exe
+ *   3. 构造命令行并 CreateProcess 启动所选服务器二进制
+ *      （launcher.ini [server] binary：native=dst_server.exe，cs=dst_server_cs.exe）
  *   4. 轮询 /health，只有 HTTP 200 后才允许部署 hook/启动游戏
  * ---------------------------------------------------------------- */
 int start_server(void) {
@@ -246,9 +268,9 @@ int start_server(void) {
         return 1;
     }
 
-    /* 构造命令行：dst_server.exe --port 19999 --cache <tsv> --api-config <ini> */
+    /* 构造命令行：<所选服务器二进制> --port 19999 --cache <tsv> --api-config <ini> */
     WCHAR exe[MAX_PATH * 4], cache[MAX_PATH * 4], api_cfg[MAX_PATH * 4], cmd[MAX_PATH * 12];
-    path_join(exe, MAX_PATH * 4, g_root, L"native\\dst_server.exe");
+    select_server_binary(exe, MAX_PATH * 4);
     path_join(cache, MAX_PATH * 4, g_root, L"translation_memory_c.tsv");
     get_api_config_path(api_cfg, MAX_PATH * 4);
     if (!exists_path(exe)) {
