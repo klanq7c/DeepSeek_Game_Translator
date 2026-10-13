@@ -17,7 +17,7 @@ namespace DstLauncher
      *   - 端口固定 19999（Contract.DefaultPort），先探测 /health，已有健康服务则"接管"而不再拉起；
      *   - launcher.ini [server] binary=native|cs 选择 native\dst_server.exe / native\dst_server_cs.exe；
      *   - 启动后轮询 /health，按真实时钟计 15 s 预算，进程提前退出立即失败；
-     *   - 关停先 POST /shutdown，1500 ms 内未退出则 TerminateProcess；
+     *   - 关停先 POST /shutdown，按真实时钟等待；仅强制终止自有进程，外部服务仍响应时保留运行状态；
      *   - 所有失败路径都写日志（含 Win32/HTTP 错误），不吞异常。
      *
      * UI 标签/按钮文本通过 StateChanged 事件交给宿主（将来的窗口），本类不依赖任何控件。
@@ -126,12 +126,12 @@ namespace DstLauncher
 
         private static bool WaitForStopped(int timeoutMs)
         {
-            int waited = 0;
+            var clock = Stopwatch.StartNew();
             for (;;) {
                 if (!HttpAlive(120)) return true;
-                if (waited >= timeoutMs) return false;
-                Thread.Sleep(ReadyPollMs);
-                waited += ReadyPollMs;
+                long elapsed = clock.ElapsedMilliseconds;
+                if (elapsed >= timeoutMs) return false;
+                Thread.Sleep((int)Math.Min(ReadyPollMs, timeoutMs - elapsed));
             }
         }
 
@@ -302,6 +302,11 @@ namespace DstLauncher
                     _proc.WaitForExit(500);
                 } else if (_proc == null && shutdownRequested && !WaitForStopped(1500)) {
                     Log.Append("External C server still owns 127.0.0.1:19999 after the shutdown deadline; cache maintenance may need a retry.");
+                    /* HTTP 接受关闭请求不代表进程退出；外部服务仍响应时保留
+                       接管状态和停止按钮，不能继续重置并报告“已停止”。 */
+                    _started = true;
+                    SetState("运行中 · 19999", "停止服务器");
+                    return;
                 }
                 if (_proc == null && !shutdownRequested) {
                     /* 关停请求未送达外部服务端：保留接管状态，避免 UI 误报"已停止"。 */

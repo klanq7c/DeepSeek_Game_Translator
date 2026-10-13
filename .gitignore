@@ -23,6 +23,8 @@ build/
 *.runtimeconfig.json
 bin/
 obj/
+__pycache__/
+*.py[cod]
 
 # Archives and generated artifacts
 artifacts/
@@ -59,6 +61,7 @@ payloads/UnityIL2CPP/DeepSeekTMPFontFallback/src/UnityInteropRefs/
 
 # Fonts are redistributed only with explicit license review
 *.otf
+!assets/fonts/NotoSansCJKsc-Regular.otf
 *.ttf
 *.ttc
 *.woff

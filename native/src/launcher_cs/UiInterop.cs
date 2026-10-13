@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace DstLauncher
 {
@@ -18,6 +19,8 @@ namespace DstLauncher
         /* ---- 窗口消息 ---- */
         internal const int WM_CREATE = 0x0001;
         internal const int WM_DESTROY = 0x0002;
+        internal const int WM_SETTINGCHANGE = 0x001A;
+        internal const int WM_DISPLAYCHANGE = 0x007E;
         internal const int WM_SIZE = 0x0005;
         internal const int WM_PAINT = 0x000F;
         internal const int WM_CLOSE = 0x0010;
@@ -35,6 +38,7 @@ namespace DstLauncher
         internal const int WM_MOUSELEAVE = 0x02A3;
         internal const int WM_NCDESTROY = 0x0082;
         internal const int WM_PRINTCLIENT = 0x0318;
+        internal const int WM_DROPFILES = 0x0233;
         internal const int WM_DPICHANGED = 0x02E0;
 
         internal const int EN_CHANGE = 0x0300;
@@ -68,6 +72,7 @@ namespace DstLauncher
         internal const int WS_SYSMENU = 0x00080000;
         internal const uint WS_EX_CLIENTEDGE = 0x00000200;
         internal const uint WS_EX_DLGMODALFRAME = 0x00000001;
+        internal const uint WS_EX_ACCEPTFILES = 0x00000010;
         internal const int COLOR_WINDOW = 5;
 
         internal const int CB_ADDSTRING = 0x0143;
@@ -98,11 +103,12 @@ namespace DstLauncher
         internal const int SM_CXSMICON = 49;
         internal const int SM_CYSMICON = 50;
 
-        /* ---- GDI ---- */
+        /* ---- GDI 图形接口 ---- */
         internal const int TRANSPARENT = 1;
         internal const int OPAQUE = 2;
         internal const int NULL_PEN = 8;
         internal const int HOLLOW_BRUSH = 5;
+        internal const int BLACK_BRUSH = 4;
         internal const int PS_SOLID = 0;
         internal const int SRCCOPY = 0x00CC0020;
         internal const int LOGPIXELSY = 90;
@@ -119,6 +125,7 @@ namespace DstLauncher
         internal const int FW_BOLD = 700;
         internal const uint DIB_RGB_COLORS = 0;
 
+        internal const uint DT_RIGHT = 0x00000002;
         internal const uint DT_LEFT = 0x00000000;
         internal const uint DT_CENTER = 0x00000001;
         internal const uint DT_VCENTER = 0x00000004;
@@ -280,7 +287,18 @@ namespace DstLauncher
         [DllImport("kernel32.dll")]
         internal static extern void OutputDebugStringW([MarshalAs(UnmanagedType.LPWStr)] string text);
 
-        /* ---- USER32 ---- */
+        [DllImport("user32.dll")]
+        internal static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool SystemParametersInfoW(uint action, uint parameter, out int value, uint flags);
+        [DllImport("gdi32.dll")]
+        internal static extern int GetClipBox(IntPtr dc, out RECT rect);
+        [DllImport("gdi32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool RectVisible(IntPtr dc, ref RECT rect);
+
+        /* ---- USER32 窗口接口 ---- */
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         internal static extern ushort RegisterClassExW(ref WNDCLASSEXW wc);
 
@@ -425,7 +443,7 @@ namespace DstLauncher
         [DllImport("user32.dll")]
         internal static extern bool SetProcessDPIAware();
 
-        /* ---- GDI32 ---- */
+        /* ---- GDI32 绘图接口 ---- */
         [DllImport("gdi32.dll")]
         internal static extern IntPtr CreateSolidBrush(uint color);
 
@@ -532,8 +550,8 @@ namespace DstLauncher
         internal static extern bool GradientFill(IntPtr dc, TRIVERTEX[] vertices, uint vertexCount,
                                                  ref GRADIENT_RECT mesh, uint meshCount, uint mode);
 
-        /* ---- COMCTL32 ---- */
-        [DllImport("comctl32.dll", CharSet = CharSet.Unicode)]
+        /* ---- COMCTL32 通用控件接口 ---- */
+        [DllImport("comctl32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         internal static extern bool SetWindowSubclass(IntPtr hwnd, SubclassProcDelegate proc,
                                                       UIntPtr id, UIntPtr refData);
 
@@ -559,6 +577,30 @@ namespace DstLauncher
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         internal static extern IntPtr ShellExecuteW(IntPtr hwnd, string verb, string file,
                                                     string parameters, string dir, int show);
+
+        [DllImport("shell32.dll")]
+        internal static extern void DragAcceptFiles(IntPtr hwnd, [MarshalAs(UnmanagedType.Bool)] bool accept);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, EntryPoint = "DragQueryFileW")]
+        internal static extern uint DragQueryFileW(IntPtr drop, uint index, StringBuilder path, uint cap);
+
+        [DllImport("shell32.dll")]
+        internal static extern void DragFinish(IntPtr drop);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+        internal static extern int GetWindowLongW(IntPtr hwnd, int index);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr GlobalLock(IntPtr block);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool GlobalUnlock(IntPtr block);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr GlobalFree(IntPtr block);
 
         [DllImport("ole32.dll")]
         internal static extern int CoInitialize(IntPtr reserved);

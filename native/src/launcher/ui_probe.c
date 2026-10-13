@@ -21,10 +21,19 @@
 #include "ui.h"
 
 #include <commctrl.h>
+#include <shellapi.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
+
+typedef struct ProbeDropFiles {
+    DWORD pFiles;
+    POINT pt;
+    BOOL fNC;
+    BOOL fWide;
+} ProbeDropFiles;
 
 /* 探针渲染的控件清单，顺序即 WM_CREATE 的创建顺序（也就是 z 序）。 */
 typedef struct ProbeControl {
@@ -159,6 +168,35 @@ static int probe_render(HWND hwnd, const WCHAR *bmp_path) {
 
     paint_background(hwnd, dc);
 
+    /* 用未缓存的真实绘制作为基准，覆盖全画面、偏移脏区和再次复用。
+       这道检查独立于 C/C# 相互比对，避免两版同时出现残影仍通过。 */
+    GdiFlush();
+    size_t pixel_bytes = (size_t)width * height * 4;
+    void *reference = malloc(pixel_bytes);
+    if (!reference) {
+        probe_line(L"buffer_reference_allocation_failed\nresult=0\n");
+        SelectObject(dc, old_bmp); DeleteObject(bmp); DeleteDC(dc);
+        return 0;
+    }
+    memcpy(reference, pixels, pixel_bytes);
+    RECT regions[] = {client, {width / 3, 20, width - 7, height / 2},
+                      {5, height / 2, width / 2, height - 3}, client};
+    int buffer_ok = 1;
+    for (size_t i = 0; i < sizeof(regions) / sizeof(regions[0]); i++) {
+        /* 先破坏目标区域，确保实际完成重绘；区域之外也必须保持原像素。 */
+        FillRect(dc, &regions[i], (HBRUSH)GetStockObject(BLACK_BRUSH));
+        paint_background_buffered(hwnd, dc, &regions[i]);
+        GdiFlush();
+        if (memcmp(reference, pixels, pixel_bytes) != 0) buffer_ok = 0;
+    }
+    free(reference);
+    free_background_buffer();
+    probe_line(L"buffer_pixels=%d\n", buffer_ok);
+    if (!buffer_ok) {
+        SelectObject(dc, old_bmp); DeleteObject(bmp); DeleteDC(dc);
+        return 0;
+    }
+
     for (size_t i = 0; i < PROBE_CONTROL_COUNT; i++) {
         HWND ctl = GetDlgItem(hwnd, g_probe_controls[i].id);
         if (!ctl || !IsWindow(ctl)) continue;
@@ -207,13 +245,28 @@ static void probe_report(HWND hwnd) {
     }
 }
 
-/* --ui-probe-and-exit <w> <h> <alive> <out.bmp> */
+/* 窗口探针参数：--ui-probe-and-exit <w> <h> <alive> <out.bmp> */
 int run_ui_probe(int width, int height, int alive, const WCHAR *bmp_path) {
     if (width <= 0 || height <= 0 || !bmp_path || !bmp_path[0]) return 2;
 
     g_ui_probe = 1;
     g_ui_probe_neutral = 1;
     g_anim_tick_override = 0;
+    /* 仅诊断模式接受冻结相位；生产动画不读取此环境变量。 */
+    WCHAR tick_text[16];
+    DWORD tick_len = GetEnvironmentVariableW(L"DST_UI_PROBE_TICK", tick_text, 16);
+    if (tick_len > 0) {
+        int tick = 0;
+        if (tick_len >= 16) { probe_line(L"invalid_animation_tick\nresult=0\n"); return 2; }
+        for (DWORD i = 0; i < tick_len; i++) {
+            if (tick_text[i] < L'0' || tick_text[i] > L'9' || tick > 30000) {
+                probe_line(L"invalid_animation_tick\nresult=0\n"); return 2;
+            }
+            tick = tick * 10 + tick_text[i] - L'0';
+        }
+        if (tick > 30000) { probe_line(L"invalid_animation_tick\nresult=0\n"); return 2; }
+        g_anim_tick_override = tick;
+    }
     g_server_started = alive ? 1 : 0;
 
     INITCOMMONCONTROLSEX ic = { sizeof(ic), ICC_STANDARD_CLASSES };
@@ -245,7 +298,7 @@ int run_ui_probe(int width, int height, int alive, const WCHAR *bmp_path) {
     if (g_scale_dpi != 96) {
         HFONT old[6] = {g_font_title, g_font_heading, g_font_body, g_font_small, g_font_mono, g_font_mono_small};
         g_scale_dpi = 96;
-        g_font_title      = make_font(22, FW_SEMIBOLD, L"Microsoft YaHei UI");
+        g_font_title      = make_font(28, FW_NORMAL, L"SimSun");
         g_font_heading    = make_font(11, FW_SEMIBOLD, L"Microsoft YaHei UI");
         g_font_body       = make_font(10, FW_NORMAL,   L"Microsoft YaHei UI");
         g_font_small      = make_font(9,  FW_NORMAL,   L"Microsoft YaHei UI");
@@ -263,4 +316,63 @@ int run_ui_probe(int width, int height, int alive, const WCHAR *bmp_path) {
     DestroyWindow(g_main);
     g_main = NULL;
     return ok ? 0 : 1;
+}
+
+/* 进程内构造 Explorer 同形态的 HDROP，送入真实主窗口/子控件过程。
+   诊断模式只记录“一键流程将被调用”，不启动服务、游戏或写用户配置。 */
+int run_ui_drop_probe(const WCHAR *path, int target_id) {
+    if (!path || !path[0] || wcslen(path) >= MAX_PATH * 4) return 2;
+    g_ui_probe = 1;
+    g_drop_probe_start_requested = 0;
+    INITCOMMONCONTROLSEX ic = { sizeof(ic), ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&ic);
+
+    WNDCLASSEXW wc;
+    ZeroMemory(&wc, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.lpfnWndProc = ui_probe_wndproc();
+    wc.hInstance = g_inst;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.lpszClassName = L"DSTNativeLauncherDropProbe";
+    if (!RegisterClassExW(&wc)) {
+        probe_line(L"class_error=%lu\nresult=0\n", GetLastError());
+        return 1;
+    }
+    g_main = CreateWindowExW(0, wc.lpszClassName, L"ds drop probe",
+                             WS_POPUP | WS_CLIPCHILDREN, 0, 0, 1200, 780,
+                             NULL, NULL, g_inst, NULL);
+    if (!g_main) {
+        probe_line(L"window_error=%lu\nresult=0\n", GetLastError());
+        return 1;
+    }
+    HWND target = target_id ? GetDlgItem(g_main, target_id) : g_main;
+    if (!target) {
+        probe_line(L"target_error=%d\nresult=0\n", target_id);
+        DestroyWindow(g_main);
+        g_main = NULL;
+        return 1;
+    }
+    int accept = (GetWindowLongPtrW(target, GWL_EXSTYLE) & WS_EX_ACCEPTFILES) != 0;
+    size_t path_bytes = (wcslen(path) + 2) * sizeof(WCHAR);
+    HGLOBAL block = GlobalAlloc(GHND, sizeof(ProbeDropFiles) + path_bytes);
+    ProbeDropFiles *drop = block ? (ProbeDropFiles *)GlobalLock(block) : NULL;
+    if (!drop) {
+        probe_line(L"drop_alloc_error=%lu\nresult=0\n", GetLastError());
+        if (block) GlobalFree(block);
+        DestroyWindow(g_main);
+        g_main = NULL;
+        return 1;
+    }
+    drop->pFiles = sizeof(ProbeDropFiles);
+    drop->fWide = TRUE;
+    memcpy((BYTE *)drop + sizeof(ProbeDropFiles), path, path_bytes - sizeof(WCHAR));
+    GlobalUnlock(block);
+    SendMessageW(target, WM_DROPFILES, (WPARAM)block, 0);
+    WCHAR selected[MAX_PATH * 4] = {0};
+    GetWindowTextW(g_path, selected, MAX_PATH * 4);
+    probe_line(L"accept=%d\nselected=%s\nstart=%d\nresult=1\n",
+               accept, selected, g_drop_probe_start_requested);
+    DestroyWindow(g_main);
+    g_main = NULL;
+    return 0;
 }

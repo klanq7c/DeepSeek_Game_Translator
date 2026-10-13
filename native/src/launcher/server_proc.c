@@ -79,14 +79,16 @@ static int wait_for_server_ready(DWORD timeout_ms) {
     }
 }
 
-/* 仅在明确请求关闭后轮询，避免缓存维护与仍在释放持久化文件的已接管服务器竞争。 */
+/* 仅在明确请求关闭后轮询，避免缓存维护与仍在释放持久化文件的已接管服务器竞争。
+   HTTP 耗时也计入真实时钟预算，避免慢响应把 1500 ms 等待累加成更长阻塞。 */
 static int wait_for_server_stopped(DWORD timeout_ms) {
-    DWORD waited = 0;
+    DWORD start = GetTickCount();
     for (;;) {
         if (!server_http_alive(120)) return 1;
-        if (waited >= timeout_ms) return 0;
-        Sleep(SERVER_READY_POLL_MS);
-        waited += SERVER_READY_POLL_MS;
+        DWORD elapsed = GetTickCount() - start;
+        if (elapsed >= timeout_ms) return 0;
+        DWORD remaining = timeout_ms - elapsed;
+        Sleep(remaining < SERVER_READY_POLL_MS ? remaining : SERVER_READY_POLL_MS);
     }
 }
 
@@ -337,7 +339,8 @@ int start_server(void) {
  * stop_server — 停止本地 C 服务器
  *
  * 先通过 HTTP /shutdown 优雅关停，等待最多 1500ms；
- * 超时则 TerminateProcess 强制终止。最后重置所有状态和 UI。
+ * 自有进程超时则 TerminateProcess；外部服务超时仍响应时保留运行状态。
+ * 只有确认关闭后才重置状态和 UI。
  * ---------------------------------------------------------------- */
 void stop_server(void) {
     int owned = g_server_owned;
@@ -356,6 +359,13 @@ void stop_server(void) {
         } else if (!g_server_pi.hProcess && shutdown_requested &&
                    !wait_for_server_stopped(1500)) {
             append_log(L"External C server still owns 127.0.0.1:19999 after the shutdown deadline; cache maintenance may need a retry.");
+            /* HTTP 接受关闭请求不代表进程已经退出。外部服务仍响应时保留接管
+               状态与停止按钮，不能落入下方的句柄重置并报告“已停止”。 */
+            g_server_started = 1;
+            set_server_label(L"\u8FD0\u884C\u4E2D \u00B7 19999");
+            set_btn_label(L"\u505C\u6B62\u670D\u52A1\u5668");
+            if (g_main && IsWindow(g_main)) InvalidateRect(g_main, NULL, FALSE);
+            return;
         }
         if (!g_server_pi.hProcess && !shutdown_requested) {
             /* 关停请求未送达外部服务端：保留接管状态，避免 UI 误报“已停止”。 */

@@ -32,6 +32,8 @@ rem font patcher). Kept in its own script so its fingerprint only changes when t
 rem managed build recipe changes.
 call "%ROOT%scripts\build_managed_payloads.bat"
 if errorlevel 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\build_artifacts\test_managed_stamp_write.ps1"
+if errorlevel 1 exit /b 1
 
 set "SVR=%ROOT%native\src\server"
 set SVR_SRC="%SVR%\main.c" "%SVR%\util.c" "%SVR%\buf.c" "%SVR%\b64.c" "%SVR%\json.c" "%SVR%\cache.c" "%SVR%\api.c" "%SVR%\http.c"
@@ -69,6 +71,28 @@ if errorlevel 1 (
     echo Shared core tests failed.
     exit /b 1
 )
+
+rem Unity Mono visible-text scan window: bounded inspection and fair resumption.
+dotnet build "%ROOT%tests\unity_visible_scan\unity_visible_scan.csproj" -c Release --nologo -v q
+if errorlevel 1 exit /b 1
+"%ROOT%tests\unity_visible_scan\bin\Release\net472\dst_unity_visible_scan_tests.exe"
+if errorlevel 1 exit /b 1
+
+rem Built XUnity endpoint and source-linked Mono/IL2CPP renderer contracts.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\unity_runtime_contract\run_unity_tests.ps1"
+if errorlevel 1 exit /b 1
+
+rem Cache batch failure recovery and response-buffer byte/size contracts.
+dotnet build "%ROOT%tests\server_contract\cache_persistence\cache_persistence.csproj" -c Release --nologo -v q
+if errorlevel 1 exit /b 1
+"%ROOT%tests\server_contract\cache_persistence\bin\Release\net472\dst_cache_persistence_tests.exe"
+if errorlevel 1 exit /b 1
+dotnet build "%ROOT%tests\server_contract\provider_response\provider_response.csproj" -c Release --nologo -v q
+if errorlevel 1 exit /b 1
+"%ROOT%tests\server_contract\provider_response\bin\Release\net472\dst_provider_response_tests.exe"
+if errorlevel 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\server_buffers\run_buffer_tests.ps1"
+if errorlevel 1 exit /b 1
 
 set "RES_RC=%ROOT%build\launcher_payloads.rc"
 set "RES_OBJ=%ROOT%build\launcher_payloads.o"
@@ -113,6 +137,9 @@ set "ROOT_RC=%ROOT:\=/%"
 >> "%RES_RC%" echo 104 RCDATA "%ROOT_RC%config/launcher.ini.example"
 >> "%RES_RC%" echo 105 RCDATA "%ROOT_RC%native/dst_server_cs.exe"
 >> "%RES_RC%" echo 106 RCDATA "%ROOT_RC%config/glossary.example.tsv"
+>> "%RES_RC%" echo 107 RCDATA "%ROOT_RC%assets/fonts/NotoSansCJKsc-Regular.otf"
+>> "%RES_RC%" echo 108 RCDATA "%ROOT_RC%assets/fonts/OFL.txt"
+>> "%RES_RC%" echo 109 RCDATA "%ROOT_RC%assets/fonts/manifest.json"
 rem Engine runtime scripts (first-party sources, always present). IDs match
 rem native\src\launcher\resource.h; deploy.c/godot_patch.c write them verbatim.
 for %%S in (payloads\RenPy\iron_deepseek.rpy payloads\RPGMaker\hook_rpgm_mv.js payloads\Godot\dst_godot_runtime_g3.gd payloads\Godot\dst_godot_runtime_g4.gd) do (
@@ -144,12 +171,12 @@ windres "%RES_RC%" -O coff -o "%RES_OBJ%"
 if errorlevel 1 exit /b 1
 
 set "LCH=%ROOT%native\src\launcher"
-set LCH_SRC="%LCH%\main.c" "%LCH%\globals.c" "%LCH%\fsutil.c" "%LCH%\engine.c" "%LCH%\deploy.c" "%LCH%\server_proc.c" "%LCH%\api_config.c" "%LCH%\warmup.c" "%LCH%\godot_warmup.c" "%LCH%\godot_patch.c" "%LCH%\godot_probe.c" "%LCH%\godot_preflight_cache.c" "%LCH%\ui.c" "%LCH%\ui_probe.c" "%LCH%\self_update.c" "%LCH%\embedded.c"
+set LCH_SRC="%LCH%\main.c" "%LCH%\globals.c" "%LCH%\fsutil.c" "%LCH%\font_bundle.c" "%LCH%\engine.c" "%LCH%\deploy.c" "%LCH%\server_proc.c" "%LCH%\api_config.c" "%LCH%\api_models.c" "%LCH%\warmup.c" "%LCH%\godot_warmup.c" "%LCH%\godot_patch.c" "%LCH%\godot_encrypted_pack.c" "%LCH%\godot_probe.c" "%LCH%\godot_preflight_cache.c" "%LCH%\ui.c" "%LCH%\ui_probe.c" "%LCH%\self_update.c" "%LCH%\embedded.c"
 set "LAUNCHER_TMP=%ROOT%build\launcher_build.exe"
 
 rem Build to an ASCII temp path first; gcc/binutils handle the final binary
 rem bytes there, then PowerShell moves it to the Chinese product filename.
-gcc -std=c17 -O2 -Wall -Wextra -Werror -municode -mwindows -D_CRT_SECURE_NO_WARNINGS -DDS_TRANSLATOR_VERSION=\"%APP_VERSION%\" -I"%LCH%" %LCH_SRC% "%RES_OBJ%" -lcomctl32 -lshell32 -lole32 -lmsimg32 -lwinhttp -o "%LAUNCHER_TMP%"
+gcc -std=c17 -O2 -Wall -Wextra -Werror -municode -mwindows -D_CRT_SECURE_NO_WARNINGS -DDS_TRANSLATOR_VERSION=\"%APP_VERSION%\" -I"%LCH%" %LCH_SRC% "%RES_OBJ%" -lcomctl32 -lshell32 -lole32 -lmsimg32 -lwinhttp -lbcrypt -o "%LAUNCHER_TMP%"
 if errorlevel 1 exit /b 1
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $ds='ds'+[string][char]0x6e38+[string][char]0x620f+[string][char]0x7ffb+[string][char]0x8bd1+[string][char]0x5668; $dest = Join-Path $env:ROOT ($ds + '.exe'); if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force }; Move-Item -LiteralPath $env:LAUNCHER_TMP -Destination $dest -Force; $legacy = Join-Path $env:ROOT 'DeepSeekTranslator.exe'; if (Test-Path -LiteralPath $legacy) { Remove-Item -LiteralPath $legacy -Force }"
@@ -171,10 +198,46 @@ if errorlevel 1 (
     echo C# launcher port failed to build.
     exit /b 1
 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\test_log_retention.ps1"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\launcher_parity\test_godot_preflight_exit.py"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\launcher_parity\test_background_buffer.py"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\launcher_parity\test_godot_encrypted_pack.py" --c-root "%ROOT%." --cs "%ROOT%build\launcher_cs\dst_launcher_cs.exe"
+if errorlevel 1 exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\run_launcher_parity.ps1" -CsLauncher "%ROOT%build\launcher_cs\dst_launcher_cs.exe"
 if errorlevel 1 (
     echo Launcher parity check failed: C# port diverges from the C launcher.
     exit /b 1
 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\run_font_bundle_tests.ps1"
+if errorlevel 1 (
+    echo Bundled CJK font fallback check failed.
+    exit /b 1
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\run_server_lifecycle_tests.ps1" -CsLauncher "%ROOT%build\launcher_cs\dst_launcher_cs.exe"
+if errorlevel 1 (
+    echo Launcher server lifecycle check failed.
+    exit /b 1
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\test_game_audit.ps1"
+if errorlevel 1 (
+    echo Game audit check failed.
+    exit /b 1
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\run_api_models_tests.ps1" -CsLauncher "%ROOT%build\launcher_cs\dst_launcher_cs.exe"
+if errorlevel 1 exit /b 1
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\server_contract\run_model_defaults_tests.ps1"
+if errorlevel 1 exit /b 1
+
+rem A provider can send headers then stall its body; both servers must release
+rem the remote channel at timeout and translate the next request.
+python "%ROOT%tests\server_contract\test_provider_body_timeout.py"
+if errorlevel 1 exit /b 1
 
 echo Built native server, C# server and launcher.

@@ -149,6 +149,32 @@ static void cache_diag(CacheDiag reason, int err, const char *path) {
     }
 }
 
+/* 中断写入或外部无换行文件会留下非记录边界，内存层无法推断磁盘尾部。
+   只在 IO 锁内打开时检查并追加分隔，绝不删除/重写旧字节。异常尾部记 stderr；
+   读取、定位或分隔写入失败仍返回失败，脏项保留供下次重试，不掩盖原故障。 */
+static FILE *cache_open_append(const char *path) {
+    FILE *f = fopen(path, "a+b");
+    if (!f) { cache_diag(CACHE_DIAG_PERSIST_OPEN, errno, path); return NULL; }
+    if (_fseeki64(f, 0, SEEK_END) != 0) goto failed;
+    long long end = _ftelli64(f);
+    if (end < 0) goto failed;
+    if (end > 0) {
+        if (_fseeki64(f, -1, SEEK_END) != 0) goto failed;
+        int last = fgetc(f);
+        if (last == EOF) { if (!ferror(f)) errno = EIO; goto failed; }
+        if (_fseeki64(f, 0, SEEK_END) != 0) goto failed;
+        if (last != '\n') {
+            fprintf(stderr, "[cache] persist-tail: unterminated tail; appending separator (path=%s)\n", path);
+            if (fputc('\n', f) == EOF) goto failed;
+        }
+    }
+    return f;
+failed:
+    cache_diag(CACHE_DIAG_PERSIST_OPEN, errno, path);
+    if (fclose(f) != 0) cache_diag(CACHE_DIAG_PERSIST_WRITE, errno, path);
+    return NULL;
+}
+
 void cache_set_many_persist(Cache *c, const char **keys, const char **values, size_t count) {
     (void)cache_set_many_persist_result(c, keys, values, count);
 }
@@ -225,12 +251,11 @@ CachePersistResult cache_set_many_persist_result(Cache *c, const char **keys,
     for (size_t i = 0; i < count; i++) {
         if (!items[i].changed) continue;
         if (!f) {
-            f = fopen(c->path, "ab");
+            f = cache_open_append(c->path);
             c->persist_f = f;
             if (!f) {
                 /* 打开失败：整批落盘被丢弃（内存已更新）。persist_f 保持 NULL，
                    下一批会重试打开。 */
-                cache_diag(CACHE_DIAG_PERSIST_OPEN, errno, c->path);
                 break;
             }
         }

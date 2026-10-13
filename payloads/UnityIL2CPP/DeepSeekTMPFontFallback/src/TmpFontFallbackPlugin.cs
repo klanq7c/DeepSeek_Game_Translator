@@ -132,7 +132,7 @@ public sealed class TmpFontFallbackBehaviour : MonoBehaviour
         float interval = _ticks < WarmupTicks ? WarmupInterval : SteadyInterval;
         if (_consecutiveFailures >= BackoffAfterFailures)
         {
-            interval = BackoffInterval; // persistent errors: back off, but never give up
+            interval = BackoffInterval; // 持续出错时延长重试间隔，但不放弃后续重试
         }
 
         _nextAttempt = Time.unscaledTime + interval;
@@ -196,6 +196,7 @@ internal static class TmpFontFallbackInstaller
         ("Alibaba-PuHuiTi-Regular.ttf", "Alibaba PuHuiTi"),
         ("STXIHEI.TTF", "STXihei"),
         ("STSONG.TTF", "STSong"),
+        ("NotoSansCJKsc-Regular.otf", "Noto Sans CJK SC"),
     };
 
     private const string CjkWarmupText = "\u4e2d\u6587\u6c49\u5316\u7ffb\u8bd1\u6e38\u620f\u8bbe\u7f6e\u5f00\u59cb\u7ee7\u7eed\u8fd4\u56de\u786e\u8ba4\u53d6\u6d88\u4fdd\u5b58\u52a0\u8f7d\u83dc\u5355\u5bf9\u8bdd";
@@ -1410,6 +1411,9 @@ internal static class TmpFontFallbackInstaller
                 yield return fonts;
             }
         }
+        /* 系统字体目录可能没有中文；部署器只在该情形提供带 OFL 的原版 OTF。 */
+        string bundled = Path.Combine(Paths.GameRootPath, "TranslationFonts");
+        if (Directory.Exists(bundled)) yield return bundled;
     }
 
     private static AssetBundle LoadAssetBundleFromFile(string path)
@@ -3008,6 +3012,12 @@ internal static class TmpFontFallbackInstaller
         System.Text.StringBuilder builder = null;
         for (int i = 0; i < text.Length; i++)
         {
+            if (DstUnity.TmpRichText.TryGetTagEnd(text, i, out int tagEnd))
+            {
+                if (builder != null) builder.Append(text, i, tagEnd - i + 1);
+                i = tagEnd;
+                continue;
+            }
             char ch = text[i];
             replacement = GetFallbackSafeReplacement(ch, containsCjk);
             if (replacement == null)

@@ -47,6 +47,7 @@ namespace DstLauncher
         private const uint FILE_SHARE_WRITE = 0x2;
         private const uint FILE_SHARE_DELETE = 0x4;
         private const uint CREATE_ALWAYS = 2;
+        private const uint CREATE_NEW = 1;
         private const uint OPEN_EXISTING = 3;
 
         [ThreadStatic] private static int _lastError;
@@ -305,6 +306,22 @@ namespace DstLauncher
             SafeFileHandle h = CreateFileW(path, GENERIC_WRITE, 0, IntPtr.Zero, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
             if (h.IsInvalid) { h.Dispose(); return Fail(Win32Error()); }
             return WriteAll(h, data ?? new byte[0], size);
+        }
+
+        /* 内嵌字体部署：CREATE_NEW 不覆盖用户已有文件，且拒绝目录重解析点。 */
+        public static bool WriteBytesIfAbsentSafe(string path, byte[] data)
+        {
+            if (path == null || data == null || !WriteTargetIsSafe(path)) return false;
+            int slash = path.LastIndexOf('\\');
+            if (slash >= 0 && !EnsureDir(path.Substring(0, slash))) return false;
+            SafeFileHandle h = CreateFileW(path, GENERIC_WRITE, 0, IntPtr.Zero, CREATE_NEW,
+                                           FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+            if (h.IsInvalid) { h.Dispose(); return Fail(Win32Error()); }
+            if (WriteAll(h, data, data.Length)) return true;
+            int error = LastError;
+            if (!DeleteFileSafe(path)) Log.Append("CJK font partial file cleanup failed: " + path);
+            LastError = error;
+            return false;
         }
 
         /* read_file_bytes：读取全部字节；> 4GB-2 的文件拒绝。 */

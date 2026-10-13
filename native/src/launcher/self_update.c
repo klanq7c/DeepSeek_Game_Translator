@@ -2,12 +2,12 @@
  * self_update.c —— 启动器内嵌自有 payload 的同步实现。
  *
  * 真实入口：wWinMain 在创建主窗口前调用 sync_embedded_payloads()。
- * build_native.bat 把本项目自有的服务端、配置示例、安装脚本和 Unity
- * 插件作为 RCDATA 写进启动器；这里负责把它们同步到 g_root 下的固定位置。
+ * build_native.bat 把服务端、配置示例、安装脚本、Unity 插件和经许可证
+ * 审核的 Noto CJK 字体/OFL 作为 RCDATA 写进启动器，并同步到 g_root。
  *
  * 边界约束：
- *   - 只同步本项目自有文件，BepInEx、XUnity、Unity 程序集等第三方运行时
- *     仍由 install_runtime_payloads.ps1 安装；
+ *   - 只同步本项目自有文件及已审核的字体/OFL；BepInEx、XUnity、Unity
+ *     程序集等第三方运行时仍由 install_runtime_payloads.ps1 安装；
  *   - 不触碰真实 api.ini、翻译记忆、日志或游戏目录；
  *   - 目标内容相同就不重写，避免无意义地改变时间戳；
  *   - 更新采用同目录临时文件 + 原子替换，失败时保留原文件。
@@ -17,6 +17,7 @@
 #include "embedded.h"
 #include "fsutil.h"
 #include "globals.h"
+#include "resource.h"
 #include "ui.h"
 
 #include <stdint.h>
@@ -55,6 +56,9 @@ static const EmbeddedPayload EMBEDDED_PAYLOADS[] = {
        随启动器一起分发，用户不必单独安装。 */
     { IDR_PAYLOAD_DST_SERVER_CS,    L"native\\dst_server_cs.exe", L"dst_server_cs.exe", 1 },
     { IDR_PAYLOAD_GLOSSARY_EXAMPLE, L"config\\glossary.example.tsv", L"glossary.example.tsv", 1 },
+    { IDR_PAYLOAD_CJK_FONT,         L"assets\\fonts\\NotoSansCJKsc-Regular.otf", L"NotoSansCJKsc-Regular.otf", 1 },
+    { IDR_PAYLOAD_CJK_FONT_LICENSE, L"assets\\fonts\\OFL.txt", L"OFL.txt", 1 },
+    { IDR_PAYLOAD_CJK_FONT_MANIFEST, L"assets\\fonts\\manifest.json", L"manifest.json", 1 },
     { IDR_PAYLOAD_UNITY_MONO5,      L"payloads\\UnityTranslator\\UnityTranslator.dll", L"UnityTranslator.dll", 0 },
     { IDR_PAYLOAD_UNITY_MONO6,      L"payloads\\UnityTranslator\\UnityTranslator.BepInEx6.dll", L"UnityTranslator.BepInEx6.dll", 0 },
     { IDR_PAYLOAD_XUNITY_ENDPOINT,  L"payloads\\UnityIL2CPP\\DeepSeekXUnityTranslator\\DeepSeekTranslate.dll", L"DeepSeekTranslate.dll", 0 },

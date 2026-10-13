@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using DstCore;
 
 namespace DstLauncher
 {
@@ -9,12 +10,12 @@ namespace DstLauncher
      *
      * 读写一律走 Windows Profile API（与 C 版同一函数），不自己解析 INI：
      * WritePrivateProfileStringW 对既有文件的编码、换行、其他小节的保留方式有既定
-     * 行为（无 UTF-16 BOM 的文件按系统 ANSI 代码页写入），自己实现必然与 C 版分叉，
-     * 而两个服务端读的是同一个文件。
+     * 行为（无 UTF-16 BOM 的文件按系统 ANSI 代码页写入）。无法无损表达新值时，
+     * C/C# 在用户保存操作中统一准备 UTF-16 副本，完整写入后原子替换。
      *
      * 对话框本身（窗口类、控件布局、模态消息循环）属于 UI 层，随 ui.c 一起移植。
      */
-    public static class ApiConfig
+    public static partial class ApiConfig
     {
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern uint GetPrivateProfileStringW(string section, string key, string def,
@@ -28,27 +29,25 @@ namespace DstLauncher
         {
             public string Name;
             public string Endpoint;   /* null 表示"自定义"，选中后不改动任何字段 */
-            public string Model;
         }
 
-        /* 提供商预设表：显示名 / endpoint / 示例模型。仅用于自动填充，不落盘。
-           示例模型名可能随平台更新，以各平台当前模型列表为准。 */
+        /* 提供商预设只存地址，不维护会过期的模型名或擅自推断“最新”模型。 */
         public static readonly Preset[] Providers = {
-            new Preset { Name = "自定义", Endpoint = null, Model = null },
-            new Preset { Name = "DeepSeek", Endpoint = "https://api.deepseek.com/v1/chat/completions", Model = "deepseek-v4-flash" },
-            new Preset { Name = "硅基流动 SiliconFlow", Endpoint = "https://api.siliconflow.cn/v1/chat/completions", Model = "deepseek-ai/DeepSeek-V3" },
-            new Preset { Name = "Moonshot Kimi", Endpoint = "https://api.moonshot.cn/v1/chat/completions", Model = "moonshot-v1-8k" },
-            new Preset { Name = "智谱 GLM", Endpoint = "https://open.bigmodel.cn/api/paas/v4/chat/completions", Model = "glm-4-flash" },
-            new Preset { Name = "阿里百炼 DashScope", Endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", Model = "qwen-plus" },
-            new Preset { Name = "OpenAI", Endpoint = "https://api.openai.com/v1/chat/completions", Model = "gpt-4o-mini" },
-            new Preset { Name = "Claude (OpenAI 兼容)", Endpoint = "https://api.anthropic.com/v1/chat/completions", Model = "claude-sonnet-4-5" },
-            new Preset { Name = "Gemini (OpenAI 兼容)", Endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", Model = "gemini-2.5-flash" },
-            new Preset { Name = "Ollama (本地, Key 可留空)", Endpoint = "http://127.0.0.1:11434/v1/chat/completions", Model = "qwen2.5:7b" },
-            new Preset { Name = "LM Studio (本地, Key 可留空)", Endpoint = "http://127.0.0.1:1234/v1/chat/completions", Model = "local-model" },
+            new Preset { Name = "自定义", Endpoint = null },
+            new Preset { Name = "DeepSeek", Endpoint = "https://api.deepseek.com/v1/chat/completions" },
+            new Preset { Name = "硅基流动 SiliconFlow", Endpoint = "https://api.siliconflow.cn/v1/chat/completions" },
+            new Preset { Name = "Moonshot Kimi", Endpoint = "https://api.moonshot.cn/v1/chat/completions" },
+            new Preset { Name = "智谱 GLM", Endpoint = "https://open.bigmodel.cn/api/paas/v4/chat/completions" },
+            new Preset { Name = "阿里百炼 DashScope", Endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions" },
+            new Preset { Name = "OpenAI", Endpoint = "https://api.openai.com/v1/chat/completions" },
+            new Preset { Name = "Claude (OpenAI 兼容)", Endpoint = "https://api.anthropic.com/v1/chat/completions" },
+            new Preset { Name = "Gemini (OpenAI 兼容)", Endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" },
+            new Preset { Name = "Ollama (本地, Key 可留空)", Endpoint = "http://127.0.0.1:11434/v1/chat/completions" },
+            new Preset { Name = "LM Studio (本地, Key 可留空)", Endpoint = "http://127.0.0.1:1234/v1/chat/completions" },
         };
 
         public const string DefaultEndpoint = "https://api.deepseek.com/v1/chat/completions";
-        public const string DefaultModel = "deepseek-v4-flash";
+        public const string DefaultModel = "";
 
         public struct Values
         {
@@ -91,9 +90,16 @@ namespace DstLauncher
            对话框打开）。ini 结构与服务端契约不变，只有 endpoint/model/key 三个键。 */
         public static bool Save(string endpoint, string model, string key)
         {
+            if (!ApiConfigText.ModelFits(model)) {
+                Log.Append("API 配置保存失败：模型名不是有效 Unicode 或超过 255 字节"); return false;
+            }
             string cfgdir = PathUtil.Join(Launcher.Root, "config");
             SafeFs.EnsureDir(cfgdir);
             string cfg = PathUtil.Join(Launcher.Root, "config\\api.ini");
+            if (NeedsUnicodeIni(endpoint) || NeedsUnicodeIni(model) || NeedsUnicodeIni(key)) {
+                if (!SaveUnicodeIni(cfgdir, cfg, endpoint, model, key)) return false;
+                Log.Append("API 配置已保存：" + cfg); return true;
+            }
             bool okEndpoint = WritePrivateProfileStringW("api", "endpoint", endpoint, cfg);
             bool okModel = WritePrivateProfileStringW("api", "model", model, cfg);
             bool okKey = WritePrivateProfileStringW("api", "key", key, cfg);

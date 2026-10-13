@@ -24,6 +24,7 @@ namespace DstLauncher
      */
     public static class GodotLaunch
     {
+        public static bool RuntimeVerified { get; private set; }
         private const string RuntimeScriptName = "dst_godot_runtime.gd";
         private const string RuntimeScriptRes = "res://dst_godot_runtime.gd";
 
@@ -142,8 +143,8 @@ namespace DstLauncher
 
         /* godot_runtime_sidecar_preflight：桥接脚本带一个私有参数，脚本真正加载后
            立即退出，因此一个短暂的隐藏进程即可验证 --script 支持是否可用。 */
-        public static bool RuntimeSidecarPreflight(string dir, string runtimeExe, string pack,
-                                                   string script, bool looseProject)
+        public static bool RuntimeSidecarPreflight(string dir, string runtimeExe, string pack, string signaturePack,
+                                                   string script, bool looseProject, bool requireProof)
         {
             if (dir == null || string.IsNullOrEmpty(script)) return false;
             string exe;
@@ -159,11 +160,12 @@ namespace DstLauncher
             var sig = new GodotPreflightCache.Sig();
             sig.AddFile(exe);
             sig.AddText(dir);
-            if (!string.IsNullOrEmpty(pack)) sig.AddFile(pack);
+            if (!string.IsNullOrEmpty(signaturePack)) sig.AddFile(signaturePack);
             else sig.AddText("nopack");
             if (script.StartsWith("res://", StringComparison.Ordinal)) sig.AddText(script);
             else sig.AddFile(script);
             sig.AddText(looseProject ? "loose" : "export");
+            sig.AddText(requireProof ? "proof73" : "legacy0");
             string signature = sig.ToString();
             int cached = GodotPreflightCache.Get("sidecar", signature);
             if (cached >= 0) {
@@ -200,7 +202,8 @@ namespace DstLauncher
 
             uint waited = WaitForSingleObject(pi.hProcess, 5000);
             uint exitCode = 1;
-            bool ok = waited == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, out exitCode) && exitCode == 0;
+            bool ok = waited == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, out exitCode) &&
+                      exitCode == (requireProof ? 73u : 0u);
             if (waited == WAIT_TIMEOUT) {
                 TerminateProcess(pi.hProcess, 1);
                 WaitForSingleObject(pi.hProcess, 1000);
@@ -216,13 +219,15 @@ namespace DstLauncher
 
         /* godot_runtime_autoload_preflight：format 3 补丁包把翻译器注册为 autoload，
            匹配的启动器自有可执行文件只需一个私有用户参数即可验证该路径可用。 */
-        public static bool RuntimeAutoloadPreflight(string dir, string runtimeExe)
+        public static bool RuntimeAutoloadPreflight(string dir, string runtimeExe, string pack)
         {
             if (dir == null || string.IsNullOrEmpty(runtimeExe)) return false;
 
             var sig = new GodotPreflightCache.Sig();
             sig.AddFile(runtimeExe);
+            if (pack != null) sig.AddFile(pack);
             sig.AddText(dir);
+            sig.AddText("autoload-ready-v1");
             string signature = sig.ToString();
             int cached = GodotPreflightCache.Get("autoload", signature);
             if (cached >= 0) {
@@ -232,29 +237,98 @@ namespace DstLauncher
                 return cached != 0;
             }
 
-            string cmd = LaunchFlow.FormatChecked("\"" + runtimeExe + "\" --headless -- --dst-preflight");
+            string cmd = LaunchFlow.FormatChecked("\"" + runtimeExe + "\" --headless -- --dst-autoload-preflight");
             if (cmd == null) {
                 Log.Append("Godot: runtime autoload preflight command is too long.");
                 return false;
             }
 
+            var inherit = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), bInheritHandle = true };
+            var tempDir = new StringBuilder(260 * 4); var capturePath = new StringBuilder(260 * 4);
+            SafeFileHandle capture = null;
+            FileStream reader = null;
+            uint tempLen = GetTempPathW(260 * 4, tempDir);
+            if (tempLen > 0 && tempLen < 260 * 4 && GetTempFileNameW(tempDir.ToString(), "dsa", 0, capturePath) != 0) {
+                capture = CreateFileW(capturePath.ToString(), 0x40000000u, 7u, ref inherit, 2,
+                    0x100u | 0x04000000u, IntPtr.Zero);
+                if (!capture.IsInvalid) {
+                    try {
+                        reader = new FileStream(capturePath.ToString(), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                    } catch (IOException ex) {
+                        Log.Append("Godot: runtime autoload preflight capture reader failed (Windows error " + (ex.HResult & 0xffff) + ").");
+                    } catch (UnauthorizedAccessException ex) {
+                        Log.Append("Godot: runtime autoload preflight capture reader failed (Windows error " + (ex.HResult & 0xffff) + ").");
+                    }
+                } else SafeFs.DeleteFileSafe(capturePath.ToString());
+            }
+            if (reader == null) {
+                Log.Append("Godot: runtime autoload preflight output capture failed (Windows error " + Marshal.GetLastWin32Error() + ").");
+                if (capture != null) capture.Dispose();
+                return false;
+            }
             PROCESS_INFORMATION pi;
-            if (!CreateProcess(runtimeExe, cmd, dir, CREATE_NO_WINDOW, true, false, IntPtr.Zero, out pi)) {
+            if (!CreateProcess(runtimeExe, cmd, dir, CREATE_NO_WINDOW, true, true, capture.DangerousGetHandle(), out pi)) {
                 Log.Append("Godot: runtime autoload preflight could not start. Windows error: " + SafeFs.LastError);
+                reader.Dispose(); capture.Dispose();
                 return false;
             }
             CloseHandle(pi.hThread);
-
-            uint waited = WaitForSingleObject(pi.hProcess, 5000);
+            // 只证明脚本实际进入 _ready；探测进程由父进程停止，不触发游戏异步加载的退出竞争。
+            var timer = Stopwatch.StartNew();
+            uint waited;
+            bool ok = false;
+            do {
+                waited = WaitForSingleObject(pi.hProcess, 50);
+                var output = new byte[16384];
+                uint got;
+                if (!SetFilePointerEx(reader.SafeFileHandle, 0, IntPtr.Zero, 0) ||
+                    !ReadFile(reader.SafeFileHandle, output, (uint)output.Length, out got, IntPtr.Zero)) {
+                    Log.Append("Godot: runtime autoload preflight output read failed (Windows error " + Marshal.GetLastWin32Error() + ").");
+                    break;
+                }
+                string text = Encoding.ASCII.GetString(output, 0, (int)got);
+                const string proof = "DST_GODOT_AUTOLOAD_READY_V1";
+                int pos = text.IndexOf(proof, StringComparison.Ordinal);
+                if (pos >= 0 && (pos == 0 || text[pos - 1] == '\n')) {
+                    int end = pos + proof.Length;
+                    if (end < text.Length && text[end] == '\r') end++;
+                    if (end < text.Length && text[end] == '\n' && waited == WAIT_TIMEOUT) { ok = true; break; }
+                }
+            } while (waited == WAIT_TIMEOUT && timer.ElapsedMilliseconds < 5000);
             uint exitCode = 1;
-            bool ok = waited == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, out exitCode) && exitCode == 0;
+            // 游戏进程可能在等待返回后、读取证明时自行退出，无法由脚本保证存活。
+            // 收尾前核对；停止失败时再区分退出与拒绝。退出证明作废且不入缓存，
+            // 日志保留真实退出码或查询错误，不能把外部崩溃隐藏成翻译模块已加载。
+            if (waited == WAIT_TIMEOUT) waited = WaitForSingleObject(pi.hProcess, 0);
             if (waited == WAIT_TIMEOUT) {
-                TerminateProcess(pi.hProcess, 1);
-                WaitForSingleObject(pi.hProcess, 1000);
-                Log.Append("Godot: runtime autoload preflight timed out.");
-            } else if (!ok) {
-                Log.Append("Godot: runtime autoload preflight exited with code " + exitCode + ".");
+                if (!TerminateProcess(pi.hProcess, 1)) {
+                    int stopError = Marshal.GetLastWin32Error();
+                    ok = false;
+                    if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) waited = WAIT_OBJECT_0;
+                    else Log.Append("Godot: runtime autoload preflight probe termination failed (Windows error " + stopError + ").");
+                } else {
+                    uint stopped = WaitForSingleObject(pi.hProcess, 1000);
+                    if (stopped != WAIT_OBJECT_0) {
+                        uint stopError = stopped == 0xffffffffu ? (uint)Marshal.GetLastWin32Error() : stopped;
+                        Log.Append("Godot: runtime autoload preflight probe termination failed (Windows error " + stopError + ").");
+                        ok = false;
+                    }
+                }
+                if (waited == WAIT_TIMEOUT) {
+                    Log.Append(ok ? "Godot: runtime autoload load proof confirmed; independent probe stopped."
+                        : "Godot: runtime autoload preflight timed out without a load proof.");
+                }
             }
+            if (waited == WAIT_OBJECT_0) {
+                ok = false;
+                if (GetExitCodeProcess(pi.hProcess, out exitCode))
+                    Log.Append("Godot: runtime autoload preflight exited with code " + exitCode + ".");
+                else Log.Append("Godot: runtime autoload preflight exit code read failed (Windows error " + Marshal.GetLastWin32Error() + ").");
+            } else if (waited != WAIT_TIMEOUT) {
+                ok = false;
+                Log.Append("Godot: runtime autoload preflight wait failed (Windows error " + Marshal.GetLastWin32Error() + ").");
+            }
+            reader.Dispose(); capture.Dispose();
             CloseHandle(pi.hProcess);
             if (ok) GodotPreflightCache.Put("autoload", signature, 1);
             return ok;
@@ -390,7 +464,7 @@ namespace DstLauncher
             string script = PathUtil.Join(dir, RuntimeScriptName);
             string runtimeScript = script;
             bool embeddedRuntimeAutoload = hasPatchLauncher && GodotPatch.PatchPackHasRuntimeAutoload(pack);
-            bool hasRuntimeAutoload = embeddedRuntimeAutoload && RuntimeAutoloadPreflight(dir, runtimeExe);
+            bool hasRuntimeAutoload = embeddedRuntimeAutoload && RuntimeAutoloadPreflight(dir, runtimeExe, pack);
             if (embeddedRuntimeAutoload && !hasRuntimeAutoload) {
                 Log.Append("Godot: runtime autoload preflight failed; trying script-launch compatibility.");
             }
@@ -401,8 +475,10 @@ namespace DstLauncher
             bool hasRuntimeBridge = !hasRuntimeAutoload && preparedRuntimeBridge &&
                                     RuntimeSidecarPreflight(dir, runtimeExe,
                                                             hasPatchLauncher ? null : pack,
-                                                            runtimeScript, false);
-            if (preparedRuntimeBridge && !hasRuntimeBridge) {
+                                                            pack,
+                                                            runtimeScript, false,
+                                                            PathUtil.Exists(pack + ".dst-source"));
+            if (preparedRuntimeBridge && !hasRuntimeBridge && !hasRuntimeAutoload) {
                 Log.Append("Godot: runtime sidecar preflight failed; falling back to the static launch path.");
             }
 
@@ -439,6 +515,7 @@ namespace DstLauncher
                 Log.Append("Godot: failed to launch with patch pack. Windows error: " + SafeFs.LastError);
                 return false;
             }
+            RuntimeVerified = hasRuntimeAutoload || (hasRuntimeBridge && PathUtil.Exists(pack + ".dst-source"));
             return true;
         }
 
@@ -451,7 +528,7 @@ namespace DstLauncher
             }
             if (!GodotPatch.PrepareRuntimeSidecar(dir)) return false;
             string script = PathUtil.Join(dir, RuntimeScriptName);
-            if (!PathUtil.Exists(script) || !RuntimeSidecarPreflight(dir, exe, null, script, false)) {
+            if (!PathUtil.Exists(script) || !RuntimeSidecarPreflight(dir, exe, null, null, script, false, true)) {
                 Log.Append("Godot: runtime sidecar preflight failed; falling back to the static launch path.");
                 return false;
             }
@@ -467,6 +544,7 @@ namespace DstLauncher
                 Log.Append("Godot: failed to launch export runtime sidecar. Windows error: " + SafeFs.LastError);
                 return false;
             }
+            RuntimeVerified = true;
             return true;
         }
 
@@ -478,7 +556,7 @@ namespace DstLauncher
                 return false;
             }
             string script = PathUtil.Join(dir, RuntimeScriptName);
-            if (!PathUtil.Exists(script) || !RuntimeSidecarPreflight(dir, exe, null, script, true)) {
+            if (!PathUtil.Exists(script) || !RuntimeSidecarPreflight(dir, exe, null, null, script, true, true)) {
                 Log.Append("Godot: runtime sidecar preflight failed; falling back to the normal launch path.");
                 return false;
             }
@@ -495,37 +573,43 @@ namespace DstLauncher
                 Log.Append("Godot: failed to launch with runtime sidecar. Windows error: " + SafeFs.LastError);
                 return false;
             }
+            RuntimeVerified = true;
             return true;
         }
 
         /* launch_game_for_engine：Godot 走补丁包/侧车路径，其余引擎直接启动游戏 exe。 */
-        public static void LaunchGameForEngine(string dir, Engine engine)
+        public static bool LaunchGameForEngine(string dir, Engine engine)
         {
             if (engine == Engine.Godot) {
+                RuntimeVerified = false;
                 if (GodotPatch.IsLooseProject(dir)) {
                     if (GodotPatch.PrepareRuntimeSidecar(dir)) {
                         Log.Append("Godot: loose project detected; launching with runtime translation sidecar.");
-                        if (LaunchGodotWithRuntimeSidecar(dir)) return;
+                        if (LaunchGodotWithRuntimeSidecar(dir)) return true;
                         Log.Append("Godot: runtime-sidecar launch failed; falling back to normal game launch.");
                     } else {
                         Log.Append("Godot: runtime sidecar could not be prepared; falling back to normal game launch.");
                     }
-                    LaunchFlow.LaunchGame(dir);
-                    return;
+                    return LaunchFlow.LaunchGame(dir);
                 }
                 GodotPatch.PromoteStagedPatchPack(dir);
                 string pack = PathUtil.Join(dir, "dst_godot_patch.pck");
-                if (PathUtil.Exists(pack)) {
+                if (PathUtil.Exists(pack) && GodotPatch.SourceCurrent(dir, pack)) {
                     Log.Append("Godot: launching with external translation patch pack.");
-                    if (LaunchGodotWithPack(dir, pack)) return;
+                    if (LaunchGodotWithPack(dir, pack)) return true;
                     Log.Append("Godot: patch-pack launch failed; falling back to normal game launch.");
                 } else {
+                    string initialPack = GodotPatch.PrepareRuntimePack(dir);
+                    if (initialPack != null) {
+                        if (LaunchGodotWithPack(dir, initialPack)) return true;
+                        Log.Append("Godot: initial runtime-pack launch failed; trying the generic sidecar.");
+                    }
                     Log.Append("Godot: no patch pack yet; using the generic runtime translator for this launch.");
-                    if (LaunchGodotExportWithRuntimeSidecar(dir)) return;
+                    if (LaunchGodotExportWithRuntimeSidecar(dir)) return true;
                     Log.Append("Godot: export runtime-sidecar launch failed; falling back to normal game launch.");
                 }
             }
-            LaunchFlow.LaunchGame(dir);
+            return LaunchFlow.LaunchGame(dir);
         }
 
         /* start_godot_patch_worker：以隐藏窗口启动 --godot-patch-worker 子进程重建补丁包。

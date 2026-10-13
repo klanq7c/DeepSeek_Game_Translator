@@ -89,6 +89,9 @@
     <EmbeddedResource Include="..\..\..\config\launcher.ini.example" LogicalName="IDR_PAYLOAD_LAUNCHER_EXAMPLE" Condition="Exists('..\..\..\config\launcher.ini.example')" />
     <EmbeddedResource Include="..\..\dst_server_cs.exe" LogicalName="IDR_PAYLOAD_DST_SERVER_CS" Condition="Exists('..\..\dst_server_cs.exe')" />
     <EmbeddedResource Include="..\..\..\config\glossary.example.tsv" LogicalName="IDR_PAYLOAD_GLOSSARY_EXAMPLE" Condition="Exists('..\..\..\config\glossary.example.tsv')" />
+    <EmbeddedResource Include="..\..\..\assets\fonts\NotoSansCJKsc-Regular.otf" LogicalName="IDR_PAYLOAD_CJK_FONT" />
+    <EmbeddedResource Include="..\..\..\assets\fonts\OFL.txt" LogicalName="IDR_PAYLOAD_CJK_FONT_LICENSE" />
+    <EmbeddedResource Include="..\..\..\assets\fonts\manifest.json" LogicalName="IDR_PAYLOAD_CJK_FONT_MANIFEST" />
     <EmbeddedResource Include="..\..\..\payloads\UnityTranslator\UnityTranslator.dll" LogicalName="IDR_PAYLOAD_UNITY_MONO5" Condition="Exists('..\..\..\payloads\UnityTranslator\UnityTranslator.dll')" />
     <EmbeddedResource Include="..\..\..\payloads\UnityTranslator\UnityTranslator.BepInEx6.dll" LogicalName="IDR_PAYLOAD_UNITY_MONO6" Condition="Exists('..\..\..\payloads\UnityTranslator\UnityTranslator.BepInEx6.dll')" />
     <EmbeddedResource Include="..\..\..\payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll" LogicalName="IDR_PAYLOAD_XUNITY_ENDPOINT" Condition="Exists('..\..\..\payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll')" />

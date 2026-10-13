@@ -6,6 +6,8 @@
    翻译服务器修补支持的资源。格式 3 的包还可能加入启动器自有的运行时 autoload。
    原始游戏文件不会被修改。 */
 int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap);
+int godot_prepare_runtime_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap);
+int godot_patch_source_current(const WCHAR *dir, const WCHAR *pack);
 
 /* 松散 Godot 工程（project.godot 加磁盘资源文件）不能用最小 --main-pack 启动，
    否则 Godot 枚举目录时会看到补丁包，而不是原始资源树。此类工程改用 sidecar

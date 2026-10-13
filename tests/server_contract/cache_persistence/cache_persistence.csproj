@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>dst_cache_persistence_tests</AssemblyName>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <DebugType>none</DebugType>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\..\native\src\server_cs\Core.cs" Link="CacheStore.cs" />
+    <Compile Include="..\..\..\native\src\server_cs\LiveBatchPersistence.cs" Link="LiveBatchPersistence.cs" />
+    <Compile Include="..\..\..\native\src\core\*.cs" Link="core\%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

@@ -1,7 +1,8 @@
 # Dependency and Redistribution Policy
 
-The public source repository should be source-only. Runtime dependencies are
-external inputs installed by the user with `scripts/install_runtime_payloads.ps1`.
+The public repository is source-first, with one reviewed OFL font asset.
+Other runtime dependencies are installed by the user with
+`scripts/install_runtime_payloads.ps1`.
 
 ## Allowed in Source Releases
 
@@ -20,7 +21,9 @@ external inputs installed by the user with `scripts/install_runtime_payloads.ps1
 - w64devkit, .NET runtime files, compiler toolchains, or downloaded archives.
 - Generated `.exe`, `.dll`, `.pdb`, `.mdb`, `bin/`, and `obj/` output.
 - CJK font files or TMP font bundles unless the exact font and license are
-  reviewed and included in the release notices.
+  reviewed and included in the release notices. The single approved exception
+  is `assets/fonts/NotoSansCJKsc-Regular.otf` at the commit and SHA-256 listed
+  in `assets/fonts/manifest.json`, together with `assets/fonts/OFL.txt`.
 - User caches, translation memory, logs, diagnostics, or local configuration.
 
 ## Program Packages

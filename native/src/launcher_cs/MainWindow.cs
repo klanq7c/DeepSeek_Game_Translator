@@ -34,25 +34,26 @@ namespace DstLauncher
         /* 日志水平滚动的最大像素宽度（随最长行动态增长） */
         private static int _logExtentPx;
 
-        private const int LogMaxLines = 2000;
+        private const int LogMaxLines = Log.RetainedLineLimit;
 
-        /* 侧边栏底部的运行时标签与副标题。两个实现故意不同——它们就是用来说明
-           "这个窗口由哪一版启动器画出来"的。--ui-probe 会把真实值单独打印出来
-           供 parity 断言，同时用中性文案渲染，使其余像素仍可逐字节比对。 */
+        /* 日志卡片的运行时标签标识窗口实现；探针使用中性标签，
+           并单独断言真实身份。玩家可见副标题在两版中保持一致。 */
         internal const string RealRuntimeTag = "C# managed runtime";
-        internal const string RealSubtitle = "C# managed - local cache + live batch API - tags / vars / color safe";
+        internal const string RealSubtitle = "选择一个游戏，让熟悉的语言带你继续探索。";
         internal const string NeutralRuntimeTag = "runtime";
-        internal const string NeutralSubtitle = "local cache + live batch API - tags / vars / color safe";
+        internal const string NeutralSubtitle = "选择一个游戏，让熟悉的语言带你继续探索。";
 
         /* --ui-probe 置 1：WM_CREATE 走确定性精简路径，渲染用中性文案，
            动画时钟冻结（见 Theme.AnimTickOverride）。 */
         internal static bool ProbeMode;
+        internal static bool ProbeDropStartRequested;
 
         internal static string RuntimeTag { get { return ProbeMode ? NeutralRuntimeTag : RealRuntimeTag; } }
         internal static string SubtitleText { get { return ProbeMode ? NeutralSubtitle : RealSubtitle; } }
 
         /* 委托由静态字段持有：交给 RegisterClassExW 后必须比窗口活得久。 */
         private static readonly Win32.WndProcDelegate WndProcHolder = WndProc;
+        private static readonly Win32.SubclassProcDelegate DropProcHolder = DropChildProc;
 
         /* 探针用同一个窗口过程注册自己的窗口类，保证被渲染的这一帧走的就是
            真实的消息处理路径（对应 C 版的 ui_probe_wndproc）。 */
@@ -183,7 +184,7 @@ namespace DstLauncher
                     Win32.SendMessageW(button, Win32.WM_SETFONT, Theme.FontBody, (IntPtr)1);
                 }
             }
-            SetFont(Status, Theme.FontMonoSmall);
+            SetFont(Status, Theme.FontSmall);
             if (LogList != IntPtr.Zero && Win32.IsWindow(LogList)) {
                 Win32.SendMessageW(LogList, Win32.WM_SETFONT, Theme.FontMono, (IntPtr)1);
                 IntPtr dc = Win32.GetDC(LogList);
@@ -225,7 +226,7 @@ namespace DstLauncher
                 }
                 int caption = (int)Theme.C_PAGE;
                 int border = (int)Theme.C_LINE;
-                int text = (int)Theme.C_TEXT;
+                int text = (int)Win32.RGB(245, 240, 229);
                 DwmSetWindowAttribute(hwnd, 35, ref caption, sizeof(int));
                 DwmSetWindowAttribute(hwnd, 34, ref border, sizeof(int));
                 DwmSetWindowAttribute(hwnd, 36, ref text, sizeof(int));
@@ -236,8 +237,8 @@ namespace DstLauncher
             }
 
             try {
-                if (LogList != IntPtr.Zero && Win32.IsWindow(LogList)) SetWindowTheme(LogList, "DarkMode_Explorer", null);
-                if (Path != IntPtr.Zero && Win32.IsWindow(Path)) SetWindowTheme(Path, "DarkMode_CFD", null);
+                if (LogList != IntPtr.Zero && Win32.IsWindow(LogList)) SetWindowTheme(LogList, "Explorer", null);
+                if (Path != IntPtr.Zero && Win32.IsWindow(Path)) SetWindowTheme(Path, "Explorer", null);
             } catch (DllNotFoundException ex) {
                 Win32.OutputDebugStringW("ds launcher: uxtheme unavailable: " + ex.Message + "\n");
             } catch (EntryPointNotFoundException ex) {
@@ -365,9 +366,7 @@ namespace DstLauncher
                 if (!ServerProcess.Start()) {
                     ReportServerStartFailure();
                 } else {
-                    Deploy.ForEngine(a.Item1, a.Item2);
-                    Log.Status("正在预热缓存并启动游戏...");
-                    LaunchFlow.RunEngineLaunchFlow(a.Item1, a.Item2);
+                    LaunchFlow.RunAfterDeploy(a.Item1, a.Item2);
                 }
             } finally {
                 _startFlowRunning = false;
@@ -412,6 +411,98 @@ namespace DstLauncher
         private const uint MbDefButton2 = 0x00000100;
         private const int IdYes = 6;
 
+        /* Explorer 会把 WM_DROPFILES 发给光标下的子控件。子控件只转发句柄，
+           主窗统一 DragFinish；委托由静态字段持有，避免 GC 回收回调。 */
+        private static IntPtr DropChildProc(IntPtr child, uint msg, IntPtr wp, IntPtr lp,
+                                            UIntPtr subId, UIntPtr refData)
+        {
+            if (msg == Win32.WM_DROPFILES) {
+                IntPtr parent = Win32.GetParent(child);
+                if (parent != IntPtr.Zero) Win32.SendMessageW(parent, msg, wp, IntPtr.Zero);
+                else Win32.DragFinish(wp);
+                return IntPtr.Zero;
+            }
+            if (msg == Win32.WM_NCDESTROY) {
+                Win32.DragAcceptFiles(child, false);
+                Win32.RemoveWindowSubclass(child, DropProcHolder, subId);
+            }
+            return Win32.DefSubclassProc(child, msg, wp, lp);
+        }
+
+        private static void RegisterDropTargets(IntPtr hwnd)
+        {
+            int[] ids = {
+                Theme.IDC_TITLE, Theme.IDC_SUBTITLE, Theme.IDC_STATUS, Theme.IDC_PATH_LABEL,
+                Theme.IDC_PATH, Theme.IDC_BROWSE, Theme.IDC_OPEN, Theme.IDC_START,
+                Theme.IDC_RESTORE, Theme.IDC_SERVER_TOGGLE, Theme.IDC_API_CONFIG,
+                Theme.IDC_ENGINE, Theme.IDC_SERVER, Theme.IDC_CACHE, Theme.IDC_CLEAR_CACHE,
+                Theme.IDC_LOG
+            };
+            Win32.DragAcceptFiles(hwnd, true);
+            foreach (int id in ids) {
+                IntPtr child = Win32.GetDlgItem(hwnd, id);
+                if (child == IntPtr.Zero) continue;
+                if (Win32.SetWindowSubclass(child, DropProcHolder, (UIntPtr)1, UIntPtr.Zero)) {
+                    Win32.DragAcceptFiles(child, true);
+                } else {
+                    Log.Append("拖放初始化失败：控件 " + id + "（Win32=" + Marshal.GetLastWin32Error() + "）。");
+                }
+            }
+        }
+
+        private static void HandleDropFiles(IntPtr drop)
+        {
+            uint count = 0;
+            string selected = "";
+            try {
+                count = Win32.DragQueryFileW(drop, uint.MaxValue, null, 0);
+                if (count == 1) {
+                    uint len = Win32.DragQueryFileW(drop, 0, null, 0);
+                    if (len > 0 && len < Win32.MAX_PATH * 4) {
+                        var path = new StringBuilder(Win32.MAX_PATH * 4);
+                        if (Win32.DragQueryFileW(drop, 0, path, (uint)path.Capacity) == len)
+                            selected = path.ToString();
+                    }
+                }
+            } finally {
+                Win32.DragFinish(drop);
+            }
+            if (_startFlowRunning) {
+                Log.Append("拖放已忽略：翻译流程仍在进行中。");
+                Log.Status("翻译流程仍在进行中，请稍候。");
+                return;
+            }
+            if (count != 1 || selected.Length == 0) {
+                Log.Append("拖放无效：请一次拖入一个游戏 exe 或游戏目录，路径不得超过 " +
+                           (Win32.MAX_PATH * 4 - 1) + " 字符。");
+                Log.Status("拖放无效：请选择单个游戏 exe 或目录。");
+                return;
+            }
+            string dir = selected;
+            if (!PathUtil.IsDir(dir)) {
+                if (!PathUtil.IsFile(selected) ||
+                    !selected.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) {
+                    Log.Append("拖放无效：仅支持游戏 exe 或游戏目录：" + selected);
+                    Log.Status("拖放无效：请选择游戏 exe 或目录。");
+                    return;
+                }
+                dir = System.IO.Path.GetDirectoryName(selected);
+                if (!PathUtil.IsDir(dir)) {
+                    Log.Append("拖放无效：游戏目录不存在：" + (dir ?? selected));
+                    Log.Status("拖放无效：游戏目录不存在。");
+                    return;
+                }
+            }
+            Win32.SetWindowTextW(Path, dir);
+            RefreshEngine();
+            Log.Append("已拖入游戏：" + selected);
+            if (ProbeMode) {
+                ProbeDropStartRequested = true;
+                return;
+            }
+            StartTranslation();
+        }
+
         private static IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp)
         {
             switch (msg) {
@@ -426,6 +517,7 @@ namespace DstLauncher
 
                     ApplyFonts();
                     UiButtons.InstallHoverTracking(hwnd);
+                    RegisterDropTargets(hwnd);
                     ApplyWindowChrome(hwnd);
                     /* --ui-probe：到此为止就够画一帧了。后面的 payload 同步、缓存卡片、
                        日志、上次目录恢复、服务器探测和动画定时器都会随机器状态变化，
@@ -451,8 +543,9 @@ namespace DstLauncher
                     }
                     ServerProcess.RefreshStatus();
                     UiLayout.Apply(hwnd);
-                    /* 约 60fps 的动画心跳：驱动数据线光束、呼吸灯与按钮悬停渐变 */
-                    Win32.SetTimer(hwnd, (UIntPtr)2, 16, IntPtr.Zero);
+                    /* 约 30fps 的动画心跳：驱动数据线光束、呼吸灯与按钮悬停渐变 */
+                    Theme.RefreshMotion();
+                    Win32.SetTimer(hwnd, (UIntPtr)2, 33, IntPtr.Zero);
                     return IntPtr.Zero;
                 }
                 case Win32.WM_PAINT: {
@@ -466,8 +559,17 @@ namespace DstLauncher
                 case Win32.WM_PRINTCLIENT:
                     UiPaint.PaintBackground(hwnd, wp);
                     return IntPtr.Zero;
+                case Win32.WM_SETTINGCHANGE:
+                    Theme.RefreshMotion();
+                    Win32.InvalidateRect(hwnd, IntPtr.Zero, false);
+                    return IntPtr.Zero;
                 case Win32.WM_SIZE:
+                    UiPaint.FreeBackgroundBuffer();
                     UiLayout.Apply(hwnd);
+                    return IntPtr.Zero;
+                case Win32.WM_DISPLAYCHANGE:
+                    UiPaint.FreeBackgroundBuffer();
+                    Win32.InvalidateRect(hwnd, IntPtr.Zero, false);
                     return IntPtr.Zero;
                 case Win32.WM_GETMINMAXINFO: {
                     var mmi = (Win32.MINMAXINFO)Marshal.PtrToStructure(lp, typeof(Win32.MINMAXINFO));
@@ -485,6 +587,7 @@ namespace DstLauncher
                     }
                     return IntPtr.Zero;
                 case Win32.WM_DPICHANGED: {
+                    UiPaint.FreeBackgroundBuffer();
                     Theme.ScaleDpi = Win32.HIWORD(wp);
                     var prc = (Win32.RECT)Marshal.PtrToStructure(lp, typeof(Win32.RECT));
                     Win32.SetWindowPos(hwnd, IntPtr.Zero, prc.left, prc.top,
@@ -512,13 +615,13 @@ namespace DstLauncher
                     if (ctl == Title || ctl == Subtitle || ctl == Status) {
                         Win32.SetBkMode(dc, Win32.OPAQUE);
                         Win32.SetBkColor(dc, Theme.C_PAGE);
-                        if (ctl == Title) Win32.SetTextColor(dc, Theme.C_TEXT);
-                        else if (ctl == Subtitle) Win32.SetTextColor(dc, Theme.C_TEXT_DIM);
+                        if (ctl == Title) Win32.SetTextColor(dc, Win32.RGB(245, 240, 229));
+                        else if (ctl == Subtitle) Win32.SetTextColor(dc, Win32.RGB(174, 190, 207));
                         else Win32.SetTextColor(dc, Theme.C_MUTED);
                         return Theme.BrushPage;
                     }
                     if (ctl == PathLabel || ctl == EngineLabel || ctl == ServerLabel || ctl == CacheLabel) {
-                        /* 卡片内文字底色匹配所在高度的面板渐变，文本框无缝衔接 */
+                        /* 卡片内文字底色匹配暖白面板，文本框无缝衔接 */
                         uint cardBg;
                         IntPtr cardBrush = UiPaint.CardTextBrush(ctl == PathLabel, out cardBg);
                         Win32.SetBkMode(dc, Win32.OPAQUE);
@@ -568,10 +671,15 @@ namespace DstLauncher
                     }
                     return IntPtr.Zero;
                 }
+                case Win32.WM_DROPFILES:
+                    HandleDropFiles(wp);
+                    return IntPtr.Zero;
                 case Win32.WM_CLOSE:
                     Win32.DestroyWindow(hwnd);
                     return IntPtr.Zero;
                 case Win32.WM_DESTROY:
+                    UiPaint.FreeBackgroundBuffer();
+                    Win32.DragAcceptFiles(hwnd, false);
                     /* 启动器窗口关闭后仍保持本地翻译服务器运行。 */
                     Win32.KillTimer(hwnd, (UIntPtr)2);
                     Theme.DeleteFontsAndBrushes();
@@ -602,9 +710,9 @@ namespace DstLauncher
         {
             const uint staticStyle = Win32.WS_CHILD | Win32.WS_VISIBLE | Win32.SS_NOPREFIX | Win32.SS_ENDELLIPSIS;
 
-            Title = Child("STATIC", "无感翻译控制台", staticStyle, hwnd, Theme.IDC_TITLE);
+            Title = Child("STATIC", "让每个故事，都被读懂。", staticStyle, hwnd, Theme.IDC_TITLE);
             Subtitle = Child("STATIC", SubtitleText, staticStyle, hwnd, Theme.IDC_SUBTITLE);
-            Status = Child("STATIC", "STATUS  ·  READY", staticStyle, hwnd, Theme.IDC_STATUS);
+            Status = Child("STATIC", "准备就绪 · 选择游戏后开始汉化", staticStyle, hwnd, Theme.IDC_STATUS);
 
             PathLabel = Child("STATIC", "游戏目录", staticStyle, hwnd, Theme.IDC_PATH_LABEL);
             Path = Child("EDIT", "", Win32.WS_CHILD | Win32.WS_VISIBLE | Win32.ES_AUTOHSCROLL, hwnd, Theme.IDC_PATH);

@@ -6,6 +6,60 @@ using DstCore;
 
 namespace DstServerCs
 {
+    /* 启动读取外部 TSV 时逐块扫描；损坏的超长行只消费、不累积。 */
+    internal sealed class BoundedCacheLineReader
+    {
+        private readonly TextReader source;
+        private readonly int maxChars;
+        private readonly char[] buffer = new char[16 * 1024];
+        private int position;
+        private int length;
+        private bool skipLf;
+
+        public BoundedCacheLineReader(TextReader source, int maxChars)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (maxChars < 0) throw new ArgumentOutOfRangeException(nameof(maxChars));
+            this.source = source;
+            this.maxChars = maxChars;
+        }
+
+        public string ReadLine(out bool tooLong)
+        {
+            tooLong = false;
+            var line = new StringBuilder();
+            bool hasContent = false;
+            while (true) {
+                if (position == length) {
+                    length = source.Read(buffer, 0, buffer.Length);
+                    position = 0;
+                    if (length == 0) return hasContent ? (tooLong ? "" : line.ToString()) : null;
+                }
+                if (skipLf) {
+                    skipLf = false;
+                    if (buffer[position] == '\n') {
+                        position++;
+                        continue;
+                    }
+                }
+                int start = position;
+                while (position < length && buffer[position] != '\r' && buffer[position] != '\n') position++;
+                int count = position - start;
+                if (count > 0) {
+                    hasContent = true;
+                    if (!tooLong) {
+                        if (count > maxChars - line.Length) tooLong = true;
+                        else line.Append(buffer, start, count);
+                    }
+                }
+                if (position < length) {
+                    if (buffer[position++] == '\r') skipLf = true;
+                    return tooLong ? "" : line.ToString();
+                }
+            }
+        }
+    }
+
     /*
      * CacheStore —— 与 cache.c 对齐的本地翻译缓存。
      *
@@ -36,6 +90,8 @@ namespace DstServerCs
         private readonly object ioLock = new object();
         private readonly Dictionary<string, string> map =
             new Dictionary<string, string>();
+        /* 与 map 一起受 opsLock 保护；存在于内存不代表当前值已落盘。 */
+        private readonly HashSet<string> unpersisted = new HashSet<string>();
         private readonly string path;
         private StreamWriter persistWriter;
 
@@ -83,33 +139,58 @@ namespace DstServerCs
                     for (int i = 0; i < keys.Length; i++) {
                         if (cleaned[i] == null) continue;
                         bool exists = map.TryGetValue(keys[i], out var old);
-                        if (exists && old == cleaned[i]) {
+                        if (exists && old == cleaned[i] && !unpersisted.Contains(keys[i])) {
                             // 同值且已持久化：不重复扩大 TSV。
+                            result.Persisted++;
                             continue;
                         }
                         map[keys[i]] = cleaned[i];
+                        unpersisted.Add(keys[i]);
                         changed[i] = true;
                     }
                 }
+                int wrote = 0;
+                bool ioFailed = false;
                 for (int i = 0; i < keys.Length; i++) {
                     if (!changed[i]) continue;
+                    EnsureWriter();
+                    if (persistWriter == null) break; // 打开失败：下一批重试
+                    CacheCodec.AppendLine(journal, keys[i], cleaned[i]);
                     try {
-                        EnsureWriter();
-                        if (persistWriter == null) break; // 打开失败：下一批重试
-                        CacheCodec.AppendLine(journal, keys[i], cleaned[i]);
                         persistWriter.Write(journal.ToString());
-                        persistWriter.Flush();
-                        result.Persisted++;
-                        journal.Length = 0;
                     } catch (Exception ex) {
-                        // 磁盘满/权限/路径非法等外部边界：内存已更新，未落盘部分
-                        // 保持脏状态，下次相同更新时重试。诊断写 stderr，不伪装
-                        // 成功——调用方以 Persisted/Accepted 差值暴露重启丢失边界。
-                        CloseWriter();
                         System.Console.Error.WriteLine(
                             "[cache] persist-write failed (" + ex.GetType().Name
                             + ", path=" + path + ")");
+                        ioFailed = true;
                         break;
+                    }
+                    wrote++;
+                    journal.Length = 0;
+                }
+                // 与 C 的 fflush 边界一致：一批只刷新一次。Write 成功不代表已落盘，
+                // 只有全部写入与最终 Flush 均成功，才能确认本批新增行及当前内存值。
+                if (wrote > 0 && !ioFailed) {
+                    try {
+                        persistWriter.Flush();
+                    } catch (Exception ex) {
+                        System.Console.Error.WriteLine(
+                            "[cache] persist-flush failed (" + ex.GetType().Name
+                            + ", path=" + path + ")");
+                        ioFailed = true;
+                    }
+                }
+                // 磁盘满/权限/句柄失效无法在上游修复；即使关闭时 Flush 恰好成功，
+                // 失败批次仍全部保留脏状态并返回未确认计数。stderr 记录操作与路径，
+                // 下次同值更新重试追加，绝不把错误藏成成功。A/B/A 也必须整批确认。
+                if (ioFailed) CloseWriter();
+                if (wrote > 0 && !ioFailed) {
+                    result.Persisted += wrote;
+                    lock (opsLock) {
+                        for (int i = 0; i < keys.Length; i++) {
+                            if (changed[i] && map.TryGetValue(keys[i], out var current)
+                                && current == cleaned[i]) unpersisted.Remove(keys[i]);
+                        }
                     }
                 }
             }
@@ -119,14 +200,37 @@ namespace DstServerCs
         private void EnsureWriter()
         {
             if (persistWriter != null) return;
+            FileStream fs = null;
             try {
-                var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+                fs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+                long end = fs.Seek(0, SeekOrigin.End);
+                if (end > 0) {
+                    fs.Seek(-1, SeekOrigin.End);
+                    int last = fs.ReadByte();
+                    if (last < 0) throw new IOException("Cannot read cache tail");
+                    fs.Seek(0, SeekOrigin.End);
+                    if (last != '\n') {
+                        // 磁盘写入中断或外部无换行文件只能在持久化边界识别，
+                        // 上游内存值无法修复记录分隔。只追加换行，保留所有既有字节；
+                        // stderr 明示异常尾部，分隔写失败仍报告失败并保留脏状态。
+                        Console.Error.WriteLine("[cache] persist-tail: unterminated tail; appending separator (path=" + path + ")");
+                        fs.WriteByte((byte)'\n');
+                    }
+                }
                 persistWriter = new StreamWriter(fs, new UTF8Encoding(false));
+                fs = null; // 句柄所有权交给 writer。
             } catch (Exception ex) {
                 persistWriter = null;
                 System.Console.Error.WriteLine(
                     "[cache] persist-open failed (" + ex.GetType().Name
                     + ", path=" + path + ")");
+            } finally {
+                if (fs != null) {
+                    try { fs.Dispose(); }
+                    catch (IOException ex) {
+                        Console.Error.WriteLine("[cache] persist-close failed (" + ex.GetType().Name + ", path=" + path + ")");
+                    }
+                }
             }
         }
 
@@ -153,14 +257,28 @@ namespace DstServerCs
         {
             if (!File.Exists(path)) return 0;
             int n = 0;
+            long oversized = 0;
             lock (opsLock) {
                 try {
-                    using (var reader = new StreamReader(path, new UTF8Encoding(false))) {
+                    using (var stream = new StreamReader(path, new UTF8Encoding(false))) {
+                        var reader = new BoundedCacheLineReader(stream, CacheCodec.MaxLineChars);
                         string line;
-                        while ((line = reader.ReadLine()) != null) {
+                        bool tooLong;
+                        while ((line = reader.ReadLine(out tooLong)) != null) {
+                            if (tooLong) {
+                                // 外部缓存文件中的超 8 MiB 损坏行会使无界 ReadLine 占满内存；
+                                // 上游已落盘的文件无法从当前内存值修复。跳过该行可能丢失其中的
+                                // 原始记录，但绝不伪装为成功译文；stderr 限频记录次数及路径。
+                                oversized++;
+                                if (oversized <= 3 || (oversized & (oversized - 1)) == 0)
+                                    Console.Error.WriteLine("[cache] load-line-too-large skipped (count="
+                                        + oversized + ", path=" + path + ")");
+                                continue;
+                            }
                             string k, v;
                             if (!CacheCodec.TryDecodeLine(line, out k, out v)) continue; // 损坏/超长/回显：跳过
                             map[k] = v;
+                            unpersisted.Remove(k);
                             n++;
                         }
                     }

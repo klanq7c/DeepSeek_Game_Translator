@@ -74,7 +74,7 @@
     <Reference Include="UnityEngine.IMGUIModule">
       <HintPath>$(UnityManagedDir)\UnityEngine.IMGUIModule.dll</HintPath>
     </Reference>
-    <Reference Include="UnityEngine.InputLegacyModule">
+    <Reference Include="UnityEngine.InputLegacyModule" Condition="Exists('$(UnityManagedDir)\UnityEngine.InputLegacyModule.dll')">
       <HintPath>$(UnityManagedDir)\UnityEngine.InputLegacyModule.dll</HintPath>
     </Reference>
   </ItemGroup>

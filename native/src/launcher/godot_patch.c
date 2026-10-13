@@ -1,8 +1,10 @@
 #include "godot_patch.h"
+#include "godot_encrypted_pack.h"
 
 #include "embedded.h"
 #include "engine.h"
 #include "fsutil.h"
+#include "font_bundle.h"
 #include "resource.h"
 #include "ui.h"
 
@@ -12,6 +14,10 @@
 #include <string.h>
 #include <wchar.h>
 #include <winhttp.h>
+
+#ifndef DS_TRANSLATOR_VERSION
+#define DS_TRANSLATOR_VERSION "dev"
+#endif
 
 #define GODOT_PCK_MAGIC 0x43504447u
 #define GODOT_PCK_V1_HEADER_SIZE 88u
@@ -33,6 +39,7 @@
 #define GODOT_PATCH_SMALL_DIALOGIC_BYTES (16u * 1024u)
 #define GODOT_PATCH_PACK_NAME L"dst_godot_patch.pck"
 #define GODOT_PATCH_NEXT_NAME L"dst_godot_patch.next.pck"
+#define GODOT_PATCH_SOURCE_SUFFIX L".dst-source"
 #define GODOT_PATCH_BUILDING_NAME L"dst_godot_patch.building"
 #define GODOT_RUNTIME_SCRIPT_NAME L"dst_godot_runtime.gd"
 #define GODOT_RUNTIME_SCRIPT_PATH "dst_godot_runtime.gd"
@@ -72,6 +79,9 @@ typedef struct {
 
 static char *trim_pack_path(char *path, size_t n);
 static const char *godot_pack_entry_name(const char *path);
+static int find_sidecar_pck(const WCHAR *dir, PckSource *src);
+static int find_embedded_pck(const WCHAR *dir, PckSource *src);
+static int read_pck_info(HANDLE h, uint64_t base_offset, uint64_t pck_size, PckInfo *info);
 
 typedef struct {
     char *path;
@@ -157,11 +167,109 @@ static uint64_t read_u64le(const unsigned char *p) {
     return lo | (hi << 32);
 }
 
+/* 来源、Godot 脚本、字库清单与构建版本共同决定补丁是否仍可复用。 */
+static int godot_source_fingerprint(const PckSource *src, char out[48]) {
+    if (!src || !src->path[0] || path_has_reparse_point(src->path, 1)) return 0;
+    HANDLE h = CreateFileW(src->path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER start, length;
+    start.QuadPart = (LONGLONG)src->offset;
+    int ok = GetFileSizeEx(h, &length) && src->offset <= (uint64_t)length.QuadPart &&
+             src->size <= (uint64_t)length.QuadPart - src->offset &&
+             SetFilePointerEx(h, start, NULL, FILE_BEGIN);
+    uint64_t hash = 14695981039346656037ULL;
+    uint64_t remaining = src->size;
+    unsigned char buf[65536];
+    while (ok && remaining) {
+        DWORD want = remaining < sizeof buf ? (DWORD)remaining : (DWORD)sizeof buf;
+        DWORD got = 0;
+        if (!ReadFile(h, buf, want, &got, NULL) || got != want) { ok = 0; break; }
+        for (DWORD i = 0; i < got; i++) { hash ^= buf[i]; hash *= 1099511628211ULL; }
+        remaining -= got;
+    }
+    CloseHandle(h);
+    if (!ok) return 0;
+    const int script_ids[] = { IDR_SCRIPT_GODOT_RUNTIME_G3, IDR_SCRIPT_GODOT_RUNTIME_G4 };
+    for (size_t script = 0; script < sizeof script_ids / sizeof script_ids[0]; script++) {
+        const unsigned char *data = NULL;
+        DWORD size = 0;
+        if (!embedded_resource_bytes(script_ids[script], &data, &size)) {
+            append_log(L"Godot: embedded runtime payload unavailable while fingerprinting the patch.");
+            return 0;
+        }
+        hash ^= (unsigned char)(0xffu - script); hash *= 1099511628211ULL;
+        for (DWORD i = 0; i < size; i++) { hash ^= data[i]; hash *= 1099511628211ULL; }
+    }
+    const unsigned char *font_manifest = NULL;
+    DWORD manifest_size = 0;
+    if (!embedded_resource_bytes(IDR_PAYLOAD_CJK_FONT_MANIFEST, &font_manifest, &manifest_size)) {
+        append_log(L"Godot: embedded CJK font manifest unavailable while fingerprinting the patch.");
+        return 0;
+    }
+    hash ^= 0xfcu; hash *= 1099511628211ULL;
+    for (DWORD i = 0; i < manifest_size; i++) { hash ^= font_manifest[i]; hash *= 1099511628211ULL; }
+    hash ^= 0xfdu; hash *= 1099511628211ULL;
+    const unsigned char *version = (const unsigned char *)DS_TRANSLATOR_VERSION;
+    for (size_t i = 0; version[i]; i++) { hash ^= version[i]; hash *= 1099511628211ULL; }
+    snprintf(out, 48, "DST_GODOT_SOURCE_V4:%016llx\n", (unsigned long long)hash);
+    return ok;
+}
+
+static int source_marker_path(const WCHAR *pack, WCHAR *out, size_t cap) {
+    return path_append_suffix(out, cap, pack, GODOT_PATCH_SOURCE_SUFFIX);
+}
+
+int godot_patch_source_current(const WCHAR *dir, const WCHAR *pack) {
+    if (!dir || !pack || !exists_path(pack)) return 0;
+    PckSource src = {0};
+    if (!find_sidecar_pck(dir, &src) && !find_embedded_pck(dir, &src)) {
+        append_log(L"Godot: patch source is missing or unreadable; existing pack is not trusted.");
+        return 0;
+    }
+    WCHAR marker[MAX_PATH * 4];
+    if (!source_marker_path(pack, marker, MAX_PATH * 4)) return 0;
+    if (!exists_path(marker)) {
+        /* 旧格式包可保留原有静态路径；格式 3/4 要生成能证实来源的新运行时包。 */
+        HANDLE h = CreateFileW(pack, GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER size;
+            PckInfo info;
+            int legacy = GetFileSizeEx(h, &size) && size.QuadPart > 0 &&
+                         read_pck_info(h, 0, (uint64_t)size.QuadPart, &info) && info.format < 3;
+            CloseHandle(h);
+            if (legacy) return 1;
+        }
+        append_log(L"Godot: patch has no source fingerprint; rebuilding its runtime before launch.");
+        return 0;
+    }
+    char expected[48], *stored = NULL;
+    DWORD size = 0;
+    WIN32_FILE_ATTRIBUTE_DATA attrs;
+    int current = GetFileAttributesExW(marker, GetFileExInfoStandard, &attrs) &&
+                  attrs.nFileSizeHigh == 0 && attrs.nFileSizeLow < 48 &&
+                  !path_has_reparse_point(marker, 1) &&
+                  godot_source_fingerprint(&src, expected) &&
+                  read_file_bytes(marker, &stored, &size) &&
+                  size == strlen(expected) && !memcmp(stored, expected, size);
+    free(stored);
+    if (!current) append_log(L"Godot: game pack or translator payload changed, or the source fingerprint is invalid; rebuilding runtime.");
+    return current;
+}
+
 static int parse_pck_info(const unsigned char *header, DWORD header_bytes, uint64_t pck_size, PckInfo *info) {
     memset(info, 0, sizeof *info);
     if (header_bytes < GODOT_PCK_V1_HEADER_SIZE || pck_size < GODOT_PCK_V1_HEADER_SIZE) return 0;
     if (read_u32le(header) != GODOT_PCK_MAGIC) return 0;
     uint32_t format = read_u32le(header + 4);
+    /* Godot 官方 file_access_pack.cpp：普通 v4 与 v3 共用目录布局；稀疏包和
+       加密目录不含可直接改写的数据，保留原包并明确诊断。 */
+    if (format == 4 && (read_u32le(header + 20) & ~2u)) {
+        append_log(L"Godot: unsupported PCK v4 encrypted/sparse/unknown pack flags.");
+        return 0;
+    }
     info->engine_major = read_u32le(header + 8);
     info->engine_minor = read_u32le(header + 12);
     if (format == 1) {
@@ -183,7 +291,7 @@ static int parse_pck_info(const unsigned char *header, DWORD header_bytes, uint6
         info->entries_offset = info->directory_offset;
         info->file_count = read_u32le(header + 96);
         info->offsets_are_absolute = 0;
-    } else if (format == 3) {
+    } else if (format == 3 || format == 4) {
         if (header_bytes < GODOT_PCK_V3_HEADER_SIZE || pck_size < GODOT_PCK_V3_HEADER_SIZE) return 0;
         info->format = format;
         info->header_size = GODOT_PCK_V3_HEADER_SIZE;
@@ -300,7 +408,7 @@ static int read_pck_info(HANDLE h, uint64_t base_offset, uint64_t pck_size, PckI
         !parse_pck_info(header, header_bytes, pck_size, info)) {
         return 0;
     }
-    if (info->format == 3) {
+    if (info->format == 3 || info->format == 4) {
         unsigned char count[4];
         if (base_offset > UINT64_MAX - info->directory_offset ||
             !read_at_exact(h, base_offset + info->directory_offset, count, sizeof count)) {
@@ -481,17 +589,28 @@ static int godot_patch_font_resource_priority(const char *path) {
 
 static int find_system_cjk_font(WCHAR *out, size_t cap) {
     WCHAR windir[MAX_PATH];
-    if (!out || !cap || !GetWindowsDirectoryW(windir, MAX_PATH)) return 0;
+    if (!out || !cap) return 0;
+    if (!GetWindowsDirectoryW(windir, MAX_PATH)) windir[0] = 0;
     const WCHAR *names[] = { L"simhei.ttf", L"msyh.ttf", L"msyh.ttc", L"simsun.ttc" };
     WCHAR font_dir[MAX_PATH * 4];
     path_join(font_dir, MAX_PATH * 4, windir, L"Fonts");
     if (!font_dir[0]) return 0;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         path_join(out, cap, font_dir, names[i]);
-        if (exists_path(out)) return 1;
+        if (windir[0] && exists_path(out)) return 1;
     }
+    /* 系统字库可能被裁剪；Godot 补丁仍须有真实字体文件可写入资源包。 */
+    WCHAR license[MAX_PATH * 4];
+    if (font_bundle_source(out, cap, license, MAX_PATH * 4)) return 1;
     out[0] = 0;
     return 0;
+}
+
+static int ensure_bundled_font_license_if_selected(const WCHAR *game_dir) {
+    WCHAR selected[MAX_PATH * 4], bundled[MAX_PATH * 4];
+    if (!find_system_cjk_font(selected, MAX_PATH * 4)) return 1;
+    path_join(bundled, MAX_PATH * 4, g_root, L"assets\\fonts\\NotoSansCJKsc-Regular.otf");
+    return _wcsicmp(selected, bundled) != 0 || font_bundle_game_license(game_dir);
 }
 
 static int ascii_contains_i(const char *s, const char *needle) {
@@ -2275,9 +2394,36 @@ int godot_prepare_patch_launcher(const WCHAR *dir, WCHAR *out_exe, size_t cap) {
     path_join(marker, MAX_PATH * 4, dir, GODOT_PATCH_LAUNCHER_MARKER);
 
     if (exists_path(launcher)) {
-        if (!exists_path(marker)) {
+        char *marker_bytes = NULL;
+        DWORD marker_size = 0;
+        WIN32_FILE_ATTRIBUTE_DATA marker_attr;
+        int owned = exists_path(marker) &&
+                    !path_has_reparse_point(marker, 1) &&
+                    GetFileAttributesExW(marker, GetFileExInfoStandard, &marker_attr) &&
+                    marker_attr.nFileSizeHigh == 0 && marker_attr.nFileSizeLow <= 128 &&
+                    read_file_bytes(marker, &marker_bytes, &marker_size) &&
+                    marker_size == strlen(GODOT_PATCH_LAUNCHER_MARKER_TEXT) &&
+                    !memcmp(marker_bytes, GODOT_PATCH_LAUNCHER_MARKER_TEXT, marker_size);
+        free(marker_bytes);
+        if (!owned) {
             append_log(L"Godot: preserved an existing dst_godot_patch.exe without a launcher ownership marker.");
             return 0;
+        }
+        if (!files_equal_safe(source_exe, launcher)) {
+            WCHAR temp[MAX_PATH] = L"";
+            DWORD error = 0;
+            if (!GetTempFileNameW(dir, L"dse", 0, temp)) error = GetLastError();
+            else if (!copy_file_safe(source_exe, temp)) error = GetLastError();
+            else if (!move_file_safe(temp, launcher,
+                                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                error = GetLastError();
+            if (error) {
+                if (temp[0] && !delete_file_safe(temp))
+                    append_log(L"Godot: stale launcher temp cleanup failed (Windows error %lu).", GetLastError());
+                append_log(L"Godot: stale patch launcher could not be refreshed (Windows error %lu).", error);
+                return 0;
+            }
+            append_log(L"Godot: refreshed launcher-owned executable after the game changed.");
         }
         wcsncpy(out_exe, launcher, cap - 1);
         out_exe[cap - 1] = 0;
@@ -2378,7 +2524,7 @@ int godot_is_loose_project(const WCHAR *dir) {
    不要因此削弱共享服务器 API。
    运行时侧车脚本是 payloads/Godot/dst_godot_runtime_g3.gd 与 _g4.gd，构建时以
    RCDATA 嵌入（resource.h）。下方的文本替换依赖脚本里的这些锚点：
-   "extends SceneTree\n"、"func _initialize():\n"、"\t\tquit(0)\n"、"get_root()"、
+   "extends SceneTree\n"、"func _initialize():\n"、"\t\tquit(73)\n"、"get_root()"、
    main_scene 切换块以及 "C:/Windows/Fonts/simhei.ttf"；改脚本时必须同步。 */
 
 /* 取内嵌 Godot 运行时脚本。返回 NULL 表示启动器构建不完整（已记录日志）。 */
@@ -2422,9 +2568,8 @@ static char *replace_all_text(const char *source, const char *needle, const char
     return result;
 }
 
-/* 运行时模板列有默认 Windows 字体路径。将首个候选项替换为本机实际解析到的
-   CJK 字体，使 Windows 目录不同的主机也能加载可用字体。若系统没有 CJK
-   字体，则保留默认列表，并由脚本在运行时警告一次。 */
+/* 运行时模板列有默认 Windows 字体路径。替换首个候选项为本机 CJK 字体；
+   系统没有字库时使用经审核的内置 OTF。资源缺失才保留默认列表并记录诊断。 */
 static char *godot_runtime_script_with_font(const char *source) {
     if (!source) return NULL;
     WCHAR font_w[MAX_PATH * 4];
@@ -2451,9 +2596,12 @@ static char *build_godot_runtime_autoload(uint32_t engine_major) {
           "\tif scene != \"\":\n"
           "\t\tchange_scene_to_file(scene)\n";
     char *step = replace_all_text(source, "extends SceneTree\n", "extends Node\n");
-    char *next = step ? replace_all_text(step, "func _initialize():\n", "func _ready():\n") : NULL;
+    const char *ready = engine_major == 3
+        ? "func _ready():\n\tif OS.get_cmdline_args().has(\"--dst-autoload-preflight\"):\n\t\tprint(\"DST_GODOT_AUTOLOAD_READY_V1\")\n\t\treturn\n"
+        : "func _ready():\n\tif OS.get_cmdline_args().has(\"--dst-autoload-preflight\") or OS.get_cmdline_user_args().has(\"--dst-autoload-preflight\"):\n\t\tprint(\"DST_GODOT_AUTOLOAD_READY_V1\")\n\t\treturn\n";
+    char *next = step ? replace_all_text(step, "func _initialize():\n", ready) : NULL;
     free(step);
-    step = next ? replace_all_text(next, "\t\tquit(0)\n", "\t\tget_tree().quit(0)\n") : NULL;
+    step = next ? replace_all_text(next, "\t\tquit(73)\n", "\t\tget_tree().quit(73)\n") : NULL;
     free(next);
     next = step ? replace_all_text(step, "get_root()", "get_tree().root") : NULL;
     free(step);
@@ -2601,7 +2749,7 @@ static int embed_format3_runtime_scripts(HANDLE h, const PckInfo *info,
     uint32_t additions = (runtime_meta_pos ? 0u : 1u) +
                          (autoload_script && !autoload_meta_pos ? 1u : 0u) +
                          (override_config && !override_meta_pos ? 1u : 0u);
-    if (h == INVALID_HANDLE_VALUE || !info || info->format != 3 ||
+    if (h == INVALID_HANDLE_VALUE || !info || (info->format != 3 && info->format != 4) ||
         info->file_count > GODOT_PATCH_MAX_FILES - additions ||
         directory_end < info->entries_offset) {
         return 0;
@@ -2710,6 +2858,7 @@ static int write_godot_runtime_sidecar_if_changed(const WCHAR *script, const cha
 
 int godot_prepare_runtime_sidecar(const WCHAR *dir) {
     if (!dir || !dir[0] || path_has_reparse_point(dir, 1)) return 0;
+    if (!ensure_bundled_font_license_if_selected(dir)) return 0;
     WCHAR script[MAX_PATH * 4];
     path_join(script, MAX_PATH * 4, dir, GODOT_RUNTIME_SCRIPT_NAME);
     int major = godot_runtime_major(dir);
@@ -2750,7 +2899,7 @@ static void free_entries(PckEntry *entries, size_t n) {
     free(entries);
 }
 
-static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, size_t *patched_strings) {
+static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, size_t *patched_strings, int runtime_only) {
     *patched_resources = 0;
     *patched_strings = 0;
     if (path_has_reparse_point(pack_path, 1)) return 0;
@@ -2797,7 +2946,19 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
         }
         pos += info.entry_meta_size;
         parsed_entries++;
+        if (info.format == 4 && read_u32le(meta + 32)) {
+            append_log(L"Godot: PCK v4 entry has unsupported encrypted/removal/delta flags; patch discarded.");
+            free(path); free_entries(entries, entry_n); goto done;
+        }
         const char *entry_name = godot_pack_entry_name(path);
+        if (info.format >= 2 && read_u32le(meta + 32)) {
+            if (read_u32le(meta + 32) != 1u || !_stricmp(entry_name, GODOT_RUNTIME_SCRIPT_PATH) ||
+                !_stricmp(entry_name, GODOT_AUTOLOAD_SCRIPT_PATH) || !_stricmp(entry_name, GODOT_AUTOLOAD_OVERRIDE_PATH)) {
+                append_log(L"Godot: unsupported encrypted runtime/config or entry flags; patch discarded.");
+                free(path); free_entries(entries, entry_n); goto done;
+            }
+            free(path); continue;
+        }
         if (!_stricmp(entry_name, GODOT_RUNTIME_SCRIPT_PATH)) runtime_meta_pos = meta_pos;
         if (!_stricmp(entry_name, GODOT_AUTOLOAD_SCRIPT_PATH)) autoload_meta_pos = meta_pos;
         if (!_stricmp(entry_name, GODOT_AUTOLOAD_OVERRIDE_PATH)) {
@@ -2838,9 +2999,9 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
     if (entry_n > 1) qsort(entries, entry_n, sizeof *entries, compare_pck_entries_for_patch);
 
     PatchHttp http = {0};
-    int http_available = http_open(&http);
-    if (!http_available && entry_n) {
-        append_log(L"Godot: local server was not reachable; building a runtime-only format 3 patch when possible.");
+    int http_available = !runtime_only && http_open(&http);
+    if (!runtime_only && !http_available && entry_n) {
+        append_log(L"Godot: local server was not reachable; building a runtime-only format 3/4 patch when possible.");
     }
 
     WCHAR cjk_font[MAX_PATH * 4] = {0};
@@ -2848,7 +3009,7 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
     int warned_missing_cjk_font = 0;
     size_t font_replacements = 0;
     size_t live_used = 0;
-    for (size_t i = 0; i < entry_n; i++) {
+    for (size_t i = 0; !runtime_only && i < entry_n; i++) {
         if (entries[i].kind == GODOT_PATCH_ENTRY_FONT) {
             if (font_replacements >= GODOT_PATCH_MAX_FONT_REPLACEMENTS) continue;
             if (!has_cjk_font) {
@@ -2951,7 +3112,7 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
         free(buf);
     }
     http_close(&http);
-    if (info.format == 3) {
+    if (info.format == 3 || info.format == 4) {
         int supports_autoload_prepend = info.engine_major > 4u ||
                                         (info.engine_major == 4u && info.engine_minor >= 6u);
         char *override_source = NULL;
@@ -3001,7 +3162,7 @@ static int patch_pack_file(const WCHAR *pack_path, size_t *patched_resources, si
                                            override_config)) {
             free(autoload_script);
             free(override_config);
-            append_log(L"Godot: failed to embed the runtime translator and rebuild the format 3 PCK directory.");
+            append_log(L"Godot: failed to embed the runtime translator and rebuild the format 3/4 PCK directory.");
             free_entries(entries, entry_n);
             goto done;
         }
@@ -3017,8 +3178,9 @@ done:
     return ok;
 }
 
-int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
+static int prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap, int runtime_only) {
     if (!dir || !out_pack || cap == 0 || path_has_reparse_point(dir, 1)) return 0;
+    if (!ensure_bundled_font_license_if_selected(dir)) return 0;
     WCHAR final_pack[MAX_PATH * 4];
     WCHAR build_pack[MAX_PATH * 4];
     WCHAR next_pack[MAX_PATH * 4];
@@ -3041,9 +3203,28 @@ int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
     PckSource src;
     memset(&src, 0, sizeof src);
     int has_pck_source = find_sidecar_pck(dir, &src) || find_embedded_pck(dir, &src);
+    char source_mark[48] = "";
+    if (has_pck_source && !godot_source_fingerprint(&src, source_mark)) {
+        append_log(L"Godot: could not fingerprint the source pack; patch build cancelled.");
+        return 0;
+    }
+    if (runtime_only) {
+        if (!has_pck_source) return 0;
+        HANDLE source = CreateFileW(src.path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (source == INVALID_HANDLE_VALUE) {
+            append_log(L"Godot: runtime pack source open failed (Windows error %lu).", GetLastError()); return 0;
+        }
+        PckInfo info;
+        int supported = read_pck_info(source, src.offset, src.size, &info);
+        CloseHandle(source);
+        if (!supported || (info.format != 3 && info.format != 4)) return 0;
+        append_log(L"Godot: preparing initial runtime pack without translation requests.");
+    }
     append_log(L"Godot: building external translation patch pack...");
     size_t patched_resources = 0, patched_strings = 0;
     int should_try_loose_project = 0;
+    WCHAR encryption_exe[MAX_PATH * 4] = {0};
+    find_exe(dir, encryption_exe, MAX_PATH * 4);
     if (has_pck_source) {
         if (!copy_range_to_file(src.path, src.offset, src.size, build_pack)) {
             delete_file_safe(build_pack);
@@ -3053,7 +3234,10 @@ int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
             delete_file_safe(build_pack);
             should_try_loose_project = 1;
             append_log(L"Godot: failed to normalize embedded PCK v1 offsets; trying loose project overrides.");
-        } else if (!patch_pack_file(build_pack, &patched_resources, &patched_strings) || !patched_resources) {
+        } else if (!godot_normalize_encrypted_directory(build_pack, encryption_exe)) {
+            delete_file_safe(build_pack);
+            should_try_loose_project = 1;
+        } else if (!patch_pack_file(build_pack, &patched_resources, &patched_strings, runtime_only) || !patched_resources) {
             delete_file_safe(build_pack);
             should_try_loose_project = 1;
             append_log(L"Godot: PCK source had no translated overrides; trying loose project overrides.");
@@ -3083,7 +3267,19 @@ int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
         }
     }
 
+    if (has_pck_source) {
+        char check[48];
+        if (!godot_source_fingerprint(&src, check) || strcmp(source_mark, check)) {
+            delete_file_safe(build_pack);
+            append_log(L"Godot: source pack changed during build; discarding the patch copy.");
+            return 0;
+        }
+    }
     if (move_file_safe(build_pack, final_pack, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        WCHAR marker[MAX_PATH * 4];
+        if (!source_marker_path(final_pack, marker, MAX_PATH * 4) ||
+            !write_file_bytes(marker, source_mark, (DWORD)strlen(source_mark)))
+            append_log(L"Godot: patch source fingerprint could not be saved (Windows error %lu).", GetLastError());
         if (exists_path(next_pack) && !delete_file_safe(next_pack)) {
             DWORD cleanup_err = GetLastError();
             if (cleanup_err != ERROR_FILE_NOT_FOUND) {
@@ -3101,10 +3297,24 @@ int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
         }
         wcsncpy(out_pack, next_pack, cap - 1);
         out_pack[cap - 1] = 0;
+        WCHAR marker[MAX_PATH * 4];
+        if (!source_marker_path(next_pack, marker, MAX_PATH * 4) ||
+            !write_file_bytes(marker, source_mark, (DWORD)strlen(source_mark)))
+            append_log(L"Godot: staged patch source fingerprint could not be saved (Windows error %lu).", GetLastError());
         append_log(L"Godot: active patch pack is busy; staged refreshed pack for next launch: %s", next_pack);
     }
     append_log(L"Godot: patched %Iu resources with %Iu translated strings.", patched_resources, patched_strings);
     return 1;
+}
+
+int godot_prepare_patch_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
+    return prepare_patch_pack(dir, out_pack, cap, 0);
+}
+
+/* 导出模板可能忽略 --script；首次启动前只复制资源并嵌入翻译模块。
+   远程翻译仍由游戏启动后的服务队列完成；失败会保留原包并沿原有路径记录诊断。 */
+int godot_prepare_runtime_pack(const WCHAR *dir, WCHAR *out_pack, size_t cap) {
+    return prepare_patch_pack(dir, out_pack, cap, 1);
 }
 
 int godot_promote_staged_patch_pack(const WCHAR *dir) {
@@ -3115,6 +3325,15 @@ int godot_promote_staged_patch_pack(const WCHAR *dir) {
     path_join(next_pack, MAX_PATH * 4, dir, GODOT_PATCH_NEXT_NAME);
     if (!exists_path(next_pack)) return 0;
     if (move_file_safe(next_pack, final_pack, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        WCHAR from[MAX_PATH * 4], to[MAX_PATH * 4];
+        if (source_marker_path(next_pack, from, MAX_PATH * 4) &&
+            source_marker_path(final_pack, to, MAX_PATH * 4)) {
+            if (exists_path(from)) {
+                if (!move_file_safe(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                    append_log(L"Godot: staged source fingerprint promotion failed (Windows error %lu).", GetLastError());
+            } else if (exists_path(to) && !delete_file_safe(to))
+                append_log(L"Godot: obsolete source fingerprint cleanup failed (Windows error %lu).", GetLastError());
+        }
         append_log(L"Godot: promoted refreshed patch pack from previous run.");
         return 1;
     }

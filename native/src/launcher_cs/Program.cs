@@ -82,13 +82,13 @@ namespace DstLauncher
             args = kept.ToArray();
             for (int i = 0; i < args.Length; i++) {
                 if (args[i] == "--server-smoke" || args[i] == "--sync-payloads" ||
-                    args[i] == "--api-config" || args[i] == "--clear-cache" ||
+                    args[i] == "--api-config" || args[i] == "--api-ui-probe" || args[i] == "--clear-cache" ||
                     args[i] == "--ui-identity") {
                     mode = args[i];
                     dir = ".";
                     continue;
                 }
-                if (args[i] == "--ui-probe") {
+                if (args[i] == "--ui-probe" || args[i] == "--ui-drop-probe") {
                     mode = args[i];
                     dir = ".";
                     var tail = new string[args.Length - i - 1];
@@ -108,9 +108,10 @@ namespace DstLauncher
                     continue;
                 }
                 if (args[i] == "--detect" || args[i] == "--deploy" || args[i] == "--restore" ||
-                    args[i] == "--warmup" || args[i] == "--godot-patch" ||
+                    args[i] == "--warmup" || args[i] == "--godot-patch" || args[i] == "--godot-runtime-pack" ||
                     args[i] == "--godot-promote" || args[i] == "--godot-launcher" ||
-                    args[i] == "--launch-flow" || args[i] == "--godot-patch-worker") {
+                    args[i] == "--launch-flow" || args[i] == "--deploy-launch-flow" ||
+                    args[i] == "--godot-patch-worker") {
                     mode = args[i];
                     dir = i + 1 < args.Length ? args[i + 1] : null;
                     i++;
@@ -129,7 +130,7 @@ namespace DstLauncher
                          "--sync-payloads | --clear-cache | --api-config | " +
                          "--api-config-set <e> <m> <k> | --godot-probe <text>... | " +
                          "--godot-preflight <kind> <file> <text> <put> | " +
-                         "--ui-probe <w> <h> <alive> <out.bmp> | --ui-identity | " +
+                         "--ui-probe <w> <h> <alive> <out.bmp> | --ui-drop-probe <path> <main|path|log|start> | --ui-identity | " +
                          "--server-smoke [--root <dir>]\n");
                 return 2;
             }
@@ -156,7 +157,7 @@ namespace DstLauncher
                     return 0;
                 }
                 if (mode == "--ui-probe") {
-                    /* --ui-probe <w> <h> <alive> <out.bmp> */
+                    /* 窗口探针参数：--ui-probe <w> <h> <alive> <out.bmp> */
                     string[] p = rest ?? new string[0];
                     if (p.Length < 4) return 2;
                     int w, h, alive;
@@ -165,6 +166,16 @@ namespace DstLauncher
                         return 2;
                     }
                     return UiProbe.Run(w, h, alive != 0, p[3], WriteOut);
+                }
+                if (mode == "--ui-drop-probe") {
+                    string[] p = rest ?? new string[0];
+                    if (p.Length < 2) return 2;
+                    int target = 0;
+                    if (p[1] == "path") target = Theme.IDC_PATH;
+                    else if (p[1] == "log") target = Theme.IDC_LOG;
+                    else if (p[1] == "start") target = Theme.IDC_START;
+                    else if (p[1] != "main") return 2;
+                    return UiProbe.RunDrop(p[0], target, WriteOut);
                 }
                 Log.SetSink(line => WriteOut("log=" + line + "\n"));
                 Log.SetStatusSink(text => WriteOut("status=" + text + "\n"));
@@ -177,6 +188,11 @@ namespace DstLauncher
                     WriteOut("result=" + (cleared ? 1 : 0) + "\n");
                     return 0;
                 }
+                if (mode == "--api-ui-probe") {
+                    MainWindow.Instance = Win32.GetModuleHandleW(null);
+                    ApiConfigDialog.Show(IntPtr.Zero, WriteOut);
+                    return 0;
+                }
                 if (mode == "--api-config" || mode == "--api-config-set" ||
                     mode == "--godot-probe" || mode == "--godot-preflight") {
                     return ConfigDiagnostic(mode, rest ?? new string[0]);
@@ -187,10 +203,10 @@ namespace DstLauncher
                     WriteOut("result=" + (ok ? 0 : 5) + "\n");
                     return ok ? 0 : 5;
                 }
-                if (mode == "--godot-patch" || mode == "--godot-promote" || mode == "--godot-launcher") {
+                if (mode == "--godot-patch" || mode == "--godot-runtime-pack" || mode == "--godot-promote" || mode == "--godot-launcher") {
                     int godotResult;
-                    if (mode == "--godot-patch") {
-                        string pack = GodotPatch.PreparePatchPack(dir);
+                    if (mode == "--godot-patch" || mode == "--godot-runtime-pack") {
+                        string pack = mode == "--godot-runtime-pack" ? GodotPatch.PrepareRuntimePack(dir) : GodotPatch.PreparePatchPack(dir);
                         godotResult = pack != null ? 1 : 0;
                         if (pack != null) WriteOut("pack=" + pack + "\n");
                     } else if (mode == "--godot-launcher") {
@@ -205,7 +221,7 @@ namespace DstLauncher
                 }
                 Engine engine = EngineDetector.Detect(dir);
                 int result;
-                if (mode == "--warmup" || mode == "--launch-flow") {
+                if (mode == "--warmup" || mode == "--launch-flow" || mode == "--deploy-launch-flow") {
                     /* 与 C 版 warmup_dump_post 同格式：post=<path> <body>\n，body 原始字节直写。 */
                     Warmup.DumpSink = (path, body) => {
                         WriteOut("post=" + path + " ");
@@ -213,13 +229,15 @@ namespace DstLauncher
                         WriteOut("\n");
                     };
                 }
-                if (mode == "--launch-flow") {
+                if (mode == "--launch-flow" || mode == "--deploy-launch-flow") {
                     /* 一键流程中"服务器已就绪之后"的部分。真正拉起进程的三处改为
                        spawn= 计划行；预检探测仍然真的启动被测 exe。 */
                     LaunchFlow.SpawnSink = (kind, exe, cmd, cwd) =>
                         WriteOut("spawn=" + kind + "|" + exe + "|" + cmd + "|" + cwd + "\n");
-                    LaunchFlow.RunEngineLaunchFlow(dir, engine);
-                    WriteOut("result=1\n");
+                    bool started = mode == "--deploy-launch-flow"
+                        ? LaunchFlow.RunAfterDeploy(dir, engine)
+                        : LaunchFlow.RunEngineLaunchFlow(dir, engine);
+                    WriteOut("result=" + (started ? 1 : 0) + "\n");
                     return 0;
                 }
                 if (mode == "--warmup") {
@@ -241,8 +259,7 @@ namespace DstLauncher
                 WriteOut("presets=" + ApiConfig.Providers.Length + "\n");
                 for (int p = 0; p < ApiConfig.Providers.Length; p++) {
                     ApiConfig.Preset preset = ApiConfig.Providers[p];
-                    WriteOut("preset" + p + "=" + preset.Name + "|" + (preset.Endpoint ?? "-") +
-                             "|" + (preset.Model ?? "-") + "\n");
+                    WriteOut("preset" + p + "=" + preset.Name + "|" + (preset.Endpoint ?? "-") + "\n");
                 }
                 ApiConfig.Values values = ApiConfig.Load();
                 WriteOut("endpoint=" + values.Endpoint + "\nmodel=" + values.Model + "\nkey=" + values.Key +
@@ -265,7 +282,7 @@ namespace DstLauncher
                 WriteOut("result=1\n");
                 return 0;
             }
-            /* --godot-preflight <kind> <file> <text> <put> */
+            /* Godot 预检参数：--godot-preflight <kind> <file> <text> <put> */
             if (rest.Length < 4) return 2;
             var sig = new GodotPreflightCache.Sig();
             sig.AddFile(rest[1]);

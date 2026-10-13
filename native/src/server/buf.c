@@ -86,7 +86,13 @@ void buf_int(Buf *b, long long v) {
    其余字节原样输出（缓存值多为 UTF-8 文本，原样保留即可）。 */
 void buf_json(Buf *b, const char *s) {
     buf_ch(b, '"');
-    for (; s && *s; s++) {
+    while (s && *s) {
+        /* 普通 UTF-8 字节连续复制；每段只预留/提交一次，减少缓存导出持锁期间
+           的逐字节函数调用。特殊字符仍走原转义规则，不改变任何引擎的标签文本。 */
+        const char *start = s;
+        while ((unsigned char)*s >= 32 && *s != '"' && *s != '\\') s++;
+        if (s != start) buf_addn(b, start, (size_t)(s - start));
+        if (!*s) break;
         unsigned char c = (unsigned char)*s;
         if (c == '"' || c == '\\') {
             buf_ch(b, '\\');
@@ -98,7 +104,8 @@ void buf_json(Buf *b, const char *s) {
             char tmp[8];
             snprintf(tmp, sizeof tmp, "\\u%04x", c);
             buf_add(b, tmp);
-        } else buf_ch(b, (char)c);
+        }
+        s++;
     }
     buf_ch(b, '"');
 }

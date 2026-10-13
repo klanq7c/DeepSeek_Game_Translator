@@ -143,6 +143,11 @@ namespace DstLauncher
             if (headerBytes < PckV1HeaderSize || pckSize < PckV1HeaderSize) return false;
             if (ReadU32Le(header, 0) != PckMagic) return false;
             uint format = ReadU32Le(header, 4);
+            // 普通 v4 复用 v3 目录布局；加密/稀疏包必须保留原文件。
+            if (format == 4 && (ReadU32Le(header, 20) & ~2u) != 0) {
+                Log.Append("Godot: unsupported PCK v4 encrypted/sparse/unknown pack flags.");
+                return false;
+            }
             info.EngineMajor = ReadU32Le(header, 8);
             info.EngineMinor = ReadU32Le(header, 12);
             if (format == 1) {
@@ -164,7 +169,7 @@ namespace DstLauncher
                 info.EntriesOffset = info.DirectoryOffset;
                 info.FileCount = ReadU32Le(header, 96);
                 info.OffsetsAreAbsolute = false;
-            } else if (format == 3) {
+            } else if (format == 3 || format == 4) {
                 if (headerBytes < PckV3HeaderSize || pckSize < PckV3HeaderSize) return false;
                 info.Format = format;
                 info.HeaderSize = PckV3HeaderSize;
@@ -224,7 +229,7 @@ namespace DstLauncher
                 !ParsePckInfo(header, headerBytes, pckSize, info)) {
                 return false;
             }
-            if (info.Format == 3) {
+            if (info.Format == 3 || info.Format == 4) {
                 var count = new byte[4];
                 if (baseOffset > ulong.MaxValue - info.DirectoryOffset ||
                     !ReadAtExact(h, baseOffset + info.DirectoryOffset, count, 4)) {
@@ -438,14 +443,25 @@ namespace DstLauncher
         internal static string FindSystemCjkFont()
         {
             string windir = SafeFs.WindowsDirectory();
-            if (string.IsNullOrEmpty(windir)) return null;
-            string fontDir = PathUtil.Join(windir, "Fonts");
-            if (string.IsNullOrEmpty(fontDir)) return null;
-            foreach (string name in new[] { "simhei.ttf", "msyh.ttf", "msyh.ttc", "simsun.ttc" }) {
-                string candidate = PathUtil.Join(fontDir, name);
-                if (PathUtil.Exists(candidate)) return candidate;
+            if (!string.IsNullOrEmpty(windir)) {
+                string fontDir = PathUtil.Join(windir, "Fonts");
+                foreach (string name in new[] { "simhei.ttf", "msyh.ttf", "msyh.ttc", "simsun.ttc" }) {
+                    string candidate = PathUtil.Join(fontDir, name);
+                    if (PathUtil.Exists(candidate)) return candidate;
+                }
             }
+            string font, license;
+            if (FontBundle.Source(out font, out license)) return font;
             return null;
+        }
+
+        internal static bool EnsureBundledFontLicenseIfSelected(string gameDir)
+        {
+            string selected = FindSystemCjkFont();
+            if (selected == null) return true;
+            string bundled = PathUtil.Join(Launcher.Root, "assets\\fonts\\NotoSansCJKsc-Regular.otf");
+            return !string.Equals(selected, bundled, StringComparison.OrdinalIgnoreCase) ||
+                   FontBundle.EnsureGodotLicense(gameDir);
         }
 
         private static bool StoryTextPath(string path)
@@ -753,7 +769,7 @@ namespace DstLauncher
             return true;
         }
 
-        /* ======================== JSON ======================== */
+        /* ======================== JSON 处理 ======================== */
 
         /* bb_json_string：JSON 转义（字节串进，字节串出）。 */
         internal static void AppendJsonString(StringBuilder b, string s)

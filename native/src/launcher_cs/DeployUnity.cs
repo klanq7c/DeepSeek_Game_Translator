@@ -48,13 +48,46 @@ namespace DstLauncher
             return false;
         }
 
-        /* disable_existing_file：改名为 .disabled（保留，不删除）。 */
+        private static bool IsOwnedUnityMonoPlugin(string path, string marker)
+        {
+            return IsBundledUnityMonoPlugin(path) ||
+                   (SafeFs.Exists(marker) && SafeFs.FilesEqual(path, marker));
+        }
+
+        /* 已有一次性备份时，只有备份与当前文件相同才允许覆盖当前文件。 */
+        private static bool BackupUnityCurrentIfSafe(string path)
+        {
+            string backup = path + ".dst-backup";
+            if (SafeFs.Exists(backup)) {
+                if (SafeFs.PathHasReparsePoint(backup, true)) {
+                    SafeFs.LastError = SafeFs.ERROR_ACCESS_DENIED;
+                    return false;
+                }
+                if (!SafeFs.FilesEqual(path, backup)) {
+                    SafeFs.LastError = SafeFs.ERROR_ALREADY_EXISTS;
+                    return false;
+                }
+                return true;
+            }
+            if (SafeFs.CopyFileIfAbsentSafe(path, backup)) return true;
+            if (SafeFs.LastError == SafeFs.ERROR_FILE_EXISTS &&
+                !SafeFs.PathHasReparsePoint(backup, true) && SafeFs.FilesEqual(path, backup)) return true;
+            return false;
+        }
+
+        /* disable_existing_file：已有 .disabled 可能是用户备份，拒绝删除或覆盖。 */
         private static bool DisableExistingFile(string path)
         {
-            if (!SafeFs.Exists(path)) return false;
+            if (!SafeFs.Exists(path)) {
+                SafeFs.LastError = SafeFs.ERROR_FILE_NOT_FOUND;
+                return false;
+            }
             string disabled = path + ".disabled";
-            if (SafeFs.Exists(disabled) && !SafeFs.DeleteFileSafe(disabled)) return false;
-            return SafeFs.MoveFileSafe(path, disabled, SafeFs.MOVEFILE_REPLACE_EXISTING | SafeFs.MOVEFILE_COPY_ALLOWED);
+            if (SafeFs.Exists(disabled)) {
+                SafeFs.LastError = SafeFs.ERROR_ALREADY_EXISTS;
+                return false;
+            }
+            return SafeFs.MoveFileSafe(path, disabled, SafeFs.MOVEFILE_COPY_ALLOWED);
         }
 
         /* find_il2cpp_payload：payloads\UnityIL2CPP\<leaf> 必须是目录。 */
@@ -624,7 +657,7 @@ namespace DstLauncher
             return InstallBepInExMonoRuntime(dir, useBepInEx6, machine);
         }
 
-        /* ---------------- deploy_unity（Mono） ---------------- */
+        /* ---------------- Unity Mono 部署：deploy_unity ---------------- */
 
         public static bool Unity(string dir)
         {
@@ -643,12 +676,17 @@ namespace DstLauncher
                 return false;
             }
             string dll = PathUtil.Join(plugins, "UnityTranslator.dll");
-            if (SafeFs.Exists(dll) && !IsBundledUnityMonoPlugin(dll) && !BackupFileOnce(dll, ".dst-backup")) {
-                Log.Append("Unity: could not back up the existing UnityTranslator.dll before overwriting it (Windows error " + SafeFs.LastError + ").");
+            string dllMarker = dll + ".dst-owned";
+            if (SafeFs.Exists(dll) && !IsOwnedUnityMonoPlugin(dll, dllMarker) && !BackupUnityCurrentIfSafe(dll)) {
+                Log.Append("Unity：现有 UnityTranslator.dll 备份与当前文件不一致或无法保存，已保留当前文件并取消部署（Windows 错误 " + SafeFs.LastError + "）。");
                 return false;
             }
             if (!SafeFs.CopyFileSafe(src, dll)) {
                 Log.Append("Unity：无法部署 UnityTranslator.dll（Windows 错误 " + SafeFs.LastError + "）。");
+                return false;
+            }
+            if (!SafeFs.CopyFileSafe(src, dllMarker)) {
+                Log.Append("Unity: could not record the deployed UnityTranslator.dll version (Windows error " + SafeFs.LastError + ").");
                 return false;
             }
             string jsonSrc = FindUnityPayloadFile("Newtonsoft.Json.dll");
@@ -658,12 +696,19 @@ namespace DstLauncher
                 return false;
             }
             string jsonDst = PathUtil.Join(plugins, "Newtonsoft.Json.dll");
-            if (SafeFs.Exists(jsonDst) && !SafeFs.FilesEqual(jsonDst, jsonSrc) && !BackupFileOnce(jsonDst, ".dst-backup")) {
-                Log.Append("Unity: could not back up the existing Newtonsoft.Json.dll before overwriting it (Windows error " + SafeFs.LastError + ").");
+            string jsonMarker = jsonDst + ".dst-owned";
+            if (SafeFs.Exists(jsonDst) && !SafeFs.FilesEqual(jsonDst, jsonSrc) &&
+                !(SafeFs.Exists(jsonMarker) && SafeFs.FilesEqual(jsonDst, jsonMarker)) &&
+                !BackupUnityCurrentIfSafe(jsonDst)) {
+                Log.Append("Unity：现有 Newtonsoft.Json.dll 备份与当前文件不一致或无法保存，已保留当前文件并取消部署（Windows 错误 " + SafeFs.LastError + "）。");
                 return false;
             }
             if (!SafeFs.CopyFileSafe(jsonSrc, jsonDst)) {
                 Log.Append("Unity：无法部署 Newtonsoft.Json.dll（Windows 错误 " + SafeFs.LastError + "）。");
+                return false;
+            }
+            if (!SafeFs.CopyFileSafe(jsonSrc, jsonMarker)) {
+                Log.Append("Unity：无法记录已部署的 Newtonsoft.Json.dll 版本（Windows 错误 " + SafeFs.LastError + "）。");
                 return false;
             }
             string fontfix = FindIl2cppPayload("TMPFontAssetBundles");
@@ -675,13 +720,14 @@ namespace DstLauncher
             } else {
                 Log.Append("Unity Mono: TMP font asset bundle payload missing; Chinese TMP glyphs may use overlay fallback.");
             }
+            if (!DeployUnityCjkFontIfNeeded(dir)) return false;
             Log.Append((useBepInEx6
                 ? "Unity: deployed BepInEx 6 compatible Unity plugin: "
                 : "Unity: deployed BepInEx 5 compatible Unity plugin: ") + dll);
             return true;
         }
 
-        /* ---------------- write_xunity_config ---------------- */
+        /* ---------------- XUnity 配置写入：write_xunity_config ---------------- */
 
         private const string XunityConfigText =
             "[Service]\n" +
@@ -854,12 +900,12 @@ namespace DstLauncher
             return true;
         }
 
-        /* ---------------- deploy_unity_il2cpp ---------------- */
+        /* ---------------- Unity IL2CPP 部署：deploy_unity_il2cpp ---------------- */
 
         public static bool UnityIl2cpp(string dir)
         {
             string dll = PathUtil.Join(dir, "BepInEx\\plugins\\UnityTranslator.dll");
-            string pdb = PathUtil.Join(dir, "BepInEx\\plugins\\UnityTranslator.pdb");
+            string dllMarker = dll + ".dst-owned";
             string il2cppMscorlib = PathUtil.Join(dir, "BepInEx\\core\\Il2Cppmscorlib.dll");
             string gameasm = PathUtil.Join(dir, "GameAssembly.dll");
 
@@ -875,14 +921,14 @@ namespace DstLauncher
 
             /* 如果存在旧的 Mono 版插件，禁用它避免冲突 */
             if (SafeFs.Exists(dll)) {
-                if (!IsBundledUnityMonoPlugin(dll)) {
+                if (!IsOwnedUnityMonoPlugin(dll, dllMarker)) {
                     Log.Append("Unity IL2CPP：保留现有 UnityTranslator.dll（不是内置 Mono 模板）。");
                 } else if (DisableExistingFile(dll)) {
                     Log.Append("Unity IL2CPP：已禁用旧的 Mono UnityTranslator.dll：" + dll + ".disabled");
-                    DisableExistingFile(pdb);
                 } else {
-                    Log.Append("Unity IL2CPP：警告：无法禁用内置 Mono UnityTranslator.dll（Windows 错误 " + SafeFs.LastError
-                               + "），它可能与 IL2CPP 插件冲突：" + dll);
+                    Log.Append("Unity IL2CPP：无法禁用内置 Mono UnityTranslator.dll（Windows 错误 " + SafeFs.LastError
+                               + "），已取消部署以避免插件冲突：" + dll);
+                    return false;
                 }
             }
 
@@ -953,12 +999,14 @@ namespace DstLauncher
                 if (DisableExistingFile(il2cppMscorlib)) {
                     Log.Append("Unity IL2CPP：已禁用旧的 core\\Il2Cppmscorlib.dll，避免遮挡新 interop。");
                 } else {
-                    Log.Append("Unity IL2CPP：警告：无法禁用旧的 core\\Il2Cppmscorlib.dll（Windows 错误 " + SafeFs.LastError
-                               + "），它可能遮挡新 interop 层。");
+                    Log.Append("Unity IL2CPP：无法禁用旧的 core\\Il2Cppmscorlib.dll（Windows 错误 " + SafeFs.LastError
+                               + "），已取消部署以避免遮挡新 interop 层。");
+                    return false;
                 }
             }
 
             if (!WriteXunityConfig(dir)) return false;
+            if (!DeployUnityCjkFontIfNeeded(dir)) return false;
             Log.Append("Unity IL2CPP: deployed TMP Chinese system font fallback.");
             Log.Append("Unity IL2CPP：已部署 BepInEx be.755 + XUnity AutoTranslator。");
             Log.Append("Unity IL2CPP：XUnity 已配置为使用本地 DeepSeek 批量端点 http://127.0.0.1:19999。");
@@ -1128,7 +1176,13 @@ namespace DstLauncher
         private static void RestoreUnityMonoPlugin(string dir, RestoreStats stats)
         {
             string installed = PathUtil.Join(dir, "BepInEx\\plugins\\UnityTranslator.dll");
-            RestoreUnityPluginWithBackup(installed, IsBundledUnityMonoPlugin(installed), stats);
+            string marker = installed + ".dst-owned";
+            bool owned = SafeFs.Exists(installed) && IsOwnedUnityMonoPlugin(installed, marker);
+            bool markerMatches = SafeFs.Exists(installed) && SafeFs.Exists(marker) && SafeFs.FilesEqual(installed, marker);
+            int failedBefore = stats.Failed;
+            RestoreUnityPluginWithBackup(installed, owned, stats);
+            if (markerMatches && stats.Failed == failedBefore)
+                RestoreDeleteFile(marker, stats);
         }
 
         /* Newtonsoft.Json.dll 是共享依赖：没有备份说明部署时未覆盖用户文件，保持原样；
@@ -1137,10 +1191,12 @@ namespace DstLauncher
         {
             string installed = PathUtil.Join(dir, "BepInEx\\plugins\\Newtonsoft.Json.dll");
             string backup = installed + ".dst-backup";
+            string marker = installed + ".dst-owned";
             if (!SafeFs.Exists(backup)) return;
+            bool markerMatches = SafeFs.Exists(installed) && SafeFs.Exists(marker) && SafeFs.FilesEqual(installed, marker);
             if (SafeFs.Exists(installed)) {
                 string payload = FindUnityPayloadFile("Newtonsoft.Json.dll");
-                if (payload == null || !SafeFs.FilesEqual(installed, payload)) {
+                if (!markerMatches && (payload == null || !SafeFs.FilesEqual(installed, payload))) {
                     stats.Preserved++;
                     Log.Append("还原 Unity：Newtonsoft.Json.dll 在部署后已被改动，文件和备份均已保留。");
                     return;
@@ -1150,6 +1206,7 @@ namespace DstLauncher
             if (SafeFs.MoveFileSafe(backup, installed, flags)) {
                 stats.Restored++;
                 Log.Append("还原 Unity：已从备份恢复原 Newtonsoft.Json.dll。");
+                if (markerMatches) RestoreDeleteFile(marker, stats);
             } else {
                 stats.Failed++;
                 Log.Append("还原 Unity：无法恢复 Newtonsoft.Json.dll 备份（Windows 错误 " + SafeFs.LastError + "）。");
@@ -1204,6 +1261,7 @@ namespace DstLauncher
 
         private static void RestoreUnityMono(string dir, RestoreStats stats)
         {
+            RestoreBundledCjkFont(PathUtil.Join(dir, "TranslationFonts\\NotoSansCJKsc-Regular.otf"), stats);
             RestoreUnityMonoPlugin(dir, stats);
             RestoreUnityMonoNewtonsoft(dir, stats);
             RestoreStrippedUnityFontPatcher(dir, stats);
@@ -1249,6 +1307,7 @@ namespace DstLauncher
 
         private static void RestoreUnityIl2cpp(string dir, RestoreStats stats)
         {
+            RestoreBundledCjkFont(PathUtil.Join(dir, "TranslationFonts\\NotoSansCJKsc-Regular.otf"), stats);
             string installed = PathUtil.Join(dir, "BepInEx\\plugins\\XUnity.AutoTranslator\\Translators\\DeepSeekTranslate.dll");
             string payload = PathUtil.Join(Launcher.Root, "payloads\\UnityIL2CPP\\DeepSeekXUnityTranslator\\DeepSeekTranslate.dll");
             RestoreRemoveMatchingFile(installed, payload, "DeepSeek XUnity endpoint", stats);
@@ -1262,13 +1321,21 @@ namespace DstLauncher
 
             string disabled = PathUtil.Join(dir, "BepInEx\\plugins\\UnityTranslator.dll.disabled");
             string disabledPdb = PathUtil.Join(dir, "BepInEx\\plugins\\UnityTranslator.pdb.disabled");
+            string dllMarker = PathUtil.Join(dir, "BepInEx\\plugins\\UnityTranslator.dll.dst-owned");
             if (SafeFs.Exists(disabled)) {
-                if (IsBundledUnityMonoPlugin(disabled)) {
-                    if (RestoreDeleteFile(disabled, stats)) RestoreDeleteFile(disabledPdb, stats);
+                if (IsOwnedUnityMonoPlugin(disabled, dllMarker)) {
+                    bool markerMatches = SafeFs.Exists(dllMarker) && SafeFs.FilesEqual(disabled, dllMarker);
+                    if (RestoreDeleteFile(disabled, stats)) {
+                        if (markerMatches) RestoreDeleteFile(dllMarker, stats);
+                    }
                 } else {
                     stats.Preserved++;
                     Log.Append("还原 Unity IL2CPP：禁用的 UnityTranslator.dll 无法确认归属，已保留。");
                 }
+            }
+            if (SafeFs.Exists(disabledPdb)) {
+                stats.Preserved++;
+                Log.Append("还原 Unity IL2CPP：UnityTranslator.pdb.disabled 无法确认归属，已保留。");
             }
 
             string mscorlib = PathUtil.Join(dir, "BepInEx\\core\\Il2Cppmscorlib.dll");

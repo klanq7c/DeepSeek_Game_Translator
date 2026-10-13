@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>dst_unity_runtime_contract</AssemblyName>
+    <CheckEolTargetFramework>false</CheckEolTargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../build/unity_runtime_contract/GeneratedSeams.cs" Link="GeneratedSeams.cs" />
+    <Compile Include="../../payloads/UnityTranslator/src/VisibleScanWindow.cs" Link="VisibleScanWindow.cs" />
+    <Reference Include="DeepSeekTranslate">
+      <HintPath>../../payloads/UnityIL2CPP/DeepSeekXUnityTranslator/DeepSeekTranslate.dll</HintPath>
+    </Reference>
+    <Reference Include="XUnity.AutoTranslator.Plugin.Core">
+      <HintPath>../../payloads/UnityIL2CPP/XUnityAutoTranslator/BepInEx/plugins/XUnity.AutoTranslator/XUnity.AutoTranslator.Plugin.Core.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+  <Target Name="GeneratePayloadSeams" BeforeTargets="CoreCompile">
+    <Exec Command="python &quot;$(MSBuildProjectDirectory)/generate_seams.py&quot;" />
+  </Target>
+</Project>

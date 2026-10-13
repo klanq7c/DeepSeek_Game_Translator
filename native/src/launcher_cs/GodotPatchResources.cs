@@ -461,7 +461,7 @@ namespace DstLauncher
             return BuildGdscriptBytecodeOverride(buf, size, patches, translations, texts, out patchedStrings);
         }
 
-        /* ======================== OptimizedTranslation（.translation） ======================== */
+        /* ======================== 优化翻译资源 OptimizedTranslation（.translation） ======================== */
 
         private struct OptItem
         {

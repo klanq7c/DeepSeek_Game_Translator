@@ -47,7 +47,7 @@ namespace DstLauncher
         private static float HoverValue(int id)
         {
             ButtonHover h = HoverFor(id);
-            return h != null ? h.t : 0.0f;
+            return h != null ? (Theme.MotionEnabled ? h.t : (h.target ? 1.0f : 0.0f)) : 0.0f;
         }
 
         private static IntPtr ButtonHoverProc(IntPtr btn, uint msg, IntPtr wp, IntPtr lp,
@@ -64,12 +64,14 @@ namespace DstLauncher
                         Win32.TrackMouseEvent(ref tme);
                         h.tracking = true;
                         h.target = true;
+                        Win32.InvalidateRect(btn, IntPtr.Zero, false);
                     }
                     break;
                 case Win32.WM_MOUSELEAVE:
                     if (h != null) {
                         h.tracking = false;
                         h.target = false;
+                        Win32.InvalidateRect(btn, IntPtr.Zero, false);
                     }
                     break;
                 case Win32.WM_NCDESTROY:
@@ -91,13 +93,13 @@ namespace DstLauncher
         }
 
         /* 指数缓动推进悬停强度，过渡期间重绘按钮（tick_ui_animation 的后半段）。 */
-        internal static void TickHover(IntPtr hwnd)
+        internal static void TickHover(IntPtr hwnd, float blend)
         {
             for (int i = 0; i < Hovers.Length; i++) {
                 ButtonHover h = Hovers[i];
                 float target = h.target ? 1.0f : 0.0f;
                 if (h.t == target) continue;
-                float next = h.t + (target - h.t) * 0.22f;
+                float next = h.t + (target - h.t) * blend;
                 if (Math.Abs(next - target) < 0.012f) next = target;
                 if (next == h.t) continue;
                 h.t = next;
@@ -207,34 +209,34 @@ namespace DstLauncher
 
             uint fillTop, fillBot, edge, fg;
             if (primary) {
-                /* 主按钮：青绿渐变，悬停提亮，按下压暗 */
-                fillTop = Mix(Theme.C_ACCENT, Theme.C_TEXT, 0.08f + 0.14f * hover);
+                /* 主按钮：暖金渐变，悬停提亮，按下压暗 */
+                fillTop = Mix(Theme.C_ACCENT, Theme.C_CARD, 0.08f + 0.14f * hover);
                 fillBot = Mix(Theme.C_ACCENT_DARK, Theme.C_ACCENT, 0.55f + 0.25f * hover);
                 if (pressed) {
                     fillTop = Theme.C_ACCENT_DARK;
                     fillBot = Mix(Theme.C_ACCENT_DARK, Theme.C_ACCENT_DEEP, 0.55f);
                 }
                 edge = Mix(Theme.C_ACCENT_DARK, Theme.C_ACCENT, 0.40f);
-                fg = Win32.RGB(6, 26, 26);
+                fg = Win32.RGB(22, 37, 57);
             } else if (serverRunning) {
-                /* 服务器运行中：深绿玻璃态 */
-                fillTop = Mix(Win32.RGB(21, 58, 48), Win32.RGB(28, 74, 61), hover);
-                fillBot = Mix(Win32.RGB(14, 40, 34), Win32.RGB(18, 52, 43), hover);
-                if (pressed) { fillTop = Win32.RGB(13, 36, 30); fillBot = Win32.RGB(11, 30, 26); }
+                /* 服务器运行中：浅绿状态色 */
+                fillTop = Mix(Win32.RGB(237, 247, 239), Win32.RGB(224, 240, 228), hover);
+                fillBot = Mix(Win32.RGB(230, 242, 232), Win32.RGB(214, 234, 219), hover);
+                if (pressed) { fillTop = Win32.RGB(207, 229, 214); fillBot = Win32.RGB(199, 222, 206); }
                 edge = Mix(Mix(Theme.C_LINE, Theme.C_GREEN, 0.45f), Theme.C_GREEN, hover);
                 fg = Theme.C_GREEN;
             } else if (restoreBtn || clearCacheBtn) {
-                /* 危险操作：暗红玻璃态 */
-                fillTop = Mix(Win32.RGB(48, 25, 35), Win32.RGB(62, 30, 43), hover);
-                fillBot = Mix(Win32.RGB(36, 19, 27), Win32.RGB(46, 23, 33), hover);
-                if (pressed) { fillTop = Win32.RGB(30, 16, 23); fillBot = Win32.RGB(26, 14, 20); }
+                /* 危险操作：浅红提示色 */
+                fillTop = Mix(Win32.RGB(255, 249, 245), Win32.RGB(253, 237, 231), hover);
+                fillBot = Mix(Win32.RGB(252, 244, 238), Win32.RGB(249, 232, 224), hover);
+                if (pressed) { fillTop = Win32.RGB(242, 222, 212); fillBot = Win32.RGB(237, 214, 204); }
                 edge = Mix(Mix(Theme.C_LINE, Theme.C_DANGER, 0.45f), Theme.C_DANGER, hover);
                 fg = Theme.C_DANGER;
             } else {
-                /* 普通按钮：深色玻璃态，悬停抬升并点亮语义色边框 */
+                /* 普通按钮：暖白底色，悬停时加深语义色边框 */
                 fillTop = Mix(Theme.C_CARD_ELEV, Mix(Theme.C_CARD_ELEV, Theme.C_TEXT, 0.05f), hover);
                 fillBot = Mix(Mix(Theme.C_CARD, Theme.C_CARD_ELEV, 0.35f), Theme.C_CARD_ELEV, hover);
-                if (pressed) { fillTop = Theme.C_CARD; fillBot = Mix(Theme.C_CARD, Theme.C_PAGE, 0.4f); }
+                if (pressed) { fillTop = Theme.C_CARD; fillBot = Mix(Theme.C_CARD, Theme.C_LINE, 0.4f); }
                 uint accent = Theme.C_LINE_BRIGHT;
                 if (di.CtlID == Theme.IDC_API_CONFIG) accent = Theme.C_VIOLET;
                 else if (di.CtlID == Theme.IDC_BROWSE || di.CtlID == Theme.IDC_OPEN) accent = Theme.C_BLUE;
@@ -243,7 +245,8 @@ namespace DstLauncher
             }
 
             /* 圆角渐变填充 + 发丝边框 */
-            int radius = Sc(10);
+            Win32.FillRect(di.hDC, ref di.rcItem, Theme.BrushCard);
+            int radius = Sc(32);
             IntPtr rgn = Win32.CreateRoundRectRgn(di.rcItem.left, di.rcItem.top,
                                                   di.rcItem.right + 1, di.rcItem.bottom + 1, radius, radius);
             if (rgn != IntPtr.Zero) {
@@ -269,7 +272,7 @@ namespace DstLauncher
 
             /* 顶部内侧高光，强化玻璃质感（主按钮更明显） */
             {
-                uint gloss = primary ? Mix(fillTop, Theme.C_TEXT, 0.35f) : Mix(edge, Theme.C_TEXT, 0.18f);
+                uint gloss = primary ? Mix(fillTop, Theme.C_CARD, 0.35f) : Mix(edge, Theme.C_CARD, 0.18f);
                 IntPtr gl = Win32.CreatePen(Win32.PS_SOLID, 1, gloss);
                 IntPtr ogl = Win32.SelectObject(di.hDC, gl);
                 Win32.MoveToEx(di.hDC, di.rcItem.left + radius / 2 + Sc(2), di.rcItem.top + Sc(1), IntPtr.Zero);

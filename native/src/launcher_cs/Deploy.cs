@@ -24,27 +24,86 @@ namespace DstLauncher
 
         /* ---------------- 字体 ---------------- */
 
+        private const string FontTtfOwner = "DST_FONT_OWNED_V1:simhei.ttf\n";
+        private const string FontTtcOwner = "DST_FONT_OWNED_V1:msyh.ttc\n";
+        private const string BundledFontOwner = "DST_FONT_OWNED_V1:NotoSansCJKsc-Regular.otf\n";
+        private const string BundledLicenseOwner = "DST_FONT_OWNED_V1:NotoSansCJKsc-Regular.otf:OFL\n";
+
+        /* 游戏已有 ds_font.* 时不认领；只有本次新复制的字体才写所有权标记。
+           标记写入失败时仍保留可用字体，还原会把它作为用户文件保留。 */
+        private static bool CopyOwnedCjkFont(string src, string dst, string ownerText)
+        {
+            string marker = dst + ".dst-owned";
+            if (SafeFs.Exists(marker)) {
+                Log.Append("CJK font ownership marker already exists; preserved: " + marker);
+                return false;
+            }
+            if (!SafeFs.CopyFileIfAbsentSafe(src, dst)) {
+                Log.Append("CJK font copy failed (Windows error " + SafeFs.LastError + "): " + dst);
+                return false;
+            }
+            if (!SafeFs.WriteTextUtf8(marker, ownerText)) {
+                int error = SafeFs.LastError;
+                if (SafeFs.Exists(marker) && !SafeFs.DeleteFileSafe(marker))
+                    Log.Append("CJK font ownership marker cleanup failed (Windows error " + SafeFs.LastError + "): " + marker);
+                Log.Append("CJK font was copied but ownership could not be recorded (Windows error " + error + "); restore will preserve it: " + dst);
+            }
+            return true;
+        }
+
+        private static bool DeployBundledCjkFont(string dst)
+        {
+            string source, license;
+            if (!FontBundle.Source(out source, out license)) return false;
+            string licenseDst = dst + ".OFL.txt";
+            if (SafeFs.Exists(licenseDst)) {
+                if (!SafeFs.FilesEqualStreaming(licenseDst, license)) {
+                    Log.Append("CJK font: existing license file differs; bundled font was not installed: " + licenseDst);
+                    return false;
+                }
+            } else if (!CopyOwnedCjkFont(license, licenseDst, BundledLicenseOwner)) return false;
+            if (!CopyOwnedCjkFont(source, dst, BundledFontOwner)) return false;
+            Log.Append("CJK font: deployed bundled Noto Sans CJK SC with OFL license: " + dst);
+            return true;
+        }
+
+        private static bool DeployUnityCjkFontIfNeeded(string dir)
+        {
+            string windir = SafeFs.WindowsDirectory();
+            if (!string.IsNullOrEmpty(windir)) {
+                string fontDir = PathUtil.Join(windir, "Fonts");
+                foreach (string name in new[] { "simhei.ttf", "msyh.ttf", "msyh.ttc", "simsun.ttc" }) {
+                    if (SafeFs.Exists(PathUtil.Join(fontDir, name))) return true;
+                }
+            }
+            string dst = PathUtil.Join(dir, "TranslationFonts\\NotoSansCJKsc-Regular.otf");
+            if (SafeFs.Exists(dst)) return true;
+            return DeployBundledCjkFont(dst);
+        }
+
         private static void DeployRenpyFont(string game)
         {
             string ttcDst = PathUtil.Join(game, "ds_font.ttc");
             string ttfDst = PathUtil.Join(game, "ds_font.ttf");
-            if (SafeFs.Exists(ttcDst) || SafeFs.Exists(ttfDst)) return;
+            string otfDst = PathUtil.Join(game, "ds_font.otf");
+            if (SafeFs.Exists(ttcDst) || SafeFs.Exists(ttfDst) || SafeFs.Exists(otfDst)) return;
 
             string windir = SafeFs.WindowsDirectory();
-            if (windir == null) return;
+            if (windir == null) windir = "";
 
             /* 优先 TTF："0@file.ttc" 集合索引语法并非所有 Ren'Py 版本都支持。 */
             string src = PathUtil.Join(windir, "Fonts\\simhei.ttf");
-            if (SafeFs.Exists(src) && SafeFs.CopyFileSafe(src, ttfDst)) {
+            if (windir.Length != 0 && SafeFs.Exists(src) && CopyOwnedCjkFont(src, ttfDst, FontTtfOwner)) {
                 Log.Append("Ren'Py：已部署中文字体（黑体）：" + ttfDst);
                 return;
             }
             src = PathUtil.Join(windir, "Fonts\\msyh.ttc");
-            if (SafeFs.Exists(src) && SafeFs.CopyFileSafe(src, ttcDst)) {
+            if (windir.Length != 0 && SafeFs.Exists(src) && CopyOwnedCjkFont(src, ttcDst, FontTtcOwner)) {
                 Log.Append("Ren'Py：已部署中文字体（微软雅黑）：" + ttcDst);
                 return;
             }
-            Log.Append("Ren'Py：未找到系统中文字体（simhei.ttf/msyh.ttc），翻译文本可能显示为方块。");
+            if (!DeployBundledCjkFont(otfDst))
+                Log.Append("Ren'Py：系统字体和内置中文备用字体均不可用，翻译文本可能显示为方块。");
         }
 
         private static void DeployRpgmFont(string contentRoot)
@@ -53,25 +112,27 @@ namespace DstLauncher
             SafeFs.EnsureDir(fontDir);
             string ttfDst = PathUtil.Join(fontDir, "ds_font.ttf");
             string ttcDst = PathUtil.Join(fontDir, "ds_font.ttc");
-            if (SafeFs.Exists(ttfDst) || SafeFs.Exists(ttcDst)) return;
+            string otfDst = PathUtil.Join(fontDir, "ds_font.otf");
+            if (SafeFs.Exists(ttfDst) || SafeFs.Exists(ttcDst) || SafeFs.Exists(otfDst)) return;
 
             string windir = SafeFs.WindowsDirectory();
-            if (windir == null) return;
+            if (windir == null) windir = "";
 
             string src = PathUtil.Join(windir, "Fonts\\simhei.ttf");
-            if (SafeFs.Exists(src) && SafeFs.CopyFileSafe(src, ttfDst)) {
+            if (windir.Length != 0 && SafeFs.Exists(src) && CopyOwnedCjkFont(src, ttfDst, FontTtfOwner)) {
                 Log.Append("RPGM MV/MZ: deployed CJK font: " + ttfDst);
                 return;
             }
             src = PathUtil.Join(windir, "Fonts\\msyh.ttc");
-            if (SafeFs.Exists(src) && SafeFs.CopyFileSafe(src, ttcDst)) {
+            if (windir.Length != 0 && SafeFs.Exists(src) && CopyOwnedCjkFont(src, ttcDst, FontTtcOwner)) {
                 Log.Append("RPGM MV/MZ: deployed CJK font: " + ttcDst);
                 return;
             }
-            Log.Append("RPGM MV/MZ: no system CJK font found (simhei.ttf/msyh.ttc); translated text may render as boxes.");
+            if (!DeployBundledCjkFont(otfDst))
+                Log.Append("RPGM MV/MZ: neither a system nor the bundled CJK font is available; translated text may render as boxes.");
         }
 
-        /* ---------------- Ren'Py ---------------- */
+        /* ---------------- Ren'Py 部署 ---------------- */
 
         private static bool RemoveStaleRenpyHookBytecode(string path)
         {
@@ -275,7 +336,7 @@ namespace DstLauncher
             return true;
         }
 
-        /* ---------------- Godot / Unity ---------------- */
+        /* ---------------- Godot / Unity 部署 ---------------- */
 
         public static bool Godot(string dir)
         {
@@ -299,7 +360,7 @@ namespace DstLauncher
             return deployed;
         }
 
-        /* ---------------- restore_game ---------------- */
+        /* ---------------- 游戏恢复：restore_game ---------------- */
 
         public sealed class RestoreStats
         {
@@ -349,16 +410,71 @@ namespace DstLauncher
             return false;
         }
 
+        /* 仅移除带启动器标记、且仍与部署时系统来源一致的字体。 */
+        private static void RestoreOwnedCjkFont(string installed, string sourceName,
+                                                string ownerText, RestoreStats stats)
+        {
+            if (!SafeFs.Exists(installed)) return;
+            string marker = installed + ".dst-owned";
+            if (!SafeFs.Exists(marker) || !RestoreFileEqualsText(marker, ownerText)) {
+                stats.Preserved++;
+                Log.Append("还原：中文字体没有有效的启动器所有权标记，已保留：" + installed);
+                return;
+            }
+            string windir = SafeFs.WindowsDirectory();
+            if (windir == null) {
+                stats.Preserved++;
+                Log.Append("还原：无法定位中文字体来源，已保留：" + installed);
+                return;
+            }
+            string source = PathUtil.Join(PathUtil.Join(windir, "Fonts"), sourceName);
+            if (!SafeFs.Exists(source) || !SafeFs.FilesEqual(installed, source)) {
+                stats.Preserved++;
+                Log.Append("还原：中文字体部署后已修改或系统来源已变化，已保留：" + installed);
+                return;
+            }
+            if (RestoreDeleteFile(installed, stats)) RestoreDeleteFile(marker, stats);
+        }
+
+        private static bool RestoreOwnedBundledFile(string installed, string source,
+                                                     string ownerText, RestoreStats stats)
+        {
+            if (!SafeFs.Exists(installed)) return true;
+            string marker = installed + ".dst-owned";
+            if (!SafeFs.Exists(marker) || !RestoreFileEqualsText(marker, ownerText) ||
+                !SafeFs.FilesEqualStreaming(installed, source)) {
+                stats.Preserved++;
+                Log.Append("还原：内置中文字体或许可证已修改/无有效所有权标记，已保留：" + installed);
+                return false;
+            }
+            if (!RestoreDeleteFile(installed, stats)) return false;
+            return RestoreDeleteFile(marker, stats);
+        }
+
+        private static void RestoreBundledCjkFont(string font, RestoreStats stats)
+        {
+            string licenseDst = font + ".OFL.txt";
+            if (!SafeFs.Exists(font) && !SafeFs.Exists(licenseDst)) return;
+            string source, licenseSrc;
+            if (!FontBundle.Source(out source, out licenseSrc)) {
+                stats.Failed++;
+                Log.Append("还原：无法验证内置中文字体及许可证：" + font);
+                return;
+            }
+            if (RestoreOwnedBundledFile(font, source, BundledFontOwner, stats))
+                RestoreOwnedBundledFile(licenseDst, licenseSrc, BundledLicenseOwner, stats);
+        }
+
         private static void RestoreRenpy(string dir, RestoreStats stats)
         {
             string[] files = {
                 "game\\iron_deepseek.rpy",
-                "game\\iron_deepseek.rpyc",
-                "game\\ds_font.ttf",
-                "game\\ds_font.ttc",
-                "game\\ds_font.otf"
+                "game\\iron_deepseek.rpyc"
             };
             foreach (string f in files) RestoreDeleteFile(PathUtil.Join(dir, f), stats);
+            RestoreOwnedCjkFont(PathUtil.Join(dir, "game\\ds_font.ttf"), "simhei.ttf", FontTtfOwner, stats);
+            RestoreOwnedCjkFont(PathUtil.Join(dir, "game\\ds_font.ttc"), "msyh.ttc", FontTtcOwner, stats);
+            RestoreBundledCjkFont(PathUtil.Join(dir, "game\\ds_font.otf"), stats);
         }
 
         private static void RestoreRpgm(string dir, RestoreStats stats)
@@ -410,20 +526,32 @@ namespace DstLauncher
             if (indexOk && SafeFs.Exists(index)) RestoreDeleteFile(backup, stats);
 
             string[] files = {
-                "js\\hook_rpgm_mv.js",
-                "fonts\\ds_font.ttf",
-                "fonts\\ds_font.ttc",
-                "fonts\\ds_font.otf"
+                "js\\hook_rpgm_mv.js"
             };
             foreach (string f in files) RestoreDeleteFile(PathUtil.Join(contentRoot, f), stats);
+            RestoreOwnedCjkFont(PathUtil.Join(contentRoot, "fonts\\ds_font.ttf"), "simhei.ttf", FontTtfOwner, stats);
+            RestoreOwnedCjkFont(PathUtil.Join(contentRoot, "fonts\\ds_font.ttc"), "msyh.ttc", FontTtcOwner, stats);
+            RestoreBundledCjkFont(PathUtil.Join(contentRoot, "fonts\\ds_font.otf"), stats);
         }
 
         private static void RestoreGodot(string dir, RestoreStats stats)
         {
+            string gameLicense = PathUtil.Join(dir, "dst_godot_patch.OFL.txt");
+            if (SafeFs.Exists(gameLicense)) {
+                string fontSource, licenseSource;
+                if (FontBundle.Source(out fontSource, out licenseSource))
+                    RestoreOwnedBundledFile(gameLicense, licenseSource, FontBundle.GodotLicenseOwner, stats);
+                else {
+                    stats.Failed++;
+                    Log.Append("还原 Godot：无法验证内置字体许可证，已保留：" + gameLicense);
+                }
+            }
             string[] files = {
                 "dst_godot_runtime.gd",
                 "dst_godot_patch.pck",
+                "dst_godot_patch.pck.dst-source",
                 "dst_godot_patch.next.pck",
+                "dst_godot_patch.next.pck.dst-source",
                 "dst_godot_patch.building"
             };
             foreach (string f in files) RestoreDeleteFile(PathUtil.Join(dir, f), stats);
@@ -520,7 +648,7 @@ namespace DstLauncher
             return -1;
         }
 
-        /* strchr(buf + start, c) */
+        /* 等价于 C 调用 strchr(buf + start, c) */
         public static int StrChr(byte[] buf, int start, int end, byte c)
         {
             int stop = NulEnd(buf, start, end);

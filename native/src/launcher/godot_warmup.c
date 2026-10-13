@@ -11,6 +11,7 @@
  * ================================================================ */
 
 #include "warmup_internal.h"
+#include "ui.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -789,6 +790,12 @@ static int read_godot_pck_info(HANDLE h, LONGLONG pck_base, uint64_t pck_size, G
     if (read_u32le(header) != GODOT_PCK_MAGIC) return 0;
 
     uint32_t format = read_u32le(header + 4);
+    /* Godot 官方 file_access_pack.cpp：普通 v4 与 v3 共用目录布局；稀疏包和
+       加密目录不含可直接改写的数据，保留原包并明确诊断。 */
+    if (format == 4 && (read_u32le(header + 20) & ~2u)) {
+        append_log(L"Godot: unsupported PCK v4 encrypted/sparse/unknown pack flags.");
+        return 0;
+    }
     if (format == 1) {
         info->format = format;
         info->header_size = GODOT_PCK_V1_HEADER_SIZE;
@@ -806,7 +813,7 @@ static int read_godot_pck_info(HANDLE h, LONGLONG pck_base, uint64_t pck_size, G
         info->entries_offset = info->header_size;
         info->file_count = read_u32le(header + 96);
         info->offsets_are_absolute = 0;
-    } else if (format == 3) {
+    } else if (format == 3 || format == 4) {
         if (pck_size < GODOT_PCK_V3_HEADER_SIZE || want < GODOT_PCK_V3_HEADER_SIZE) return 0;
         uint64_t directory_offset = read_u64le(header + 32);
         if (directory_offset > pck_size - 4u || directory_offset > (uint64_t)LLONG_MAX) return 0;
@@ -913,6 +920,10 @@ static int scan_godot_pck_at(HANDLE h, LONGLONG pck_base, uint64_t pck_size, Tex
             return 0;
         }
         pos += info.entry_meta_size;
+        if (info.format == 4 && read_u32le(entry + 32)) {
+            if (pass == 0) append_log(L"Godot: PCK v4 entry has unsupported encrypted/removal/delta flags; warmup skipped entry.");
+            free(path); continue;
+        }
 
         uint64_t rel = read_u64le(entry);
         uint64_t size = read_u64le(entry + 8);

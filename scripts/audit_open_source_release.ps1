@@ -1,9 +1,15 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$Path
 )
 
 $ErrorActionPreference = "Stop"
+function Get-Sha256Hex([string]$path) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($path)
+    try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
 
 $target = Resolve-Path -LiteralPath $Path
 $root = $target.Path
@@ -21,10 +27,17 @@ if ((Get-Item -LiteralPath $root).PSIsContainer -eq $false) {
 }
 
 try {
+    $reviewedFont = Join-Path $root 'assets\fonts\NotoSansCJKsc-Regular.otf'
+    $reviewedLicense = Join-Path $root 'assets\fonts\OFL.txt'
+    if (!(Test-Path -LiteralPath $reviewedFont) -or !(Test-Path -LiteralPath $reviewedLicense) -or
+        (Get-Sha256Hex $reviewedFont) -ine '2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b' -or
+        (Get-Sha256Hex $reviewedLicense) -ine '6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2') {
+        throw 'Reviewed Noto CJK font or OFL license is missing or changed.'
+    }
     $forbiddenExtensions = @(
         ".dll", ".exe", ".pdb", ".mdb", ".otf", ".ttf", ".ttc", ".woff",
         ".woff2", ".zip", ".7z", ".rar", ".tar", ".gz", ".tsv", ".log",
-        ".ini"
+        ".ini", ".pyc"
     )
 
     $binaryAssetExtensions = @(".ico", ".png")
@@ -42,7 +55,8 @@ try {
         "UnityMonoRuntime6X86",
         "XUnityAutoTranslator",
         "TMPFontAssetBundles",
-        "TranslationCache"
+        "TranslationCache",
+        "__pycache__"
     )
 
     $forbiddenFileNamePatterns = @(
@@ -82,10 +96,11 @@ try {
     foreach ($file in $files) {
         $ext = $file.Extension.ToLowerInvariant()
         $rel = $file.FullName.Substring($root.Length).TrimStart("\", "/").Replace("/", "\")
-        # Synthetic glossary example only. Real translation_memory*.tsv stays forbidden.
+        # 仅允许合成的术语表示例；真实 translation_memory*.tsv 始终禁止包含在发布包中。
         $isGlossaryExample = $rel -ieq "config\glossary.example.tsv" -or
             $rel -like "*\config\glossary.example.tsv"
-        if ($forbiddenExtensions -contains $ext -and -not $isGlossaryExample) {
+        $isReviewedFont = $rel -ieq "assets\fonts\NotoSansCJKsc-Regular.otf"
+        if ($forbiddenExtensions -contains $ext -and -not $isGlossaryExample -and -not $isReviewedFont) {
             [void]$errors.Add("Forbidden file extension: $($file.FullName)")
         }
         foreach ($pattern in $forbiddenFileNamePatterns) {
@@ -94,7 +109,7 @@ try {
                 break
             }
         }
-        if ($binaryAssetExtensions -contains $ext) {
+        if ($binaryAssetExtensions -contains $ext -or $isReviewedFont) {
             continue
         }
         try {

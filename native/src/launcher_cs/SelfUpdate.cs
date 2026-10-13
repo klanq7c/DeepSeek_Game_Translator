@@ -9,7 +9,7 @@ namespace DstLauncher
      *
      * C 版由 build_native.bat 以 RCDATA 101..106 / 201..205 嵌入；C# 版在 launcher_cs.csproj
      * 里用同名 LogicalName 的 EmbeddedResource 嵌入同一批文件。边界约束与 C 版相同：
-     *   - 只同步本项目自有文件，第三方运行时（BepInEx、XUnity 等）仍由安装脚本负责；
+     *   - 同步本项目文件和经许可证审核的 Noto 字体/OFL；BepInEx、XUnity 等运行时由安装脚本负责；
      *   - 不触碰 api.ini、翻译记忆、日志或游戏目录；
      *   - 目标内容相同就不重写（流式比较，不改时间戳）；
      *   - 更新走同目录临时文件 + 原子替换，失败时删除临时文件并保留原文件。
@@ -37,6 +37,9 @@ namespace DstLauncher
             new EmbeddedPayload("IDR_PAYLOAD_LAUNCHER_EXAMPLE",   @"config\launcher.ini.example", "launcher.ini.example", true),
             new EmbeddedPayload("IDR_PAYLOAD_DST_SERVER_CS",      @"native\dst_server_cs.exe", "dst_server_cs.exe", true),
             new EmbeddedPayload("IDR_PAYLOAD_GLOSSARY_EXAMPLE",   @"config\glossary.example.tsv", "glossary.example.tsv", true),
+            new EmbeddedPayload("IDR_PAYLOAD_CJK_FONT",           @"assets\fonts\NotoSansCJKsc-Regular.otf", "NotoSansCJKsc-Regular.otf", true),
+            new EmbeddedPayload("IDR_PAYLOAD_CJK_FONT_LICENSE",   @"assets\fonts\OFL.txt", "OFL.txt", true),
+            new EmbeddedPayload("IDR_PAYLOAD_CJK_FONT_MANIFEST",  @"assets\fonts\manifest.json", "manifest.json", true),
             new EmbeddedPayload("IDR_PAYLOAD_UNITY_MONO5",        @"payloads\UnityTranslator\UnityTranslator.dll", "UnityTranslator.dll", false),
             new EmbeddedPayload("IDR_PAYLOAD_UNITY_MONO6",        @"payloads\UnityTranslator\UnityTranslator.BepInEx6.dll", "UnityTranslator.BepInEx6.dll", false),
             new EmbeddedPayload("IDR_PAYLOAD_XUNITY_ENDPOINT",    @"payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll", "DeepSeekTranslate.dll", false),

@@ -398,13 +398,13 @@ namespace DstLauncher
             return true;
         }
 
-        /* _stricmp(s, ascii) == 0 */
+        /* 等价于 C 比较 _stricmp(s, ascii) == 0 */
         public static bool EqualsNoCase(string s, string ascii)
         {
             return s.Length == ascii.Length && StartsWithNoCase(s, ascii);
         }
 
-        /* _strnicmp(s + start, ascii, n) == 0，n ≤ ascii.Length。 */
+        /* 等价于 C 比较 _strnicmp(s + start, ascii, n) == 0，且 n ≤ ascii.Length。 */
         public static bool RegionEqualsNoCase(string s, int start, string ascii, int n)
         {
             if (start + n > s.Length) return false;
@@ -518,12 +518,14 @@ namespace DstLauncher
      *   - 只有 2xx 视为批次被接受；4xx/5xx 记一次日志并返回失败，调用方不得计为已排队；
      *   - 超时/连接失败静默返回失败（与 WinHttpSendRequest 失败一致）。
      * Warmup.DumpSink 非 null 时不联网：Open/WaitReady 直接成功，Post 交给 sink，
-     * GetCachedTranslate 一律未命中。
+     * Lookup 一律未命中。
      */
     internal sealed class LocalHttp
     {
         private bool _open;
         private bool _rejectLogged;
+        private bool _lookupLogged;
+        private bool _lookupSplitLogged;
 
         public bool Open()
         {
@@ -612,52 +614,104 @@ namespace DstLauncher
             return true;
         }
 
-        /* RFC 3986 非保留字节直接保留，其余按 UTF-8 原始字节百分号编码（大写十六进制）。 */
-        private static string UrlEncodeUtf8(string byteStr)
+        /* 本地 HTTP/JSON 边界的失败不能由资源扫描修复；保留原行并继续后台预热。
+           首次失败记录阶段、HTTP 与系统错误；损坏/截断/过大响应永远不成为成功译文。 */
+        public void LookupDiagnostic(string stage, int status, int error)
         {
-            const string hex = "0123456789ABCDEF";
-            var b = new StringBuilder(byteStr.Length * 3);
-            for (int i = 0; i < byteStr.Length; i++) {
-                char c = byteStr[i];
-                if (Warmup.IsAlpha(c) || Warmup.IsDigit(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-                    b.Append(c);
-                } else {
-                    b.Append('%').Append(hex[c >> 4]).Append(hex[c & 15]);
-                }
-            }
-            return b.ToString();
+            if (_lookupLogged) return;
+            _lookupLogged = true;
+            Log.Append("Unity warmup: cache lookup failed (" + stage + ", HTTP " + status +
+                ", Windows error " + error + "); original lines retained.");
         }
 
-        /* localhost_get_cached_translate：GET /translate?cache_only=true&text=…，只接受 200 且
-           完整读取的响应体（纯文本译文，字节串）；其余一律视为未命中。 */
-        public static bool GetCachedTranslate(string text, out string body)
+        /* 严格读取整个 /cache/lookup 响应，再通过共享 DstCore.Json 校验固定响应形状。
+           调用方持有同一个 LocalHttp，HttpWebRequest 的 ServicePoint 连接池复用连接。 */
+        public void LookupSplitDiagnostic()
         {
-            body = null;
-            if (Warmup.DumpSink != null) return false;
+            if (_lookupSplitLogged) return;
+            _lookupSplitLogged = true;
+            Log.Append("Unity warmup: cache lookup response exceeded batch limit; splitting lookup batch.");
+        }
+
+        public Dictionary<string, string> Lookup(byte[] body, bool single, out bool oversized)
+        {
+            oversized = false;
+            if (Warmup.DumpSink != null) return null;
+            if (!_open) Open();
+            int status = 0;
+            byte[] bytes;
             try {
-                var req = (HttpWebRequest)WebRequest.Create(Contract.DefaultBaseUrl + Contract.PathTranslate +
-                                                             "?cache_only=true&text=" + UrlEncodeUtf8(text));
-                req.Method = "GET";
+                var req = (HttpWebRequest)WebRequest.Create(Contract.DefaultBaseUrl + Contract.PathCacheLookup);
+                req.Method = "POST";
+                req.ContentType = "application/json";
+                req.ContentLength = body.Length;
                 req.Timeout = 350;
                 req.ReadWriteTimeout = 350;
                 req.Proxy = null;
                 req.UserAgent = "ds-game-translator Launcher/3.1";
+                using (Stream stream = req.GetRequestStream()) stream.Write(body, 0, body.Length);
                 using (var resp = (HttpWebResponse)req.GetResponse()) {
-                    if ((int)resp.StatusCode != 200) return false;
-                    using (Stream s = resp.GetResponseStream())
+                    status = (int)resp.StatusCode;
+                    if (status != 200) { LookupDiagnostic("response", status, 0); return null; }
+                    using (Stream stream = resp.GetResponseStream())
                     using (var ms = new MemoryStream()) {
                         var buf = new byte[4096];
                         int n;
-                        while ((n = s.Read(buf, 0, buf.Length)) > 0) ms.Write(buf, 0, n);
-                        byte[] bytes = ms.ToArray();
-                        body = ByteStr.FromBytes(bytes, 0, ByteStr.CStrLen(bytes));
-                        return true;
+                        while ((n = stream.Read(buf, 0, buf.Length)) > 0) {
+                            if (ms.Length + n > (single ? 64 : 2) * 1024 * 1024) {
+                                oversized = true;
+                                if (single) LookupDiagnostic("size", status, 13);
+                                return null;
+                            }
+                            if (Array.IndexOf(buf, (byte)0, 0, n) >= 0) {
+                                LookupDiagnostic("content", status, 13); return null;
+                            }
+                            ms.Write(buf, 0, n);
+                        }
+                        if (resp.ContentLength >= 0 && ms.Length != resp.ContentLength) {
+                            LookupDiagnostic("read", status, 13); return null;
+                        }
+                        bytes = ms.ToArray();
                     }
                 }
-            } catch (WebException) {
-                return false;
-            } catch (IOException) {
-                return false; /* 读取中途断开：截断内容不可用 */
+            } catch (WebException ex) {
+                var resp = ex.Response as HttpWebResponse;
+                if (resp != null) { status = (int)resp.StatusCode; resp.Dispose(); }
+                LookupDiagnostic("response", status, resp == null ? (int)ex.Status : 0);
+                return null;
+            } catch (IOException ex) {
+                LookupDiagnostic("read", status, ex.HResult); return null;
+            } catch (OutOfMemoryException) {
+                // 与 C 的追加长度检查一致：局部响应缓冲分配失败不能成为缓存命中。
+                LookupDiagnostic("allocate", status, 8); return null;
+            }
+            try {
+                var root = Json.Parse(new UTF8Encoding(false, true).GetString(bytes)) as Dictionary<string, object>;
+                object hitObject, hitCount, missCount;
+                if (root == null || root.Count != 3 || !root.TryGetValue("hits", out hitObject) ||
+                    !root.TryGetValue("hit_count", out hitCount) || !root.TryGetValue("miss_count", out missCount) ||
+                    !(hitCount is double) || !(missCount is double) || (double)hitCount < 0 || (double)missCount < 0 ||
+                    Math.Floor((double)hitCount) != (double)hitCount || Math.Floor((double)missCount) != (double)missCount) {
+                    LookupDiagnostic("JSON", 200, 13); return null;
+                }
+                var hits = hitObject as Dictionary<string, object>;
+                if (hits == null) { LookupDiagnostic("JSON", 200, 13); return null; }
+                var result = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var entry in hits) {
+                    string val = entry.Value as string;
+                    if (val == null || entry.Key.IndexOf('\0') >= 0 || val.IndexOf('\0') >= 0) {
+                        LookupDiagnostic("JSON", 200, 13); return null;
+                    }
+                    byte[] keyBytes = Encoding.UTF8.GetBytes(entry.Key), valBytes = Encoding.UTF8.GetBytes(val);
+                    result[ByteStr.FromBytes(keyBytes, 0, keyBytes.Length)] = ByteStr.FromBytes(valBytes, 0, valBytes.Length);
+                }
+                return result;
+            } catch (Json.ParseException) {
+                LookupDiagnostic("JSON", 200, 13); return null;
+            } catch (DecoderFallbackException) {
+                LookupDiagnostic("JSON", 200, 13); return null;
+            } catch (OutOfMemoryException) {
+                LookupDiagnostic("allocate", 200, 8); return null;
             }
         }
     }

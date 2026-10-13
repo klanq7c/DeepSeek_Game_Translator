@@ -763,6 +763,11 @@ namespace DstLauncher
             if (ReadU32Le(header, 0) != GodotPckMagic) return false;
 
             uint format = ReadU32Le(header, 4);
+            // 普通 v4 复用 v3 目录布局；加密/稀疏包必须保留原文件。
+            if (format == 4 && (ReadU32Le(header, 20) & ~2u) != 0) {
+                Log.Append("Godot: unsupported PCK v4 encrypted/sparse/unknown pack flags.");
+                return false;
+            }
             if (format == 1) {
                 info.Format = format;
                 info.HeaderSize = GodotPckV1HeaderSize;
@@ -780,7 +785,7 @@ namespace DstLauncher
                 info.EntriesOffset = info.HeaderSize;
                 info.FileCount = ReadU32Le(header, 96);
                 info.OffsetsAreAbsolute = false;
-            } else if (format == 3) {
+            } else if (format == 3 || format == 4) {
                 if (pckSize < GodotPckV3HeaderSize || want < GodotPckV3HeaderSize) return false;
                 ulong directoryOffset = ReadU64Le(header, 32);
                 if (directoryOffset > pckSize - 4u || directoryOffset > (ulong)long.MaxValue) return false;
@@ -871,6 +876,10 @@ namespace DstLauncher
                         return false;
                     }
                     pos += info.EntryMetaSize;
+                    if (info.Format == 4 && ReadU32Le(entry, 32) != 0) {
+                        if (pass == 0) Log.Append("Godot: PCK v4 entry has unsupported encrypted/removal/delta flags; warmup skipped entry.");
+                        continue;
+                    }
 
                     ulong rel = ReadU64Le(entry, 0);
                     ulong size = ReadU64Le(entry, 8);
@@ -1024,7 +1033,7 @@ namespace DstLauncher
             }
         }
 
-        /* warmup_scan_godot_resources */
+        /* 扫描 Godot 资源，对应 warmup_scan_godot_resources */
         internal static void WarmupScanGodotResources(string dir, TextList prefetch)
         {
             ScanGodotResourceDir(dir, prefetch, 0);
@@ -1035,6 +1044,8 @@ namespace DstLauncher
         {
             var prefetch = new TextList { MaxItems = GodotMaxItems };
             WarmupScanGodotResources(dir, prefetch);
+            if (prefetch.Full)
+                Log.Append("预热扫描达到 " + prefetch.Limit + " 条上限，部分资源文本可能未预热。");
             int queued = PostPrefetchAll(prefetch);
             if (queued > 0) Log.Append("Godot preheated translation cache: queued " + queued + " texts.");
         }

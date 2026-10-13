@@ -15,6 +15,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="..\..\..\UnityTranslator\src\TmpRichText.cs" Link="renderer\TmpRichText.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <Reference Include="BepInEx.Core">
       <HintPath>$(BepInExCoreDir)\BepInEx.Core.dll</HintPath>
       <Private>false</Private>

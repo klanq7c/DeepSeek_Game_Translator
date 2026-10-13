@@ -27,7 +27,17 @@ namespace DstCore
 
         public static object Parse(string text)
         {
-            var p = new Parser(text ?? "");
+            return ParseImpl(text, false);
+        }
+
+        /* 外部目录采用无歧义的字段与数字语法；不改变既有服务器解析契约。 */
+        public static object ParseStrict(string text)
+        {
+            return ParseImpl(text, true);
+        }
+        private static object ParseImpl(string text, bool strict)
+        {
+            var p = new Parser(text ?? "", strict);
             var value = p.ParseValue();
             p.SkipWs();
             if (!p.AtEnd) throw new ParseException("trailing content after JSON value");
@@ -44,12 +54,13 @@ namespace DstCore
             private readonly string s;
             private int i;
             private int depth;
+            private readonly bool strict;
 
-            public Parser(string text) { s = text; }
+            public Parser(string text, bool strict) { s = text; this.strict = strict; }
 
             private void Enter()
             {
-                if (++depth > MaxDepth) throw new ParseException("JSON nesting too deep");
+                if (++depth > (strict ? 65 : MaxDepth)) throw new ParseException("JSON nesting too deep");
             }
 
             private void Leave() { depth--; }
@@ -79,6 +90,7 @@ namespace DstCore
 
             public object ParseValue()
             {
+                if (strict && depth > 64) throw new ParseException("JSON nesting too deep");
                 SkipWs();
                 char c = Peek();
                 if (c == '{') return ParseObject();
@@ -113,6 +125,7 @@ namespace DstCore
                     SkipWs();
                     if (Next() != ':') throw new ParseException("expected ':' in object");
                     var value = ParseValue();
+                    if (strict && obj.ContainsKey(key)) throw new ParseException("duplicate JSON property");
                     obj[key] = value;
                     SkipWs();
                     char c = Next();
@@ -190,9 +203,23 @@ namespace DstCore
             {
                 int start = i;
                 if (Peek() == '-') i++;
+                if (strict) {
+                    if (i < s.Length && s[i] == '0') i++;
+                    else {
+                        if (i >= s.Length || s[i] < '1' || s[i] > '9') throw new ParseException("invalid JSON number");
+                        Digits();
+                    }
+                    if (i < s.Length && s[i] == '.') { i++; RequireDigits(); }
+                    if (i < s.Length && (s[i] == 'e' || s[i] == 'E')) {
+                        i++;
+                        if (i < s.Length && (s[i] == '+' || s[i] == '-')) i++;
+                        RequireDigits();
+                    }
+                } else {
                 while (i < s.Length && ((s[i] >= '0' && s[i] <= '9') ||
                        s[i] == '.' || s[i] == 'e' || s[i] == 'E' ||
                        s[i] == '+' || s[i] == '-')) i++;
+                }
                 if (i == start) throw new ParseException("invalid JSON value");
                 double d;
                 if (!double.TryParse(s.Substring(start, i - start), NumberStyles.Float,
@@ -200,6 +227,12 @@ namespace DstCore
                     throw new ParseException("invalid JSON number");
                 }
                 return d;
+            }
+            private void Digits() { while (i < s.Length && s[i] >= '0' && s[i] <= '9') i++; }
+            private void RequireDigits()
+            {
+                int start = i; Digits();
+                if (i == start) throw new ParseException("invalid JSON number");
             }
         }
 
