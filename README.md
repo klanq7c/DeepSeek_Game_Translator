@@ -1,5 +1,7 @@
 # ds游戏翻译器
 
+**新用户下载（Windows）：[点击下载 EXE，下载后双击运行](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/download/v0.4.1.0/ds-translator_0.4.1.0.exe)。**
+
 ## 更新日志
 
 后续更新请继续把最新更新日志放在本节最上方。
@@ -56,15 +58,21 @@ ds游戏翻译器是一个本地游戏翻译工具，目标是支持：
 
 ## 下载
 
-最新下载地址：
+### 新用户下载这个
 
-https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.4.1.0
+**[下载 ds游戏翻译器 0.4.1.0.exe（Windows，下载后双击运行）](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/download/v0.4.1.0/ds-translator_0.4.1.0.exe)**
 
-推荐下载：
+只需下载这个 EXE，放到一个固定文件夹后双击打开，再配置 API 并选择游戏目录。
+浏览器保存的文件名为 `ds-translator_0.4.1.0.exe`。首次运行会自动释放所需的自有组件；
+Unity 游戏另需按下方说明安装对应运行组件。
 
-- `ds-translator_0.4.1.0.exe`：单文件启动器。首次运行会自动释放/更新本项目自有服务端、脚本、示例配置、自有 Unity 插件及已审核的中文字体资源。
-- `ds-translator_0.4.1.0.zip`：带更新日志、说明文档和许可文件的 Windows 程序包，核心仍是 `ds游戏翻译器.exe`。
-- `DeepSeek_Game_Translator_source_0.4.1.0.zip`：源码包，包含源码、测试、文档及带完整许可的 Noto CJK 字体资源。
+备用：[下载 ZIP 程序包，解压后运行](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/download/v0.4.1.0/ds-translator_0.4.1.0.zip)。
+它与 EXE 的程序功能相同，附带说明文档，**二选一即可**。
+
+源码和校验文件供开发或检查文件使用。普通使用无需下载它们，也无需下载
+GitHub 附件区自动显示的 `Source code (zip)` 或 `Source code (tar.gz)`。
+
+[全部附件与更新说明](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.4.1.0)
 
 为了降低侵权和授权风险，下载包不直接内置 BepInEx、XUnity、Unity 官方 DLL、游戏文件、TMP 字体包、翻译记忆或 API key。Unity 第三方运行时和 XUnity TMP 字体 AssetBundle 由用户通过命令行脚本从上游项目下载。
 

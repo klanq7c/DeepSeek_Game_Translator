@@ -1,6 +1,8 @@
 # ds游戏翻译器使用说明
 
-本文面向直接下载程序的用户。推荐下载 Release 页面里的 `ds-translator_0.4.1.0.exe`。
+新用户请直接 [下载 ds游戏翻译器 0.4.1.0.exe](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/download/v0.4.1.0/ds-translator_0.4.1.0.exe)，放到固定文件夹后双击运行。
+Release 附件中标有“推荐下载”的 EXE 就是这个文件。ZIP 程序包是附带说明的备用下载，
+两者功能相同，选一个即可。普通使用无需下载源码、`Source code` 或校验文件。
 
 ## 第一次使用
 
