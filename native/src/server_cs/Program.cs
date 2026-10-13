@@ -324,15 +324,12 @@ namespace DstServerCs
             lock (liveLock) {
                 foreach (var job in jobs) liveMemoryBytes -= job.Bytes;
             }
+            // 同一模型批次只经过一次缓存追加/Flush；准入结果仍逐项对应等待者。
+            bool[] accepted = LiveBatchPersistence.Persist(cache, texts, results);
             for (int i = 0; i < jobs.Count; i++) {
-                string value = results != null ? results[i] : null;
-                if (value != null && TextRules.IsResolvedTranslation(texts[i], value)) {
-                    var persisted = cache.SetManyPersist(
-                        new[] { texts[i] }, new[] { value });
-                    if (persisted.Accepted > 0) {
-                        jobs[i].Done.TrySetResult(value);
-                        continue;
-                    }
+                if (accepted[i]) {
+                    jobs[i].Done.TrySetResult(results[i]);
+                    continue;
                 }
                 // 实时批量失败的条目转入后台队列（与 C 的 live 路径一致）：
                 // 下次由后台批量+二分重试填充缓存，而不是让英文永久漏出。
@@ -784,18 +781,25 @@ namespace DstServerCs
         private static byte[] BuildResponse(string cors, int status, string msg,
                                             string body, bool plain)
         {
+            int bodyBytes = Encoding.UTF8.GetByteCount(body);
             var sb = new StringBuilder(128);
             sb.Append("HTTP/1.1 ").Append(status).Append(' ').Append(msg).Append("\r\n")
               .Append("Content-Type: ")
               .Append(plain ? "text/plain; charset=utf-8" : "application/json; charset=utf-8")
               .Append("\r\n")
-              .Append("Content-Length: ").Append(Encoding.UTF8.GetByteCount(body)).Append("\r\n")
+              .Append("Content-Length: ").Append(bodyBytes).Append("\r\n")
               .Append("Access-Control-Allow-Origin: ").Append(cors).Append("\r\n")
               .Append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")
               .Append("Access-Control-Allow-Headers: Content-Type\r\n")
-              .Append("Connection: close\r\n\r\n")
-              .Append(body);
-            return Encoding.UTF8.GetBytes(sb.ToString());
+              .Append("Connection: close\r\n\r\n");
+            // 正文直接编码到最终发送缓冲，避免全量缓存导出先复制进 StringBuilder，
+            // 再生成一份同样大的 UTF-16 字符串。保留原来的单缓冲发送与字节长度契约。
+            string header = sb.ToString();
+            int headerBytes = Encoding.UTF8.GetByteCount(header);
+            var bytes = new byte[checked(headerBytes + bodyBytes)];
+            Encoding.UTF8.GetBytes(header, 0, header.Length, bytes, 0);
+            Encoding.UTF8.GetBytes(body, 0, body.Length, bytes, headerBytes);
+            return bytes;
         }
 
         /* 连接层诊断：限频写 stderr，不含请求文本。对端提前断开、发送失败、

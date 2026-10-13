@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$ManagedPayloadsOnly,
     [switch]$RequireComplete,
     [ValidateSet("UnityMono5", "UnityMono6", "UnityXUnity", "UnityTmpFallback", "UnityFontPatcher")]
@@ -29,10 +29,10 @@ function Get-SourceFiles {
     })
 }
 
-# Source files a .csproj pulls in from outside its own directory via
-# <Compile Include="..\..\native\src\core\X.cs" ...>. Wildcards are expanded
-# relative to the project directory; missing files are ignored (the compiler
-# would already have failed on them).
+# 收集 .csproj 通过下列引用方式引入的项目目录外源码：
+# <Compile Include="..\..\native\src\core\X.cs" ...>。通配符相对于
+# 项目目录展开；缺失文件予以忽略，编译器此前
+# 已会因缺失文件而报错。
 function Get-LinkedCompileSources {
     param([Parameter(Mandatory = $true)][string]$Csproj)
 
@@ -87,9 +87,9 @@ function Assert-ManagedPayloadsFresh {
 
 function Get-ManagedPayloadDefinitions {
     $stampRoot = Join-Path $repo "payloads\ManagedBuildStamps"
-    # The managed build recipe lives in its own script so that launcher/server
-    # changes in build_native.bat do not invalidate payload stamps that can only
-    # be re-recorded on a machine with the Unity/BepInEx reference assemblies.
+    # 托管组件的构建规则放在独立脚本中，避免 build_native.bat 的
+    # 启动器或服务器变更使组件指纹失效；重新记录这些指纹
+    # 需要机器上具备 Unity/BepInEx 引用程序集。
     $recipeInputs = @(
         Get-Item -LiteralPath (Join-Path $repo "scripts\build_managed_payloads.bat")
         Get-Item -LiteralPath (Join-Path $repo "scripts\install_runtime_payloads.ps1")
@@ -99,8 +99,8 @@ function Get-ManagedPayloadDefinitions {
         $_.FullName -notmatch "[\\/]FontPatcher[\\/]"
     })
     $endpointRoot = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src"
-    # The endpoint links shared-core sources from native\src\core (see its .csproj);
-    # a change there must invalidate the payload too, so fingerprint it repo-relative.
+    # 端点从 native\src\core 链接共享核心源码（见其 .csproj）；
+    # 这些源码变化也必须使组件指纹失效，因此按仓库相对路径纳入计算。
     $endpointInputs = @(Get-SourceFiles -Root $endpointRoot) +
         @(Get-LinkedCompileSources -Csproj (Join-Path $endpointRoot "DeepSeekXUnityTranslator.csproj"))
     $tmpRoot = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\src"
@@ -120,8 +120,8 @@ function Get-ManagedPayloadDefinitions {
             Inputs = $endpointInputs; Output = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll"
         },
         [pscustomobject]@{
-            Name = "UnityTmpFallback"; Label = "Unity IL2CPP TMP fallback payload"; SourceRoot = $tmpRoot
-            Inputs = @(Get-SourceFiles -Root $tmpRoot); Output = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll"
+            Name = "UnityTmpFallback"; Label = "Unity IL2CPP TMP fallback payload"; SourceRoot = $repo
+            Inputs = @(Get-SourceFiles -Root $tmpRoot) + @(Get-LinkedCompileSources -Csproj (Join-Path $tmpRoot "DeepSeekTMPFontFallback.csproj")); Output = Join-Path $repo "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\BepInEx\plugins\DeepSeekTMPFontFallback\DeepSeekTMPFontFallback.dll"
         },
         [pscustomobject]@{
             Name = "UnityFontPatcher"; Label = "Unity Mono stripped-font patcher"; SourceRoot = $fontPatcherRoot
@@ -264,7 +264,38 @@ function Write-ManagedPayloadStamp {
     }
     $utf8NoBom = [Text.UTF8Encoding]::new($false)
     $json = ($stamp | ConvertTo-Json).Replace("`r`n", "`n")
-    [IO.File]::WriteAllText($Definition.Stamp, ($json + "`n"), $utf8NoBom)
+    $bytes = $utf8NoBom.GetBytes($json + "`n")
+    $temporary = $null
+    try {
+        if (Test-Path -LiteralPath $Definition.Stamp -PathType Leaf) {
+            $existing = [IO.File]::ReadAllBytes($Definition.Stamp)
+            $same = $existing.Length -eq $bytes.Length
+            for ($i = 0; $same -and $i -lt $bytes.Length; $i++) {
+                $same = $existing[$i] -eq $bytes[$i]
+            }
+            if ($same) {
+                Write-Host ("Managed payload fingerprint unchanged: " + $Definition.Name) -ForegroundColor Green
+                return
+            }
+        }
+        # Windows 无法截断已被只读映射的文件，因此改为发布同目录的新文件；
+        # 若替换被拒绝，操作仍应失败，并保留旧记录。
+        $temporary = $Definition.Stamp + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+        [IO.File]::WriteAllBytes($temporary, $bytes)
+        if (Test-Path -LiteralPath $Definition.Stamp -PathType Leaf) {
+            [IO.File]::Replace($temporary, $Definition.Stamp, [NullString]::Value)
+        } else {
+            [IO.File]::Move($temporary, $Definition.Stamp)
+        }
+    } catch {
+        Write-Error -Message ("Managed fingerprint write failed: name=" + $Definition.Name +
+            " stamp=" + $Definition.Stamp + " error=" + $_.Exception.Message) -ErrorAction Continue
+        throw
+    } finally {
+        if ($temporary -and (Test-Path -LiteralPath $temporary)) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop
+        }
+    }
     Write-Host ("Recorded managed payload fingerprint: " + $Definition.Name) -ForegroundColor Green
 }
 
@@ -344,7 +375,7 @@ if ($RequireComplete -or -not $ManagedPayloadsOnly) {
     $server = Join-Path $repo "native\dst_server.exe"
     Assert-OutputFresh "native translation server" $server $serverInputs
 
-    # C# server: its own sources plus the shared core it links (native\src\core).
+    # C# 服务器：自身源码及所链接的共享核心（native\src\core）。
     $serverCsInputs = @(Get-SourceFiles -Root (Join-Path $repo "native\src\server_cs"))
     $serverCsInputs += @(Get-SourceFiles -Root (Join-Path $repo "native\src\core"))
     $serverCs = Join-Path $repo "native\dst_server_cs.exe"
@@ -402,7 +433,10 @@ if ($RequireComplete -or -not $ManagedPayloadsOnly) {
         Assert-EmbeddedResourceMatches $launcher 104 (Join-Path $repo "config\launcher.ini.example")
         Assert-EmbeddedResourceMatches $launcher 105 $serverCs
         Assert-EmbeddedResourceMatches $launcher 106 (Join-Path $repo "config\glossary.example.tsv")
-        # Engine runtime scripts: deployed verbatim by deploy.c/godot_patch.c (resource.h 301-304).
+        Assert-EmbeddedResourceMatches $launcher 107 (Join-Path $repo "assets\fonts\NotoSansCJKsc-Regular.otf")
+        Assert-EmbeddedResourceMatches $launcher 108 (Join-Path $repo "assets\fonts\OFL.txt")
+        Assert-EmbeddedResourceMatches $launcher 109 (Join-Path $repo "assets\fonts\manifest.json")
+        # 引擎运行时脚本：由 deploy.c/godot_patch.c 原样部署（resource.h 301-304）。
         Assert-EmbeddedResourceMatches $launcher 301 (Join-Path $repo "payloads\RenPy\iron_deepseek.rpy")
         Assert-EmbeddedResourceMatches $launcher 302 (Join-Path $repo "payloads\RPGMaker\hook_rpgm_mv.js")
         Assert-EmbeddedResourceMatches $launcher 303 (Join-Path $repo "payloads\Godot\dst_godot_runtime_g3.gd")

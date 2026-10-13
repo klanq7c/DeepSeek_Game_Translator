@@ -31,7 +31,9 @@ int ensure_dir(const WCHAR *path);                  /* 递归创建目录，已�
 int write_text_file_utf8(const WCHAR *path, const char *bytes);   /* 以 UTF-8 写纯文本 */
 int read_file_bytes(const WCHAR *path, char **out, DWORD *size);    /* 读取文件全部字节，*out 新分配 */
 int write_file_bytes(const WCHAR *path, const char *buf, DWORD size); /* 写入原始字节 */
+int write_file_bytes_if_absent_safe(const WCHAR *path, const char *buf, DWORD size); /* 安全创建，不覆盖 */
 int copy_file_safe(const WCHAR *from, const WCHAR *to);             /* 复制单个文件，自动创建目标父目录 */
+int files_equal_safe(const WCHAR *left, const WCHAR *right);       /* 流式比较普通文件 */
 int copy_file_if_absent_safe(const WCHAR *from, const WCHAR *to);   /* 安全复制且不覆盖已存在文件 */
 int move_file_safe(const WCHAR *from, const WCHAR *to, DWORD flags); /* 拒绝重解析点后移动/替换文件 */
 int delete_file_safe(const WCHAR *path);                            /* 拒绝重解析点后删除普通文件 */
@@ -40,9 +42,9 @@ int copy_tree_safe(const WCHAR *from, const WCHAR *to);            /* 递归复�
 void bb_add(ByteBuf *b, const char *s, size_t n);  /* 往 ByteBuf 追加字节 */
 
 /* 配置路径辅助——全部基于 g_root 派生。 */
-void get_config_dir(WCHAR *out, size_t cap);                /* g_root\config */
-void get_api_config_path(WCHAR *out, size_t cap);          /* g_root\config\api.ini */
-void get_launcher_config_path(WCHAR *out, size_t cap);      /* g_root\config\launcher.ini */
+void get_config_dir(WCHAR *out, size_t cap);                /* 配置目录：g_root\config */
+void get_api_config_path(WCHAR *out, size_t cap);          /* API 配置：g_root\config\api.ini */
+void get_launcher_config_path(WCHAR *out, size_t cap);      /* 启动器配置：g_root\config\launcher.ini */
 int save_last_game_dir(const WCHAR *dir);                    /* 记住上次选择的目录 */
 int load_last_game_dir(WCHAR *out, size_t cap);              /* 读取上次目录（校验存在） */
 

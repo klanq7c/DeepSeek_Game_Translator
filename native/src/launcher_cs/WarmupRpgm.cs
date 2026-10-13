@@ -9,6 +9,7 @@ namespace DstLauncher
      *   - data/*.json：事件命令 101/102/401/405 的 parameters、数据库文本字段
      *     （name/description/message1..4 等）；MapNNN.json 的 "name" 是编辑器标签，跳过；
      *     连续 401 行合并为多行消息块，与运行时显示形态一致。
+     *   - 启用插件的 plugins.js 可显示参数优先采集；不执行 JavaScript、不采集技术配置。
      *   - 插件外部 TXT/CSV（Recipes.txt、quest/Quests.txt、game_messages.csv 等）：
      *     只读扫描，8 MiB 上限，跳过素材目录。
      *   - RPG Maker 控制码（\C[n] \N[n] \I[n] \FS[24] \\ 等）保留在缓存键里，只用可见
@@ -339,7 +340,7 @@ namespace DstLauncher
             block.Clear();
         }
 
-        /* scan_rpgm_data_dir：<content_root>\data\*.json */
+        /* 扫描 RPG Maker 数据目录：scan_rpgm_data_dir，路径为 <content_root>\data\*.json */
         private static void ScanRpgmDataDir(string contentRoot, TextList prefetch)
         {
             string data = PathUtil.Join(contentRoot, "data");
@@ -572,21 +573,205 @@ namespace DstLauncher
             }
         }
 
-        /* warmup_scan_rpgm_resources：从 www/ 或扁平内容根扫描外部文本与 data/*.json。 */
+        /* 插件清单由 RPG Maker 生成；只跨过 JSON 值，不执行任意插件脚本。 */
+        private static int RpgmPluginValueEnd(byte[] buf, int end, int p)
+        {
+            if (p >= end) return -1;
+            char first = ByteStr.At(buf, end, p);
+            if (first == '"') {
+                for (p++; p < end; p++) {
+                    char c = ByteStr.At(buf, end, p);
+                    if (c == '\\') { if (++p >= end) return -1; }
+                    else if (c == '"') return p + 1;
+                }
+                return -1;
+            }
+            if (first == '{' || first == '[') {
+                var stack = new char[32];
+                int depth = 0;
+                do {
+                    if (p >= end) return -1;
+                    char c = ByteStr.At(buf, end, p);
+                    if (c == '"') {
+                        p = RpgmPluginValueEnd(buf, end, p);
+                        if (p < 0) return -1;
+                        continue;
+                    }
+                    if (c == '{' || c == '[') {
+                        if (depth >= stack.Length) return -1;
+                        stack[depth++] = c;
+                    } else if (c == '}' || c == ']') {
+                        if (depth == 0 || (c == '}' && stack[depth - 1] != '{') ||
+                            (c == ']' && stack[depth - 1] != '[')) return -1;
+                        depth--;
+                    }
+                    p++;
+                } while (depth > 0);
+                return p;
+            }
+            while (p < end) {
+                char c = ByteStr.At(buf, end, p);
+                if (c == ',' || c == '}' || c == ']' || c == ' ' ||
+                    c == '\r' || c == '\n' || c == '\t') break;
+                p++;
+            }
+            return p;
+        }
+
+        private static bool RpgmPluginUiKey(string key)
+        {
+            if (string.IsNullOrEmpty(key) || key.Length >= 128 || key[0] == '-') return false;
+            var chars = new char[key.Length];
+            for (int i = 0; i < chars.Length; i++) chars[i] = ByteStr.AsciiLower(key[i]);
+            string lower = new string(chars);
+            string[] reject = { "filename", "file name", "script", "formula", "path", "variable" };
+            foreach (string word in reject) if (lower.Contains(word)) return false;
+            if (lower.StartsWith("web ", StringComparison.Ordinal) ||
+                lower.StartsWith("local ", StringComparison.Ordinal)) return false;
+            string[] ui = { "help", "command", "text", "message", "title", "label",
+                            "name", "playtime", "count", "confirm", "format",
+                            "vocab", "caption", "tooltip", "prompt", "description" };
+            foreach (string word in ui) if (lower.Contains(word)) return true;
+            return false;
+        }
+
+        private static bool RpgmPluginUiValue(string value)
+        {
+            string t = value.TrimStart(' ', '\t');
+            if (t.StartsWith("{", StringComparison.Ordinal) || t.StartsWith("[", StringComparison.Ordinal) ||
+                t.StartsWith("<", StringComparison.Ordinal) ||
+                t.StartsWith("function", StringComparison.Ordinal) ||
+                t.StartsWith("this.", StringComparison.Ordinal) ||
+                t.Contains("=>") || t.Contains(".rpgsave")) return false;
+            return ShouldWarmRpgmText(value);
+        }
+
+        private static bool RpgmPluginParameters(byte[] buf, int end, int begin, int after,
+                                                 TextList prefetch)
+        {
+            int p = begin + 1;
+            while (p < after && ByteStr.At(buf, end, JsonWs(buf, end, p)) != '}') {
+                p = JsonWs(buf, end, p);
+                if (ByteStr.At(buf, end, p) != '"') return false;
+                string key = JsonStringAt(buf, end, ref p);
+                p = JsonWs(buf, end, p);
+                if (key == null || ByteStr.At(buf, end, p) != ':') return false;
+                int value = JsonWs(buf, end, p + 1);
+                int next = RpgmPluginValueEnd(buf, end, value);
+                if (next <= value) return false;
+                if (ByteStr.At(buf, end, value) == '"' && RpgmPluginUiKey(key)) {
+                    int v = value;
+                    string text = JsonStringAt(buf, end, ref v);
+                    if (text != null && RpgmPluginUiValue(text)) CollectRpgmString(text, prefetch);
+                }
+                p = JsonWs(buf, end, next);
+                char separator = ByteStr.At(buf, end, p);
+                if (separator == ',') p++;
+                else if (separator != '}') return false;
+                if (prefetch.Full) break;
+            }
+            return true;
+        }
+
+        private static bool RpgmPluginRecord(byte[] buf, int end, int begin, int after,
+                                             TextList prefetch)
+        {
+            int p = begin + 1, parameters = -1, parametersEnd = -1;
+            bool enabled = false;
+            while (p < after && ByteStr.At(buf, end, JsonWs(buf, end, p)) != '}') {
+                p = JsonWs(buf, end, p);
+                if (ByteStr.At(buf, end, p) != '"') return false;
+                string key = JsonStringAt(buf, end, ref p);
+                p = JsonWs(buf, end, p);
+                if (key == null || ByteStr.At(buf, end, p) != ':') return false;
+                int value = JsonWs(buf, end, p + 1);
+                int next = RpgmPluginValueEnd(buf, end, value);
+                if (next <= value) return false;
+                if (key == "status" && next - value == 4 &&
+                    ByteStr.At(buf, end, value) == 't' && ByteStr.At(buf, end, value + 1) == 'r' &&
+                    ByteStr.At(buf, end, value + 2) == 'u' && ByteStr.At(buf, end, value + 3) == 'e') enabled = true;
+                if (key == "parameters" && ByteStr.At(buf, end, value) == '{') {
+                    parameters = value;
+                    parametersEnd = next;
+                }
+                p = JsonWs(buf, end, next);
+                char separator = ByteStr.At(buf, end, p);
+                if (separator == ',') p++;
+                else if (separator != '}') return false;
+            }
+            return !enabled || parameters < 0 ||
+                   RpgmPluginParameters(buf, end, parameters, parametersEnd, prefetch);
+        }
+
+        private static int RpgmPluginFindAscii(byte[] buf, int start, int end, string needle)
+        {
+            for (int p = start; p + needle.Length <= end; p++) {
+                int i = 0;
+                while (i < needle.Length && ByteStr.At(buf, end, p + i) == needle[i]) i++;
+                if (i == needle.Length) return p;
+            }
+            return -1;
+        }
+
+        private static void ScanRpgmPluginParameters(string contentRoot, TextList prefetch)
+        {
+            string path = PathUtil.Join(PathUtil.Join(contentRoot, "js"), "plugins.js");
+            if (!PathUtil.IsFile(path)) return;
+            if (!SafeFs.FileSizeAtMost(path, 8u * 1024u * 1024u)) {
+                Log.Append("RPGM 插件参数预热跳过：plugins.js 超过 8 MiB 上限。");
+                return;
+            }
+            byte[] buf = SafeFs.ReadBytes(path);
+            if (buf == null) {
+                Log.Append("RPGM 插件参数预热失败：无法读取 plugins.js。");
+                return;
+            }
+            int end = ByteStr.CStrLen(buf);
+            int p = end >= 3 && buf[0] == 0xef && buf[1] == 0xbb && buf[2] == 0xbf ? 3 : 0;
+            int marker = RpgmPluginFindAscii(buf, p, end, "var $plugins");
+            p = marker < 0 ? -1 : RpgmPluginFindAscii(buf, marker, end, "=");
+            p = p < 0 ? -1 : RpgmPluginFindAscii(buf, p, end, "[");
+            if (p < 0) {
+                Log.Append("RPGM 插件参数预热跳过：plugins.js 不是预期的生成格式。");
+                return;
+            }
+            p++;
+            bool valid = true;
+            while (p < end && ByteStr.At(buf, end, p = JsonWs(buf, end, p)) != ']') {
+                if (ByteStr.At(buf, end, p) != '{') { valid = false; break; }
+                int next = RpgmPluginValueEnd(buf, end, p);
+                if (next < 0 || !RpgmPluginRecord(buf, end, p, next, prefetch)) {
+                    valid = false;
+                    break;
+                }
+                p = JsonWs(buf, end, next);
+                char separator = ByteStr.At(buf, end, p);
+                if (separator == ',') p++;
+                else if (separator != ']') { valid = false; break; }
+                if (prefetch.Full) break;
+            }
+            if (!valid || p >= end)
+                Log.Append("RPGM 插件参数预热未完成：plugins.js 格式不完整或不受支持。");
+        }
+
+        /* warmup_scan_rpgm_resources：先采集插件界面参数，再扫描外部文本和 data/*.json。 */
         internal static void ScanRpgmResources(string dir, TextList prefetch)
         {
             if (string.IsNullOrEmpty(dir) || prefetch == null) return;
             string contentRoot = EngineDetector.RpgmContentRoot(dir);
             if (contentRoot == null) return;
+            ScanRpgmPluginParameters(contentRoot, prefetch);
             ScanRpgmExternalTextDir(contentRoot, prefetch, 0);
             ScanRpgmDataDir(contentRoot, prefetch);
         }
 
-        /* warmup_rpgm */
+        /* RPG Maker 预热，对应 warmup_rpgm */
         private static void WarmupRpgm(string dir)
         {
             var prefetch = new TextList { MaxItems = RpgmMaxItems };
             ScanRpgmResources(dir, prefetch);
+            if (prefetch.Full)
+                Log.Append("预热扫描达到 " + prefetch.Limit + " 条上限，部分资源文本可能未预热。");
             int queued = PostPrefetchAll(prefetch);
             if (queued > 0) Log.Append("RPGM 预热翻译缓存：后台排队 " + queued + " 条。");
         }

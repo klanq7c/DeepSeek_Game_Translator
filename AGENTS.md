@@ -105,11 +105,22 @@ For code changes, run the closest practical verification before finishing:
   correctness, so still take a screenshot of the real window at your own DPI —
   the probe runs at a fixed 96 DPI with a frozen animation clock.
 - For server/translation changes: `tests\server_contract\run_contract_tests.ps1`
-  (fake provider, 50 checks per binary; runs both servers by default, or pass
+  (fake provider, 74 checks per binary; runs both servers by default, or pass
   `-Exe native\dst_server_cs.exe` for one). Both servers must pass; they share
   one contract.
+- `build_native.bat` also gates `tests\server_contract\cache_persistence`
+  (source-linked cache batch write/flush fault injection) and
+  `tests\server_buffers\run_buffer_tests.ps1` (native JSON escaping/allocation
+  bounds and the built C# server's exact HTTP response bytes).
 - For payload script changes (`payloads\RenPy`, `payloads\RPGMaker`,
   `payloads\Godot`): `tests\payload_scripts\check_payload_scripts.ps1`.
+- For API model discovery: `tests\launcher_parity\run_api_models_tests.ps1`
+  (local fake provider on a dynamic port, C/C# parity; also a build gate).
+  The launcher parity `api-config/ui` scenario checks the dialog controls and
+  editable model selection without network requests or configuration writes.
+- For provider model defaults or request options:
+  `tests\server_contract\run_model_defaults_tests.ps1` (real native request
+  builders and the C# shared message builder; no external requests; build gate).
 - For launcher server-lifecycle changes:
   `tests\launcher_parity\run_launcher_parity.ps1 -ServerSmoke` (needs port
   19999 free; it will stop a server it finds running, so do not run it against
@@ -129,6 +140,12 @@ If a verification step cannot be run, report that clearly and explain why.
   第三方版权或许可证原文保持原样，不要为了注释语言改动外部接口与测试名称。
 - Keep engine-specific behavior isolated when possible.
 - Add or update regression tests when fixing a bug that could return.
+- Provider presets must contain addresses only, never a hard-coded model list
+  or a model advertised as "latest". Model choices come from the live catalog
+  or explicit user input. Preserve saved choices across refreshes, show catalog
+  absence without declaring an alias retired, and never silently upgrade a
+  user's selected model. New catalog adapters require official protocol evidence
+  and fake-provider C/C# parity tests, including incomplete/failed pagination.
 - Preserve public API response fields and launcher workflows unless there is a
   deliberate migration plan.
 - When unsure whether a change affects original functionality, stop and inspect

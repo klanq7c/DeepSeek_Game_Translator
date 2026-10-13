@@ -513,6 +513,16 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private volatile int _cacheApplyHitCount;
 
+	private readonly VisibleScanWindow _tmpCacheScanWindow = new VisibleScanWindow();
+
+	private readonly VisibleScanWindow _uguiCacheScanWindow = new VisibleScanWindow();
+
+	// 同一轮三个缓存消费者共享枚举结果；绝不跨回调/帧保留 Unity 对象。
+	private int _cacheApplySnapshotDepth;
+	private int _cacheApplySnapshotGeneration;
+	private Object[] _cacheApplyTmpSnapshot;
+	private Text[] _cacheApplyUguiSnapshot;
+
 	private volatile int _textEnableHookCount;
 
 	private volatile int _targetedCacheQueueCount;
@@ -651,6 +661,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int MaxSceneCacheAppliesPerPass = 256;
 
+	private const int MaxSceneCacheInspectionsPerPass = 512;
+
 	private volatile int _immediateSceneApplyCount;
 
 	private volatile int _immediateSceneHits;
@@ -679,7 +691,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private const int MaxUiActivationCacheAppliesPerPass = 128;
 
+	private const int MaxUiActivationCacheInspectionsPerPass = 512;
+
 	private const int MaxPeriodicCacheAppliesPerPass = 32;
+
+	private const int MaxPeriodicCacheInspectionsPerPass = 256;
 
 	private const int MaxTargetedCacheQueuesPerActivation = 48;
 
@@ -1514,9 +1530,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			RunOverlayValidationTick();
 			RunAlphaSweepTick();
-			RunSceneCacheApplyTick();
-			RunUiCacheApplyTick();
-			RunPeriodicCacheApplyTick();
+			RunCacheApplyTicks();
 			FlushDebouncedTextRequests();
 			FlushPendingTranslations();
 			RunDeepPrefetchTick();
@@ -1550,9 +1564,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				_lastCanvasFlushRealtime = realtimeSinceStartup;
 				RunOverlayValidationTick();
-				RunSceneCacheApplyTick();
-				RunUiCacheApplyTick();
-				RunPeriodicCacheApplyTick();
+				RunCacheApplyTicks();
 				FlushPendingTranslations();
 				FlushDebouncedTextRequests();
 			}
@@ -1592,6 +1604,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void RequestUiCacheApplyBurst()
 	{
+		// 即使即时扫描被节流，新控件仍必须使本轮旧快照失效。
+		InvalidateCacheApplySnapshot();
 		float realtimeSinceStartup = Time.realtimeSinceStartup;
 		if (realtimeSinceStartup - _lastUiActivationRealtime < UiActivationThrottleSeconds)
 		{
@@ -1623,7 +1637,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_nextUiCacheApplyRealtime = realtimeSinceStartup + UiActivationCacheApplyIntervalSeconds;
 		try
 		{
-			ApplyCachedVisibleTextPass(MaxUiActivationCacheAppliesPerPass);
+			ApplyCachedVisibleTextPass(MaxUiActivationCacheAppliesPerPass, MaxUiActivationCacheInspectionsPerPass);
 		}
 		catch (Exception ex)
 		{
@@ -1644,7 +1658,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		bool completed = false;
 		try
 		{
-			ApplyCachedVisibleTextPass(MaxPeriodicCacheAppliesPerPass);
+			// 新译文到达时完整检查当前界面；只有无新译文的巡检才分片。
+			ApplyCachedVisibleTextPass(MaxPeriodicCacheAppliesPerPass,
+				cacheChanged ? int.MaxValue : MaxPeriodicCacheInspectionsPerPass);
 			completed = true;
 		}
 		catch (Exception ex)
@@ -2110,7 +2126,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		float realtimeSinceStartup = Time.realtimeSinceStartup;
 		if (!(realtimeSinceStartup < _nextSceneCacheApplyRealtime))
 		{
-			ApplyCachedVisibleTextPass(MaxSceneCacheAppliesPerPass);
+			ApplyCachedVisibleTextPass(MaxSceneCacheAppliesPerPass, MaxSceneCacheInspectionsPerPass);
 			FlushPendingTranslations();
 			_sceneCacheApplyPassesRemaining--;
 			_nextSceneCacheApplyRealtime = realtimeSinceStartup + SceneCacheApplyIntervalSeconds;
@@ -2454,98 +2470,170 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return true;
 	}
 
-	private void ApplyCachedVisibleTextPass(int maxApply)
+	private void InvalidateCacheApplySnapshot()
+	{
+		_cacheApplySnapshotGeneration = unchecked(_cacheApplySnapshotGeneration + 1);
+		_cacheApplyTmpSnapshot = null;
+		_cacheApplyUguiSnapshot = null;
+	}
+
+	private void RunCacheApplyTicks()
+	{
+		// 重入回调先丢弃旧结果；finally 无论成功或异常都释放对象引用。
+		InvalidateCacheApplySnapshot();
+		_cacheApplySnapshotDepth++;
+		try
+		{
+			RunSceneCacheApplyTick();
+			RunUiCacheApplyTick();
+			RunPeriodicCacheApplyTick();
+		}
+		finally
+		{
+			_cacheApplySnapshotDepth--;
+			InvalidateCacheApplySnapshot();
+		}
+	}
+
+	private void ApplyCachedVisibleTextPass(int maxApply, int maxInspect = int.MaxValue)
 	{
 		EnsureScannerInitialized("CACHE");
 		Interlocked.Increment(ref _cacheApplyPassCount);
-		int num = 0;
+		// 场景首次扫描和界面唤醒的即时扫描仍从头完整检查，避免首帧漏译。
+		bool fullScan = maxInspect == int.MaxValue;
+		if (fullScan)
+		{
+			_tmpCacheScanWindow.Reset();
+			_uguiCacheScanWindow.Reset();
+		}
+		int applied = 0;
+		int tmpInspected = 0;
 		if (_tmpTextTypeCache != null && CanHandleTmp())
 		{
-			Object[] array = FindTmpTextObjectsSafe(_tmpTextTypeCache);
-			foreach (Object val in array)
+			Object[] array = _cacheApplyTmpSnapshot;
+			if (array == null)
 			{
-				if (num >= maxApply)
-				{
-					return;
-				}
-				if (val == (Object)null || !IsComponentActive(val))
-				{
-					continue;
-				}
-				string text = _textPropCache?.GetValue(val) as string;
-				EnsureTmpOverlayMatchesCurrentText(val, text);
-				if (!string.IsNullOrWhiteSpace(text))
-				{
-					int componentInstanceId = GetComponentInstanceId(val);
-					if (TryRepairMixedTranslatedText(text, out var originalText, out var repaired))
-					{
-						ApplyTMProTranslation(val, componentInstanceId, originalText, repaired, _textPropCache, _fontPropCache, _forceMeshMethodCache);
-						Interlocked.Increment(ref _cacheApplyHitCount);
-						num++;
-					}
-					else if (!ContainsCjk(text) && TryGetLocalTranslation(text, out var translated))
-					{
-						ApplyTMProTranslation(val, componentInstanceId, text, translated, _textPropCache, _fontPropCache, _forceMeshMethodCache);
-						Interlocked.Increment(ref _cacheApplyHitCount);
-						num++;
-					}
-					else if (!ContainsCjk(text) && !WasProcessed(componentInstanceId, text))
-					{
-						ShouldSkipText(text);
-					}
-				}
+				int generation = _cacheApplySnapshotGeneration;
+				array = FindTmpTextObjectsSafe(_tmpTextTypeCache);
+				if (_cacheApplySnapshotDepth > 0 && generation == _cacheApplySnapshotGeneration)
+					_cacheApplyTmpSnapshot = array;
 			}
+			int tmpBudget = fullScan ? int.MaxValue : Math.Max(1, maxInspect / 2);
+			applied = ScanCachedVisibleObjects(_tmpCacheScanWindow, array, tmpBudget, maxApply, TryApplyCachedTmpText, out tmpInspected);
 		}
-		Text[] array2 = FindObjectsOfTypeAllSafe<Text>();
-		foreach (Text val2 in array2)
+		if (applied >= maxApply)
 		{
-			if (num >= maxApply)
-			{
-				break;
-			}
-			if ((Object)(object)val2 == (Object)null || !IsComponentActive(val2))
-			{
-				continue;
-			}
-			string text2 = val2.text;
-			if (string.IsNullOrWhiteSpace(text2))
-			{
-				continue;
-			}
-			int componentInstanceId2 = GetComponentInstanceId(val2);
-			if (TryRepairMixedTranslatedText(text2, out var originalText2, out var repaired2))
-			{
-				val2.text = PrepareTranslatedTextForUGUIText(val2, repaired2, originalText2);
-				if ((Object)(object)_chineseFont != (Object)null)
-				{
-					val2.font = _chineseFont;
-				}
-				MarkProcessed(componentInstanceId2, originalText2);
-				TryMarkAppliedCacheKeyForPersist(originalText2, repaired2);
-				Interlocked.Increment(ref _cacheApplyHitCount);
-				num++;
-			}
-			else if (ContainsCjk(text2))
-			{
-				continue;
-			}
-			else if (TryGetLocalTranslation(text2, out var translated2))
-			{
-				val2.text = PrepareTranslatedTextForUGUIText(val2, translated2, text2);
-				if ((Object)(object)_chineseFont != (Object)null)
-				{
-					val2.font = _chineseFont;
-				}
-				MarkProcessed(componentInstanceId2, text2);
-				TryMarkAppliedCacheKeyForPersist(text2, translated2);
-				Interlocked.Increment(ref _cacheApplyHitCount);
-				num++;
-			}
-			else if (!WasProcessed(componentInstanceId2, text2))
-			{
-				ShouldSkipText(text2);
-			}
+			return;
 		}
+		Text[] array2 = _cacheApplyUguiSnapshot;
+		if (array2 == null)
+		{
+			int generation = _cacheApplySnapshotGeneration;
+			array2 = FindObjectsOfTypeAllSafe<Text>();
+			if (_cacheApplySnapshotDepth > 0 && generation == _cacheApplySnapshotGeneration)
+				_cacheApplyUguiSnapshot = array2;
+		}
+		int uguiBudget = fullScan ? int.MaxValue : Math.Max(0, maxInspect - tmpInspected);
+		int uguiInspected;
+		ScanCachedVisibleObjects(_uguiCacheScanWindow, array2, uguiBudget, maxApply - applied, TryApplyCachedUguiText, out uguiInspected);
+	}
+
+	private int ScanCachedVisibleObjects<T>(VisibleScanWindow window, T[] items, int maxInspect,
+		int maxApply, Func<T, bool> tryApply, out int inspected)
+	{
+		int applied = 0;
+		bool completed = false;
+		try
+		{
+			applied = window.Scan(items, maxInspect, maxApply, tryApply, out inspected);
+			completed = true;
+			return applied;
+		}
+		finally
+		{
+			// 设置译文会调用游戏自己的属性/布局回调，可能创建新的 TMP 或 UGUI 控件。
+			// 仅无命中的完整巡检可复用列表；部分写入后抛错也必须使列表失效。
+			if (!completed || applied > 0) InvalidateCacheApplySnapshot();
+		}
+	}
+
+	private bool TryApplyCachedTmpText(Object val)
+	{
+		if (val == (Object)null || !IsComponentActive(val))
+		{
+			return false;
+		}
+		string text = _textPropCache?.GetValue(val) as string;
+		EnsureTmpOverlayMatchesCurrentText(val, text);
+		if (string.IsNullOrWhiteSpace(text))
+		{
+			return false;
+		}
+		int componentInstanceId = GetComponentInstanceId(val);
+		if (TryRepairMixedTranslatedText(text, out var originalText, out var repaired))
+		{
+			ApplyTMProTranslation(val, componentInstanceId, originalText, repaired, _textPropCache, _fontPropCache, _forceMeshMethodCache);
+			Interlocked.Increment(ref _cacheApplyHitCount);
+			return true;
+		}
+		if (!ContainsCjk(text) && TryGetLocalTranslation(text, out var translated))
+		{
+			ApplyTMProTranslation(val, componentInstanceId, text, translated, _textPropCache, _fontPropCache, _forceMeshMethodCache);
+			Interlocked.Increment(ref _cacheApplyHitCount);
+			return true;
+		}
+		if (!ContainsCjk(text) && !WasProcessed(componentInstanceId, text))
+		{
+			ShouldSkipText(text);
+		}
+		return false;
+	}
+
+	private bool TryApplyCachedUguiText(Text val2)
+	{
+		if ((Object)(object)val2 == (Object)null || !IsComponentActive(val2))
+		{
+			return false;
+		}
+		string text2 = val2.text;
+		if (string.IsNullOrWhiteSpace(text2))
+		{
+			return false;
+		}
+		int componentInstanceId2 = GetComponentInstanceId(val2);
+		if (TryRepairMixedTranslatedText(text2, out var originalText2, out var repaired2))
+		{
+			val2.text = PrepareTranslatedTextForUGUIText(val2, repaired2, originalText2);
+			if ((Object)(object)_chineseFont != (Object)null)
+			{
+				val2.font = _chineseFont;
+			}
+			MarkProcessed(componentInstanceId2, originalText2);
+			TryMarkAppliedCacheKeyForPersist(originalText2, repaired2);
+			Interlocked.Increment(ref _cacheApplyHitCount);
+			return true;
+		}
+		if (ContainsCjk(text2))
+		{
+			return false;
+		}
+		if (TryGetLocalTranslation(text2, out var translated2))
+		{
+			val2.text = PrepareTranslatedTextForUGUIText(val2, translated2, text2);
+			if ((Object)(object)_chineseFont != (Object)null)
+			{
+				val2.font = _chineseFont;
+			}
+			MarkProcessed(componentInstanceId2, text2);
+			TryMarkAppliedCacheKeyForPersist(text2, translated2);
+			Interlocked.Increment(ref _cacheApplyHitCount);
+			return true;
+		}
+		if (!WasProcessed(componentInstanceId2, text2))
+		{
+			ShouldSkipText(text2);
+		}
+		return false;
 	}
 
 	private void ConfigureHttpFastPath()
@@ -3896,12 +3984,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_instance.RestoreTmpOverlay(__instance);
 		string rawText = value;
 		_instance.ClearProcessedIfChanged(componentInstanceId, value);
-		if (LooksLikeTypewriterFragment(value))
+		// 动画每帧重写已知短语时应立即命中；去抖只约束未翻译的新片段。
+		string text2 = _instance.Translate(value);
+		if (text2 == value && LooksLikeTypewriterFragment(value))
 		{
 			_instance.QueueDebouncedTextRequest(__instance, componentInstanceId, value, isTmp: true);
 			return true;
 		}
-		string text2 = _instance.Translate(value);
 		if (text2 != value)
 		{
 			string cachedText = text2;
@@ -4013,12 +4102,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		string rawText = value;
 		_instance.ClearProcessedIfChanged(componentInstanceId, value);
-		if (LooksLikeTypewriterFragment(value))
+		// 已有译文不等待去抖，避免逐帧改写把恢复推迟到动画结束。
+		string text = _instance.Translate(value);
+		if (text == value && LooksLikeTypewriterFragment(value))
 		{
 			_instance.QueueDebouncedTextRequest(__instance, componentInstanceId, value, isTmp: false);
 			return true;
 		}
-		string text = _instance.Translate(value);
 		if (text != value)
 		{
 			_instance.ApplyFont(__instance);
@@ -4435,6 +4525,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	{
 		if (!((Object)(object)_instance == (Object)null) && __instance != null && _instance.CanHandleTmp())
 		{
+			// Instantiate/AddComponent 也会启用文本，不一定经过 GameObject.SetActive。
+			// 先丢弃枚举快照，覆盖 OnEnable 返回后游戏才填入文字的情况。
+			_instance.InvalidateCacheApplySnapshot();
 			Interlocked.Increment(ref _instance._textEnableHookCount);
 			_instance.QueueCachedComponentTextIfAvailable(__instance, isTmp: true, allowRemoteFallback: false);
 		}
@@ -7972,6 +8065,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		StringBuilder stringBuilder = null;
 		for (int i = 0; i < text.Length; i++)
 		{
+			if (DstUnity.TmpRichText.TryGetTagEnd(text, i, out int tagEnd))
+			{
+				if (stringBuilder != null) stringBuilder.Append(text, i, tagEnd - i + 1);
+				i = tagEnd;
+				continue;
+			}
 			char c = text[i];
 			if (!missing.Contains(c) || !TryGetTmpPunctuationFallback(c, out var replacement))
 			{
@@ -8366,6 +8465,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void ResetSceneScopedState(bool clearPendingComponentWork)
 	{
+		InvalidateCacheApplySnapshot();
 		/* 场景对象状态不能跨场景复用。翻...cache/glossary 是进程级资产...		   因此这里仅回收“场景代”的组件 ID、预取队列和渲染器状态，不清共享译文...		   大场景退出时顺便收缩深扫描集合，避免 Clear 后仍永久保留峰值桶数组...*/
 		lock (_pendingLock)
 		{
@@ -8810,6 +8910,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				_flushSkipped++;
 				continue;
 			}
+			// 队列中的属性写入也会触发游戏回调，不能跨这次写入复用控件列表。
+			InvalidateCacheApplySnapshot();
 			try
 			{
 				if (item2.IsTmp)
@@ -8860,6 +8962,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			catch (Exception ex)
 			{
 				base.Logger.LogWarning("Queued apply failed (" + obj.GetType().FullName + "): " + (ex.InnerException?.Message ?? ex.Message));
+			}
+			finally
+			{
+				// 回调可能在创建新控件后抛错，仍需让本轮后续扫描重新发现对象。
+				InvalidateCacheApplySnapshot();
 			}
 		}
 	}
@@ -9920,6 +10027,27 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	// 部分旧版或精简 Unity 删除 isReadable 元数据；上游游戏程序集不可改写。
+	// 只跳过 CPU 诊断采样，不改变字体创建或译文；缺失及 getter 故障记录在此边界。
+	private static bool TryGetTextureReadability(object texture, out bool readable)
+	{
+		readable = false;
+		try
+		{
+			PropertyInfo property = texture.GetType().GetProperty("isReadable", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+			if (property == null) throw new MissingMemberException(texture.GetType().FullName, "isReadable");
+			object value = property.GetValue(texture, null);
+			if (!(value is bool)) throw new InvalidOperationException("Texture readability getter returned a non-boolean value.");
+			readable = (bool)value;
+			return true;
+		}
+		catch (Exception ex)
+		{
+			ReportCaughtException(ex, "renderer=UnityMono property=isReadable; CPU atlas diagnostics skipped", "TryGetTextureReadability");
+			return false;
+		}
+	}
+
 	private static Color GetTexturePixelSafe(Texture2D texture, int x, int y)
 	{
 		if ((Object)(object)texture == (Object)null)
@@ -10007,7 +10135,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					{
 						object obj3 = propertyQuiet?.GetValue(val2);
 						Material val3 = (Material)((obj3 is Material) ? obj3 : null);
-						if (!((Object)(object)val3 != (Object)null) || !((Object)(object)val3.shader != (Object)null) || !val3.HasProperty("_MainTex"))
+						if (!((Object)(object)val3 != (Object)null) || !((Object)(object)val3.shader != (Object)null) || !val3.HasProperty(Shader.PropertyToID("_MainTex")))
 						{
 							if (propertyQuiet != null && propertyQuiet.CanWrite)
 							{
@@ -11771,9 +11899,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				int generatedVertices = generator?.verts?.Count ?? -1;
 				Material material = uguiText.material;
 				string materialName = (Object)(object)material == (Object)null ? "<null>" : ((Object)material).name;
-				string textureName = (Object)(object)material == (Object)null || !material.HasProperty("_MainTex") || (Object)(object)material.GetTexture("_MainTex") == (Object)null
-					? "<null>"
-					: ((Object)material.GetTexture("_MainTex")).name;
+				int mainTexProperty = Shader.PropertyToID("_MainTex");
+				Texture materialTexture = (Object)(object)material == (Object)null || !material.HasProperty(mainTexProperty) ? null : material.GetTexture(mainTexProperty);
+				string textureName = (Object)(object)materialTexture == (Object)null ? "<null>" : ((Object)materialTexture).name;
 				base.Logger.LogWarning($"[CJK-RENDER-DIAG] renderer=UGUI path={GetComponentLogPath(component)} rect={rect} textLength={visibleText.Length} font='{((Object)(object)font == (Object)null ? "<null>" : ((Object)font).name)}' dynamic={((Object)(object)font != (Object)null && font.dynamic)} hasFirstCjk={hasFirstCjk} fontSize={uguiText.fontSize} alignment={uguiText.alignment} overflow={uguiText.horizontalOverflow}/{uguiText.verticalOverflow} bestFit={uguiText.resizeTextForBestFit} richText={uguiText.supportRichText} generatedVisible={generatedVisible} generatedVertices={generatedVertices} material='{materialName}' texture='{textureName}' text='{preview}'");
 				return;
 			}
@@ -11794,7 +11922,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			object renderedWidth = GetPropertyQuiet(componentType, "renderedWidth")?.GetValue(component);
 			object textInfo = GetPropertyQuiet(componentType, "textInfo")?.GetValue(component);
 			object generatedCharacters = textInfo == null ? null : GetPropertyQuiet(textInfo.GetType(), "characterCount")?.GetValue(textInfo);
-			Texture mainTexture = (Object)(object)fontMaterial == (Object)null || !fontMaterial.HasProperty("_MainTex") ? null : fontMaterial.GetTexture("_MainTex");
+			int fontMainTexProperty = Shader.PropertyToID("_MainTex");
+			Texture mainTexture = (Object)(object)fontMaterial == (Object)null || !fontMaterial.HasProperty(fontMainTexProperty) ? null : fontMaterial.GetTexture(fontMainTexProperty);
 			bool hasInlineParagraphAlignment = Regex.IsMatch(text ?? string.Empty, @"<\s*align\s*=", RegexOptions.IgnoreCase);
 			base.Logger.LogWarning($"[CJK-RENDER-DIAG] renderer={componentType.FullName} path={GetComponentLogPath(component)} rect={rect} preferred/rendered={preferredWidth ?? "<null>"}/{renderedWidth ?? "<null>"} textLength={visibleText.Length} font='{((fontAsset as Object)?.name ?? "<null>")}' material='{(((Object)(object)fontMaterial == (Object)null) ? "<null>" : ((Object)fontMaterial).name)}' texture='{(((Object)(object)mainTexture == (Object)null) ? "<null>" : ((Object)mainTexture).name)}' alignment={alignment ?? "<null>"} spacing={characterSpacing ?? "<null>"}/{wordSpacing ?? "<null>"}/{lineSpacing ?? "<null>"}/{paragraphSpacing ?? "<null>"} richText={richText ?? "<null>"} inlineAlign={hasInlineParagraphAlignment} overflow={overflowMode ?? "<null>"} maxVisible={maxVisibleCharacters ?? "<null>"}/{maxVisibleWords ?? "<null>"}/{maxVisibleLines ?? "<null>"} generatedCharacters={generatedCharacters ?? "<null>"} text='{preview}'");
 		}
@@ -11844,7 +11973,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				if ((Object)(object)val != (Object)null)
 				{
 					string text2 = (((Object)(object)val.shader != (Object)null) ? ((Object)val.shader).name : "<no shader>");
-					Texture val2 = (val.HasProperty("_MainTex") ? val.GetTexture("_MainTex") : null);
+					int mainTexProperty = Shader.PropertyToID("_MainTex");
+					Texture val2 = (val.HasProperty(mainTexProperty) ? val.GetTexture(mainTexProperty) : null);
 					text = "name='" + ((Object)val).name + "' shader='" + text2 + "' mainTex='" + (((Object)(object)val2 != (Object)null) ? ((Object)val2).name : "<null>") + "'";
 				}
 				else
@@ -12027,7 +12157,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				name = "TranslatorCJK_AtlasMaterial"
 			};
-			if (val3.HasProperty("_MainTex"))
+			if (val3.HasProperty(Shader.PropertyToID("_MainTex")))
 			{
 				SetMaterialTextureSafe(val3, "_MainTex", (Texture)(object)val);
 			}
@@ -12234,10 +12364,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				{
 					ReportCaughtException(reportedException);
 				}
-				base.Logger.LogWarning($"[FONT-DEEP] glyphTable={num5} charTable={num6} hasChar(中)={flag4} hasChar(文)={flag5} atlas={((Texture)val).width}x{((Texture)val).height} format={val.format} isReadable={((Texture)val).isReadable}");
+				bool readabilityKnown = TryGetTextureReadability(val, out bool atlasReadable);
+				base.Logger.LogWarning($"[FONT-DEEP] glyphTable={num5} charTable={num6} hasChar(中)={flag4} hasChar(文)={flag5} atlas={((Texture)val).width}x{((Texture)val).height} format={val.format} isReadable={(readabilityKnown ? atlasReadable.ToString() : "unavailable")}");
 				try
 				{
-					if (((Texture)val).isReadable)
+					if (readabilityKnown && atlasReadable)
 					{
 						int num7 = ((Texture)val).width / 2;
 						int num8 = ((Texture)val).height / 2;

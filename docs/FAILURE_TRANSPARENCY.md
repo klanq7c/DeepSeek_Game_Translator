@@ -1,5 +1,12 @@
 # Failure Transparency
 
+## 启动器外部服务关闭确认（2026-10-07）
+
+- 外部边界：接管的本地服务可能接受 `/shutdown` 后仍持续响应 `/health`。HTTP 成功只表示请求被接受，不能表示进程已退出。
+- 所有权：启动器没有接管进程的句柄，不能强制结束它。C/C# 均保留运行状态、停止按钮和重试能力；已有的缓存清除流程继续复查实际状态。
+- 不掩盖失败：1500 ms 关闭等待计入 HTTP 耗时；期限后服务仍响应，保留已有的 `External C server still owns ... after the shutdown deadline` 诊断并返回，不再清空状态或报告已停止。正常关闭和明确拒绝关闭的行为保持原契约。
+- 回归：`run_server_lifecycle_tests.ps1` 源链接 C 生产模块并调用实际 C# 启动器程序集，通过本地假服务验证接受但不退出、拒绝关闭、立即关闭、延迟关闭、慢健康响应，共 10 项；19999 端口已被占用时明确跳过。完整构建和真实服务器冒烟另行验证正常启动及自有进程退出。
+
 This document records the recovery boundaries that intentionally keep a game
 running after an external failure. A recovery must preserve the original text,
 must not create a successful cache entry, and must retain enough context to
@@ -19,6 +26,7 @@ diagnose the real fault.
 | C/C# split-retry terminal abort | A failed batch is caused by an unreachable endpoint, handle/encoding failure, authentication rejection, rate limiting, or a 5xx, so binary splitting would replay the same error on every half (a fully failed 48-item batch would otherwise cost about 79 requests, each waiting the full timeout) | Provider availability, credentials, and quota are external; only the request-side failure stage can tell a content/shape failure from a terminal one | It can leave a whole batch unresolved after one request, instead of probing smaller batches that might have succeeded during a transient outage; those texts are forgotten by the async queue on completion and re-queue on the next miss, and no abort produces a cache entry. Only content/shape failures (`batch-shape`, empty/missing content, oversized body, request timeout, HTTP 400/408/413/422) still split | C: `api_diag` classifies each stage into the thread-local `g_api_last_fail`; `api_split_abort_diag` records rate-limited remaining counts. C#: `ApiClient.FailureInfo` carries the class through `SendChatAsync`; `SplitAbortDiag` records the same |
 | C# server connection lifecycle | A local client stays idle without sending a complete request (net472 `NetworkStream.ReadAsync` ignores its cancellation token, so the recv timeout never fired), the peer resets mid-response, or a route handler throws on an unexpected request shape | The client owns its socket lifetime; .NET Framework's stream implementation cannot be changed from this process | Recv timeout is enforced with `Task.WhenAny`; on timeout the server answers `400 incomplete_request` exactly like C's `serve_one`, then `Shutdown(Send)` before `Close` so the response leaves with the FIN instead of being discarded by an abortive close, and the pooled buffer is not reused after the aborted read. The pre-close drain builds its `NetworkStream` *before* `Shutdown(Send)` because net472 `Socket.Shutdown` flips `Connected` to false and the stream constructor would otherwise throw on every connection (the drain silently never ran until the 2026-09-08 audit). A route-layer exception answers `500 internal_error` instead of silently dropping the connection; transport failures close the socket. Neither path can create a translation or cache entry | `HttpDiag` writes rate-limited stage (`recv`, `send`, `drain`, `timeout-shutdown`, `route-transport`, `route-internal:<type>`, `accept`, `listener-stop`), exception type, the underlying `SocketError` when present, and (first three occurrences) the message to stderr without request text |
 | C# server cache load | The persisted TSV cannot be opened or read at startup (permissions, exclusive lock, path failure) | The file system and any other process holding the file are external | It can start with a partial or empty in-memory cache; entries read before the failure remain, misses stay unresolved, and the file is never rewritten | `[cache] load failed after N entries` records exception type and path on stderr |
+| C# server cache append recovery | Opening, writing or flushing the TSV fails because the directory is missing, the file is locked, permissions deny access, or the disk fails | The cache cannot repair external file ownership, permissions or storage; it retains valid translations in memory so current rendering can continue | Failure remains visible as `memory_only` and an error/partial import status. Unpersisted keys remain dirty, so a later same-value import retries after the external fault is repaired; only successful writes and the final batch flush confirm new persistence. Write/flush failure retains every changed key as dirty, including A/B/A overwrites. Already persisted duplicates count as success without another append | `[cache] persist-open`, `persist-write`, `persist-flush`, and `persist-close` stderr diagnostics record the operation, exception type and cache path; `tests/server_contract -PersistenceOnly` verifies both servers through failure, repair, duplicate import and restart, and `tests/server_contract/cache_persistence` injects write/flush failures against the source-linked CacheStore |
 | C HTTP connection admission | Local clients open more idle connections than the one-connection/one-thread server can safely own at once | A local game, browser, or broken hook owns its socket lifetime; the server cannot force it to send a complete request | Excess connections are closed before a worker is created, so an overloaded caller sees a transport failure rather than a false translation or cache hit | Server stderr records the first rejection and power-of-two occurrences with the active hard limit; `/health` exposes active, limit, and cumulative rejection counts |
 | C worker-thread creation | Windows refuses a connection, live-translation, or asynchronous-prefetch worker because process resources are exhausted | Thread creation and the process resource limit are owned by Windows; the request cannot safely execute on the accept loop or an unrelated engine thread | A connection is closed before parsing, while translation work remains unresolved until at least one lane worker exists; a partially created translation pool remains usable and later calls retry only its missing capacity | Server stderr records rate-limited lane, desired/available worker counts and Win32 error; `/health` exposes connection-thread and translation-pool creation failure totals |
 | C HTTP browser-origin boundary | A remote website targets the loopback server to read translation memory, spend the configured provider account, mutate cache state, or stop the service | RPG Maker file-origin hooks require CORS, while native Ren'Py/Unity/Godot clients do not send an Origin header; removing CORS globally would break the browser-engine runtime | File/null and explicit loopback origins retain translation routes, but every browser-origin administrative request and every non-local browser origin receives 403 before routing; rejected requests cannot become translations or cache entries | Server stderr records rate-limited `untrusted-or-malformed` versus `administrative-route` rejection counts without logging origin or game text |
@@ -27,7 +35,10 @@ diagnose the real fault.
 | C asynchronous warmup admission | A malformed game or local caller queues a small number of extremely large unique strings, defeating the item-count limit and exhausting memory before provider workers drain | The external hook owns warmup text size and arrival rate; the server must remain nonblocking and cannot force the caller to split valid scripts | New jobs are rejected as unresolved misses once queued/in-flight job ownership reaches 32 MiB; existing work completes normally and no rejection becomes a cache hit | Server stderr records the first three and power-of-two byte-budget rejections; `/health` exposes current bytes and the hard limit |
 | C synchronous translation admission | Concurrent local clients submit enough large foreground batches that their duplicated live-worker text exceeds a safe process budget | The local hooks own foreground request size and concurrency, while provider calls may retain jobs until an external timeout | New live work is left unresolved once queued/in-flight text ownership reaches 32 MiB; admitted requests finish normally and rejected text is not cached | Server stderr records the first three and power-of-two live budget rejections; `/health` exposes current live bytes and the hard limit |
 | C remote API transport admission | An API configuration points at a non-loopback plaintext HTTP endpoint, which would expose its bearer key and game text to the network, or a non-loopback provider is configured without any API key and could never authenticate | TLS and account authentication are owned by the external provider and WinHTTP cannot make an unauthenticated HTTP origin confidential | The provider is disabled until its URL uses HTTPS; loopback HTTP remains available for local OpenAI-compatible providers, and an empty API key is accepted only on those loopback endpoints. Rejected work remains an unresolved miss and is never cached | Server stderr records that a non-loopback plaintext or malformed endpoint was disabled, or that an empty key is allowed only for loopback/local endpoints, without printing the endpoint, bearer key, or game text |
-| DeepSeek model retirement compatibility | The official DeepSeek endpoint rejects the retired exact model name `deepseek-chat` after 2026-07-24, and V4 enables thinking by default even for short translation work | The provider owns model availability and defaults; rewriting a user's config could silently alter a custom OpenAI-compatible endpoint | It can select `deepseek-v4-flash` only in memory for the exact official endpoint and exact retired alias, but never rewrites `api.ini`; explicit custom endpoints/models remain untouched. V4 thinking is disabled only for official DeepSeek V4 translation requests | Server stderr records the one-time official-endpoint migration without the API key; `api_diag` retains HTTP status/stage for any later provider rejection |
+| Remote provider response byte limit | An external model endpoint returns a body larger than 2 MiB, including a chunked or incorrectly sized UTF-8 response | The provider controls its response bytes; the local server cannot constrain them upstream | Both servers stop reading after the limit is exceeded, leave the text unresolved, and never cache the oversized body; this can hide the provider's intended translation, but not report it as success | Native `api_diag` and C# `ApiClient.Diag` record `body-too-large` with per-stage rate limiting and no game text or key |
+| C# provider response body deadline | A model endpoint sends successful headers then stalls before completing its body; on .NET Framework the response stream can ignore cancellation during `ReadAsync` | The remote provider owns the incomplete body, and request-header cancellation alone cannot close its already-open stream | Closing the response at the configured deadline can discard a late answer, but it returns an unresolved miss and never caches the original as a translation | `ApiClient.Diag("read-body", "timeout")` records the stage with rate limiting; `test_provider_body_timeout.py` checks that the next request can use the released channel |
+| Godot scene deferred setter recovery | A game script queues another `set_deferred` from a method already deferred in scene `_ready`, overwriting a cached translation after the first ready-event flush | The game owns its message queue and text setters; the launcher and shared cache cannot reorder them | The next process-frame cache-only pass can replace only known originals with known translations before draw, without inventing hits or concealing a cache miss | Both runtimes rate-limit `scene-frame-connect` and `scene-cache-capacity` diagnostics; the real-engine scene regression checks the final draw in Godot 3 and 4 |
+| DeepSeek model retirement compatibility | The official DeepSeek endpoint rejects the retired exact model name `deepseek-chat` after 2026-07-24, and V4 enables thinking by default even for short translation work | The provider owns model availability and defaults; rewriting a user's config could silently alter a custom OpenAI-compatible endpoint | It can select `deepseek-flash` only in memory for the exact official endpoint and exact retired alias, but never rewrites `api.ini`; explicit custom endpoints/models remain untouched. Thinking is disabled only for official DeepSeek `deepseek-flash` (V4.1 Flash) and V4-series translation requests | Server stderr records the one-time official-endpoint migration without the API key; `api_diag` retains HTTP status/stage for any later provider rejection |
 | C batch-to-single translation | Provider rejects or malforms a batch while individual requests may still work | Provider batch behavior cannot be repaired by the local cache | No; the batch failure is logged and each individual result is independently validated | `api_diag` logs the batch failure; individual failures retain their own stage logs |
 | Ren'Py launcher hook bytecode invalidation | A packaged Ren'Py runtime keeps loading an older `iron_deepseek.rpyc` after the launcher writes a newer hook source | Release-mode bytecode selection and source recompilation are owned by the packaged Ren'Py runtime, and some builds do not refresh an externally replaced `.rpy` | No; deployment stops if the launcher-owned stale bytecode cannot be removed, so the game is not reported as successfully prepared with an old hook | Launcher log records the exact `iron_deepseek.rpyc` path and Windows inspection, attribute, or deletion error |
 | Ren'Py shared-store name isolation | A game assigns common store variables such as `time`, replacing standard-library modules imported by the hook and preventing cache misses from entering the worker queue | Ren'Py intentionally executes `init python` globals in the game store, whose variable names are owned by each game | No; hook modules use `_ds_*` aliases and real worker failures remain unresolved misses | `_ds_report_exception` retains its own `_ds_sys` and `_ds_traceback` aliases and reports the operation, occurrence count, and traceback through `renpy.log`/stderr |
@@ -79,13 +90,17 @@ diagnose the real fault.
 | Godot `--main-pack` compatibility probe | Exported templates can reject launcher CLI flags, while unrelated headless autoload/audio/DRM failures can produce the same non-zero process exit | Only the exported executable can parse its own supported command-line surface; exit status alone cannot identify the failing subsystem | The launcher disables the static patch path only when captured output explicitly names `--main-pack` with an option-rejection diagnostic; other failures remain inconclusive and the translated launch is still attempted | `godot_main_pack_supported` records capture creation/start/wait failures, explicit rejection, timeout, or the unrelated non-zero exit code |
 | Launcher Godot main-pack capability probe | A restricted export template rejects `--main-pack`, and the final static fallback would abort the game at launch | Command-line policy is compiled into the external Godot export template | It can launch without the patch pack, so that run has no static translations, but the game starts instead of aborting | Launcher log records the probe outcome and the plain-launch fallback |
 | Launcher embedded script resource | `FindResourceW`/`LoadResource` fails or an RCDATA script (301–304) is missing/corrupted in a partial launcher build, so `deploy_renpy`, `deploy_rpgm`, or the Godot sidecar builder has no hook text | The launcher binary's resource section is produced by the build (`build_native.bat` RCDATA lines) and cannot be reconstructed at run time | No; deploy/patch stops and returns failure for that engine, nothing is written, and the game is not reported as prepared | `embedded_script_text` records the resource ID and Win32 error once per ID; the owning deploy path adds the user-facing consequence and target path. C# port: `EmbeddedScripts.Bytes`/`Text` log the logical name and refuse NUL-containing payloads |
+| Unity Mono DLL ownership across translator updates | A newer translator payload no longer matches an older `UnityTranslator.dll` that this launcher deployed; comparing only with the current template would retain the old DLL as if it were foreign during IL2CPP switching or restore | The old installed bytes are external game-directory state and cannot be reconstructed from the new payload alone | A matching `.dst-owned` byte snapshot permits disabling/removing only the exact deployed DLL; a user-modified or unknown DLL is preserved, so an old install without a snapshot may still require manual inspection | `deploy_unity` writes the snapshot or fails with a logged Windows error; `deploy_unity_il2cpp` and restore log when a DLL cannot be disabled or its ownership cannot be confirmed; `tests/launcher_parity` covers old-owned and user-modified copies |
+| Unity IL2CPP `.disabled` collision | A game already contains `UnityTranslator.dll.disabled` or `Il2Cppmscorlib.dll.disabled`; replacing it would destroy an existing backup. A historical `UnityTranslator.pdb.disabled` has no reliable ownership record | The conflicting target is external game-directory state; the launcher cannot know who created it or reconstruct overwritten bytes | DLL/interop conflicts stop deployment and one-click launch; PDB files remain untouched during deployment and historical disabled PDB files remain on restore, which reports an incomplete restore | `disable_existing_file` returns `ERROR_ALREADY_EXISTS` (183), the owning deploy path logs the exact file/error, and `restore_unity_il2cpp` logs preservation; `tests/launcher_parity` checks byte preservation and launch cancellation on both launchers |
+| Unity Mono backup changed after its first snapshot | A user edits `UnityTranslator.dll` or `Newtonsoft.Json.dll` again while an older `.dst-backup` exists; reusing that backup would overwrite the new edit with no recoverable copy. A launcher payload upgrade can also change the DLL bytes | Only the live game directory contains the second edit; the first backup cannot represent it. The running launcher can distinguish its prior deployed bytes only if an ownership snapshot was recorded | A differing live file and backup stops deployment before that file is overwritten. Matching `.dst-owned` snapshots allow launcher-owned old DLLs to upgrade and restore; pre-snapshot installations with ambiguous old dependencies may require manual inspection | The Unity deploy path logs the affected DLL and Windows conflict code 183; snapshot write/restore failures log the path/error; `tests/launcher_parity` checks repeated edits, legitimate upgrades, matching backups, and one-click launch cancellation |
 | C# launcher port coverage boundary | A caller reaches a C# launcher path that has not been ported. As of 2026-09-09 the port is complete — deploy/restore, warmup scanners for all five engines, embedded payload self-update, the Godot patch pack, the `api.ini` data layer and its dialog, the Godot launch preflight, the one-click launch flow, and the Win32 window itself are all ported — so this boundary now only guards future modules and engines | The C# port is a module-by-module migration; faking the C result or silently skipping would make parity tests green while the module is absent | No; unported entry points must return `Deploy.NotPorted` (`-1`) / exit 3 with a `[not ported]` log line, so a caller cannot mistake it for the C `0/1` result | The log line names the missing module; `tests/launcher_parity` only adds scenarios for ported modules, and the synthetic launcher root there omits `UnityMonoRuntime6X86` so the "missing payload + install command" branch is pinned rather than hidden |
 | Launcher window render probe (`--ui-probe-and-exit` / `--ui-probe`) | The parity test needs the exact pixels both launchers paint, but a live window depends on the wall clock (`GetTickCount` animation), the host's DPI, the user's saved game directory, the real cache size, log timestamps, and whether a server happens to be listening on 19999 — none of which are comparable between two runs | Those inputs belong to the OS and the user's machine; rendering through a screenshot of the real window would compare the environment instead of the code | No; probe mode is opt-in (`g_ui_probe` / `MainWindow.ProbeMode`), never set by the GUI flow, and it only *removes* nondeterminism: DPI is forced to 96, `anim_tick()`/`Theme.AnimTick()` return the frozen `g_anim_tick_override`/`Theme.AnimTickOverride` instead of `GetTickCount`, the server state comes from an argument (`ServerProcess.SetStartedForProbe`), and `WM_CREATE` skips payload sync, the last-directory restore and the timers. The paint, layout and owner-draw code under test is the shipped code, unbranched — a probe-only drawing path would prove nothing | A render difference *is* the diagnostic: the `ui/*` scenarios compare the layout report line by line and the bitmap by SHA-256, printing the first differing pixel's coordinates and both colours on mismatch |
 | C# launcher optional Win32 APIs (`Theme.EnableDpiAwareness`, `Theme.SetDpiForWindow`, `MainWindow.ApplyWindowChrome`) | `SetProcessDpiAwarenessContext` (Win8.1-), `GetDpiForWindow` (Win10 1607-), `DwmSetWindowAttribute` dark-mode/caption attributes, and `SetWindowTheme` are missing on older Windows, raising `EntryPointNotFoundException`/`DllNotFoundException` at the P/Invoke boundary instead of C's `GetProcAddress` returning NULL | These entry points ship with the OS; the launcher cannot add them | No; each catch covers exactly one import and falls back the same way the C launcher does (Per-Monitor V2 → V1 → `SetProcessDPIAware` → system virtualisation; `GetDpiForWindow` → `GetDeviceCaps(LOGPIXELSY)` → 96; title bar keeps the default light chrome). Only cosmetics or DPI crispness degrade — no translation, deploy or cache path is involved | The DPI fallbacks are silent in both languages by design (C's `GetProcAddress` branch is silent too, and the parity gate would break if one side logged); the chrome failures write the missing DLL/entry point to `OutputDebugStringW` |
 | Launcher runtime identity strings | The rail footer tag and hero subtitle deliberately differ (`C native runtime` / `C# managed runtime`), so a user can tell which binary is running; comparing them in the pixel diff would fail every render, and harmonising them would hide which launcher produced a bug report | The difference is the point — it is the only user-visible way to identify the running implementation | No; `--ui-probe` swaps in the neutral strings *only* for the bitmap, and the real strings are asserted separately by `--ui-identity*`, so neutralisation cannot quietly spread to the shipped window | `ui/identity` fails if either binary reports the other's tag or subtitle, or if a probe render leaks a real runtime string |
 | C# launcher server lifecycle (`ServerProcess`) | `Process.Start` throws `Win32Exception`, the child exits before `/health`, readiness times out, `/shutdown` transport/status fails, or `Kill` races an already-exited child | Same external boundaries as the C `server_proc.c`: process creation, port ownership, child initialization | No; start returns false after logging the exit code/timeout and terminating an owned child; a failed `/shutdown` to an *adopted* external server keeps the "running" state instead of reporting "stopped". The only swallowed exception is `InvalidOperationException` from `Process.Kill` on a child that exited between `HasExited` and `Kill`, which is the success case | Log lines mirror `server_proc.c` wording (`C 服务端在健康检查前退出，退出码：N`, `... 内未通过 /health 健康检查`, `发送服务端关闭请求失败。错误：<WebExceptionStatus>`) and the `StateChanged` event carries the label/button the UI must show |
 | Launcher warmup dump mode (`--warmup-and-exit` / `--warmup`) | The parity test needs the exact `/prefetch` and `/cache/import` bodies both launchers would send, but a real POST requires a running server and would mutate the translation memory; the XUnity cached-rewrite branch would also modify fixture files | Scanner output is only observable at the HTTP boundary; a separate "collect only" API would duplicate the batching code and drift from the shipped path | No; dump mode is opt-in (`g_warmup_dump_stdout` / `Warmup.DumpSink`), never set by the GUI flow, and inside it `/health` is reported ready, `localhost_get_cached_translate` returns a forced miss, and every `local_http_post` prints `post=<path> <body>` instead of connecting, so no translation-file rewrite or cache write can happen | Each `warm_*` scenario snapshots the fixture tree before and after both dumps and fails if anything changed; the dumped bodies are compared byte-for-byte |
-| Launcher warmup C# `LocalHttp` | `HttpWebRequest` throws `WebException` (refused/timeout/protocol) or the local server answers non-2xx to `/prefetch`, `/cache/import`, `/cache/lookup` | The local server is a separate process; the launcher cannot repair its availability from the scanner | No; `Post` returns false, `WaitReady` returns false after the deadline, `GetCachedTranslate` returns null so the XUnity file keeps its original line; nothing is written back as translated. `WebException` responses are read for the status code and closed; connection-level `WebException` without a response returns false silently, which is the same as C's `WinHttpSendRequest` failure path; other exception types propagate | The first non-2xx per session logs `预热批次被本地服务端拒绝（HTTP N），该批次未入队。` and later rejections stay quiet, exactly like C's `LocalHttp.reject_logged` guard; readiness timeout logs `预热跳过：本地服务端未及时就绪。` |
+| Launcher warmup C# `LocalHttp` submission/readiness | `HttpWebRequest` throws `WebException` (refused/timeout/protocol) or the local server answers non-2xx to `/prefetch` or `/cache/import` | The local server is a separate process; the launcher cannot repair its availability from the scanner | No; `Post` returns false and `WaitReady` returns false after the deadline. `WebException` responses are read for the status code and closed; connection-level `WebException` without a response returns false silently, which is the same as C's `WinHttpSendRequest` failure path; other exception types propagate | The first non-2xx per session logs `预热批次被本地服务端拒绝（HTTP N），该批次未入队。` and later rejections stay quiet, exactly like C's `LocalHttp.reject_logged` guard; readiness timeout logs `预热跳过：本地服务端未及时就绪。`. XUnity immediate-miss submission failure additionally records the lookup boundary diagnostic below |
+| XUnity batched cache lookup (C `xunity_lookup_*`, C# `LocalHttp.Lookup`) | Local HTTP refusal, non-200, timeout, truncated response, invalid UTF-8/JSON/shape/NUL, or a valid multi-key response larger than 2 MiB | Availability and cache values belong to the separate server; the scanner cannot repair them or reduce an existing translation's size | No; only a complete validated hit replaces a line. Faults retain original lines and queue candidates for background work. Only confirmed oversize responses split; network/JSON faults do not retry. A single-key response permits up to 64 MiB to cover the existing 8-MiB encoded cache-row limit with worst-case JSON escaping | First failure per session logs `Unity warmup: cache lookup failed` with stage, HTTP status and platform error; first oversize split logs `cache lookup response exceeded batch limit`. `tests/launcher_parity/run_warmup_http_tests.ps1` checks writeback/backup, faults, large values and exact C/C# requests |
 | Launcher Godot pack scan (C and C# `godot_warmup`) | A `.pck` or embedded `pck` section has a malformed directory (zero/oversized path length, entry table past the pack end, unknown format, > 200000 files, `file_base` beyond the pack), an entry whose data offset/size leaves the pack, or the pack file cannot be opened/read (`CreateFileW`/`FileStream` failure, short read) | Pack layout is owned by the exported game and cannot be repaired by the launcher; the scan is a read-only best-effort text discovery | No; a directory-parse failure makes `scan_godot_pck_file`/`ScanGodotPckFile` return false and the whole file falls back to raw byte-run scanning (same as a foreign or corrupt pack), single bad entries are skipped, and nothing is ever queued as a translation — texts only enter `/prefetch` | Same in both languages by design: the fallback is silent (no log line), which is the pre-existing C behavior pinned by `warm_godot_pck_v2_v3_fallback`; a mismatch between the two scanners is the diagnostic and fails `tests/launcher_parity` |
 | Launcher embedded payload self-update (C `self_update.c` and C# `SelfUpdate`) | A required RCDATA/EmbeddedResource payload (101–106) is absent from a partial build, or a target under the launcher root cannot be replaced: temp write fails, `MoveFileSafe` refuses (target is a directory/reparse point, in use by a running server or game), or the streaming compare cannot open the existing file | The launcher binary's resource section is produced by `build_native.bat`/the csproj `EmbeddedResource` items and cannot be reconstructed at run time; a locked target is owned by another process | No; a missing required payload counts as `missing_important` and a failed write counts as `failed`, both make `sync_embedded_payloads`/`SyncEmbeddedPayloads` return false (`--sync-payloads-and-exit`/`--sync-payloads` exit 5), the `.dstmp` temporary is deleted and the previous target file stays intact, other payloads are still synced. Optional Unity assemblies (201–205) are allowed to be absent without a log line, the pre-existing C rule (they require a local BepInEx reference build) | `Built-in component update failed: <label>`, `Warning: launcher was built without N required embedded component(s).`, `Warning: N built-in component(s) could not be updated. ...` — identical wording in both launchers, mirrored to stdout in the diagnostic mode and compared by the four `sync-payloads` checks in `tests/launcher_parity` |
 | Launcher Godot patch pack build (C `godot_patch.c` and C# `GodotPatch`) | The source `.pck`/embedded section cannot be copied or its offsets normalised, the copy's directory ends before all declared entries, the local server is unreachable or answers a batch with the wrong shape, a resource fails to parse (invalid UTF-8 payload, unknown GDScript variant type, out-of-range OptimizedTranslation record), a translation would break bracket/`%s`/`%d`/`%1.2f` formatting, no system CJK font exists, or the finished pack cannot replace a pack the running game still holds open | Pack layout, resource encoding, and the installed font set belong to the exported game and the OS; the translation itself comes from a separate process | No; every stage is fail-closed on a copy under `dst_godot_patch.building` while the original `.pck`/EXE stays read-only. A rejected translation leaves the original bytes in place, a resource with no accepted string is not rewritten, a pack with zero patched resources is deleted instead of installed (`no patch output for the packaged game`), and a format 3 pack whose runtime embed fails is discarded — a partially patched pack is never installed. A busy active pack degrades to `dst_godot_patch.next.pck` for the next launch, which is reported, not silent | `Godot: local server was not reachable…`, `Godot: PCK directory ended before all declared entries were parsed.`, `Godot: no system CJK font found …`, `Godot: existing override.cfg is unreadable…`, `Godot: failed to embed the runtime translator and rebuild the format 3 PCK directory.`, `Godot: failed to install refreshed patch pack (replace error N, stage error M).`, and the closing `Godot: patched N resources with M translated strings.` — identical wording in both launchers, compared with the built pack bytes and the `/batch` bodies by the `godot-patch/*` scenarios in `tests/launcher_parity` |
@@ -94,6 +109,351 @@ diagnose the real fault.
 | Launcher one-click flow dry run (`--launch-flow-and-exit` / `--launch-flow`) | The parity test needs the exact process the launcher would start for each engine, but really starting a game (or the detached patch worker) would leave live processes behind on the test machine | The decision is only observable at the process-creation boundary; a separate "planner" API would duplicate the branch logic and drift from the shipped path | No; the dry run is opt-in (`g_launch_dry_run` / `LaunchFlow.SpawnSink`), never set by the GUI flow, and it replaces only the three points that start something (game `ShellExecuteW`, Godot `CreateProcessW`, patch worker) with a printed plan line. Everything that decides *which* line to print still runs for real, including the Godot headless preflight probes, which really start the game executable — a probe answered with a canned result would test nothing | Each `launch-flow` scenario compares stdout, the resulting tree, and the command lines the probed executable recorded, so both the decision and the probe arguments have to match |
 | Launcher `path_join` self-aliasing | `path_join(out, cap, out, b)` cleared `out` before formatting, so `unity_is_il2cpp` compared `is_dir("il2cpp_data")` (relative to the CWD) and the `*_Data\il2cpp_data` IL2CPP marker never fired; games without a root `GameAssembly.dll` were classified as Mono | C `snprintf` with overlapping buffers is undefined behavior; only the call site can avoid it | No; `path_join` now appends in place when `a == out` (fail-closed on overflow with `ERROR_INSUFFICIENT_BUFFER`) and the call site uses a separate buffer. Detected 2026-09-08 by `tests/launcher_parity` when the C# port reported `Unity (IL2CPP)` for a fixture the C build called `Unity` | The parity test's `unity_il2cpp_data_dir` fixture pins the corrected behavior on both launchers |
 
+Cache tail recovery (2026-09-17): an interrupted append or an externally
+provided file without a final newline can leave the next record outside a TSV
+boundary. Only the cache IO owner can inspect this disk state; the in-memory
+map cannot repair it. C and C# check the final byte when opening the writer,
+append only a missing separator, and preserve all earlier bytes. The anomaly
+is visible as `[cache] persist-tail`; open/read/seek/write failures remain
+unconfirmed and retain dirty entries. Partial-byte failure and restart guards
+protect this recovery, complete final records and adjacent engine markup.
+
+XUnity allocation failures (2026-09-17): resource pressure can make the native
+`ByteBuf` append silently fail; the scanner cannot repair OS allocation. The
+XUnity boundary checks actual encoded lengths when constructing requests,
+receiving responses, decoding strings, assembling output and importing values.
+Any mismatch rejects that buffer before file writeback or import, preserving
+the original file. C# catches `OutOfMemoryException` at its corresponding HTTP,
+decode, row-output and import-encoding boundaries. Failures are not reported as
+successful translations and log the rate-limited `cache lookup failed` with
+`allocate` and error 8. Six native allocation-injection scenarios verify the
+original file/backup, diagnostics and absence of damaged cache imports; the
+normal C/C# parity and adjacent RPG Maker cases remain enabled.
+
+Provider catalog discovery (2026-09-18): a provider may omit GET `/models`, reject
+the key, redirect, time out, or return malformed/incomplete/oversized JSON. The
+launcher cannot repair provider availability or account permissions upstream.
+At the catalog boundary, discovery fails visibly and leaves manual model entry
+available; it never substitutes a static preset list as a successful online
+result, changes the chosen model, or saves configuration. The window status and
+launcher log record stage plus HTTP/transport error codes, while debug output
+records completion even if the window has closed. URLs, credentials and raw
+response bodies are omitted. HTTPS is required except explicit loopback hosts;
+redirects are disabled so credentials cannot follow a new destination. Response
+size, item count, UTF-8 ID length, JSON depth and request/read time are bounded.
+The Anthropic host uses its documented headers and `after_id` cursor pagination.
+DashScope's documented same-host `/api/v1/models` uses `output.models[].model`,
+`page_no` and `output.total`; its host may require an account workspace, which
+the launcher cannot infer. No key is sent to a guessed replacement host. The
+SiliconFlow adapter requests `sub_type=chat`. Bounds apply across pagination:
+64 pages, 4096 unique IDs, 16 MiB overall and 60 seconds between bounded network
+operations. Missing/repeating cursors, no-progress pages, changed totals and any
+later HTTP/JSON failure discard all partial results and emit the same visible
+stage/HTTP diagnostics. Manual entry remains available without hiding the fault.
+Presets no longer contain model names. A selected ID missing from a complete
+catalog may be a valid alias or private model: only the provider can determine
+that, so the UI retains it with an explicit membership warning and fetch time,
+allowing a deliberate manual save. This warning is shown in the dialog; the
+completion log records catalog count, not the potentially private model ID.
+Changing endpoint/key invalidates in-flight results; workers own copied inputs
+and never access HWNDs. UI completion polling observes a worker handle/task, not
+an assumed fixed network delay. Fake-provider guards cover these fallbacks and
+normal discovery without touching user files.
+
+Catalog adapter protocol references (checked 2026-09-18):
+[Claude Models](https://platform.claude.com/docs/en/api/models/list),
+[DashScope Models](https://help.aliyun.com/zh/model-studio/list-models),
+[SiliconFlow Models](https://api-docs.siliconflow.cn/docs/api/models-get).
+
 The short sleeps in launcher health polling and server foreground-priority
 scheduling are deadline/scheduling boundaries, not attempts to repair a state
 race. They must not be expanded into blind retry loops.
+
+## Godot PCK v4 and first launch (2026-09-22)
+
+- Boundary: Godot 4.7 exports can use PCK v4 and release templates can ignore
+  `--script`. A sidecar-only first launch then starts an untranslated game.
+- Ownership: only the Godot launcher can read the pack and embed a runtime;
+  the shared translation cache/server cannot repair export loading behavior.
+- Recovery: ordinary v4 packs share the v3 directory layout. Both launchers now
+  read it, preserve the original pack, and embed the runtime in a separate copy.
+  Before the first launch a runtime-only pack is prepared without HTTP or static
+  resource translation; ordinary warmup and background refresh still run later.
+  This does not claim a successful translation or put originals in the cache.
+- Diagnostics: source/copy/embed/install failures retain existing stage logs;
+  encrypted/sparse/unknown pack flags and encrypted/removal/delta entries are
+  explicitly rejected for patching. Warmup skips flagged v4 entries with a log.
+  The initial path logs `preparing initial runtime pack without translation requests`.
+  Its success is checked by autoload preflight before use.
+- Protocol evidence: [Godot's pack reader](https://github.com/godotengine/godot/blob/master/core/io/file_access_pack.cpp)
+  and [pack flags](https://github.com/godotengine/godot/blob/master/core/io/file_access_pack.h),
+  inspected 2026-09-22. Guards cover ordinary/embedded v4, flagged packs,
+  runtime injection and first-launch behavior alongside v1-v3 and other engines.
+
+## Model catalog and INI boundaries (2026-09-22)
+
+- Windows Profile APIs cannot represent every model ID in an ANSI INI. Only an
+  explicit save that needs Unicode prepares a UTF-16 temporary copy, writes all
+  three API values, flushes the file and atomically replaces the target. Existing
+  unrelated content is retained; rejected lengths/read-only files keep original
+  bytes. Save failures log the stage and Windows error; opening/refreshing a
+  catalog never converts configuration. Both server readers encode model IDs
+  as UTF-8 and reject IDs exceeding their 255-byte wire buffer.
+- A provider can repeat pagination fields or close the response before its
+  advertised Content-Length. The catalog reader owns these checks; a provider
+  cannot be repaired by selecting a guessed default. Duplicate consumed fields,
+  invalid JSON numbers, and truncated responses discard the catalog and expose
+  failure status, retaining the user's selected value. Legitimate close-delimited
+  and chunked responses remain accepted. No response failure becomes a successful
+  partial catalog. Fake-provider tests cover both implementations; the general
+  server JSON parser retains its existing duplicate-key/depth behavior.
+
+## Godot source updates and runtime proof (2026-09-23)
+
+- Boundary: an exported game's PCK or EXE can be replaced by an updater while
+  preserving its filename, size or timestamp. The launcher cannot repair that
+  upstream update, so its owned runtime pack records a byte fingerprint of the
+  source PCK, both bundled Godot runtime scripts and the translator version;
+  its owned EXE copy is compared with the current game EXE.
+  Mismatches rebuild the runtime or refresh only the owned EXE. A source that
+  changes during the build discards the generated copy. The original PCK/EXE
+  and user translation memory are never rewritten.
+- Boundary: some export templates ignore `--script` and exit normally. Exit 0
+  alone cannot prove a translation hook loaded. Newly generated Godot scripts
+  answer the private preflight argument with exit 73; only that result counts
+  as runtime proof. Old unstamped v1/v2 patch packs keep the earlier exit-0
+  compatibility path. The preflight signature includes the proof protocol and
+  pack identity, so an earlier cached success cannot certify a rebuilt pack.
+- Recovery and visibility: when runtime proof fails the existing static or
+  normal launch fallback remains available, but the final launcher status says
+  the live module was not confirmed. The exact probe exit code, timeout or
+  process error is logged. An unrecognized future PCK layout is diagnosed and
+  left unmodified, never treated as a successful translated pack.
+- Guards: launcher parity covers C/C# byte-identical source markers, same-size
+  same-time PCK changes, payload/version stamp validation and migration, owned
+  EXE refresh, ignored preflight exit 0, legacy v1 behavior, marker cleanup on
+  restore, and adjacent engine flows.
+
+## Ren'Py and RPG Maker font ownership (2026-09-26)
+
+- Boundary: a game or mod can already contain `ds_font.ttf/.ttc/.otf`, can edit
+  a font after deployment, or Windows can replace/remove the source font.
+  The launcher cannot infer ownership from the filename or repair a changed
+  external font upstream. It now creates a small `.dst-owned` marker only when
+  it copies a new system font, and never overwrites an existing font.
+- Recovery: restore removes the copied font only when the marker has the
+  expected source identifier and the file still equals that system source.
+  Missing/invalid markers, changed fonts and changed system sources are
+  preserved. This can leave an old launcher-created font from a version that
+  did not write markers; preserving an ambiguous file is intentional and does
+  not mark a translation or cache hit as successful.
+- Visibility: deployment logs copy or marker-write failures; restore logs each
+  preserved font and includes it in the `preserved` count. The C/C# launcher
+  parity scenarios check user TTF/OTF preservation, edited owned fonts,
+  launcher-owned font removal, and adjacent engine flows.
+
+## Bundled CJK fallback when Windows has no Chinese font (2026-09-26)
+
+- Incompatibility: Windows installations with no usable CJK font file leave
+  Chinese translations as missing glyphs in Ren'Py, RPG Maker, Godot, or Unity.
+- Upstream boundary: an exported game cannot add a missing OS font, so the
+  launcher embeds an unmodified Noto Sans CJK SC OTF and its SIL OFL text.
+- Visibility: the fallback can make a game display text that previously failed,
+  but cannot hide a missing/corrupt embedded font, a user file conflict, or a
+  renderer that rejects external OTF. These produce diagnostics and no
+  successful font-deployment result.
+- Diagnostics: `CJK font bundle resource ...`, `CJK font bundle asset ...`,
+  `CJK font copy failed ...`, and per-engine failure logs record the path and
+  Windows error. Restore requires matching `.dst-owned` markers and byte-for-byte
+  font/license matches; modified files are reported and preserved.
+- Godot patch packaging creates `dst_godot_patch.OFL.txt` only when the bundled
+  font is selected. A conflicting license cancels the patch; restore verifies
+  exact license bytes and its ownership marker before removal.
+
+## RPG Maker plugin parameter warmup (2026-09-27)
+
+- Incompatibility: RPG Maker MV/MZ plugins can draw save/help/menu labels from
+  `js/plugins.js` parameters, outside the standard `data/*.json` scanner. A
+  malformed or oversized third-party manifest cannot be repaired by the
+  launcher without rewriting the game's own plugin configuration.
+- Fallback: the launcher only reads generated manifests up to 8 MiB and
+  selects display-like values from enabled plugins before the general resource
+  scan. Unsupported manifests are skipped and normal data scanning continues.
+  This can leave plugin labels untranslated on first display; it never records
+  a cache hit or successful translation for a skipped value.
+- Diagnostics: the warmup log distinguishes oversized, unreadable, unexpected
+  and incomplete `plugins.js` files. The existing 40,000-entry cap warning
+  remains visible when later resources may have been skipped.
+- Guards: C/C# launcher parity checks active and disabled plugins, UI and
+  technical parameters, scan ordering, flat MZ layouts, malformed-manifest
+  fallback, and isolation from Ren'Py scanning.
+
+## Launcher Explorer file drop registration (2026-09-29)
+
+- Incompatibility: a Windows child control may reject `SetWindowSubclass`, so
+  Explorer can deliver `WM_DROPFILES` to a control without a forwarding handler.
+- Upstream boundary: the failure occurs at the Win32 control boundary; the
+  launcher cannot force an OS control to accept subclassing.
+- Fallback: the main window remains a drop target, and directory selection and
+  the browse button still work. A child area whose subclass failed may not
+  accept a drop; this cannot create a false translation or cache entry.
+- Diagnostics: both launchers append `拖放初始化失败` with the control ID and
+  Win32 error code. The `ui/drop-*` parity scenarios check the main window,
+  path field, start button, log control, automatic start decision and C/C# parity.
+
+## Godot localhost HTTP response and pause boundaries (2026-09-30)
+
+- External failure: the local service can stop after HTTP headers or a partial
+  body, return a failed transfer with an HTTP status, or send a `translations`
+  field/value of the wrong JSON type. Godot's default HTTPRequest timeout is
+  zero (unbounded), so four stalled requests previously occupied the entire pool.
+  Nonstring values were coerced into display translations; Godot 4 also called
+  `has` on a string/null map and raised a script error.
+- Ownership: the game-side adapter cannot finish a stalled external process or
+  repair its response upstream. Each owned HTTPRequest now has a 12-second
+  deadline. Both callbacks require `RESULT_SUCCESS`, HTTP 200 and a translations
+  dictionary; each accepted entry must be a nonblank, nonidentity string.
+  Original engine tags and shared translation memory are not normalized here.
+- Recovery visibility: a failed batch releases its busy/pending ownership and
+  uses the existing eight-second miss backoff. A malformed entry alone remains
+  unresolved while valid adjacent entries can still be accepted. This may leave
+  source text visible until a later successful response, but cannot hide the
+  original failure or turn it into a successful cache record.
+- Diagnostics: existing rate-limited `batch-http` includes request ID, engine
+  result and status; `batch-schema` records the missing dictionary; `batch-value`
+  records request ID, source length and actual Variant type. Existing JSON parse
+  diagnostics remain active. Real-engine tests inspect both state recovery and
+  diagnostic counts instead of treating absence of a crash as success.
+- Pause ownership: an external Godot 3 game may pause its SceneTree while its
+  menu stays visible. Only the translator's owned HTTP nodes and scan timer now
+  use `PAUSE_MODE_PROCESS`; Godot 4 already uses `PROCESS_MODE_ALWAYS`. This
+  keeps translation/timeout processing alive without changing game pause state.
+  Request failures continue through the same diagnosed boundary.
+- Evidence: `test_godot_http_contract.py` reproduces wrong-value caching, Godot 4
+  map errors, four-slot stalls and Godot 3 paused stalls before the fixes. With
+  configured real Godot 3.6/4.3 engines it checks autoload and sidecar modes,
+  normal strings, blank/identity rejection, markup, recovery and paused menus.
+  Timeout semantics follow the official
+  [Godot HTTPRequest documentation](https://docs.godotengine.org/en/4.3/classes/class_httprequest.html).
+
+## Managed build fingerprint publication (2026-09-30)
+
+- Incompatibility: Windows rejects truncation of a file with a live memory-mapped
+  reader (`ERROR_USER_MAPPED_FILE`). A final build encountered this on a JSON
+  payload stamp even though the fingerprint contents were unchanged.
+- Ownership: a build script cannot close another process's mapped view. The real
+  stamp writer now skips byte-identical records and writes changed records to a
+  unique sibling before atomically replacing the destination. Existing readers
+  keep their previous complete view; new readers see the complete new record.
+- Visibility: this avoids an unnecessary destructive write, not a failed
+  fingerprint check. A reader that denies replacement, inaccessible directory,
+  unsupported filesystem replacement, or failed write still stops the build.
+  No delay, retry, or fabricated success is introduced; the old stamp remains
+  intact and the temporary sibling is removed.
+- Diagnostics: the narrow write boundary records the payload name, stamp path
+  and original exception with `Managed fingerprint write failed`, then rethrows.
+  The actual external reader from the observed build was not identified; the
+  regression fixture owns a known mapped reader and reproduces the same Windows
+  error before the fix, then checks replacement-denying ownership separately.
+
+## RPG Maker visible UI completion and reconnect (2026-09-30)
+
+- Incompatibility: the local server intentionally answers `queued` immediately;
+  static menus have no completion event, and a disconnected/restarted server can
+  leave the original request unqueued or lose its in-memory queue. Completed
+  dialogue still awaiting input is visible even though `_textState` is null.
+- Ownership: the server cannot refresh live MV/MZ windows or infer whether the
+  player has left a page. The RPG Maker hook owns scene/window visibility, page
+  signatures and engine input pause; no shared translation-memory changes apply.
+- Visibility: ordinary UI checks only local cache after `queued`, retries failed
+  requests at the existing cooldown, and restores enqueue permission after a
+  cache transport/parse failure. Misses do not repeatedly redraw. Scene changes
+  and loss of all visible refresh targets cancel polling; at most 128 keys poll
+  for 60 seconds each.
+  Retry callbacks retain the original deadline, so a late failure cannot restart
+  expired polling. A completed message keeps its existing 15-second page deadline
+  and can repaint while preserving the engine's input pause. Unresolved text
+  stays source text and is never accepted as a successful translation.
+- Diagnostics: HTTP and parsing failures remain recorded at the request boundary;
+  `visible-ui-cache-poll-capacity`, `visible-ui-cache-poll-timeout`, timer
+  scheduling and scene/window property failures are rate limited through
+  `reportRpgmError`. A plugin property failure skips only its target; the poll
+  worker is not wrapped in a broad exception handler. Message-page
+  timeouts retain `active-message-cache-poll-timeout`. The public-method fixture
+  in `test_rpgm_runtime_refresh.js` loads the complete shipped hook and verifies
+  async cache/queue/reconnect, scene/page changes, window reuse, cancellation,
+  cooldown and late callbacks; it simulates engine classes and does not establish
+  compatibility with every commercial game's plugins.
+
+## Ren'Py legacy main-thread refresh and late responses (2026-09-30)
+
+- Incompatibility: Ren'Py 7.2 lacks `invoke_in_main_thread`; calling layout,
+  redraw and restart APIs from an HTTP worker can race the engine. A delayed
+  queued reply can also arrive after a cache poll has already resolved the text.
+- Ownership: the hook cannot upgrade the game's engine or serialize external
+  HTTP completion order. The existing engine periodic/interaction callback lists
+  own legacy main-thread refresh, and `_ds_lock` owns memo publication.
+- Visibility: a worker only marks refresh pending; legacy lifecycle callbacks
+  drain it on the main thread. Callback lists preserve game handlers. If none
+  can be registered, source text remains and the incompatibility is reported;
+  there is no worker-thread UI fallback. A queued identity value cannot downgrade
+  a positive memo entry; genuine new translations can still replace it.
+- Diagnostics: registration exceptions name their callback list; unavailable
+  lists and legacy deferral use rate-limited diagnostics. Existing per-displayable
+  layout/redraw and interaction errors keep their original diagnostic boundaries.
+  Four threaded guards and real Ren'Py 7.2/8.3 isolated Text-token fixtures verify
+  ownership, coalescing, preserved handlers, tags and late-result behavior.
+
+## Unity renderer attributes, stripped atlas metadata and XUnity JSON (2026-09-30)
+
+- Incompatibility: TMP punctuation fallback previously also changed punctuation
+  inside link/sprite identifiers. Some stripped Unity assemblies omit the
+  `isReadable` property, so directly referencing it can fail compilation or JIT.
+  The XUnity field scanner also accepted truncated JSON and blank translations.
+- Ownership: tag attributes identify engine resources, and only the Unity
+  renderer can distinguish them from visible text. The hook cannot restore APIs
+  removed from the game's assemblies. Endpoint parsing uses the source-linked
+  `DstCore.Json` implementation; shared translation memory is not rewritten.
+- Visibility: all three Unity renderers preserve complete quoted tag spans and
+  normalize only display text. Unavailable atlas metadata skips CPU diagnostics
+  with an explicit `unavailable` result, preserving font/translation work.
+  Invalid JSON, blank results or source echoes after display normalization fail
+  the XUnity task; they cannot become successful translation/cache entries.
+- Diagnostics: atlas property absence, invalid return type and getter exceptions
+  record operation and exception through `ReportCaughtException`. XUnity initial,
+  lookup and extraction parse failures use `context.Fail` with the original parse
+  exception. Blank/identity batch failures identify the ownership boundary/index.
+  The Unity contract tests exercise the built endpoint with actual SDK interfaces
+  and source-linked renderer methods; full player/native glyph execution remains
+  a separate verification level.
+
+## Godot 4.6 加密目录与自动加载预检（2026-10-01）
+
+- **外部边界：** PCK v3 的目录可单独加密；把密文当作路径长度会使运行时补丁构建失败。兼容层依据 Godot 4.6.1 `FileAccessEncrypted` 的 AES-256-CFB128 包装，在匹配的导出程序可写初始化数据区寻找编译期 32 字节数组（8 字节对齐、扫描最多 32 MiB/100 万候选）。整个目录的 MD5 和全部条目边界必须通过校验。密钥仅在内存中使用，不写入文件、配置或日志。
+- **上游限制：** 已导出的游戏无法要求作者重新导出明文资源。仅在启动器自有 PCK 副本追加明文目录并清除目录加密位；原始 EXE/PCK 不变，文件级加密资源及其元数据原样保留，补丁层跳过这些资源。其他加密格式、异常标志、坏校验或无法定位数组均拒绝补丁。
+- **预检边界：** Godot .NET 游戏可在主场景启动时后台加载资源；autoload 的 `_ready` 中立即 `SceneTree.quit(73)` 会与这些工作竞争，实际样本触发 `0xC0000374`。自动加载预检改为专用用户参数、完整 stdout 证明行和仍存活的探测进程；启动器在确认脚本实际进入 `_ready` 后结束自己创建的独立探测。普通游戏启动不带该参数；侧车 `--script` 的退出码 73 协议保持不变。
+- **不掩盖失败：** 证明仅表示补丁脚本已加载，不宣称远程翻译或整个游戏运行成功。缺少证明、脚本错误里引用证明字符串、已退出/崩溃的进程、创建/读取/结束探测失败均不确认自动加载，也不缓存成功。加密资源跳过不成为成功译文或缓存项。
+- **诊断与验证：** 加密目录和预检结果进入 C/C# 启动器日志，操作失败保留对应原因。`test_godot_encrypted_pack.py` 验证正常/损坏目录、不同密钥、边界、原文件保护和 C/C# 补丁字节一致；launcher parity 验证真实进程证明、误导性错误文本及提前崩溃。实际游戏另外验证 `/batch` 请求和控件文字应用。
+
+## 选择动画与缓存译文绘制（2026-10-01）
+
+- **外部边界：** 游戏动画可在翻译扫描后重写英文。Godot 3/4 控件的 `draw` 在本次画布命令生成后发出，延迟连接在同一帧队列收尾时只恢复该控件的已有译文，重新生成画布命令；不遍历场景，也不请求 HTTP。原有扫描仍负责未命中发现。
+- **上游限制：** 作者脚本、插件、控制符和渲染队列属于游戏。仅在各自渲染边界修复：Godot 保留 BBCode；Unity Mono 的 TMP/UGUI setter 先查本地命中再对未命中片段去抖；RPG Maker 对原始反斜杠和已转换 ESC 控制符均按片段命中，保留当帧颜色、字号及变量。Ren’Py 已在 Text 分词前替换；IL2CPP 的 XUnity 端点和 TMP 层保留当帧标签与链接属性，不增加公共缓存改写。
+- **不掩盖失败：** 未命中新选项保留新原文，不能冻结到旧译文，也不能将原文缓存为成功。Godot 若游戏 `_draw` 不断写回原文，可能形成重绘循环；每控件每处理帧最多恢复两次，超过后保留游戏文本。弱引用和原有控件/项目容量上限限制存活记录。
+- **诊断：** Godot 信号连接失败记录 `scene-draw-connect`；循环保护实际阻止缓存命中时记录 `scene-draw-repeat`，含节点、属性或项目索引，按原有限频器输出。原有队列、HTTP、字体与容量错误继续按各自边界记录；循环保护可能留下未恢复原文，明确报告该限制，不伪造翻译成功。
+- **回归：** `test_godot_animated_text.py` 在真实 Godot 3/4、autoload/sidecar 中观察最终 CanvasItem 命令与帧提交；RPG Maker 动画控制符和完整缓存相邻行为、实际 Ren’Py 7/8 Text 连续替换、Unity Mono 源链接 setter 与 IL2CPP 实际 SDK 端点均覆盖 60 次动画变化及未命中新内容。Unity 测试的字体/原生对象边界由夹具模拟，不等同于商业游戏完整游玩。
+
+## Godot 设置选择器拆词与部分命中（2026-10-01）
+
+- **外部边界：** 已导出的游戏可以把同一个选择器值拆到两个 URL 点击区域，例如 `< Gen` 与 `eral >`。按 BBCode 文本槽分别翻译会请求半词；整块正文必须全部命中的旧渲染方式又使一个未命中项阻止其他已命中项显示。数字分辨率 `0x0` 也会被误拆成待译的 `x0 >`，带斜杠的按键说明则被旧路径过滤拒绝。
+- **上游限制：** 作者的文本拆分及 URL 标识决定点击动作，翻译器不能重写原始游戏脚本。Godot 3/4 的渲染与发现路径共用逻辑文本计划：同一行完整 `< ... >` 选择器及单词内部样式合并查询；译文按可见长度比例分配回原槽，标签、箭头和 URL 标识保留。数字值不翻译，实际路径继续过滤，操作说明允许斜杠。相邻独立链接、图片及布局标签仍隔开语义。
+- **不掩盖失败：** 只显示已完成的缓存命中，缺少译文的余项保留当前原文并继续原有异步队列；原文不能成为成功译文。旧半词缓存记录不删除、不改写，只是不再用于完整选择器查询。没有完整箭头边界、图片/布局阻隔或路径判定时保持既有原文；不宣称其已翻译。该修复不改变共享服务器或其他引擎的文本拆分。
+- **诊断与回归：** 请求、HTTP、未命中退避、容量与绘制循环继续由原有 `batch-request`、`batch-http`、schema 和 `scene-draw-repeat` 边界限频记录；计划函数不联网、不写缓存、不隐藏异常。`test_godot_settings_text.py` 在 Godot 3/4、autoload/sidecar 各观察 60 个实际提交帧，覆盖已命中与未命中混排、晚到译文、旧半词缓存、动态颜色、独立链接、多词选择器、数字值、斜杠说明和资源路径。HardStuck 独立副本另外通过真实元数据点击切换五个分类并返回重进，缓存仅只读使用；未命中的项目在该缓存隔离试验中仍保持英文，远程译文质量不由此证明。
+
+## 启动器减少动画设置（2026-10-12）
+
+- 外部边界：Windows `SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION)` 读取失败。
+- 上游限制：偏好由操作系统管理，启动器不能修复该系统调用；失败时以静态装饰显示。
+- 可见限制：星轨与呼吸灯不再运动，悬停仍直接反馈；不改变翻译、缓存或按钮操作结果。
+- 诊断：C `refresh_ui_motion` / C# `Theme.RefreshMotion` 用 `OutputDebugStringW`
+  记录操作和 Win32 错误码，同一故障段只记录一次，读取恢复后重新允许报告。

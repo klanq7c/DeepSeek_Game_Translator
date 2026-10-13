@@ -11,13 +11,13 @@
 
 /* 显示 API 配置模态对话框（阻塞调用，直到用户保存或取消） */
 void show_api_config(void);
+void api_config_ui_probe(void);
 
 /* 与窗口无关的数据层，供对话框与诊断子命令共用（C# 侧对应 ApiConfig）。
-   提供商预设表：显示名 / endpoint / 示例模型；endpoint 为 NULL 表示"自定义"。 */
+   提供商预设表只保存显示名和地址；模型必须来自目录或用户输入。 */
 typedef struct {
     const WCHAR *name;
     const WCHAR *endpoint;
-    const WCHAR *model;
 } ApiProviderPreset;
 
 int api_config_preset_count(void);

@@ -30,6 +30,7 @@
 #include "ui.h"
 
 #include <stdint.h>
+#include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -45,6 +46,10 @@
    导致大部分台词在首次显示时才翻译（中英文闪烁）。 */
 #define RENPY_WARMUP_MAX_ITEMS 100000      /* Ren'Py 脚本最大采集条数 */
 #define WARMUP_BATCH_ITEMS 512             /* 每批提交到服务器的条数 */
+#define XUNITY_LOOKUP_ITEMS 128
+#define XUNITY_LOOKUP_BODY_BYTES (64u * 1024u)
+#define XUNITY_LOOKUP_RESPONSE_BYTES (2u * 1024u * 1024u)
+#define XUNITY_LOOKUP_SINGLE_RESPONSE_BYTES (64u * 1024u * 1024u)
 #define UNITY_ASSET_SCAN_MAX_BYTES (64u * 1024u * 1024u)   /* Unity .assets 扫描上限 64MB */
 #define UNITY_BUNDLE_SCAN_MAX_BYTES (256ull * 1024ull * 1024ull) /* 大包只流式扫描前 256MB */
 #define UNITY_BUNDLE_SCAN_CHUNK_BYTES (1024u * 1024u)
@@ -52,6 +57,7 @@
 #define RENPY_SCAN_MAX_DEPTH 12            /* .rpy 目录递归最大深度 */
 #define RPGM_JSON_SCAN_MAX_BYTES (64u * 1024u * 1024u)  /* RPGM 数据 JSON 读前大小上限（含大型地图） */
 #define RPGM_TEXT_SCAN_MAX_BYTES (8u * 1024u * 1024u)   /* RPGM 插件外部 TXT/CSV 读前大小上限 */
+#define RPGM_PLUGIN_SCAN_MAX_BYTES (8u * 1024u * 1024u) /* plugins.js 是生成的插件清单，不扫描任意脚本 */
 
 /* 键值对列表：用于 XUnity 翻译文件导入（key=原文, value=译文） */
 typedef struct {
@@ -931,6 +937,8 @@ typedef struct {
     HINTERNET ses;
     HINTERNET con;
     int reject_logged; /* 本次会话是否已记录过服务端拒绝（限流诊断） */
+    int lookup_logged;
+    int lookup_split_logged;
 } LocalHttp;
 
 /* 诊断转储模式（--warmup-and-exit）：不建立 WinHTTP 会话、不查询本地缓存、
@@ -1054,140 +1062,255 @@ static void local_http_close(LocalHttp *h) {
     h->ses = NULL;
 }
 
-/* 读取完整 WinHTTP 响应体。读到正常 EOF 时返回新分配的 NUL 结尾缓冲，
-   所有权交给调用方；读取中途失败（连接中断、查询错误）返回 NULL，
-   调用方不得把截断内容当作完整响应使用。 */
-static char *winhttp_read_all(HINTERNET req) {
-    ByteBuf b = {0};
-    if (!bb_init(&b, 1024)) return NULL;
-
-    for (;;) {
-        DWORD avail = 0;
-        if (!WinHttpQueryDataAvailable(req, &avail)) {
-            free(b.data);
-            return NULL;  /* 无法确认剩余数据，按不完整处理 */
-        }
-        if (!avail) break;  /* 正常 EOF */
-        char *tmp = (char *)malloc(avail);
-        if (!tmp) {
-            free(b.data);
-            return NULL;
-        }
-        DWORD rd = 0;
-        if (!WinHttpReadData(req, tmp, avail, &rd) || !rd) {
-            /* 已报告可读却读失败/读空：连接中断，截断内容不可用 */
-            free(tmp);
-            free(b.data);
-            return NULL;
-        }
-        bb_add(&b, tmp, rd);
-        free(tmp);
-    }
-    return b.data;
+/* 查询是本地 HTTP 边界：拒绝、断流、超长或损坏的 JSON 无法在扫描器上游修复。
+   失败时整批视为未命中且保留原行，只允许后台预热；同一会话记录首次阶段、状态及
+   Windows 错误，避免隐藏故障或用错误响应污染翻译文件。 */
+static void xunity_lookup_diag(LocalHttp *h, const WCHAR *stage, DWORD status, DWORD error) {
+    if (h->lookup_logged) return;
+    h->lookup_logged = 1;
+    append_log(L"Unity warmup: cache lookup failed (%s, HTTP %lu, Windows error %lu); original lines retained.",
+               stage, status, error);
 }
 
-/* RFC 3986 查询参数中可直接保留的 ASCII 字节。 */
-static int url_unreserved(unsigned char c) {
-    return (c >= 'A' && c <= 'Z') ||
-           (c >= 'a' && c <= 'z') ||
-           (c >= '0' && c <= '9') ||
-           c == '-' || c == '_' || c == '.' || c == '~';
+/* ByteBuf 的旧接口不返回分配失败；XUnity 持久写回边界必须核对实际追加长度。
+   内存不足无法由文本来源修复，失败结果只丢弃本次缓冲并由调用者限流记录，
+   不将少字节的响应或译文伪装为命中；其他引擎缓冲行为不在这里改变。 */
+static int xunity_add(ByteBuf *b, const char *s, size_t n) {
+    if (n > SIZE_MAX - b->len - 1) return 0;
+    size_t expected = b->len + n;
+    bb_add(b, s, n);
+    return b->len == expected;
 }
 
-/* 按 UTF-8 原始字节做百分号编码；返回缓冲由调用方 free。 */
-static char *url_encode_utf8(const char *s) {
-    ByteBuf b = {0};
-    if (!bb_init(&b, strlen(s) * 3 + 1)) return NULL;
-    static const char hex[] = "0123456789ABCDEF";
+static size_t xunity_json_size(const char *s) {
+    size_t n = 2;
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        if (url_unreserved(*p)) {
-            bb_ch(&b, (char)*p);
-        } else {
-            char tmp[3] = {'%', hex[*p >> 4], hex[*p & 15]};
-            bb_add(&b, tmp, 3);
-        }
+        n += (*p == '"' || *p == '\\' || *p == '\n' || *p == '\r' || *p == '\t') ? 2 : *p < 32 ? 6 : 1;
     }
-    return b.data;
+    return n;
 }
 
-/* 把 UTF-8 字符串复制为 UTF-16；返回缓冲由调用方 free。 */
-static WCHAR *utf8_to_wide_dup(const char *s) {
-    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
-    if (n <= 0) return NULL;
-    WCHAR *w = (WCHAR *)malloc((size_t)n * sizeof(WCHAR));
-    if (!w) return NULL;
-    if (!MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n)) {
-        free(w);
+/* 响应必须完整且有界。达到上限后仍需确认 EOF，不能把截断 JSON 当命中。 */
+static char *xunity_lookup_http(LocalHttp *h, const char *body, int single, int *oversized) {
+    *oversized = 0;
+    if (g_warmup_dump_stdout) return NULL;
+    if (!h->con && !local_http_open(h)) {
+        xunity_lookup_diag(h, L"open", 0, GetLastError());
         return NULL;
     }
-    return w;
+    HINTERNET req = WinHttpOpenRequest(h->con, L"POST", L"/cache/lookup", NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!req) {
+        xunity_lookup_diag(h, L"request", 0, GetLastError());
+        return NULL;
+    }
+    WinHttpSetTimeouts(req, 350, 350, 350, 350);
+    WCHAR headers[] = L"Content-Type: application/json\r\n";
+    DWORD len = (DWORD)strlen(body), status = 0, status_len = sizeof status;
+    int ok = WinHttpSendRequest(req, headers, (DWORD)-1, (LPVOID)body, len, len, 0) &&
+        WinHttpReceiveResponse(req, NULL) &&
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_len, WINHTTP_NO_HEADER_INDEX);
+    DWORD error = ok ? 0 : GetLastError();
+    const WCHAR *stage = L"response";
+    ByteBuf out = {0};
+    if (!ok || status != 200) ok = 0;
+    else if (!bb_init(&out, 4096)) { ok = 0; error = ERROR_NOT_ENOUGH_MEMORY; }
+    while (ok) {
+        char buf[4096];
+        DWORD rd = 0;
+        if (!WinHttpReadData(req, buf, sizeof buf, &rd)) {
+            ok = 0; error = GetLastError(); stage = L"read"; break;
+        }
+        if (!rd) break;
+        size_t limit = single ? XUNITY_LOOKUP_SINGLE_RESPONSE_BYTES : XUNITY_LOOKUP_RESPONSE_BYTES;
+        if (out.len + rd > limit) {
+            *oversized = 1; ok = 0; error = ERROR_INVALID_DATA; stage = L"size"; break;
+        }
+        if (memchr(buf, 0, rd)) {
+            ok = 0; error = ERROR_INVALID_DATA; stage = L"content"; break;
+        }
+        if (!xunity_add(&out, buf, rd)) {
+            ok = 0; error = ERROR_NOT_ENOUGH_MEMORY; stage = L"allocate"; break;
+        }
+    }
+    WinHttpCloseHandle(req);
+    if (!ok) {
+        if (!*oversized || single) xunity_lookup_diag(h, stage, status, error);
+        free(out.data);
+        return NULL;
+    }
+    if (!out.len || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, out.data, (int)out.len, NULL, 0)) {
+        xunity_lookup_diag(h, L"JSON", 200, ERROR_INVALID_DATA);
+        free(out.data); return NULL;
+    }
+    return out.data;
 }
 
-/* 通过 cache_only GET 查询一条现有译文，不等待远程 API。
-   仅接受 HTTP 200 且完整读取的响应体；非 200（如代理错误页）与截断
-   响应一律视为未命中，避免把错误内容写回翻译文件或共享缓存。
-   成功时 *out 接管响应体，即使内容等于原文也由上层按缓存语义判断。 */
-static int localhost_get_cached_translate(const char *text, char **out) {
-    *out = NULL;
-    if (g_warmup_dump_stdout) return 0; /* 转储模式：一律视为未命中，不回写文件 */
-    char *enc = url_encode_utf8(text);
-    if (!enc) return 0;
+/* 只供缓存回填使用的严格字符串解析：资源扫描的宽松解析器不能用于持久写回。
+   拒绝 NUL（XUnity 行/缓存键采用 C 字符串），完整处理 JSON 转义与代理对。 */
+static char *xunity_lookup_string(const char **pp) {
+    const char *p = json_ws(*pp);
+    if (*p != '"') return NULL;
+    p++;
+    ByteBuf b = {0};
+    if (!bb_init(&b, 64)) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    while (*p && *p != '"') {
+        unsigned char c = (unsigned char)*p++;
+        if (c < 32) goto invalid;
+        if (c != '\\') {
+            if (!xunity_add(&b, (const char *)&c, 1)) goto allocation_failed;
+            continue;
+        }
+        size_t before = b.len, added = 1;
+        char e = *p++;
+        if (e == 'n') bb_ch(&b, '\n');
+        else if (e == 'r') bb_ch(&b, '\r');
+        else if (e == 't') bb_ch(&b, '\t');
+        else if (e == 'b') bb_ch(&b, '\b');
+        else if (e == 'f') bb_ch(&b, '\f');
+        else if (e == '"' || e == '\\' || e == '/') bb_ch(&b, e);
+        else if (e == 'u') {
+            unsigned cp;
+            if (!json_u4(p, &cp) || !cp) goto invalid;
+            p += 4;
+            if (cp >= 0xd800 && cp <= 0xdbff) {
+                unsigned lo;
+                if (p[0] == '\\' && p[1] == 'u' && json_u4(p + 2, &lo) && lo >= 0xdc00 && lo <= 0xdfff) {
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00); p += 6;
+                } else cp = 0xfffd;
+            } else if (cp >= 0xdc00 && cp <= 0xdfff) cp = 0xfffd;
+            added = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+            bb_utf8(&b, cp);
+        } else goto invalid;
+        if (b.len != before + added) goto allocation_failed;
+    }
+    if (*p != '"') goto invalid;
+    *pp = p + 1;
+    return b.data;
+allocation_failed:
+    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+invalid:
+    free(b.data);
+    return NULL;
+}
 
-    ByteBuf path8 = {0};
-    if (!bb_init(&path8, strlen(enc) + 64)) {
-        free(enc);
-        return 0;
-    }
-    bb_add(&path8, "/translate?cache_only=true&text=", 32);
-    bb_add(&path8, enc, strlen(enc));
-    free(enc);
-    WCHAR *path = utf8_to_wide_dup(path8.data);
-    free(path8.data);
-    if (!path) return 0;
+typedef struct {
+    const char *original;
+    size_t original_len;
+    int had_cr, had_lf;
+    char *key, *val, *cached;
+} XUnityLine;
 
-    HINTERNET ses = WinHttpOpen(L"ds-game-translator Launcher/3.1",
-                                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                WINHTTP_NO_PROXY_NAME,
-                                WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses) {
-        free(path);
-        return 0;
+/* /cache/lookup 的固定响应契约为 hits 字符串映射及两个非负整数计数。
+   先验证完整响应再使用任何命中，未知字段、非字符串、尾随垃圾均失败关闭。 */
+static int xunity_lookup_parse(const char *body, XUnityLine *lines, size_t count) {
+    SetLastError(ERROR_INVALID_DATA);
+    const char *p = json_ws(body);
+    int fields = 0;
+    if (*p++ != '{') return 0;
+    for (;;) {
+        char *field = xunity_lookup_string(&p);
+        if (!field) return 0;
+        p = json_ws(p);
+        if (*p++ != ':') { free(field); return 0; }
+        p = json_ws(p);
+        int bit = !strcmp(field, "hits") ? 1 : !strcmp(field, "hit_count") ? 2 : !strcmp(field, "miss_count") ? 4 : 0;
+        free(field);
+        if (!bit) return 0;
+        fields |= bit;
+        if (bit == 1) {
+            /* 与 DstCore.Json 一致，重复字段以最后一个值为准。 */
+            for (size_t i = 0; i < count; i++) { free(lines[i].cached); lines[i].cached = NULL; }
+            if (*p++ != '{') return 0;
+            p = json_ws(p);
+            if (*p != '}') for (;;) {
+                char *key = xunity_lookup_string(&p);
+                if (!key) return 0;
+                p = json_ws(p);
+                if (*p++ != ':') { free(key); return 0; }
+                char *val = xunity_lookup_string(&p);
+                if (!val) { free(key); return 0; }
+                for (size_t i = 0; i < count; i++) {
+                    if (lines[i].key && !strcmp(lines[i].key, key)) {
+                        free(lines[i].cached);
+                        lines[i].cached = dup_range(val, strlen(val));
+                        if (!lines[i].cached) {
+                            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                            free(key); free(val); return 0;
+                        }
+                    }
+                }
+                free(key); free(val);
+                p = json_ws(p);
+                if (*p == '}') break;
+                if (*p++ != ',') return 0;
+            }
+            p++;
+        } else {
+            const char *number = p;
+            if (*p == '-') p++;
+            if (*p < '0' || *p > '9') return 0;
+            if (*p == '0') p++;
+            else while (*p >= '0' && *p <= '9') p++;
+            if (*p == '.') {
+                p++;
+                if (*p < '0' || *p > '9') return 0;
+                while (*p >= '0' && *p <= '9') p++;
+            }
+            if (*p == 'e' || *p == 'E') {
+                p++;
+                if (*p == '+' || *p == '-') p++;
+                if (*p < '0' || *p > '9') return 0;
+                while (*p >= '0' && *p <= '9') p++;
+            }
+            double value = strtod(number, NULL);
+            if (!isfinite(value) || value < 0 || floor(value) != value) return 0;
+        }
+        p = json_ws(p);
+        if (*p == '}') return fields == 7 && !*json_ws(p + 1);
+        if (*p++ != ',') return 0;
     }
-    HINTERNET con = WinHttpConnect(ses, L"127.0.0.1", 19999, 0);
-    if (!con) {
-        WinHttpCloseHandle(ses);
-        free(path);
-        return 0;
+}
+
+/* 合法大译文可能让批响应超过 2 MiB：只对已确认超长的响应二分，不重试网络故障。
+   单键放宽到 64 MiB，覆盖 8 MiB Base64 缓存行解码后的最坏 JSON 六倍转义。
+   此边界无法改变既有缓存大小；拆分本身只限流记一次日志，失败仍保留原行。 */
+static void xunity_lookup_rows(LocalHttp *http, XUnityLine *lines, size_t count) {
+    if (!count || g_warmup_dump_stdout) return;
+    ByteBuf body = {0};
+    if (!bb_init(&body, 4096)) { xunity_lookup_diag(http, L"allocate", 0, ERROR_NOT_ENOUGH_MEMORY); return; }
+    bb_add(&body, "{\"texts\":[", 10);
+    size_t keys = 0;
+    size_t expected = 12;
+    for (size_t i = 0; i < count; i++) {
+        if (!lines[i].key || (*lines[i].val && strcmp(lines[i].key, lines[i].val))) continue;
+        if (keys++) { bb_ch(&body, ','); expected++; }
+        expected += xunity_json_size(lines[i].key);
+        bb_json(&body, lines[i].key);
     }
-    HINTERNET req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
-                                       WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
-    free(path);
-    if (!req) {
-        WinHttpCloseHandle(con);
-        WinHttpCloseHandle(ses);
-        return 0;
+    bb_add(&body, "]}", 2);
+    if (body.len != expected) {
+        xunity_lookup_diag(http, L"allocate", 0, ERROR_NOT_ENOUGH_MEMORY);
+        free(body.data); return;
     }
-    int timeout = 350;
-    WinHttpSetTimeouts(req, timeout, timeout, timeout, timeout);
-    DWORD status = 0;
-    DWORD status_len = sizeof status;
-    int ok = WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-             WinHttpReceiveResponse(req, NULL) &&
-             WinHttpQueryHeaders(req,
-                                 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                 WINHTTP_HEADER_NAME_BY_INDEX,
-                                 &status,
-                                 &status_len,
-                                 WINHTTP_NO_HEADER_INDEX) &&
-             status == 200;
-    char *body = ok ? winhttp_read_all(req) : NULL;
-    WinHttpCloseHandle(req);
-    WinHttpCloseHandle(con);
-    WinHttpCloseHandle(ses);
-    if (!body) return 0;
-    *out = body;
-    return 1;
+    int oversized = 0;
+    char *reply = keys ? xunity_lookup_http(http, body.data, keys == 1, &oversized) : NULL;
+    free(body.data);
+    if (oversized && keys > 1) {
+        if (!http->lookup_split_logged) {
+            http->lookup_split_logged = 1;
+            append_log(L"Unity warmup: cache lookup response exceeded batch limit; splitting lookup batch.");
+        }
+        size_t half = count / 2;
+        xunity_lookup_rows(http, lines, half);
+        xunity_lookup_rows(http, lines + half, count - half);
+    } else if (reply && !xunity_lookup_parse(reply, lines, count)) {
+        DWORD error = GetLastError();
+        xunity_lookup_diag(http, error == ERROR_NOT_ENOUGH_MEMORY ? L"allocate" : L"JSON", 200, error);
+        for (size_t i = 0; i < count; i++) { free(lines[i].cached); lines[i].cached = NULL; }
+    }
+    free(reply);
 }
 
 /* 找到 XUnity 文本行中第一个未转义的 '='，用于分隔原文和译文。 */
@@ -1230,8 +1353,10 @@ static char *xunity_unescape(const char *s) {
 }
 
 /* 按 XUnity 文本格式转义换行、制表符、反斜杠和键值分隔符。 */
-static void xunity_escape_to(ByteBuf *b, const char *s) {
+static int xunity_escape_to(ByteBuf *b, const char *s) {
+    size_t expected = b->len;
     for (const char *p = s; p && *p; p++) {
+        expected += (*p == '\n' || *p == '\r' || *p == '\t' || *p == '=' || *p == '\\') ? 2 : 1;
         if (*p == '\n') bb_add(b, "\\n", 2);
         else if (*p == '\r') bb_add(b, "\\r", 2);
         else if (*p == '\t') bb_add(b, "\\t", 2);
@@ -1242,6 +1367,7 @@ static void xunity_escape_to(ByteBuf *b, const char *s) {
             bb_ch(b, *p);
         }
     }
+    return b->len == expected;
 }
 
 /* 首次修改翻译文件前保留一份固定后缀备份；已有备份不会被覆盖。 */
@@ -1305,10 +1431,12 @@ static int post_import_batch(LocalHttp *http, PairList *l, size_t start, size_t 
     ByteBuf b = {0};
     b.cap = 4096;
     b.data = (char *)malloc(b.cap);
-    if (!b.data) return 0;
+    if (!b.data) { xunity_lookup_diag(http, L"allocate", 0, ERROR_NOT_ENOUGH_MEMORY); return 0; }
     b.data[0] = 0;
     bb_add(&b, "{\"entries\":[", 12);
+    size_t expected = 14;
     for (size_t i = 0; i < count; i++) {
+        expected += (i ? 1 : 0) + 17 + xunity_json_size(l->keys[start + i]) + xunity_json_size(l->vals[start + i]);
         if (i) bb_add(&b, ",", 1);
         bb_add(&b, "{\"key\":", 7);
         bb_json(&b, l->keys[start + i]);
@@ -1317,100 +1445,131 @@ static int post_import_batch(LocalHttp *http, PairList *l, size_t start, size_t 
         bb_add(&b, "}", 1);
     }
     bb_add(&b, "]}", 2);
+    if (b.len != expected) {
+        xunity_lookup_diag(http, L"allocate", 0, ERROR_NOT_ENOUGH_MEMORY);
+        free(b.data); return 0;
+    }
     int ok = local_http_post(http, L"/cache/import", b.data, 1500);
     free(b.data);
     return ok;
 }
 
-/* 解析并按需修补一个 XUnity 翻译文件：
-   已有译文进入 imports，空译文/恒等条目进入 prefetch 且原行保留写回；
-   写回前先创建一次备份。 */
-static void parse_translation_file(const WCHAR *path, PairList *imports, TextList *prefetch) {
+/* 按文件原顺序处理有界窗口，保留 BOM、未改行与各行自己的换行符。
+   限制同时覆盖行数及转义后的请求字节；不会为了批量查询缓存所有文件的候选。 */
+static void parse_translation_file(const WCHAR *path, PairList *imports, TextList *prefetch, LocalHttp *http) {
     char *buf = NULL;
     DWORD size = 0;
     if (!read_file_bytes(path, &buf, &size)) return;
-
     ByteBuf out = {0};
     int changed = 0;
-    if (!bb_init(&out, size + 256)) {
-        free(buf);
-        return;
+    if (!bb_init(&out, (size_t)size + 256)) {
+        xunity_lookup_diag(http, L"allocate", 0, ERROR_NOT_ENOUGH_MEMORY);
+        free(buf); return;
     }
-
     char *p = buf;
     if (size >= 3 && (unsigned char)p[0] == 0xef && (unsigned char)p[1] == 0xbb && (unsigned char)p[2] == 0xbf) {
         bb_add(&out, "\xef\xbb\xbf", 3);
         p += 3;
     }
-
     while (*p) {
-        char *line_start = p;
-        while (*p && *p != '\r' && *p != '\n') p++;
-        size_t line_len = (size_t)(p - line_start);
-        int had_cr = (*p == '\r');
-        if (*p == '\r') p++;
-        int had_lf = (*p == '\n');
-        if (*p == '\n') p++;
-
-        char *work = dup_range(line_start, line_len);
-        if (!work) continue;
-        char *line = trim_ascii(work);
-        int keep_original = 1;
-
-        if (*line && strncmp(line, "//", 2) && *line != '#' && *line != ';') {
-            char *eq = xunity_find_separator(line);
-            if (eq) {
-                *eq = 0;
-                char *raw_key = line;
-                char *raw_val = eq + 1;
-                char *key = xunity_unescape(raw_key);
-                char *val = xunity_unescape(raw_val);
-                if (key && val && *key && should_warm_text(key)) {
-                    if (*val && strcmp(key, val)) {
-                        pairlist_add(imports, key, val);
-                    } else {
-                        char *cached = NULL;
-                        if (localhost_get_cached_translate(key, &cached) &&
-                            cached && *cached && strcmp(cached, key) && should_warm_text(key)) {
-                            xunity_escape_to(&out, key);
-                            bb_ch(&out, '=');
-                            xunity_escape_to(&out, cached);
-                            if (had_cr) bb_ch(&out, '\r');
-                            if (had_lf) bb_ch(&out, '\n');
-                            pairlist_add(imports, key, cached);
-                            keep_original = 0;
-                            changed = 1;
-                        } else {
-                            /* 缓存未命中：只排队待译。空值条目（key=）与恒等
-                               标记（key=key，用户/工具常用的“保持原文”标记）
-                               的原行必须原样写回，不能从翻译文件中删除。 */
-                            textlist_add(prefetch, key);
+        XUnityLine lines[XUNITY_LOOKUP_ITEMS] = {{0}};
+        size_t count = 0, keys = 0;
+        ByteBuf body = {0};
+        if (!bb_init(&body, 4096)) {
+            xunity_lookup_diag(http, L"allocate", 0, ERROR_NOT_ENOUGH_MEMORY);
+            changed = 0; break;
+        }
+        bb_add(&body, "{\"texts\":[", 10);
+        while (*p && count < XUNITY_LOOKUP_ITEMS) {
+            XUnityLine *row = &lines[count];
+            char *start = p;
+            row->original = p;
+            while (*p && *p != '\r' && *p != '\n') p++;
+            size_t line_len = (size_t)(p - start);
+            row->had_cr = *p == '\r';
+            if (row->had_cr) p++;
+            row->had_lf = *p == '\n';
+            if (row->had_lf) p++;
+            row->original_len = (size_t)(p - start);
+            char *work = dup_range(start, line_len);
+            if (work) {
+                char *line = trim_ascii(work);
+                if (*line && strncmp(line, "//", 2) && *line != '#' && *line != ';') {
+                    char *eq = xunity_find_separator(line);
+                    if (eq) {
+                        *eq = 0;
+                        row->key = xunity_unescape(line);
+                        row->val = xunity_unescape(eq + 1);
+                        if (!row->key || !row->val || !*row->key || !should_warm_text(row->key)) {
+                            free(row->key); free(row->val); row->key = row->val = NULL;
                         }
-                        free(cached);
                     }
                 }
-                free(key);
-                free(val);
+                free(work);
             }
+            if (row->key && (!*row->val || !strcmp(row->key, row->val))) {
+                size_t mark = body.len;
+                if (keys) bb_ch(&body, ',');
+                bb_json(&body, row->key);
+                if (body.len != mark + (keys ? 1 : 0) + xunity_json_size(row->key)) {
+                    xunity_lookup_diag(http, L"allocate", 0, ERROR_NOT_ENOUGH_MEMORY);
+                    for (size_t i = 0; i <= count; i++) { free(lines[i].key); free(lines[i].val); }
+                    free(body.data); goto cleanup;
+                }
+                if (body.len + 2 > XUNITY_LOOKUP_BODY_BYTES && keys) {
+                    body.len = mark; body.data[mark] = 0;
+                    free(row->key); free(row->val); row->key = row->val = NULL;
+                    p = start; break;
+                }
+                keys++;
+            }
+            count++;
         }
-
-        if (keep_original) {
-            bb_add(&out, line_start, line_len);
-            if (had_cr) bb_ch(&out, '\r');
-            if (had_lf) bb_ch(&out, '\n');
+        bb_add(&body, "]}", 2);
+        if (keys) xunity_lookup_rows(http, lines, count);
+        free(body.data);
+        TextList misses = {0};
+        int output_ok = 1;
+        for (size_t i = 0; i < count; i++) {
+            XUnityLine *row = &lines[i];
+            if (!output_ok) { free(row->key); free(row->val); free(row->cached); continue; }
+            int replace = 0;
+            if (row->key) {
+                if (*row->val && strcmp(row->key, row->val)) pairlist_add(imports, row->key, row->val);
+                else if (row->cached && *row->cached && strcmp(row->cached, row->key)) {
+                    output_ok = xunity_escape_to(&out, row->key) && xunity_add(&out, "=", 1)
+                        && xunity_escape_to(&out, row->cached)
+                        && (!row->had_cr || xunity_add(&out, "\r", 1))
+                        && (!row->had_lf || xunity_add(&out, "\n", 1));
+                    if (output_ok) {
+                        pairlist_add(imports, row->key, row->cached);
+                        replace = changed = 1;
+                    }
+                } else {
+                    textlist_add(prefetch, row->key);
+                    textlist_add(&misses, row->key);
+                }
+            }
+            if (!replace && output_ok) output_ok = xunity_add(&out, row->original, row->original_len);
+            free(row->key); free(row->val); free(row->cached);
         }
-        free(work);
+        if (!output_ok) {
+            xunity_lookup_diag(http, L"allocate", 0, ERROR_NOT_ENOUGH_MEMORY);
+            textlist_free(&misses); goto cleanup;
+        }
+        /* 旧 cache_only GET 会即刻入队每个 miss，包含最终 8000 条采集上限以外的键。
+           用本窗口有界 /prefetch 保留该副作用；最终就绪后的重发及统计保持原约定。 */
+        if (misses.n && !g_warmup_dump_stdout &&
+            !post_prefetch_batch(http, &misses, 0, misses.n)) {
+            xunity_lookup_diag(http, L"prefetch", 0, GetLastError());
+        }
+        textlist_free(&misses);
     }
-
-    if (changed) {
-        if (backup_once(path) &&
-            !write_file_bytes(path, out.data, (DWORD)out.len)) {
-            append_log(L"Unity warmup: could not update translation file (Windows error %lu).",
-                       GetLastError());
-        }
+    if (changed && backup_once(path) && !write_file_bytes(path, out.data, (DWORD)out.len)) {
+        append_log(L"Unity warmup: could not update translation file (Windows error %lu).", GetLastError());
     }
-    free(out.data);
-    free(buf);
+cleanup:
+    free(out.data); free(buf);
 }
 
 /* ----------------------------------------------------------------
@@ -1419,7 +1578,7 @@ static void parse_translation_file(const WCHAR *path, PairList *imports, TextLis
  * 跳过 XUnity 内部配置文件（_Substitutions / _Preprocessors /
  * _Postprocessors），对其余文件调用 parse_translation_file。
  * ---------------------------------------------------------------- */
-static void scan_text_dir(const WCHAR *dir, PairList *imports, TextList *prefetch) {
+static void scan_text_dir(const WCHAR *dir, PairList *imports, TextList *prefetch, LocalHttp *http) {
     if (!is_dir(dir)) return;
     WCHAR pat[MAX_PATH * 4];
     path_join(pat, MAX_PATH * 4, dir, L"*.txt");
@@ -1435,7 +1594,7 @@ static void scan_text_dir(const WCHAR *dir, PairList *imports, TextList *prefetc
         }
         WCHAR p[MAX_PATH * 4];
         path_join(p, MAX_PATH * 4, dir, fd.cFileName);
-        parse_translation_file(p, imports, prefetch);
+        parse_translation_file(p, imports, prefetch, http);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
@@ -2194,12 +2353,172 @@ static void scan_rpgm_external_texts(const WCHAR *content_root, TextList *prefet
     scan_rpgm_external_text_dir(content_root, prefetch, 0);
 }
 
+/* 只跳过 JSON 值，不执行插件 JavaScript。生成的 plugins.js 以 JSON 数组赋给
+   $plugins；如果文件损坏或格式不符，记录诊断并继续扫描 data/，不把错误当作成功预热。 */
+static const char *rpgm_plugin_value_end(const char *p, const char *end) {
+    if (p >= end) return NULL;
+    if (*p == '"') {
+        for (p++; p < end; p++) {
+            if (*p == '\\') { if (++p >= end) return NULL; }
+            else if (*p == '"') return p + 1;
+        }
+        return NULL;
+    }
+    if (*p == '{' || *p == '[') {
+        char stack[32];
+        int depth = 0;
+        do {
+            if (p >= end || !*p) return NULL;
+            if (*p == '"') {
+                p = rpgm_plugin_value_end(p, end);
+                if (!p) return NULL;
+                continue;
+            }
+            if (*p == '{' || *p == '[') {
+                if (depth >= (int)sizeof stack) return NULL;
+                stack[depth++] = *p;
+            } else if (*p == '}' || *p == ']') {
+                if (!depth || (*p == '}' && stack[depth - 1] != '{') ||
+                    (*p == ']' && stack[depth - 1] != '[')) return NULL;
+                depth--;
+            }
+            p++;
+        } while (depth);
+        return p;
+    }
+    while (p < end && *p != ',' && *p != '}' && *p != ']' &&
+           *p != ' ' && *p != '\r' && *p != '\n' && *p != '\t') p++;
+    return p;
+}
+
+static int rpgm_plugin_ui_key(const char *key) {
+    char lower[128];
+    size_t n = strlen(key);
+    if (!n || n >= sizeof lower || key[0] == '-') return 0;
+    for (size_t i = 0; i <= n; i++) {
+        char c = key[i];
+        lower[i] = c >= 'A' && c <= 'Z' ? (char)(c + 'a' - 'A') : c;
+    }
+    if (strstr(lower, "filename") || strstr(lower, "file name") ||
+        strstr(lower, "script") || strstr(lower, "formula") ||
+        strstr(lower, "path") || strstr(lower, "variable") ||
+        !strncmp(lower, "web ", 4) || !strncmp(lower, "local ", 6)) return 0;
+    const char *ui[] = {"help", "command", "text", "message", "title", "label",
+                        "name", "playtime", "count", "confirm", "format",
+                        "vocab", "caption", "tooltip", "prompt", "description"};
+    for (size_t i = 0; i < sizeof ui / sizeof ui[0]; i++)
+        if (strstr(lower, ui[i])) return 1;
+    return 0;
+}
+
+static int rpgm_plugin_ui_value(const char *value) {
+    const char *p = value;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '{' || *p == '[' || *p == '<' ||
+        !strncmp(p, "function", 8) || !strncmp(p, "this.", 5) ||
+        strstr(p, "=>") || strstr(p, ".rpgsave")) return 0;
+    return should_warm_rpgm_text(value);
+}
+
+static int rpgm_plugin_parameters(const char *begin, const char *end, TextList *prefetch) {
+    const char *p = begin + 1;
+    while (p < end && *json_ws(p) != '}') {
+        p = json_ws(p);
+        if (*p != '"') return 0;
+        char *key = json_string_at(&p);
+        if (!key || *(p = json_ws(p)) != ':') { free(key); return 0; }
+        const char *value = json_ws(p + 1);
+        const char *next = rpgm_plugin_value_end(value, end);
+        if (!next || next == value) { free(key); return 0; }
+        if (*value == '"' && rpgm_plugin_ui_key(key)) {
+            const char *v = value;
+            char *text = json_string_at(&v);
+            if (text) {
+                if (rpgm_plugin_ui_value(text)) collect_string(text, prefetch);
+                free(text);
+            }
+        }
+        free(key);
+        p = json_ws(next);
+        if (*p == ',') p++;
+        else if (*p != '}') return 0;
+        if (prefetch->n >= textlist_limit(prefetch)) break;
+    }
+    return 1;
+}
+
+static int rpgm_plugin_record(const char *begin, const char *end, TextList *prefetch) {
+    const char *p = begin + 1, *parameters = NULL, *parameters_end = NULL;
+    int enabled = 0;
+    while (p < end && *json_ws(p) != '}') {
+        p = json_ws(p);
+        if (*p != '"') return 0;
+        char *key = json_string_at(&p);
+        if (!key || *(p = json_ws(p)) != ':') { free(key); return 0; }
+        const char *value = json_ws(p + 1);
+        const char *next = rpgm_plugin_value_end(value, end);
+        if (!next || next == value) { free(key); return 0; }
+        if (!strcmp(key, "status") && next - value == 4 && !memcmp(value, "true", 4)) enabled = 1;
+        if (!strcmp(key, "parameters") && *value == '{') {
+            parameters = value;
+            parameters_end = next;
+        }
+        free(key);
+        p = json_ws(next);
+        if (*p == ',') p++;
+        else if (*p != '}') return 0;
+    }
+    return !enabled || !parameters || rpgm_plugin_parameters(parameters, parameters_end, prefetch);
+}
+
+static void scan_rpgm_plugin_parameters(const WCHAR *content_root, TextList *prefetch) {
+    WCHAR js[MAX_PATH * 4], path[MAX_PATH * 4];
+    path_join(js, MAX_PATH * 4, content_root, L"js");
+    path_join(path, MAX_PATH * 4, js, L"plugins.js");
+    DWORD attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return;
+    if (!file_size_at_most(path, RPGM_PLUGIN_SCAN_MAX_BYTES)) {
+        append_log(L"RPGM 插件参数预热跳过：plugins.js 超过 8 MiB 上限。");
+        return;
+    }
+    char *buf = NULL;
+    DWORD size = 0;
+    if (!read_file_bytes(path, &buf, &size)) {
+        append_log(L"RPGM 插件参数预热失败：无法读取 plugins.js。");
+        return;
+    }
+    const char *p = buf, *end = buf + size;
+    if (size >= 3 && (unsigned char)p[0] == 0xef && (unsigned char)p[1] == 0xbb &&
+        (unsigned char)p[2] == 0xbf) p += 3;
+    const char *marker = strstr(p, "var $plugins");
+    if (!marker || !(p = strchr(marker, '=')) || !(p = strchr(p, '['))) {
+        append_log(L"RPGM 插件参数预热跳过：plugins.js 不是预期的生成格式。");
+        free(buf);
+        return;
+    }
+    p++;
+    int valid = 1;
+    while (p < end && *(p = json_ws(p)) != ']') {
+        if (*p != '{') { valid = 0; break; }
+        const char *next = rpgm_plugin_value_end(p, end);
+        if (!next || !rpgm_plugin_record(p, next, prefetch)) { valid = 0; break; }
+        p = json_ws(next);
+        if (*p == ',') p++;
+        else if (*p != ']') { valid = 0; break; }
+        if (prefetch->n >= textlist_limit(prefetch)) break;
+    }
+    if (!valid || p >= end)
+        append_log(L"RPGM 插件参数预热未完成：plugins.js 格式不完整或不受支持。");
+    free(buf);
+}
+
 void warmup_scan_rpgm_resources(const WCHAR *dir, TextList *prefetch) {
     WCHAR content_root[MAX_PATH * 4];
     if (!dir || !prefetch ||
         !rpgm_content_root(dir, content_root, MAX_PATH * 4)) {
         return;
     }
+    scan_rpgm_plugin_parameters(content_root, prefetch);
     scan_rpgm_external_texts(content_root, prefetch);
     scan_rpgm_data_dir(content_root, prefetch);
 }
@@ -2215,6 +2534,7 @@ void warmup_scan_rpgm_resources(const WCHAR *dir, TextList *prefetch) {
  * 3. 等待服务器就绪后，批量导入已有翻译 + 批量提交待翻译文本
  * ---------------------------------------------------------------- */
 static void warmup_xunity(const WCHAR *dir) {
+    LocalHttp http = {0};
     PairList imports = {0};
     TextList prefetch = {0};
     prefetch.max_items = UNITY_WARMUP_MAX_ITEMS;
@@ -2226,15 +2546,18 @@ static void warmup_xunity(const WCHAR *dir) {
     for (size_t i = 0; i < sizeof(rels) / sizeof(rels[0]); i++) {
         WCHAR p[MAX_PATH * 4];
         path_join(p, MAX_PATH * 4, dir, rels[i]);
-        scan_text_dir(p, &imports, &prefetch);
+        scan_text_dir(p, &imports, &prefetch, &http);
     }
 
     scan_unity_assets(dir, &prefetch);
+    if (prefetch.n >= textlist_limit(&prefetch))
+        append_log(L"预热扫描达到 %zu 条上限，部分资源文本可能未预热。", textlist_limit(&prefetch));
+    if (imports.n >= WARMUP_MAX_ITEMS)
+        append_log(L"已有译文导入达到 %u 条上限，部分条目可能未导入本地缓存。", (unsigned)WARMUP_MAX_ITEMS);
 
     size_t imported = 0;
     size_t queued = 0;
-    LocalHttp http = {0};
-    if ((imports.n || prefetch.n) && local_http_open(&http)) {
+    if ((imports.n || prefetch.n) && (http.con || local_http_open(&http))) {
         if (local_http_wait_ready(&http, 8000)) {
             for (size_t i = 0; i < imports.n; i += WARMUP_BATCH_ITEMS) {
                 size_t n = imports.n - i;
@@ -2249,8 +2572,8 @@ static void warmup_xunity(const WCHAR *dir) {
         } else {
             append_log(L"预热跳过：本地服务端未及时就绪。");
         }
-        local_http_close(&http);
     }
+    local_http_close(&http);
 
     if (imported || queued) {
         append_log(L"预热翻译缓存：导入 %zu 条，后台排队 %zu 条。", imported, queued);
@@ -2370,6 +2693,8 @@ static void warmup_rpgm(const WCHAR *dir) {
     TextList prefetch = {0};
     prefetch.max_items = RPGM_WARMUP_MAX_ITEMS;
     warmup_scan_rpgm_resources(dir, &prefetch);
+    if (prefetch.n >= textlist_limit(&prefetch))
+        append_log(L"预热扫描达到 %zu 条上限，部分资源文本可能未预热。", textlist_limit(&prefetch));
     size_t queued = post_prefetch_all(&prefetch);
     if (queued) append_log(L"RPGM 预热翻译缓存：后台排队 %zu 条。", queued);
     textlist_free(&prefetch);
@@ -2381,6 +2706,8 @@ static void warmup_godot(const WCHAR *dir) {
     /* 扫描资源，为通用运行时 sidecar 和外部补丁包准备文本。原始 .pck 与编译
        资源始终只作为只读输入。 */
     warmup_scan_godot_resources(dir, &prefetch);
+    if (prefetch.n >= textlist_limit(&prefetch))
+        append_log(L"预热扫描达到 %zu 条上限，部分资源文本可能未预热。", textlist_limit(&prefetch));
     size_t queued = post_prefetch_all(&prefetch);
     if (queued) append_log(L"Godot preheated translation cache: queued %zu texts.", queued);
     textlist_free(&prefetch);
@@ -2393,6 +2720,8 @@ static void warmup_renpy(const WCHAR *dir) {
     WCHAR game[MAX_PATH * 4];
     path_join(game, MAX_PATH * 4, dir, L"game");
     scan_renpy_script_dir(game, &prefetch, 0);
+    if (prefetch.n >= textlist_limit(&prefetch))
+        append_log(L"预热扫描达到 %zu 条上限，部分资源文本可能未预热。", textlist_limit(&prefetch));
     size_t queued = post_prefetch_all(&prefetch);
     if (queued) append_log(L"Ren'Py preheated translation cache: queued %zu texts.", queued);
     textlist_free(&prefetch);

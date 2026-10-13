@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using DstCore;
@@ -92,7 +93,7 @@ namespace DstLauncher
             return ByteStr.CStr(b);
         }
 
-        /* xunity_escape_to */
+        /* XUnity 文本转义，对应 xunity_escape_to */
         private static void XunityEscapeTo(StringBuilder b, string s)
         {
             for (int i = 0; s != null && i < s.Length; i++) {
@@ -125,14 +126,66 @@ namespace DstLauncher
             return false;
         }
 
-        /* parse_translation_file：已有译文进 imports；空值/恒等条目查缓存回写或排队，原行保留。 */
-        private static void ParseTranslationFile(string path, PairList imports, TextList prefetch)
+        private sealed class XunityLine
+        {
+            public int Start, Length;
+            public bool HadCr, HadLf;
+            public string Key, Val, Cached;
+        }
+
+        /* 只对确认超长的响应拆分；单键 64 MiB 覆盖缓存行 8 MiB 的最坏 JSON 转义。
+           与 C 版一致，网络/JSON 故障不会触发重试；拆分限流记日志，失败保留原行。 */
+        private static void LookupXunityRows(LocalHttp http, List<XunityLine> rows, int start, int count)
+        {
+            if (DumpSink != null || count == 0) return;
+            var body = new StringBuilder("{\"texts\":[");
+            int keys = 0;
+            for (int i = start; i < start + count; i++) {
+                var row = rows[i];
+                if (row.Key == null || (row.Val.Length > 0 && row.Key != row.Val)) continue;
+                if (keys++ > 0) body.Append(',');
+                AppendJson(body, row.Key);
+            }
+            body.Append("]}");
+            if (keys == 0) return;
+            bool oversized;
+            var hits = http.Lookup(ByteStr.ToBytes(body.ToString()), keys == 1, out oversized);
+            if (oversized && keys > 1) {
+                http.LookupSplitDiagnostic();
+                int half = count / 2;
+                LookupXunityRows(http, rows, start, half);
+                LookupXunityRows(http, rows, start + half, count - half);
+            } else if (hits != null) {
+                for (int i = start; i < start + count; i++) {
+                    if (rows[i].Key != null) hits.TryGetValue(rows[i].Key, out rows[i].Cached);
+                }
+            }
+        }
+
+        /* 内存不足只能在局部编码边界处理，输入扫描器无法修复系统分配失败。
+           失败缓冲不得回填；调用者保留原文件，限流记录分配阶段，避免隐藏错误。 */
+        private static bool AppendXunityRow(StringBuilder output, byte[] source, XunityLine row, string cached, LocalHttp http)
+        {
+            try {
+                if (cached == null) output.Append(ByteStr.FromBytes(source, row.Start, row.Length));
+                else {
+                    XunityEscapeTo(output, row.Key); output.Append('='); XunityEscapeTo(output, cached);
+                    if (row.HadCr) output.Append('\r');
+                    if (row.HadLf) output.Append('\n');
+                }
+                return true;
+            } catch (OutOfMemoryException) {
+                http.LookupDiagnostic("allocate", 0, 8);
+                return false;
+            }
+        }
+
+        /* 按原顺序处理窗口：最多 128 行且转义后请求最多 64 KiB；保持未改行原始字节。 */
+        private static void ParseTranslationFile(string path, PairList imports, TextList prefetch, LocalHttp http)
         {
             byte[] buf = SafeFs.ReadBytes(path);
             if (buf == null) return;
-            int size = buf.Length;
-            int end = ByteStr.CStrLen(buf);
-
+            int size = buf.Length, end = ByteStr.CStrLen(buf);
             var outText = new StringBuilder(size + 256);
             bool changed = false;
             int p = 0;
@@ -140,59 +193,71 @@ namespace DstLauncher
                 outText.Append((char)0xef).Append((char)0xbb).Append((char)0xbf);
                 p += 3;
             }
-
             while (p < end) {
-                int lineStart = p;
-                while (p < end && buf[p] != '\r' && buf[p] != '\n') p++;
-                int lineLen = p - lineStart;
-                bool hadCr = ByteStr.At(buf, end, p) == '\r';
-                if (hadCr) p++;
-                bool hadLf = ByteStr.At(buf, end, p) == '\n';
-                if (hadLf) p++;
-
-                string work = ByteStr.FromBytes(buf, lineStart, lineLen);
-                string line = ByteStr.Trim(work);
-                bool keepOriginal = true;
-
-                if (line.Length > 0 && !line.StartsWith("//", StringComparison.Ordinal) && line[0] != '#' && line[0] != ';') {
-                    int eq = XunityFindSeparator(line);
-                    if (eq >= 0) {
-                        string key = XunityUnescape(line.Substring(0, eq));
-                        string val = XunityUnescape(line.Substring(eq + 1));
-                        if (key.Length > 0 && ShouldWarmText(key)) {
-                            if (val.Length > 0 && key != val) {
-                                imports.Add(key, val);
+                var lines = new List<XunityLine>(128);
+                var body = new StringBuilder("{\"texts\":[");
+                int keys = 0;
+                while (p < end && lines.Count < 128) {
+                    var row = new XunityLine { Start = p };
+                    while (p < end && buf[p] != '\r' && buf[p] != '\n') p++;
+                    int lineLen = p - row.Start;
+                    row.HadCr = ByteStr.At(buf, end, p) == '\r';
+                    if (row.HadCr) p++;
+                    row.HadLf = ByteStr.At(buf, end, p) == '\n';
+                    if (row.HadLf) p++;
+                    row.Length = p - row.Start;
+                    string line = ByteStr.Trim(ByteStr.FromBytes(buf, row.Start, lineLen));
+                    if (line.Length > 0 && !line.StartsWith("//", StringComparison.Ordinal) && line[0] != '#' && line[0] != ';') {
+                        int eq = XunityFindSeparator(line);
+                        if (eq >= 0) {
+                            row.Key = XunityUnescape(line.Substring(0, eq));
+                            row.Val = XunityUnescape(line.Substring(eq + 1));
+                            if (row.Key.Length == 0 || !ShouldWarmText(row.Key)) row.Key = row.Val = null;
+                        }
+                    }
+                    if (row.Key != null && (row.Val.Length == 0 || row.Key == row.Val)) {
+                        int mark = body.Length;
+                        if (keys > 0) body.Append(',');
+                        AppendJson(body, row.Key);
+                        if (body.Length + 2 > 64 * 1024 && keys > 0) {
+                            body.Length = mark; p = row.Start; break;
+                        }
+                        keys++;
+                    }
+                    lines.Add(row);
+                }
+                body.Append("]}");
+                if (keys > 0) LookupXunityRows(http, lines, 0, lines.Count);
+                var misses = new TextList();
+                foreach (var row in lines) {
+                    bool replace = false;
+                    if (row.Key != null) {
+                        if (row.Val.Length > 0 && row.Key != row.Val) imports.Add(row.Key, row.Val);
+                        else {
+                            string cached = row.Cached;
+                            if (!string.IsNullOrEmpty(cached) && cached != row.Key) {
+                                if (!AppendXunityRow(outText, buf, row, cached, http)) return;
+                                imports.Add(row.Key, cached);
+                                replace = changed = true;
                             } else {
-                                string cached;
-                                if (LocalHttp.GetCachedTranslate(key, out cached) &&
-                                    !string.IsNullOrEmpty(cached) && cached != key && ShouldWarmText(key)) {
-                                    XunityEscapeTo(outText, key);
-                                    outText.Append('=');
-                                    XunityEscapeTo(outText, cached);
-                                    if (hadCr) outText.Append('\r');
-                                    if (hadLf) outText.Append('\n');
-                                    imports.Add(key, cached);
-                                    keepOriginal = false;
-                                    changed = true;
-                                } else {
-                                    /* 缓存未命中：只排队待译。空值条目（key=）与恒等标记（key=key）
-                                       的原行必须原样写回，不能从翻译文件中删除。 */
-                                    prefetch.Add(key);
-                                }
+                                prefetch.Add(row.Key);
+                                misses.Add(row.Key);
                             }
                         }
                     }
+                    if (!replace && !AppendXunityRow(outText, buf, row, null, http)) return;
                 }
-
-                if (keepOriginal) {
-                    outText.Append(work);
-                    if (hadCr) outText.Append('\r');
-                    if (hadLf) outText.Append('\n');
+                /* 保留旧 GET cache_only 对所有 miss 的即时入队（含最终 8000 条上限以外）。
+                   最终就绪后的原预热顺序、重发和计数不变；诊断转储仍不联网且一律未命中。 */
+                if (misses.Count > 0 && DumpSink == null &&
+                    !http.Post(Contract.PathPrefetch, BuildPrefetchBody(misses, 0, misses.Count), 1500)) {
+                    http.LookupDiagnostic("prefetch", 0, 0);
                 }
             }
-
             if (changed) {
-                byte[] bytes = ByteStr.ToBytes(outText.ToString());
+                byte[] bytes;
+                try { bytes = ByteStr.ToBytes(outText.ToString()); }
+                catch (OutOfMemoryException) { http.LookupDiagnostic("allocate", 0, 8); return; }
                 if (BackupOnce(path) && !SafeFs.WriteBytes(path, bytes, bytes.Length)) {
                     Log.Append("Unity warmup: could not update translation file (Windows error " + SafeFs.LastError + ").");
                 }
@@ -200,7 +265,7 @@ namespace DstLauncher
         }
 
         /* scan_text_dir：目录下的 *.txt，跳过 XUnity 自身的 _Substitutions/_Preprocessors/_Postprocessors。 */
-        private static void ScanTextDir(string dir, PairList imports, TextList prefetch)
+        private static void ScanTextDir(string dir, PairList imports, TextList prefetch, LocalHttp http)
         {
             if (!PathUtil.IsDir(dir)) return;
             var files = Win32Find.EnumerateOrNull(dir, "*.txt");
@@ -212,13 +277,13 @@ namespace DstLauncher
                     PathUtil.EqualsNoCase(fd.Name, "_Postprocessors.txt")) {
                     continue;
                 }
-                ParseTranslationFile(PathUtil.Join(dir, fd.Name), imports, prefetch);
+                ParseTranslationFile(PathUtil.Join(dir, fd.Name), imports, prefetch, http);
             }
         }
 
         /* ---------------- Unity 资源文件 ---------------- */
 
-        /* unity_asset_file_name：resources.assets / globalgamemanagers / sharedassets*.assets / level<N>。 */
+        /* Unity 资源文件名判定 unity_asset_file_name：resources.assets / globalgamemanagers / sharedassets*.assets / level<N>。 */
         private static bool UnityAssetFileName(string name)
         {
             if (PathUtil.EqualsNoCase(name, "resources.assets") || PathUtil.EqualsNoCase(name, "globalgamemanagers")) {
@@ -540,6 +605,7 @@ namespace DstLauncher
         /* warmup_xunity：翻译目录 + 资源扫描，就绪后先导入再预热。 */
         private static void WarmupXunity(string dir)
         {
+            var http = new LocalHttp();
             var imports = new PairList();
             var prefetch = new TextList { MaxItems = UnityMaxItems };
             string[] rels = {
@@ -548,19 +614,25 @@ namespace DstLauncher
                 "AutoTranslator\\Translation\\zh-CN\\Text"
             };
             foreach (string rel in rels) {
-                ScanTextDir(PathUtil.Join(dir, rel), imports, prefetch);
+                ScanTextDir(PathUtil.Join(dir, rel), imports, prefetch, http);
             }
 
             ScanUnityAssets(dir, prefetch);
+            if (prefetch.Full)
+                Log.Append("预热扫描达到 " + prefetch.Limit + " 条上限，部分资源文本可能未预热。");
+            if (imports.Count >= MaxItems)
+                Log.Append("已有译文导入达到 " + MaxItems + " 条上限，部分条目可能未导入本地缓存。");
 
             int imported = 0;
             int queued = 0;
-            var http = new LocalHttp();
             if ((imports.Count > 0 || prefetch.Count > 0) && http.Open()) {
                 if (http.WaitReady(8000)) {
                     for (int i = 0; i < imports.Count; i += BatchItems) {
                         int n = Math.Min(BatchItems, imports.Count - i);
-                        if (http.Post(Contract.PathCacheImport, BuildImportBody(imports, i, n), 1500)) imported += n;
+                        byte[] body;
+                        try { body = BuildImportBody(imports, i, n); }
+                        catch (OutOfMemoryException) { http.LookupDiagnostic("allocate", 0, 8); break; }
+                        if (http.Post(Contract.PathCacheImport, body, 1500)) imported += n;
                     }
                     for (int i = 0; i < prefetch.Count; i += BatchItems) {
                         int n = Math.Min(BatchItems, prefetch.Count - i);
@@ -569,8 +641,8 @@ namespace DstLauncher
                 } else {
                     Log.Append("预热跳过：本地服务端未及时就绪。");
                 }
-                http.Close();
             }
+            http.Close();
 
             if (imported > 0 || queued > 0) {
                 Log.Append("预热翻译缓存：导入 " + imported + " 条，后台排队 " + queued + " 条。");

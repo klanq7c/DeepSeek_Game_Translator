@@ -26,7 +26,8 @@
 ;
 [api]
 endpoint=https://api.deepseek.com/v1/chat/completions
-model=deepseek-v4-flash
+; DeepSeek V4.1 Flash 的官方 API ID；更多模型可在启动器中点击“刷新模型”。
+model=deepseek-flash
 key=YOUR_API_KEY_HERE
 timeout_ms=15000
 concurrency=4

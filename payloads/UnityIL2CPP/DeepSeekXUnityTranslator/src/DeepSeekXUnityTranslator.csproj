@@ -19,6 +19,8 @@
   <ItemGroup>
     <Compile Include="..\..\..\..\native\src\core\TextRules.cs" Link="core\TextRules.cs" />
     <Compile Include="..\..\..\..\native\src\core\Contract.cs" Link="core\Contract.cs" />
+    <Compile Include="..\..\..\..\native\src\core\Json.cs" Link="core\Json.cs" />
+    <Compile Include="..\..\..\UnityTranslator\src\TmpRichText.cs" Link="renderer\TmpRichText.cs" />
   </ItemGroup>
 
   <ItemGroup>

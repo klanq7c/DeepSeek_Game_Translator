@@ -61,7 +61,7 @@ namespace DstCoreTests
             return 0;
         }
 
-        /* ---------------- TextRules（util.c / http.c） ---------------- */
+        /* ---------------- 文本规则 TextRules（util.c / http.c） ---------------- */
         private static void TextRulesTests()
         {
             // has_translation_signal：ASCII 字母或任何非 ASCII
@@ -81,7 +81,7 @@ namespace DstCoreTests
             Check("cjk: U+9FA6.. still in range", TextRules.HasCjk("\u9fa6"));
             Check("cjk: U+A000 out of range", !TextRules.HasCjk("\ua000"));
 
-            // should_translate_text
+            // 文本可翻译性：should_translate_text
             Check("should: english yes", TextRules.ShouldTranslate("Start Game"));
             Check("should: japanese yes (non-ascii signal, no han)", TextRules.ShouldTranslate("はじめる"));
             Check("should: chinese no", !TextRules.ShouldTranslate("开始游戏"));
@@ -89,7 +89,7 @@ namespace DstCoreTests
             Check("should: numbers no", !TextRules.ShouldTranslate("100%"));
             Check("should: empty no", !TextRules.ShouldTranslate(""));
 
-            // is_resolved_translation
+            // 译文完成判定：is_resolved_translation
             Check("resolved: different", TextRules.IsResolvedTranslation("Hello", "你好"));
             Check("resolved: identity is not success", !TextRules.IsResolvedTranslation("Hello", "Hello"));
             Check("resolved: empty translated", !TextRules.IsResolvedTranslation("Hello", ""));
@@ -138,9 +138,16 @@ namespace DstCoreTests
             Eq("fence: unclosed <<< kept", "<<< 你好", TextRules.NormalizeTranslation("<<< 你好"));
         }
 
-        /* ---------------- Json（json.c） ---------------- */
+        /* ---------------- JSON 处理 Json（json.c） ---------------- */
         private static void JsonTests()
         {
+            Throws<Json.ParseException>("catalog strict duplicate rejected", () => Json.ParseStrict("{\"has_more\":true,\"has_more\":true}"));
+            foreach (var number in new[] { "01", "+1", ".1", "1.", "-01", "1e" })
+                Throws<Json.ParseException>("catalog strict number " + number, () => Json.ParseStrict(number));
+            Check("catalog strict valid exponent", Json.ParseStrict("-1.25e+2") != null);
+            Check("catalog strict nesting boundary", Json.ParseStrict(new string('[', 64) + "0" + new string(']', 64)) != null);
+            Throws<Json.ParseException>("catalog strict depth rejected", () => Json.ParseStrict(new string('[', 65) + "0" + new string(']', 65)));
+
             var dom = Json.Parse("{\"texts\":[\"a\",\"b\"],\"cache_only\":true,\"n\":1.5,\"z\":null,\"s\":\"\\u4f60\\n\"}");
             var top = Json.TopObject(dom);
             Check("json: top object", top != null);
@@ -174,7 +181,7 @@ namespace DstCoreTests
             Eq("json roundtrip", sample, (string)Json.Parse(Json.Escape(sample)));
         }
 
-        /* ---------------- CacheCodec（cache.c） ---------------- */
+        /* ---------------- 缓存编解码 CacheCodec（cache.c） ---------------- */
         private static void CacheCodecTests()
         {
             Eq("codec: accept normal", "你好", CacheCodec.NormalizeForStore("Hello", "你好"));
@@ -211,7 +218,7 @@ namespace DstCoreTests
             Check("codec: standard alphabet with padding", CacheCodec.EncodeLine("a", "b") == "YQ==\tYg==\n");
         }
 
-        /* ---------------- Contract ---------------- */
+        /* ---------------- 共享契约 Contract ---------------- */
         private static void ContractTests()
         {
             Check("contract: resolved cache", Contract.IsResolvedSource(Contract.SourceCache));

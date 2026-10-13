@@ -200,6 +200,8 @@ namespace DstLauncher
         {
             var prefetch = new TextList { MaxItems = RenpyMaxItems };
             ScanRenpyScriptDir(PathUtil.Join(dir, "game"), prefetch, 0);
+            if (prefetch.Full)
+                Log.Append("预热扫描达到 " + prefetch.Limit + " 条上限，部分资源文本可能未预热。");
             int queued = PostPrefetchAll(prefetch);
             if (queued > 0) Log.Append("Ren'Py preheated translation cache: queued " + queued + " texts.");
         }

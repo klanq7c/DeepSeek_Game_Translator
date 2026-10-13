@@ -18,7 +18,7 @@ void refresh_server_status(void);
 /* 启动本地 C 服务器子进程；如果已运行则复用 */
 int start_server(void);
 
-/* 通过 /shutdown 端点优雅停止服务器，超时则强制终止 */
+/* 通过 /shutdown 优雅停止；仅强制终止自有进程。外部服务超时仍响应时保留运行状态。 */
 void stop_server(void);
 
 /* 根据当前状态切换服务器运行/停止 */

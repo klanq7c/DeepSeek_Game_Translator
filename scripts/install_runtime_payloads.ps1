@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$UnityMono5,
     [switch]$UnityMono6,
     [switch]$UnityMonoCorlib,
@@ -238,10 +238,10 @@ function Install-MonoCorlib {
         "mono-6.12.0.206-x64-0.msi" `
         $sourceUrl `
         $sourceSha256
-    # Windows Installer still applies a legacy path limit while expanding this
-    # MSI's deeply nested portable-framework files. Keep only this owned
-    # administrative image under a short system-temp child, then copy the
-    # fixed corlib allowlist back into the program directory.
+    # Windows Installer 展开此 MSI 内层级较深的可移植框架文件时，
+    # 仍受旧版路径长度限制。仅将本次拥有的管理安装映像
+    # 放在系统临时目录下的短路径子目录中，再将
+    # 固定白名单内的 corlib 文件复制回程序目录。
     $temporaryRoot = Get-FullPath ([System.IO.Path]::GetTempPath())
     $temporary = Join-Path $temporaryRoot ("dst-mono-" + [Guid]::NewGuid().ToString("N").Substring(0, 12))
     $diagnosticLog = Join-Path $DownloadCache "mono-admin-extract.log"

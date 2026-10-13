@@ -1,18 +1,20 @@
-# check_payload_scripts.ps1 -- static checks for the engine runtime scripts that
-# build_native.bat embeds into the launcher (resource.h 301-304) and that
-# deploy.c / godot_patch.c write verbatim into game directories.
+﻿# check_payload_scripts.ps1：检查由 build_native.bat 嵌入启动器的
+# 引擎运行时脚本（resource.h 301-304）；这些脚本由
+# deploy.c / godot_patch.c 原样写入游戏目录。
 #
-# Guards:
-#   * byte hygiene: UTF-8 without BOM, LF only, no NUL (a NUL would truncate the
-#     C string write path), trailing newline
-#   * syntax: Ren'Py hook body parses as Python (Python 3 AST) and avoids
-#     Python-3-only syntax (Ren'Py 7 still ships Python 2.7); RPG Maker hook
-#     passes `node --check`
-#   * Godot: the text anchors godot_patch.c rewrites are present exactly once
-#   * server contract: every endpoint a script calls is routed by BOTH the C
-#     server (http.c) and the C# server (Program.cs)
+# 检查内容：
+#   * 字节规范：UTF-8 无 BOM、仅使用 LF、无 NUL（NUL 会截断
+#     C 字符串写入路径），文件末尾有换行。
+#   * 语法：Ren'Py 钩子主体可由 Python 3 AST 解析，且不使用
+#     Python 3 专属语法（Ren'Py 7 仍使用 Python 2.7）；RPG Maker 钩子
+#     通过 `node --check` 检查。
+#   * Ren'Py 队列行为：有界轮询选择、优先级/重试/处理中状态语义，
+#     以及共享服务器未完成的响应仍保持待处理状态。
+#   * Godot：godot_patch.c 所替换的文本锚点必须各出现一次。
+#   * 服务器契约：脚本调用的每个端点，都必须由 C 服务器（http.c）
+#     和 C# 服务器（Program.cs）同时提供路由。
 #
-# Usage: powershell -NoProfile -ExecutionPolicy Bypass -File tests\payload_scripts\check_payload_scripts.ps1
+# 用法：powershell -NoProfile -ExecutionPolicy Bypass -File tests\payload_scripts\check_payload_scripts.ps1
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $failures = New-Object System.Collections.Generic.List[string]
@@ -30,7 +32,7 @@ $scripts = @(
     @{ Id = 304; Path = 'payloads\Godot\dst_godot_runtime_g4.gd';  Kind = 'gd4' }
 )
 
-# --- resource table consistency: resource.h, build_native.bat, verify_build_artifacts.ps1 ---
+# --- 资源表一致性：resource.h、build_native.bat、verify_build_artifacts.ps1 ---
 $resourceH = Get-Content (Join-Path $repo 'native\src\launcher\resource.h') -Raw -Encoding UTF8
 $buildBat = Get-Content (Join-Path $repo 'build_native.bat') -Raw -Encoding UTF8
 $verifyPs = Get-Content (Join-Path $repo 'scripts\verify_build_artifacts.ps1') -Raw -Encoding UTF8
@@ -41,7 +43,7 @@ foreach ($s in $scripts) {
     Check "resource $($s.Id) verified by verify_build_artifacts.ps1" ($verifyPs.Contains("$($s.Id) (Join-Path `$repo `"$($s.Path)`")"))
 }
 
-# --- byte hygiene ---
+# --- 字节规范 ---
 $bytesByPath = @{}
 foreach ($s in $scripts) {
     $full = Join-Path $repo $s.Path
@@ -58,7 +60,7 @@ foreach ($s in $scripts) {
 
 function Get-Utf8Text([string]$rel) { return [Text.Encoding]::UTF8.GetString($bytesByPath[$rel]) }
 
-# --- Ren'Py hook: Python syntax of the init block body ---
+# --- Ren'Py 钩子：初始化块主体的 Python 语法 ---
 $renpyRel = 'payloads\RenPy\iron_deepseek.rpy'
 $renpy = Get-Utf8Text $renpyRel
 $renpyLines = $renpy.Split("`n")
@@ -80,10 +82,25 @@ if ($python) {
         $out = & python -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read(), sys.argv[1]); print('parsed')" $tmp 2>&1
         Check "renpy: hook body parses as Python" ($LASTEXITCODE -eq 0 -and "$out" -match 'parsed') "$out"
     } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+    $out = & python (Join-Path $PSScriptRoot 'test_renpy_poll_batch.py') 2>&1
+    Check "renpy: bounded poll and shared-server pending behavior" ($LASTEXITCODE -eq 0) "$out"
+    $out = & python (Join-Path $PSScriptRoot 'test_renpy_refresh_thread.py') 2>&1
+    Check "renpy: legacy main-thread drain and late queued cache ownership" ($LASTEXITCODE -eq 0) "$out"
+    foreach ($runtimeName in @('RENPY7_RUNTIME', 'RENPY8_RUNTIME')) {
+        $runtime = [Environment]::GetEnvironmentVariable($runtimeName)
+        if ($runtime) {
+            $out = & python (Join-Path $PSScriptRoot 'test_renpy_engine_runtime.py') --runtime $runtime 2>&1
+            Check "renpy: actual Text lifecycle ($runtimeName)" ($LASTEXITCODE -eq 0) "$out"
+        } else {
+            Write-Host "  note actual RenPy Text checks require $runtimeName; boundary tests still run."
+        }
+    }
 } else {
     Check "renpy: hook body parses as Python" $false "python not found on PATH"
+    Check "renpy: bounded poll and shared-server pending behavior" $false "python not found on PATH"
+    Check "renpy: legacy main-thread drain and late queued cache ownership" $false "python not found on PATH"
 }
-# Ren'Py 7.x runs Python 2.7; reject syntax that only Python 3 accepts.
+# Ren'Py 7.x 使用 Python 2.7；拒绝仅 Python 3 支持的语法。
 $py3Only = @(
     @{ Name = 'f-string';        Regex = '(?<![A-Za-z0-9_])f["'']' },
     @{ Name = 'walrus :=';       Regex = ':=' },
@@ -96,18 +113,27 @@ foreach ($rule in $py3Only) {
     Check "renpy: no Python-3-only syntax ($($rule.Name))" (-not ($renpy -match $rule.Regex))
 }
 
-# --- RPG Maker hook: JavaScript syntax ---
+# --- RPG Maker 钩子：JavaScript 语法 ---
 $node = Get-Command node -ErrorAction SilentlyContinue
 if ($node) {
     $out = & node --check (Join-Path $repo 'payloads\RPGMaker\hook_rpgm_mv.js') 2>&1
     Check "rpgm: hook passes node --check" ($LASTEXITCODE -eq 0) "$out"
+    $out = & node (Join-Path $repo 'tests\payload_scripts\test_rpgm_boot_font.js') 2>&1
+    Check "rpgm: late plugin and CJK font guard" ($LASTEXITCODE -eq 0) "$out"
+    $out = & node (Join-Path $repo 'tests\payload_scripts\test_rpgm_save_display.js') 2>&1
+    Check "rpgm: save display redraw and polluted slot guard" ($LASTEXITCODE -eq 0) "$out"
+    $out = & node (Join-Path $repo 'tests\payload_scripts\test_rpgm_runtime_refresh.js') 2>&1
+    Check "rpgm: queued UI, reconnect, completed dialogue and lifecycle bounds" ($LASTEXITCODE -eq 0) "$out"
 } else {
     Check "rpgm: hook passes node --check" $false "node not found on PATH"
+    Check "rpgm: late plugin and CJK font guard" $false "node not found on PATH"
+    Check "rpgm: save display redraw and polluted slot guard" $false "node not found on PATH"
+    Check "rpgm: queued UI, reconnect, completed dialogue and lifecycle bounds" $false "node not found on PATH"
 }
 $rpgm = Get-Utf8Text 'payloads\RPGMaker\hook_rpgm_mv.js'
 Check "rpgm: hook is an IIFE in strict mode" ($rpgm.StartsWith("(function(){`n  'use strict';"))
 
-# --- Godot sidecars: anchors rewritten by godot_patch.c (build_godot_runtime_autoload, godot_runtime_script_with_font) ---
+# --- Godot 侧车脚本：godot_patch.c 替换的锚点（build_godot_runtime_autoload、godot_runtime_script_with_font）---
 function CountOf([string]$hay, [string]$needle) {
     $n = 0; $i = 0
     while (($i = $hay.IndexOf($needle, $i, [StringComparison]::Ordinal)) -ge 0) { $n++; $i += $needle.Length }
@@ -116,7 +142,7 @@ function CountOf([string]$hay, [string]$needle) {
 $gdAnchors = @(
     @{ Text = "extends SceneTree`n";        Count = 1 },
     @{ Text = "func _initialize():`n";      Count = 1 },
-    @{ Text = "`t`tquit(0)`n";              Count = 1 },
+    @{ Text = "`t`tquit(73)`n";             Count = 1 },
     @{ Text = "C:/Windows/Fonts/simhei.ttf"; Count = 1 }
 )
 $sceneBlocks = @{
@@ -137,8 +163,26 @@ foreach ($s in $scripts | Where-Object { $_.Kind -like 'gd*' }) {
     $badIndent = @($gd.Split("`n") | Where-Object { $_ -match '^ +' })
     Check "$($s.Path): tab indentation only" ($badIndent.Count -eq 0) "$($badIndent.Count) space-indented line(s)"
 }
+if ($python) {
+    $out = & python (Join-Path $PSScriptRoot 'test_godot_cache_ring.py') 2>&1
+    Check "godot: bounded FIFO cache ring matches reference in both runtimes" ($LASTEXITCODE -eq 0) "$out"
+    $out = & python (Join-Path $PSScriptRoot 'test_godot_scene_refresh.py') --check-source 2>&1
+    Check "godot: scene lifecycle cache restoration (source + configured runtimes)" ($LASTEXITCODE -eq 0) "$out"
+    $out = & python (Join-Path $PSScriptRoot 'test_godot_animated_text.py') 2>&1
+    Check "godot: animated cached text before frame submission (configured runtimes)" ($LASTEXITCODE -eq 0) "$out"
+    $out = & python (Join-Path $PSScriptRoot 'test_godot_settings_text.py') 2>&1
+    Check "godot: logical picker words, partial hits and preserved links (source + configured runtimes)" ($LASTEXITCODE -eq 0) "$out"
+    $out = & python (Join-Path $PSScriptRoot 'test_godot_http_contract.py') 2>&1
+    Check "godot: HTTP response validation and paused request-pool recovery (configured runtimes)" ($LASTEXITCODE -eq 0) "$out"
+    if (!$env:GODOT3_EXE -or !$env:GODOT4_EXE) {
+        Write-Host '  note Godot scene runtime checks require GODOT3_EXE and GODOT4_EXE; only configured engines were run.'
+    }
+} else {
+    Check "godot: bounded FIFO cache ring matches reference in both runtimes" $false "python not found on PATH"
+    Check "godot: scene lifecycle cache restoration" $false "python not found on PATH"
+}
 
-# --- server contract: endpoints used by scripts must be routed by both servers ---
+# --- 服务器契约：脚本使用的端点必须由两版服务器提供路由 ---
 $httpC = Get-Content (Join-Path $repo 'native\src\server\http.c') -Raw -Encoding UTF8
 $programCs = Get-Content (Join-Path $repo 'native\src\server_cs\Program.cs') -Raw -Encoding UTF8
 foreach ($s in $scripts) {

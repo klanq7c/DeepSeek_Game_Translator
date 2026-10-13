@@ -47,28 +47,30 @@ namespace DstLauncher
                                                    string param, string dir, int show);
 
         /* launch_game_with_params：找到游戏 exe 并用 ShellExecuteW 打开。 */
-        public static void LaunchGameWithParams(string dir, string parameters)
+        public static bool LaunchGameWithParams(string dir, string parameters)
         {
             string exe = EngineDetector.FindExe(dir);
             if (exe == null) {
                 Log.Append("未找到游戏 exe。");
-                return;
+                return false;
             }
             Log.Append("启动游戏：" + exe);
             if (DryRun) {
                 Spawn("shell", exe, parameters, dir);
-                return;
+                return true;
             }
             IntPtr result = ShellExecuteW(IntPtr.Zero, "open", exe, parameters, dir, 1 /* SW_SHOWNORMAL */);
             /* ShellExecuteW 返回值 <=32 表示失败（2=文件未找到、5=拒绝访问等） */
             if (result.ToInt64() <= 32) {
                 Log.Append("启动游戏失败：" + exe + "（ShellExecuteW 错误码：" + result.ToInt64() + "）");
+                return false;
             }
+            return true;
         }
 
-        public static void LaunchGame(string dir)
+        public static bool LaunchGame(string dir)
         {
-            LaunchGameWithParams(dir, null);
+            return LaunchGameWithParams(dir, null);
         }
 
         /* ---------------- 一键流程（服务器就绪之后） ---------------- */
@@ -76,22 +78,22 @@ namespace DstLauncher
         /* run_engine_launch_flow：Ren'Py 先启动再后台预热（渲染回调从不等 HTTP）；
            Unity/XUnity 先导入后启动，让插件的实时查询命中已导入的行；Godot 先启动、
            再预热、最后派出独立的补丁刷新进程。 */
-        public static void RunEngineLaunchFlow(string dir, Engine engine)
+        public static bool RunEngineLaunchFlow(string dir, Engine engine)
         {
             if (engine == Engine.RenPy) {
-                GodotLaunch.LaunchGameForEngine(dir, engine);
+                if (!GodotLaunch.LaunchGameForEngine(dir, engine)) goto launchFailed;
                 Log.Status("已启动 · 正在后台预热剧本...");
                 Warmup.Run(dir, engine);
             } else if (engine == Engine.Godot) {
                 string patch = PathUtil.Join(dir, "dst_godot_patch.pck");
-                bool hadPatch = PathUtil.Exists(patch);
+                bool hadPatch = PathUtil.Exists(patch) && GodotPatch.SourceCurrent(dir, patch);
                 if (hadPatch) {
                     Log.Append("Godot: existing patch pack found; launching before cache warmup and patch refresh.");
-                    GodotLaunch.LaunchGameForEngine(dir, engine);
+                    if (!GodotLaunch.LaunchGameForEngine(dir, engine)) goto launchFailed;
                     Log.Status("Godot: 已启动，正在后台预热缓存...");
                 } else {
                     Log.Append("Godot: no patch pack yet; launching first, then warming resources for patch preparation.");
-                    GodotLaunch.LaunchGameForEngine(dir, engine);
+                    if (!GodotLaunch.LaunchGameForEngine(dir, engine)) goto launchFailed;
                     Log.Status("Godot: 已启动，正在后台准备翻译补丁...");
                 }
                 Warmup.Run(dir, engine);
@@ -102,9 +104,32 @@ namespace DstLauncher
                 }
             } else {
                 Warmup.Run(dir, engine);
-                GodotLaunch.LaunchGameForEngine(dir, engine);
+                if (!GodotLaunch.LaunchGameForEngine(dir, engine)) goto launchFailed;
             }
-            Log.Status("已启动 · 本地缓存 + 实时批量 API");
+            if (engine == Engine.Godot && !GodotLaunch.RuntimeVerified)
+                Log.Status("Godot: 游戏已启动，但实时翻译模块未确认加载；请查看日志。");
+            else if (engine == Engine.Unknown || engine == Engine.RpgmLegacy)
+                Log.Status("游戏已启动；当前引擎未部署实时翻译模块，请查看日志。");
+            else if (engine == Engine.Godot)
+                Log.Status("已启动 · 本地缓存 + 实时批量 API");
+            else Log.Status("游戏已启动；翻译组件已部署，游戏内加载待确认。");
+            return true;
+
+        launchFailed:
+            Log.Status("游戏启动失败；请查看日志。");
+            return false;
+        }
+
+        public static bool RunAfterDeploy(string dir, Engine engine)
+        {
+            int deployed = Deploy.ForEngine(dir, engine);
+            if (deployed <= 0 && engine != Engine.Unknown && engine != Engine.RpgmLegacy) {
+                Log.Append("翻译组件部署失败，已取消游戏启动；请查看上方具体错误。");
+                Log.Status("翻译组件部署失败，未启动游戏；请查看日志。");
+                return false;
+            }
+            Log.Status("正在预热缓存并启动游戏...");
+            return RunEngineLaunchFlow(dir, engine);
         }
 
         /* ---------------- 缓存卡片 ---------------- */

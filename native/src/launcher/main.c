@@ -23,13 +23,107 @@
 #include <stdlib.h>
 #include <wchar.h>
 
+int g_drop_probe_start_requested = 0;
+
+/* Explorer 会把 WM_DROPFILES 发给光标下的子控件，因此主窗与所有子控件都要
+   注册。子控件只转发句柄，由主窗统一 DragFinish，避免双重释放。 */
+static LRESULT CALLBACK drop_child_proc(HWND child, UINT msg, WPARAM wp, LPARAM lp,
+                                        UINT_PTR sub_id, DWORD_PTR ref) {
+    (void)ref;
+    if (msg == WM_DROPFILES) {
+        HWND parent = GetParent(child);
+        if (parent) SendMessageW(parent, WM_DROPFILES, wp, 0);
+        else DragFinish((HDROP)wp);
+        return 0;
+    }
+    if (msg == WM_NCDESTROY) {
+        DragAcceptFiles(child, FALSE);
+        RemoveWindowSubclass(child, drop_child_proc, sub_id);
+    }
+    return DefSubclassProc(child, msg, wp, lp);
+}
+
+static void register_drop_targets(HWND hwnd) {
+    static const int ids[] = {
+        IDC_TITLE, IDC_SUBTITLE, IDC_STATUS, IDC_PATH_LABEL, IDC_PATH,
+        IDC_BROWSE, IDC_OPEN, IDC_START, IDC_RESTORE, IDC_SERVER_TOGGLE,
+        IDC_API_CONFIG, IDC_ENGINE, IDC_SERVER, IDC_CACHE, IDC_CLEAR_CACHE,
+        IDC_LOG
+    };
+    DragAcceptFiles(hwnd, TRUE);
+    for (size_t i = 0; i < sizeof ids / sizeof ids[0]; i++) {
+        HWND child = GetDlgItem(hwnd, ids[i]);
+        if (!child) continue;
+        if (SetWindowSubclass(child, drop_child_proc, 1, 0)) {
+            DragAcceptFiles(child, TRUE);
+        } else {
+            append_log(L"拖放初始化失败：控件 %d（Win32=%lu）。", ids[i], GetLastError());
+        }
+    }
+}
+
+static void handle_drop_files(HDROP drop) {
+    UINT count = DragQueryFileW(drop, 0xffffffffu, NULL, 0);
+    WCHAR selected[MAX_PATH * 4] = {0};
+    if (count == 1) {
+        UINT len = DragQueryFileW(drop, 0, NULL, 0);
+        if (len > 0 && len < MAX_PATH * 4 &&
+            DragQueryFileW(drop, 0, selected, MAX_PATH * 4) != len) selected[0] = 0;
+    }
+    DragFinish(drop);
+    if (translation_flow_running()) {
+        append_log(L"拖放已忽略：翻译流程仍在进行中。");
+        set_status(L"翻译流程仍在进行中，请稍候。");
+        return;
+    }
+    if (count != 1 || !selected[0]) {
+        append_log(L"拖放无效：请一次拖入一个游戏 exe 或游戏目录，路径不得超过 %d 字符。", MAX_PATH * 4 - 1);
+        set_status(L"拖放无效：请选择单个游戏 exe 或目录。");
+        return;
+    }
+    WCHAR dir[MAX_PATH * 4];
+    wcsncpy(dir, selected, MAX_PATH * 4);
+    dir[MAX_PATH * 4 - 1] = 0;
+    if (!is_dir(dir)) {
+        const WCHAR *ext = wcsrchr(selected, L'.');
+        if (!exists_path(selected) || !ext || _wcsicmp(ext, L".exe")) {
+            append_log(L"拖放无效：仅支持游戏 exe 或游戏目录：%s", selected);
+            set_status(L"拖放无效：请选择游戏 exe 或目录。");
+            return;
+        }
+        WCHAR *slash = wcsrchr(dir, L'\\');
+        WCHAR *forward = wcsrchr(dir, L'/');
+        if (forward && (!slash || forward > slash)) slash = forward;
+        if (!slash) {
+            append_log(L"拖放无效：无法确定 exe 所在目录：%s", selected);
+            set_status(L"拖放无效：无法确定游戏目录。");
+            return;
+        }
+        if (slash == dir + 2 && dir[1] == L':') slash[1] = 0;
+        else *slash = 0;
+        if (!is_dir(dir)) {
+            append_log(L"拖放无效：游戏目录不存在：%s", dir);
+            set_status(L"拖放无效：游戏目录不存在。");
+            return;
+        }
+    }
+    SetWindowTextW(g_path, dir);
+    refresh_engine();
+    append_log(L"已拖入游戏：%s", selected);
+    if (g_ui_probe) {
+        g_drop_probe_start_requested = 1;
+        return;
+    }
+    start_translation();
+}
+
 /* 主窗口过程：处理创建、绘制、DPI 变化、命令分发、颜色主题、销毁等消息 */
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     /* ---- WM_CREATE：初始化 DPI、字体、画刷、所有子控件 ---- */
     case WM_CREATE: {
         dpi_set_for_window(hwnd);
-        g_font_title       = make_font(22, FW_SEMIBOLD, L"Microsoft YaHei UI");
+        g_font_title       = make_font(28, FW_NORMAL, L"SimSun");
         g_font_heading     = make_font(11, FW_SEMIBOLD, L"Microsoft YaHei UI");
         g_font_body        = make_font(10, FW_NORMAL,   L"Microsoft YaHei UI");
         g_font_small       = make_font(9,  FW_NORMAL,   L"Microsoft YaHei UI");
@@ -43,9 +137,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_brush_transparent = (HBRUSH)GetStockObject(HOLLOW_BRUSH);
 
         DWORD static_style = WS_CHILD | WS_VISIBLE | SS_NOPREFIX | SS_ENDELLIPSIS;
-        g_title    = CreateWindowW(L"STATIC", L"无感翻译控制台",        static_style, 0,0,0,0, hwnd, (HMENU)IDC_TITLE,    g_inst, NULL);
+        g_title    = CreateWindowW(L"STATIC", L"让每个故事，都被读懂。",        static_style, 0,0,0,0, hwnd, (HMENU)IDC_TITLE,    g_inst, NULL);
         g_subtitle = CreateWindowW(L"STATIC", ui_subtitle_text(), static_style, 0,0,0,0, hwnd, (HMENU)IDC_SUBTITLE, g_inst, NULL);
-        g_status   = CreateWindowW(L"STATIC", L"STATUS  ·  READY",       static_style, 0,0,0,0, hwnd, (HMENU)IDC_STATUS,   g_inst, NULL);
+        g_status   = CreateWindowW(L"STATIC", L"准备就绪 · 选择游戏后开始汉化",       static_style, 0,0,0,0, hwnd, (HMENU)IDC_STATUS,   g_inst, NULL);
 
         g_path_label = CreateWindowW(L"STATIC", L"游戏目录",             static_style, 0,0,0,0, hwnd, (HMENU)IDC_PATH_LABEL, g_inst, NULL);
         g_path       = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0,0,0,0, hwnd, (HMENU)IDC_PATH, g_inst, NULL);
@@ -69,6 +163,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         apply_fonts();
         install_button_hover_tracking(hwnd);
+        register_drop_targets(hwnd);
         apply_window_chrome(hwnd);
         /* --ui-probe-and-exit：到此为止就够画一帧了。后面的 payload 同步、缓存卡片、
            日志、上次目录恢复、服务器探测和动画定时器都会随机器状态变化，各自另有
@@ -91,8 +186,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         refresh_server_status();
         layout(hwnd);
-        /* 约 60fps 的动画心跳：驱动数据线光束、呼吸灯与按钮悬停渐变 */
-        SetTimer(hwnd, 2, 16, NULL);
+        /* 约 30fps 的动画心跳：驱动数据线光束、呼吸灯与按钮悬停渐变 */
+        refresh_ui_motion();
+        SetTimer(hwnd, 2, 33, NULL);
         return 0;
     }
     /* ---- WM_PAINT：绘制深色页面背景 ---- */
@@ -110,8 +206,17 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         paint_background(hwnd, (HDC)wp);
         return 0;
     /* ---- WM_SIZE：窗口尺寸变化时重新布局并重绘 ---- */
+    case WM_SETTINGCHANGE:
+        refresh_ui_motion();
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
     case WM_SIZE:
+        free_background_buffer();
         layout(hwnd);
+        return 0;
+    case WM_DISPLAYCHANGE:
+        free_background_buffer();
+        InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     /* ---- WM_GETMINMAXINFO：限制窗口最小尺寸 ---- */
     case WM_GETMINMAXINFO: {
@@ -131,13 +236,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     /* ---- WM_DPICHANGED：DPI 变化时重建字体、重新布局 ---- */
     case WM_DPICHANGED: {
+        free_background_buffer();
         g_scale_dpi = HIWORD(wp);
         RECT *prc = (RECT *)lp;
         SetWindowPos(hwnd, NULL, prc->left, prc->top,
                      prc->right - prc->left, prc->bottom - prc->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
         HFONT old[6] = {g_font_title, g_font_heading, g_font_body, g_font_small, g_font_mono, g_font_mono_small};
-        g_font_title       = make_font(22, FW_SEMIBOLD, L"Microsoft YaHei UI");
+        g_font_title       = make_font(28, FW_NORMAL, L"SimSun");
         g_font_heading     = make_font(11, FW_SEMIBOLD, L"Microsoft YaHei UI");
         g_font_body        = make_font(10, FW_NORMAL,   L"Microsoft YaHei UI");
         g_font_small       = make_font(9,  FW_NORMAL,   L"Microsoft YaHei UI");
@@ -162,13 +268,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (ctl == g_title || ctl == g_subtitle || ctl == g_status) {
             SetBkMode(dc, OPAQUE);
             SetBkColor(dc, C_PAGE);
-            if (ctl == g_title) SetTextColor(dc, C_TEXT);
-            else if (ctl == g_subtitle) SetTextColor(dc, C_TEXT_DIM);
+            if (ctl == g_title) SetTextColor(dc, RGB(245, 240, 229));
+            else if (ctl == g_subtitle) SetTextColor(dc, RGB(174, 190, 207));
             else SetTextColor(dc, C_MUTED);
             return (LRESULT)g_brush_page;
         }
         if (ctl == g_path_label || ctl == g_engine || ctl == g_server || ctl == g_cache) {
-            /* 卡片内文字底色匹配所在高度的面板渐变，文本框无缝衔接 */
+            /* 卡片内文字底色匹配暖白面板，文本框无缝衔接 */
             COLORREF card_bg;
             HBRUSH card_brush = card_text_brush(ctl == g_path_label, &card_bg);
             SetBkMode(dc, OPAQUE);
@@ -217,11 +323,16 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(hwnd, 1, 200, NULL);
         }
         return 0;
+    case WM_DROPFILES:
+        handle_drop_files((HDROP)wp);
+        return 0;
     /* ---- WM_CLOSE / WM_DESTROY：关闭窗口并释放 GDI 资源 ---- */
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        free_background_buffer();
+        DragAcceptFiles(hwnd, FALSE);
         /* 启动器窗口关闭后仍保持本地翻译服务器运行。游戏启动后会继续请求实时
            翻译；显式服务器开关仍是由用户控制的停止路径。 */
         KillTimer(hwnd, 2);
@@ -273,6 +384,20 @@ static int run_ui_probe_from_cmd(PWSTR cmd) {
         }
         code = run_ui_probe(_wtoi(argv[i + 1]), _wtoi(argv[i + 2]), _wtoi(argv[i + 3]), argv[i + 4]);
         break;
+    }
+
+    if (code < 0) {
+        for (int i = 0; i < argc; i++) {
+            if (wcscmp(argv[i], L"--ui-drop-probe-and-exit") != 0) continue;
+            if (i + 2 >= argc) { code = 2; break; }
+            int target = 0;
+            if (!wcscmp(argv[i + 2], L"path")) target = IDC_PATH;
+            else if (!wcscmp(argv[i + 2], L"log")) target = IDC_LOG;
+            else if (!wcscmp(argv[i + 2], L"start")) target = IDC_START;
+            else if (wcscmp(argv[i + 2], L"main")) { code = 2; break; }
+            code = run_ui_drop_probe(argv[i + 1], target);
+            break;
+        }
     }
 
     LocalFree(argv);
@@ -335,12 +460,14 @@ static int run_config_diagnostic_from_cmd(PWSTR cmd) {
     for (int i = 0; i < argc; i++) {
         int api_show = wcscmp(argv[i], L"--api-config-and-exit") == 0;
         int api_set = wcscmp(argv[i], L"--api-config-set-and-exit") == 0;
+        int api_ui = wcscmp(argv[i], L"--api-ui-probe-and-exit") == 0;
         int probe = wcscmp(argv[i], L"--godot-probe-and-exit") == 0;
         int preflight = wcscmp(argv[i], L"--godot-preflight-and-exit") == 0;
-        if (!api_show && !api_set && !probe && !preflight) continue;
+        if (!api_show && !api_set && !api_ui && !probe && !preflight) continue;
         handled = 1;
         g_log_to_stdout = 1;
         WCHAR line[MAX_PATH * 8];
+        if (api_ui) { api_config_ui_probe(); break; }
 
         if (api_show) {
             _snwprintf(line, MAX_PATH * 8, L"presets=%d\n", api_config_preset_count());
@@ -348,9 +475,8 @@ static int run_config_diagnostic_from_cmd(PWSTR cmd) {
             write_stdout_utf8(line);
             for (int p = 0; p < api_config_preset_count(); p++) {
                 const ApiProviderPreset *preset = api_config_preset(p);
-                _snwprintf(line, MAX_PATH * 8, L"preset%d=%s|%s|%s\n", p, preset->name,
-                           preset->endpoint ? preset->endpoint : L"-",
-                           preset->model ? preset->model : L"-");
+                _snwprintf(line, MAX_PATH * 8, L"preset%d=%s|%s\n", p, preset->name,
+                           preset->endpoint ? preset->endpoint : L"-");
                 line[MAX_PATH * 8 - 1] = 0;
                 write_stdout_utf8(line);
             }
@@ -385,7 +511,7 @@ static int run_config_diagnostic_from_cmd(PWSTR cmd) {
             write_stdout_utf8(L"result=1\n");
             break;
         }
-        /* preflight */
+        /* 预检 */
         if (i + 4 >= argc) {
             code = 2;
             break;
@@ -471,12 +597,14 @@ static int run_diagnostic_from_cmd(PWSTR cmd) {
         int restore = wcscmp(argv[i], L"--restore-and-exit") == 0;
         int warmup = wcscmp(argv[i], L"--warmup-and-exit") == 0;
         int godot_patch = wcscmp(argv[i], L"--godot-patch-and-exit") == 0;
+        int godot_runtime = wcscmp(argv[i], L"--godot-runtime-pack-and-exit") == 0;
         int godot_promote = wcscmp(argv[i], L"--godot-promote-and-exit") == 0;
         int godot_launcher = wcscmp(argv[i], L"--godot-launcher-and-exit") == 0;
         int launch_flow = wcscmp(argv[i], L"--launch-flow-and-exit") == 0;
+        int deploy_launch_flow = wcscmp(argv[i], L"--deploy-launch-flow-and-exit") == 0;
         int clear_cache = wcscmp(argv[i], L"--clear-cache-and-exit") == 0;
-        if (!detect && !deploy && !restore && !warmup && !launch_flow && !clear_cache &&
-            !godot_patch && !godot_promote && !godot_launcher) continue;
+        if (!detect && !deploy && !restore && !warmup && !launch_flow && !deploy_launch_flow && !clear_cache &&
+            !godot_patch && !godot_runtime && !godot_promote && !godot_launcher) continue;
         handled = 1;
         if (clear_cache) {
             /* 缓存卡片文本 + 删除共享缓存文件（不含服务端停止/重启与弹窗）。 */
@@ -507,12 +635,13 @@ static int run_diagnostic_from_cmd(PWSTR cmd) {
             break;
         }
         g_log_to_stdout = 1;
-        if (godot_patch || godot_promote || godot_launcher) {
+        if (godot_patch || godot_runtime || godot_promote || godot_launcher) {
             WCHAR out[MAX_PATH * 4];
             out[0] = 0;
             int godot_result;
-            if (godot_patch) {
-                godot_result = godot_prepare_patch_pack(dir, out, MAX_PATH * 4);
+            if (godot_patch || godot_runtime) {
+                godot_result = godot_runtime ? godot_prepare_runtime_pack(dir, out, MAX_PATH * 4)
+                                            : godot_prepare_patch_pack(dir, out, MAX_PATH * 4);
                 if (godot_result) {
                     write_stdout_utf8(L"pack=");
                     write_stdout_utf8(out);
@@ -541,14 +670,16 @@ static int run_diagnostic_from_cmd(PWSTR cmd) {
             write_stdout_utf8(L"result=0\n");
             break;
         }
-        if (launch_flow) {
+        if (launch_flow || deploy_launch_flow) {
             /* 一键流程中"服务器已就绪之后"的部分：预热改为 post= 转储，
                真正拉起进程的三处改为 spawn= 计划行，其余（引擎检测、
                Godot 预检探测、sidecar/补丁包准备）照常真跑。 */
             g_warmup_dump_stdout = 1;
             g_launch_dry_run = 1;
-            run_engine_launch_flow(dir, engine);
-            write_stdout_utf8(L"result=1\n");
+            int started = 1;
+            if (deploy_launch_flow) started = run_deploy_launch_flow(dir, engine);
+            else started = run_engine_launch_flow(dir, engine);
+            write_stdout_utf8(started ? L"result=1\n" : L"result=0\n");
             break;
         }
         int result = deploy ? deploy_for_engine(dir, engine) : restore_game(dir, engine);

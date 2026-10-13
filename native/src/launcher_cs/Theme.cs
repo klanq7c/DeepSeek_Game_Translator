@@ -11,25 +11,25 @@ namespace DstLauncher
      */
     internal static class Theme
     {
-        internal static readonly uint C_PAGE = Win32.RGB(9, 12, 18);
-        internal static readonly uint C_RAIL = Win32.RGB(11, 15, 23);
-        internal static readonly uint C_CARD = Win32.RGB(17, 23, 33);
-        internal static readonly uint C_CARD_ELEV = Win32.RGB(25, 33, 47);
-        internal static readonly uint C_LINE = Win32.RGB(33, 43, 58);
-        internal static readonly uint C_LINE_BRIGHT = Win32.RGB(64, 80, 102);
-        internal static readonly uint C_TEXT = Win32.RGB(238, 243, 248);
-        internal static readonly uint C_TEXT_DIM = Win32.RGB(170, 181, 197);
-        internal static readonly uint C_MUTED = Win32.RGB(106, 120, 142);
-        internal static readonly uint C_ACCENT = Win32.RGB(78, 222, 201);
-        internal static readonly uint C_ACCENT_DARK = Win32.RGB(42, 176, 159);
-        internal static readonly uint C_ACCENT_DEEP = Win32.RGB(19, 86, 79);
-        internal static readonly uint C_GREEN = Win32.RGB(96, 214, 148);
-        internal static readonly uint C_DANGER = Win32.RGB(246, 106, 122);
-        internal static readonly uint C_BLUE = Win32.RGB(98, 160, 255);
-        internal static readonly uint C_VIOLET = Win32.RGB(180, 138, 255);
-        internal static readonly uint C_AMBER = Win32.RGB(247, 188, 78);
-        internal static readonly uint C_LOG = Win32.RGB(6, 9, 14);
-        internal static readonly uint C_LOG_TEXT = Win32.RGB(178, 229, 219);
+        internal static readonly uint C_PAGE = Win32.RGB(6, 21, 46);
+        internal static readonly uint C_RAIL = Win32.RGB(3, 12, 30);
+        internal static readonly uint C_CARD = Win32.RGB(255, 253, 247);
+        internal static readonly uint C_CARD_ELEV = Win32.RGB(249, 245, 235);
+        internal static readonly uint C_LINE = Win32.RGB(223, 215, 197);
+        internal static readonly uint C_LINE_BRIGHT = Win32.RGB(185, 157, 106);
+        internal static readonly uint C_TEXT = Win32.RGB(22, 37, 57);
+        internal static readonly uint C_TEXT_DIM = Win32.RGB(84, 98, 111);
+        internal static readonly uint C_MUTED = Win32.RGB(120, 125, 126);
+        internal static readonly uint C_ACCENT = Win32.RGB(244, 202, 114);
+        internal static readonly uint C_ACCENT_DARK = Win32.RGB(234, 180, 92);
+        internal static readonly uint C_ACCENT_DEEP = Win32.RGB(142, 103, 47);
+        internal static readonly uint C_GREEN = Win32.RGB(48, 129, 97);
+        internal static readonly uint C_DANGER = Win32.RGB(174, 78, 76);
+        internal static readonly uint C_BLUE = Win32.RGB(32, 83, 135);
+        internal static readonly uint C_VIOLET = Win32.RGB(126, 113, 92);
+        internal static readonly uint C_AMBER = Win32.RGB(175, 124, 63);
+        internal static readonly uint C_LOG = Win32.RGB(249, 246, 238);
+        internal static readonly uint C_LOG_TEXT = Win32.RGB(64, 84, 107);
 
         internal const int RAIL_W = 256;
 
@@ -126,9 +126,27 @@ namespace DstLauncher
            确定的相位，否则两次渲染永远对不上。见 ui.c 的 g_anim_tick_override。 */
         internal static long AnimTickOverride = -1;
 
+        internal static bool MotionEnabled = true;
+        internal static uint MotionTick;
+        private static bool _motionWarning;
+        internal static uint MotionLast;
+
+        internal static void RefreshMotion() {
+            int enabled;
+            if (!Win32.SystemParametersInfoW(0x1042, 0, out enabled, 0)) {
+                /* 系统设置读取失败时静态显示；诊断保留 Win32 错误码，不影响翻译流程。 */
+                if (!_motionWarning) {
+                    Win32.OutputDebugStringW("ds launcher: animation preference unavailable (" + System.Runtime.InteropServices.Marshal.GetLastWin32Error() + "); using static decoration.\n");
+                    _motionWarning = true;
+                }
+                enabled = 0;
+            } else { _motionWarning = false; }
+            MotionEnabled = enabled != 0;
+        }
+
         internal static uint AnimTick()
         {
-            return AnimTickOverride >= 0 ? (uint)AnimTickOverride : Win32.GetTickCount();
+            return AnimTickOverride >= 0 ? (uint)AnimTickOverride : MotionTick;
         }
 
         /* ---- 字体与画刷句柄（对应 globals.c 的 extern 定义） ---- */
@@ -137,7 +155,7 @@ namespace DstLauncher
 
         internal static void CreateFonts()
         {
-            FontTitle = MakeFont(22, Win32.FW_SEMIBOLD, "Microsoft YaHei UI");
+            FontTitle = MakeFont(28, Win32.FW_NORMAL, "SimSun");
             FontHeading = MakeFont(11, Win32.FW_SEMIBOLD, "Microsoft YaHei UI");
             FontBody = MakeFont(10, Win32.FW_NORMAL, "Microsoft YaHei UI");
             FontSmall = MakeFont(9, Win32.FW_NORMAL, "Microsoft YaHei UI");

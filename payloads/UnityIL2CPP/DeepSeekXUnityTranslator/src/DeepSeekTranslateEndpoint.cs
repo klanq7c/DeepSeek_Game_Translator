@@ -90,8 +90,11 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
             yield break;
         }
 
-        if (!TryCollectPendingTexts(initialResponse.Data, requestTexts, out string[] pendingTexts) ||
-            pendingTexts.Length == 0)
+        string[] pendingTexts = null;
+        bool pendingShapeValid = false;
+        try { pendingShapeValid = TryCollectPendingTexts(initialResponse.Data, requestTexts, out pendingTexts); }
+        catch (Json.ParseException exception) { context.Fail("DeepSeek initial response is invalid JSON.", exception); }
+        if (!pendingShapeValid || pendingTexts.Length == 0)
         {
             yield break;
         }
@@ -120,7 +123,16 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
             {
                 yield break;
             }
-            if (HasAllLookupHits(lookupResponse.Data, pendingTexts))
+            bool allHits = false;
+            Json.ParseException lookupError = null;
+            try { allHits = HasAllLookupHits(lookupResponse.Data, pendingTexts); }
+            catch (Json.ParseException exception) { lookupError = exception; }
+            if (lookupError != null)
+            {
+                context.Fail("DeepSeek cache lookup response is invalid JSON.", lookupError);
+                yield break;
+            }
+            if (allHits)
             {
                 yield break;
             }
@@ -150,6 +162,14 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         if (string.IsNullOrEmpty(data))
         {
             context.Fail("DeepSeek local server returned an empty response.");
+            return;
+        }
+        // 外部响应必须完整通过共享解析器，不能从截断正文中提取看似成功的字段。
+        // 本地传输故障无法由渲染器上游修复；失败通过 XUnity context.Fail 记录，保持原文。
+        try { ParseResponseObject(data); }
+        catch (Json.ParseException exception)
+        {
+            context.Fail("DeepSeek local server returned invalid JSON.", exception);
             return;
         }
 
@@ -210,7 +230,7 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
                 return;
             }
             one = PrepareDisplayTranslation(one);
-            if (string.IsNullOrEmpty(one))
+            if (string.IsNullOrWhiteSpace(one))
             {
                 context.Fail("DeepSeek local server returned no translation.");
                 return;
@@ -276,13 +296,22 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
                 context.Fail("DeepSeek mixed-language batch translation lost protected text: " + itemRestoreError);
                 return;
             }
-            if (string.IsNullOrEmpty(results[i]) || string.Equals(results[i], original[i], StringComparison.Ordinal))
+            if (string.IsNullOrWhiteSpace(results[i]) || string.Equals(results[i], original[i], StringComparison.Ordinal))
             {
                 context.Fail("DeepSeek local server returned an unresolved batch item.");
                 return;
             }
         }
         results = PrepareDisplayTranslations(results);
+        // 标点兼容和回显剥离之后再次检查；显示层处理不能把空白或原文报告为批量成功。
+        for (int i = 0; i < results.Length; i++)
+        {
+            if (!identityResults[i] && (string.IsNullOrWhiteSpace(results[i]) || string.Equals(results[i], original[i], StringComparison.Ordinal)))
+            {
+                context.Fail("DeepSeek display normalization left an unresolved batch item at index " + i + ".");
+                return;
+            }
+        }
 
         if (hasIdentityResult &&
             !TryKeepIdentityResultsSessionOnly(context, identityResults, out string batchIdentityError))
@@ -593,6 +622,12 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         StringBuilder sb = null;
         for (int i = 0; i < text.Length; i++)
         {
+            if (DstUnity.TmpRichText.TryGetTagEnd(text, i, out int tagEnd))
+            {
+                if (sb != null) sb.Append(text, i, tagEnd - i + 1);
+                i = tagEnd;
+                continue;
+            }
             string replacement = GetFallbackSafeReplacement(text[i], containsCjk);
             if (replacement == null)
             {
@@ -946,164 +981,42 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         sb.Append('"');
     }
 
-    /*
-     * 以下是面向本地服务固定响应结构的最小 JSON 读取器。
-     * 该 payload 只引用 XUnity Core，故不额外携带 Newtonsoft.Json。
-     * 解析失败统一返回 null，由 OnExtractTranslation 走 Fail 降级。
-     */
+    // 响应字段统一使用 DstCore.Json 的完整、严格解析，不复制另一套 JSON 扫描器。
+    private static Dictionary<string, object> ParseResponseObject(string json)
+    {
+        if (Json.ParseStrict(json) is Dictionary<string, object> root) return root;
+        throw new Json.ParseException("response root must be an object");
+    }
+
     private static string ReadStringProperty(string json, string name)
     {
-        int value = FindPropertyValue(json, name, 0);
-        if (value < 0) return null;
-        return ReadJsonString(json, ref value);
+        var root = ParseResponseObject(json);
+        return root.TryGetValue(name, out object value) ? value as string : null;
     }
 
     private static string[] ReadStringArrayProperty(string json, string name)
     {
-        int value = FindPropertyValue(json, name, 0);
-        if (value < 0) return null;
-        return ReadJsonStringArray(json, ref value);
+        var root = ParseResponseObject(json);
+        if (!root.TryGetValue(name, out object value) || !(value is List<object> array)) return null;
+        var values = new string[array.Count];
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (!(array[i] is string item)) return null;
+            values[i] = item;
+        }
+        return values;
     }
 
     private static string[] ReadMapValues(string json, string propertyName, string[] keys)
     {
-        int value = FindPropertyValue(json, propertyName, 0);
-        if (value < 0 || value >= json.Length || json[value] != '{') return null;
-        var map = new Dictionary<string, string>();
-        value++;
-        while (value < json.Length)
-        {
-            SkipWs(json, ref value);
-            if (value < json.Length && json[value] == '}') break;
-            string key = ReadJsonString(json, ref value);
-            if (key == null) return null;
-            SkipWs(json, ref value);
-            if (value >= json.Length || json[value++] != ':') return null;
-            string val = ReadJsonString(json, ref value);
-            if (val == null) return null;
-            map[key] = val;
-            SkipWs(json, ref value);
-            if (value < json.Length && json[value] == ',') value++;
-        }
-
-        var result = new string[keys.Length];
+        var root = ParseResponseObject(json);
+        if (!root.TryGetValue(propertyName, out object value) || !(value is Dictionary<string, object> map)) return null;
+        var values = new string[keys.Length];
         for (int i = 0; i < keys.Length; i++)
         {
-            if (!map.TryGetValue(keys[i], out result[i])) return null;
+            if (!map.TryGetValue(keys[i], out object item) || !(item is string text)) return null;
+            values[i] = text;
         }
-        return result;
-    }
-
-    /* 只匹配响应顶层对象的键：批量响应里 translations/hits 映射的键是任意
-       游戏文本，若恰好等于 "results"/"sources"/"hits" 等属性名，无深度跟踪
-       的扫描会先命中嵌套键导致解析错位。用 {} 深度把匹配限制在顶层。 */
-    private static int FindPropertyValue(string json, string name, int start)
-    {
-        int i = Math.Max(0, start);
-        int depth = 0;
-        while (i < json.Length)
-        {
-            char ch = json[i];
-            if (ch == '"')
-            {
-                int keyStart = i;
-                string key = ReadJsonString(json, ref i);
-                if (key == null)
-                {
-                    i = keyStart + 1;
-                    continue;
-                }
-                SkipWs(json, ref i);
-                if (depth == 1 && i < json.Length && json[i] == ':' && key == name)
-                {
-                    i++;
-                    SkipWs(json, ref i);
-                    return i;
-                }
-                continue;
-            }
-            if (ch == '{')
-            {
-                depth++;
-            }
-            else if (ch == '}')
-            {
-                depth--;
-                if (depth <= 0) return -1;
-            }
-            i++;
-        }
-        return -1;
-    }
-
-    private static string[] ReadJsonStringArray(string json, ref int i)
-    {
-        SkipWs(json, ref i);
-        if (i >= json.Length || json[i++] != '[') return null;
-        var values = new List<string>();
-        while (i < json.Length)
-        {
-            SkipWs(json, ref i);
-            if (i < json.Length && json[i] == ']')
-            {
-                i++;
-                return values.ToArray();
-            }
-            string value = ReadJsonString(json, ref i);
-            if (value == null) return null;
-            values.Add(value);
-            SkipWs(json, ref i);
-            if (i < json.Length && json[i] == ',') i++;
-        }
-        return null;
-    }
-
-    private static string ReadJsonString(string json, ref int i)
-    {
-        SkipWs(json, ref i);
-        if (i >= json.Length || json[i++] != '"') return null;
-        var sb = new StringBuilder();
-        while (i < json.Length)
-        {
-            char ch = json[i++];
-            if (ch == '"') return sb.ToString();
-            if (ch != '\\')
-            {
-                sb.Append(ch);
-                continue;
-            }
-            if (i >= json.Length) return null;
-            char esc = json[i++];
-            switch (esc)
-            {
-                case '"': sb.Append('"'); break;
-                case '\\': sb.Append('\\'); break;
-                case '/': sb.Append('/'); break;
-                case 'b': sb.Append('\b'); break;
-                case 'f': sb.Append('\f'); break;
-                case 'n': sb.Append('\n'); break;
-                case 'r': sb.Append('\r'); break;
-                case 't': sb.Append('\t'); break;
-                case 'u':
-                    if (i + 4 > json.Length) return null;
-                    if (!ushort.TryParse(json.Substring(i, 4), System.Globalization.NumberStyles.HexNumber, null, out ushort cp)) return null;
-                    sb.Append((char)cp);
-                    i += 4;
-                    break;
-                default:
-                    return null;
-            }
-        }
-        return null;
-    }
-
-    private static void SkipWs(string json, ref int i)
-    {
-        while (i < json.Length)
-        {
-            char ch = json[i];
-            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') break;
-            i++;
-        }
+        return values;
     }
 }

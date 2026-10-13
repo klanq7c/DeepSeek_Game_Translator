@@ -13,8 +13,8 @@
    - `config\launcher.ini.example`
    - `config\glossary.example.tsv`
    - 自有 Unity 插件 DLL
-3. 在启动器中点击“配置 API”，从“提供商”下拉选择服务（预设会自动填好 API 地址和示例模型名，仍可手动修改），填入自己的 API Key 并保存。任意 OpenAI 兼容（chat/completions）服务均可使用；本机回环服务（Ollama、LM Studio）的 Key 可留空。
-4. 如果要翻译 Ren'Py、RPG Maker 或 Godot 游戏，可以直接选择游戏目录并开始。
+3. 在启动器中点击“配置 API”，从“提供商”下拉选择服务（预设只填写 API 地址），填入自己的 API Key，刷新当前账号可见的模型目录并自主选择，也可以手动输入模型 ID，然后保存。任意 OpenAI 兼容（chat/completions）服务均可使用；本机回环服务（Ollama、LM Studio）的 Key 可留空。
+4. 如果要翻译 Ren'Py、RPG Maker 或 Godot 游戏，可以直接选择游戏目录并开始；也可以把游戏的单个 `.exe` 或游戏目录拖到启动器窗口，启动器会自动选择目录并执行一键流程。拖入多个文件或其他类型的文件会提示无效。
 5. 如果要翻译 Unity 游戏，在程序所在目录运行：
 
 ```powershell
@@ -22,6 +22,22 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 ```
 
 运行完成后回到启动器，或重新运行你下载的同一个 exe，选择游戏目录并部署。
+
+翻译器会为缺少中文字形的游戏补充字体：Ren'Py 和 RPG Maker MV/MZ 优先复制可用的 Windows 中文字体；系统缺少这些字体时，改用内置的 Noto Sans CJK SC（SIL OFL 1.1）和许可证。Godot 的补丁及运行时也会在系统字体缺失时使用该字体，并在游戏目录放置 `dst_godot_patch.OFL.txt`；Unity Mono/IL2CPP 会在游戏的 `TranslationFonts/` 中获得备用字体，供各自字体回退路径读取。原有 `ds_font.ttf/.ttc/.otf` 优先保留；还原只移除有启动器所有权标记且字节未变的字体及许可证。不同游戏的自定义文字渲染仍需实机检查。
+
+## 检查单个游戏的汉化状态
+
+源码目录提供只读检查脚本。先确认游戏已退出，再在 PowerShell 中运行（把路径改成你的游戏目录）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\audit_game_translation.ps1 -GamePath 'D:\Games\MyGame'
+```
+
+脚本调用启动器的引擎检测与预热扫描诊断模式，不启动游戏、服务端，也不修改游戏、存档、补丁或翻译记忆。它报告**原游戏目录中被识别的 exe 完整路径**、扫描到的唯一文本数、已有翻译文件与本地持久缓存的命中数、未命中示例，以及变量、控制码或常见富文本标记不一致的疑点。RPG Maker 的等待/速度控制码差异单独计数；这些都是待复核线索，不会自动改写译文。需要自动化读取时可加 `-AsJson`；从其他目录运行启动器时可指定 `-LauncherPath` 与 `-CachePath`。
+
+覆盖率的分母只是当前预热扫描器能看到的文本。达到采集上限时报告会明确提示，尚未扫描到的台词、运行时动态文本、菜单和其他界面都不计入其中。缓存命中也不等于译文通顺或已在游戏中显示；报告始终把人工校对、字形/排版和实际启动标为“未验证”。如果画面缺字，先对照报告中的原文与译文，再检查该界面使用的字体和字形，避免把字体问题当成翻译问题重复请求 API。
+
+交付或自行验收汉化时，应从报告给出的**原目录 exe** 启动，实际检查菜单、设置、序章、选项、教程和问题对白，确认换行、字形、文本框长度、存档和性能。先检查游戏是否已有中文选项；已有中文时只修确实缺失或错误的部分。修改游戏资源前退出游戏并备份将要改动的文件，不覆盖存档。向别人说明结果时，分别写清已提取、已有译文、已人工校对和已实机验证的范围，以及残留英文与还原方法。检查脚本不会创建游戏副本或额外的“修复版 exe”。
 
 ### 支持哪些 API 提供商？
 

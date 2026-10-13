@@ -301,6 +301,30 @@ int write_file_bytes(const WCHAR *path, const char *buf, DWORD size) {
     return ok;
 }
 
+/* 内嵌字体等资源只在目标缺失时创建；不能覆盖游戏或用户文件。 */
+int write_file_bytes_if_absent_safe(const WCHAR *path, const char *buf, DWORD size) {
+    if (!path || (!buf && size != 0) || !write_target_is_safe(path)) return 0;
+    WCHAR parent[MAX_PATH * 4];
+    size_t len = wcslen(path);
+    if (len >= MAX_PATH * 4) return 0;
+    memcpy(parent, path, (len + 1) * sizeof(WCHAR));
+    WCHAR *slash = wcsrchr(parent, L'\\');
+    if (slash) {
+        *slash = 0;
+        if (!ensure_dir(parent)) return 0;
+    }
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int ok = write_handle_all(h, buf, size);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(h);
+    if (!ok) {
+        if (!delete_file_safe(path)) OutputDebugStringW(L"CJK font partial file cleanup failed.\n");
+        SetLastError(error);
+    }
+    return ok;
+}
+
 /* 用固定缓冲区比较两个普通文件，避免为了跳过重复部署而整文件载入内存。 */
 static int files_equal_streaming(const WCHAR *left, const WCHAR *right) {
     HANDLE left_file = CreateFileW(left, GENERIC_READ,
@@ -367,6 +391,12 @@ static int copy_file_checked(const WCHAR *from, const WCHAR *to,
 
 int copy_file_safe(const WCHAR *from, const WCHAR *to) {
     return copy_file_checked(from, to, 0);
+}
+
+int files_equal_safe(const WCHAR *left, const WCHAR *right) {
+    if (!left || !right || path_has_reparse_point(left, 1) ||
+        path_has_reparse_point(right, 1)) return 0;
+    return files_equal_streaming(left, right);
 }
 
 int copy_file_if_absent_safe(const WCHAR *from, const WCHAR *to) {

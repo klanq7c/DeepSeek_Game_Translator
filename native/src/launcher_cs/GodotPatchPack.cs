@@ -16,9 +16,89 @@ namespace DstLauncher
      */
     public static partial class GodotPatch
     {
+        private const string SourceSuffix = ".dst-source";
+
+        private static string SourceFingerprint(PckSource src)
+        {
+            if (string.IsNullOrEmpty(src.Path) || SafeFs.PathHasReparsePoint(src.Path, true)) return null;
+            try {
+                using (var input = new FileStream(src.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+                    if (src.Offset > (ulong)input.Length || src.Size > (ulong)input.Length - src.Offset) return null;
+                    input.Seek((long)src.Offset, SeekOrigin.Begin);
+                    ulong hash = 14695981039346656037UL;
+                    ulong remaining = src.Size;
+                    var bytes = new byte[65536];
+                    while (remaining != 0) {
+                        int want = (int)Math.Min((ulong)bytes.Length, remaining);
+                        int got = input.Read(bytes, 0, want);
+                        if (got != want) return null;
+                        for (int i = 0; i < got; i++) { hash ^= bytes[i]; hash *= 1099511628211UL; }
+                        remaining -= (ulong)got;
+                    }
+                    string[] scripts = { EmbeddedScripts.GodotRuntimeG3, EmbeddedScripts.GodotRuntimeG4 };
+                    for (int script = 0; script < scripts.Length; script++) {
+                        byte[] payload = EmbeddedScripts.Bytes(scripts[script]);
+                        if (payload == null || payload.Length == 0) {
+                            Log.Append("Godot: embedded runtime payload unavailable while fingerprinting the patch.");
+                            return null;
+                        }
+                        hash = unchecked((hash ^ (byte)(0xff - script)) * 1099511628211UL);
+                        foreach (byte b in payload) hash = unchecked((hash ^ b) * 1099511628211UL);
+                    }
+                    byte[] fontManifest = EmbeddedScripts.BytesOrNull("IDR_PAYLOAD_CJK_FONT_MANIFEST");
+                    if (fontManifest == null) {
+                        Log.Append("Godot: embedded CJK font manifest unavailable while fingerprinting the patch.");
+                        return null;
+                    }
+                    hash = unchecked((hash ^ 0xfcUL) * 1099511628211UL);
+                    foreach (byte b in fontManifest) hash = unchecked((hash ^ b) * 1099511628211UL);
+                    hash = unchecked((hash ^ 0xfdUL) * 1099511628211UL);
+                    foreach (byte b in Encoding.UTF8.GetBytes(BuildInfo.TranslatorVersion))
+                        hash = unchecked((hash ^ b) * 1099511628211UL);
+                    return "DST_GODOT_SOURCE_V4:" + hash.ToString("x16", System.Globalization.CultureInfo.InvariantCulture) + "\n";
+                }
+            } catch (IOException ex) {
+                Log.Append("Godot: source fingerprint read failed (Windows error " + (ex.HResult & 0xffff) + ").");
+                return null;
+            } catch (UnauthorizedAccessException ex) {
+                Log.Append("Godot: source fingerprint read failed (Windows error " + (ex.HResult & 0xffff) + ").");
+                return null;
+            }
+        }
+
+        public static bool SourceCurrent(string dir, string pack)
+        {
+            if (dir == null || pack == null || !PathUtil.Exists(pack)) return false;
+            PckSource src;
+            if (!FindSidecarPck(dir, out src) && !FindEmbeddedPck(dir, out src)) {
+                Log.Append("Godot: patch source is missing or unreadable; existing pack is not trusted.");
+                return false;
+            }
+            string marker = pack + SourceSuffix;
+            if (!PathUtil.Exists(marker)) {
+                using (var h = OpenSharedRead(pack)) {
+                    if (h != null) {
+                        var info = new PckInfo();
+                        if (ReadPckInfo(h, 0, (ulong)h.Length, info) && info.Format < 3) return true;
+                    }
+                }
+                Log.Append("Godot: patch has no source fingerprint; rebuilding its runtime before launch.");
+                return false;
+            }
+            string expected = SourceFingerprint(src);
+            byte[] stored = SafeFs.FileSizeAtMost(marker, 47) ? SafeFs.ReadBytes(marker) : null;
+            byte[] want = expected == null ? null : Encoding.ASCII.GetBytes(expected);
+            bool current = stored != null && want != null && stored.Length == want.Length;
+            for (int i = 0; current && i < want.Length; i++) if (stored[i] != want[i]) current = false;
+            if (!current) Log.Append("Godot: game pack or translator payload changed, or the source fingerprint is invalid; rebuilding runtime.");
+            return current;
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool CreateHardLinkW(string newFile, string existingFile, IntPtr securityAttributes);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetTempFileNameW(string directory, string prefix, uint unique, StringBuilder output);
 
         /* ======================== 源包发现 ======================== */
 
@@ -451,9 +531,34 @@ namespace DstLauncher
             string marker = PathUtil.Join(dir, PatchLauncherMarker);
 
             if (PathUtil.Exists(launcher)) {
-                if (!PathUtil.Exists(marker)) {
+                byte[] ownedBytes = SafeFs.FileSizeAtMost(marker, 128) ? SafeFs.ReadBytes(marker) : null;
+                byte[] expected = ByteStr.ToBytes(PatchLauncherMarkerText);
+                bool owned = ownedBytes != null && ownedBytes.Length == expected.Length;
+                for (int i = 0; owned && i < expected.Length; i++)
+                    if (ownedBytes[i] != expected[i]) owned = false;
+                if (!owned) {
                     Log.Append("Godot: preserved an existing dst_godot_patch.exe without a launcher ownership marker.");
                     return null;
+                }
+                if (!SafeFs.FilesEqualStreaming(sourceExe, launcher)) {
+                    var name = new StringBuilder(260);
+                    string temp = null;
+                    int error = 0;
+                    if (GetTempFileNameW(dir, "dse", 0, name) == 0) error = Marshal.GetLastWin32Error();
+                    else {
+                        temp = name.ToString();
+                        if (!SafeFs.CopyFileSafe(sourceExe, temp)) error = SafeFs.LastError;
+                        else if (!SafeFs.MoveFileSafe(temp, launcher,
+                                    SafeFs.MOVEFILE_REPLACE_EXISTING | SafeFs.MOVEFILE_WRITE_THROUGH))
+                            error = SafeFs.LastError;
+                    }
+                    if (error != 0) {
+                        if (temp != null && !SafeFs.DeleteFileSafe(temp))
+                            Log.Append("Godot: stale launcher temp cleanup failed (Windows error " + SafeFs.LastError + ").");
+                        Log.Append("Godot: stale patch launcher could not be refreshed (Windows error " + error + ").");
+                        return null;
+                    }
+                    Log.Append("Godot: refreshed launcher-owned executable after the game changed.");
                 }
                 return launcher;
             }
@@ -567,7 +672,7 @@ namespace DstLauncher
          * Godot 3 与 4 的 JSON、信号和字体 API 不兼容，侧车脚本按版本分为
          * payloads/Godot/dst_godot_runtime_g3.gd 与 _g4.gd（以 EmbeddedResource 嵌入）。
          * 下方的文本替换依赖脚本里的锚点："extends SceneTree\n"、"func _initialize():\n"、
-         * "\t\tquit(0)\n"、"get_root()"、main_scene 切换块与 "C:/Windows/Fonts/simhei.ttf"；
+         * "\t\tquit(73)\n"、"get_root()"、main_scene 切换块与 "C:/Windows/Fonts/simhei.ttf"；
          * 改脚本时必须同步。
          */
         private static string RuntimeSidecarSource(bool useGodot3)
@@ -582,8 +687,8 @@ namespace DstLauncher
             return ByteStr.FromBytes(bytes, 0, bytes.Length);
         }
 
-        /* 运行时模板里的默认 Windows 字体路径换成本机实际解析到的 CJK 字体；
-           没有 CJK 字体时保留默认列表，由脚本在运行时警告一次。 */
+        /* 用解析到的系统字体或内置 OTF 替换运行时模板首个候选路径。
+           两者均不可用时保留默认列表，并由脚本在运行时记录诊断。 */
         private static string RuntimeScriptWithFont(string source)
         {
             if (source == null) return null;
@@ -607,8 +712,12 @@ namespace DstLauncher
                   "\tif scene != \"\":\n" +
                   "\t\tchange_scene_to_file(scene)\n";
             string step = source.Replace("extends SceneTree\n", "extends Node\n");
-            step = step.Replace("func _initialize():\n", "func _ready():\n");
-            step = step.Replace("\t\tquit(0)\n", "\t\tget_tree().quit(0)\n");
+            step = step.Replace("func _initialize():\n", "func _ready():\n" +
+                "\tif OS.get_cmdline_args().has(\"--dst-autoload-preflight\")" +
+                (engineMajor == 3 ? "" : " or OS.get_cmdline_user_args().has(\"--dst-autoload-preflight\")") + ":\n" +
+                "\t\tprint(\"DST_GODOT_AUTOLOAD_READY_V1\")\n" +
+                "\t\treturn\n");
+            step = step.Replace("\t\tquit(73)\n", "\t\tget_tree().quit(73)\n");
             step = step.Replace("get_root()", "get_tree().root");
             step = step.Replace(sceneStart, "");
             if (step.Contains("extends SceneTree") || step.Contains("change_scene")) return null;
@@ -709,7 +818,7 @@ namespace DstLauncher
             uint additions = (runtimeMetaPos != 0 ? 0u : 1u) +
                              (autoloadScript != null && autoloadMetaPos == 0 ? 1u : 0u) +
                              (overrideConfig != null && overrideMetaPos == 0 ? 1u : 0u);
-            if (h == null || info == null || info.Format != 3 ||
+            if (h == null || info == null || (info.Format != 3 && info.Format != 4) ||
                 info.FileCount > MaxFiles - additions ||
                 directoryEnd < info.EntriesOffset) {
                 return false;
@@ -809,6 +918,7 @@ namespace DstLauncher
         public static bool PrepareRuntimeSidecar(string dir)
         {
             if (string.IsNullOrEmpty(dir) || SafeFs.PathHasReparsePoint(dir, true)) return false;
+            if (!EnsureBundledFontLicenseIfSelected(dir)) return false;
             string script = PathUtil.Join(dir, RuntimeScriptName);
             int major = RuntimeMajor(dir);
             string sidecar = RuntimeScriptWithFont(RuntimeSidecarSource(major < 4));
@@ -828,7 +938,7 @@ namespace DstLauncher
 
         /* patch_pack_file：解析目录表 → 按优先级排序 → 逐条改写（字体/文本/字节码/
            .translation）→ 格式 3 追加运行时脚本并重建目录。 */
-        private static bool PatchPackFile(string packPath, ref int patchedResources, ref int patchedStrings)
+        private static bool PatchPackFile(string packPath, ref int patchedResources, ref int patchedStrings, bool runtimeOnly)
         {
             patchedResources = 0;
             patchedStrings = 0;
@@ -871,8 +981,20 @@ namespace DstLauncher
                     if (!ReadAtExact(h, pos, meta, (int)info.EntryMetaSize)) break;
                     pos += info.EntryMetaSize;
                     parsedEntries++;
+                    if (info.Format == 4 && ReadU32Le(meta, 32) != 0) {
+                        Log.Append("Godot: PCK v4 entry has unsupported encrypted/removal/delta flags; patch discarded.");
+                        return false;
+                    }
 
                     string entryName = PackEntryName(path);
+                    if (info.Format >= 2 && ReadU32Le(meta, 32) != 0) {
+                        if (ReadU32Le(meta, 32) != 1u || ByteStr.EqualsNoCase(entryName, RuntimeScriptPath) ||
+                            ByteStr.EqualsNoCase(entryName, AutoloadScriptPath) || ByteStr.EqualsNoCase(entryName, AutoloadOverridePath)) {
+                            Log.Append("Godot: unsupported encrypted runtime/config or entry flags; patch discarded.");
+                            return false;
+                        }
+                        continue;
+                    }
                     if (ByteStr.EqualsNoCase(entryName, RuntimeScriptPath)) runtimeMetaPos = metaPos;
                     if (ByteStr.EqualsNoCase(entryName, AutoloadScriptPath)) autoloadMetaPos = metaPos;
                     if (ByteStr.EqualsNoCase(entryName, AutoloadOverridePath)) {
@@ -911,9 +1033,9 @@ namespace DstLauncher
                 if (entries.Count > 1) entries.Sort(CompareEntriesForPatch);
 
                 var http = new PatchHttp();
-                bool httpAvailable = http.Open();
-                if (!httpAvailable && entries.Count != 0) {
-                    Log.Append("Godot: local server was not reachable; building a runtime-only format 3 patch when possible.");
+                bool httpAvailable = !runtimeOnly && http.Open();
+                if (!runtimeOnly && !httpAvailable && entries.Count != 0) {
+                    Log.Append("Godot: local server was not reachable; building a runtime-only format 3/4 patch when possible.");
                 }
 
                 string cjkFont = FindSystemCjkFont();
@@ -921,6 +1043,7 @@ namespace DstLauncher
                 int fontReplacements = 0;
                 int liveUsed = 0;
                 foreach (PckEntry entry in entries) {
+                    if (runtimeOnly) break;
                     if (entry.Kind == EntryFont) {
                         if (fontReplacements >= MaxFontReplacements) continue;
                         if (cjkFont == null) {
@@ -984,7 +1107,7 @@ namespace DstLauncher
                 }
                 http.Close();
 
-                if (info.Format == 3) {
+                if (info.Format == 3 || info.Format == 4) {
                     bool supportsAutoloadPrepend = info.EngineMajor > 4u ||
                                                    (info.EngineMajor == 4u && info.EngineMinor >= 6u);
                     string overrideSource = null;
@@ -1020,7 +1143,7 @@ namespace DstLauncher
                     }
                     if (!EmbedFormat3RuntimeScripts(h, info, directoryEnd, runtimeMetaPos, autoloadMetaPos,
                                                     overrideMetaPos, autoloadScript, overrideConfig)) {
-                        Log.Append("Godot: failed to embed the runtime translator and rebuild the format 3 PCK directory.");
+                        Log.Append("Godot: failed to embed the runtime translator and rebuild the format 3/4 PCK directory.");
                         return false;
                     }
                     patchedResources += 1 + (autoloadConfigured ? 2 : 0);
@@ -1033,9 +1156,14 @@ namespace DstLauncher
 
         /* godot_prepare_patch_pack：返回启动时应使用的覆盖包（或松散工程的侧车脚本）路径，
            失败返回 null。原始 .pck / EXE 不被修改。 */
-        public static string PreparePatchPack(string dir)
+        public static string PreparePatchPack(string dir) { return PreparePack(dir, false); }
+        public static string PrepareRuntimePack(string dir) { return PreparePack(dir, true); }
+
+        // 首次启动只嵌入模块；不让远程 API 延迟阻塞游戏启动。
+        private static string PreparePack(string dir, bool runtimeOnly)
         {
             if (string.IsNullOrEmpty(dir) || SafeFs.PathHasReparsePoint(dir, true)) return null;
+            if (!EnsureBundledFontLicenseIfSelected(dir)) return null;
             string finalPack = PathUtil.Join(dir, PackName);
             string buildPack = PathUtil.Join(dir, BuildingName);
             string nextPack = PathUtil.Join(dir, NextName);
@@ -1051,6 +1179,26 @@ namespace DstLauncher
 
             PckSource src;
             bool hasPckSource = FindSidecarPck(dir, out src) || FindEmbeddedPck(dir, out src);
+            string sourceMark = hasPckSource ? SourceFingerprint(src) : "";
+            if (hasPckSource && sourceMark == null) {
+                Log.Append("Godot: could not fingerprint the source pack; patch build cancelled.");
+                return null;
+            }
+            if (runtimeOnly) {
+                if (!hasPckSource) return null;
+                var info = new PckInfo();
+                bool supported;
+                try {
+                    using (var source = new FileStream(src.Path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                        supported = ReadPckInfo(source, src.Offset, src.Size, info);
+                } catch (IOException ex) {
+                    Log.Append("Godot: runtime pack source open failed (Windows error " + (ex.HResult & 0xffff) + ")."); return null;
+                } catch (UnauthorizedAccessException ex) {
+                    Log.Append("Godot: runtime pack source open failed (Windows error " + (ex.HResult & 0xffff) + ")."); return null;
+                }
+                if (!supported || (info.Format != 3 && info.Format != 4)) return null;
+                Log.Append("Godot: preparing initial runtime pack without translation requests.");
+            }
             Log.Append("Godot: building external translation patch pack...");
             int patchedResources = 0, patchedStrings = 0;
             string outPack = finalPack;
@@ -1064,7 +1212,10 @@ namespace DstLauncher
                     SafeFs.DeleteFileSafe(buildPack);
                     shouldTryLooseProject = true;
                     Log.Append("Godot: failed to normalize embedded PCK v1 offsets; trying loose project overrides.");
-                } else if (!PatchPackFile(buildPack, ref patchedResources, ref patchedStrings) || patchedResources == 0) {
+                } else if (!NormalizeEncryptedDirectory(buildPack, EngineDetector.FindExe(dir))) {
+                    SafeFs.DeleteFileSafe(buildPack);
+                    shouldTryLooseProject = true;
+                } else if (!PatchPackFile(buildPack, ref patchedResources, ref patchedStrings, runtimeOnly) || patchedResources == 0) {
                     SafeFs.DeleteFileSafe(buildPack);
                     shouldTryLooseProject = true;
                     Log.Append("Godot: PCK source had no translated overrides; trying loose project overrides.");
@@ -1093,7 +1244,15 @@ namespace DstLauncher
                 }
             }
 
+            if (hasPckSource && SourceFingerprint(src) != sourceMark) {
+                SafeFs.DeleteFileSafe(buildPack);
+                Log.Append("Godot: source pack changed during build; discarding the patch copy.");
+                return null;
+            }
             if (SafeFs.MoveFileSafe(buildPack, finalPack, SafeFs.MOVEFILE_REPLACE_EXISTING | SafeFs.MOVEFILE_WRITE_THROUGH)) {
+                byte[] mark = Encoding.ASCII.GetBytes(sourceMark);
+                if (!SafeFs.WriteBytes(finalPack + SourceSuffix, mark, mark.Length))
+                    Log.Append("Godot: patch source fingerprint could not be saved (Windows error " + SafeFs.LastError + ").");
                 if (PathUtil.Exists(nextPack) && !SafeFs.DeleteFileSafe(nextPack)) {
                     int cleanupErr = SafeFs.LastError;
                     if (cleanupErr != SafeFs.ERROR_FILE_NOT_FOUND) {
@@ -1111,6 +1270,9 @@ namespace DstLauncher
                     return null;
                 }
                 outPack = nextPack;
+                byte[] mark = Encoding.ASCII.GetBytes(sourceMark);
+                if (!SafeFs.WriteBytes(nextPack + SourceSuffix, mark, mark.Length))
+                    Log.Append("Godot: staged patch source fingerprint could not be saved (Windows error " + SafeFs.LastError + ").");
                 Log.Append("Godot: active patch pack is busy; staged refreshed pack for next launch: " + nextPack);
             }
             Log.Append("Godot: patched " + patchedResources + " resources with " + patchedStrings + " translated strings.");
@@ -1125,6 +1287,12 @@ namespace DstLauncher
             string nextPack = PathUtil.Join(dir, NextName);
             if (!PathUtil.Exists(nextPack)) return false;
             if (SafeFs.MoveFileSafe(nextPack, finalPack, SafeFs.MOVEFILE_REPLACE_EXISTING | SafeFs.MOVEFILE_WRITE_THROUGH)) {
+                string from = nextPack + SourceSuffix, to = finalPack + SourceSuffix;
+                if (PathUtil.Exists(from)) {
+                    if (!SafeFs.MoveFileSafe(from, to, SafeFs.MOVEFILE_REPLACE_EXISTING | SafeFs.MOVEFILE_WRITE_THROUGH))
+                        Log.Append("Godot: staged source fingerprint promotion failed (Windows error " + SafeFs.LastError + ").");
+                } else if (PathUtil.Exists(to) && !SafeFs.DeleteFileSafe(to))
+                    Log.Append("Godot: obsolete source fingerprint cleanup failed (Windows error " + SafeFs.LastError + ").");
                 Log.Append("Godot: promoted refreshed patch pack from previous run.");
                 return true;
             }

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -26,7 +27,7 @@ namespace DstServerCs
         public int TimeoutMs = 15000;
         public int Concurrency = ApiClient.ConcurrencyMax;
         public string Endpoint = "https://api.deepseek.com/v1/chat/completions";
-        public string Model = "deepseek-v4-flash";
+        public string Model = "deepseek-flash";
         public string Key = "";
         public string Glossary = "";
 
@@ -38,6 +39,9 @@ namespace DstServerCs
         [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
         private static extern int GetPrivateProfileIntA(
             string section, string key, int def, string file);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetPrivateProfileStringW(string section, string key, string def,
+            StringBuilder buffer, int size, string file);
 
         private static string IniString(string file, string key, string def)
         {
@@ -51,7 +55,7 @@ namespace DstServerCs
             TimeoutMs = 15000;
             Concurrency = ApiClient.ConcurrencyMax;
             Endpoint = "https://api.deepseek.com/v1/chat/completions";
-            Model = "deepseek-v4-flash";
+            Model = "deepseek-flash";
             Key = "";
             Glossary = "";
             Enabled = false;
@@ -62,7 +66,13 @@ namespace DstServerCs
             InitDefaults();
             if (string.IsNullOrEmpty(path)) return;
             Endpoint = IniString(path, "endpoint", Endpoint);
-            Model = IniString(path, "model", Model);
+            var model = new StringBuilder(257);
+            GetPrivateProfileStringW("api", "model", Model, model, model.Capacity, path);
+            Model = model.ToString();
+            if (!ApiConfigText.ModelFits(Model)) {
+                Model = "";
+                Console.Error.WriteLine("[api] invalid Unicode model or UTF-8 model exceeds 255 bytes"); return;
+            }
             Key = IniString(path, "key", "");
             // 与 api.c 一致：本地模型（回环端点）单批生成可能远慢于云 API，
             // 未显式配置 timeout_ms 时默认 180s、上限 300s；远程维持 15s/60s。
@@ -91,18 +101,16 @@ namespace DstServerCs
         {
             if (!ApiClient.IsOfficialDeepseekEndpoint(Endpoint)) return;
             if (Model != "deepseek-chat") return;
-            Model = "deepseek-v4-flash";
+            Model = "deepseek-flash";
             Console.Error.WriteLine(
                 "[api] migrated retired official model deepseek-chat to " +
-                "deepseek-v4-flash for this process; api.ini was not rewritten");
+                "deepseek-flash for this process; api.ini was not rewritten");
         }
     }
 
     public static class ApiClient
     {
         public const int ConcurrencyMax = 8;
-        private const int MaxResponseBytes = 2 * 1024 * 1024;
-
         private static readonly HttpClient Http = new HttpClient(new HttpClientHandler
         {
             AutomaticDecompression = DecompressionMethods.None,
@@ -158,8 +166,9 @@ namespace DstServerCs
         public static void Configure(ApiConfig cfg)
         {
             ModelName = cfg.Model;
+            /* V4.1 Flash 的稳定 ID 与旧 V4 系列都保持翻译专用非思考模式。 */
             DisableThinking = IsOfficialDeepseekEndpoint(cfg.Endpoint)
-                && cfg.Model.StartsWith("deepseek-v4-", StringComparison.Ordinal);
+                && (cfg.Model == "deepseek-flash" || cfg.Model.StartsWith("deepseek-v4-", StringComparison.Ordinal));
             ChatUrl = cfg.Endpoint;
             AuthHeader = string.IsNullOrEmpty(cfg.Key)
                 ? null
@@ -259,11 +268,13 @@ namespace DstServerCs
             return sb.ToString();
         }
 
-        private static long diagCount;
+        private static readonly ConcurrentDictionary<string, long> DiagCounts =
+            new ConcurrentDictionary<string, long>();
 
         private static void Diag(string stage, string detail)
         {
-            long n = Interlocked.Increment(ref diagCount);
+            // 与 C 服务端一样按失败阶段限频，避免其他错误掩盖首次响应超限。
+            long n = DiagCounts.AddOrUpdate(stage, 1, (key, count) => count + 1);
             if (n <= 3 || (n & (n - 1)) == 0) {
                 Console.Error.WriteLine("[api] " + stage + " failed #" + n
                     + (detail != null ? " (" + detail + ")" : ""));
@@ -300,7 +311,8 @@ namespace DstServerCs
                         }
                         HttpResponseMessage resp;
                         try {
-                            resp = await Http.SendAsync(req, cts.Token).ConfigureAwait(false);
+                            resp = await Http.SendAsync(req,
+                                HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false);
                         } catch (OperationCanceledException) {
                             // 超时：大批次在慢速本地模型上可能超时，缩小批次有意义。
                             Diag("send", "timeout");
@@ -324,23 +336,43 @@ namespace DstServerCs
                                 if (fail != null) fail.Splittable = HttpStatusSplittable(status);
                                 return null;
                             }
-                            string raw;
+                            byte[] rawBytes;
                             try {
-                                raw = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                                // .NET Framework 的响应流可能在 ReadAsync 中忽略取消标记。
+                                // 截止时关闭实际响应连接，使只发头或半截正文的厂商不能永久占用通道。
+                                // 下方按取消状态记录超时；关闭导致的 IO 异常不能伪装为有效译文。
+                                using (cts.Token.Register(() => resp.Dispose())) {
+                                    using (var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false)) {
+                                        rawBytes = await ProviderResponseReader.ReadAsync(
+                                            stream, resp.Content.Headers.ContentLength, cts.Token).ConfigureAwait(false);
+                                    }
+                                }
+                            } catch (OperationCanceledException) {
+                                Diag("read-body", "timeout");
+                                if (fail != null) fail.Splittable = true;
+                                return null;
                             } catch (HttpRequestException ex) {
                                 Diag("read-body", ex.GetType().Name);
                                 if (fail != null) fail.Splittable = false;
                                 return null;
                             } catch (IOException ex) {
-                                Diag("read-body", ex.GetType().Name);
-                                if (fail != null) fail.Splittable = false;
+                                bool timedOut = cts.IsCancellationRequested;
+                                Diag("read-body", timedOut ? "timeout" : ex.GetType().Name);
+                                if (fail != null) fail.Splittable = timedOut;
+                                return null;
+                            } catch (ObjectDisposedException ex) {
+                                bool timedOut = cts.IsCancellationRequested;
+                                Diag("read-body", timedOut ? "timeout" : ex.GetType().Name);
+                                if (fail != null) fail.Splittable = timedOut;
                                 return null;
                             }
-                            if (string.IsNullOrEmpty(raw) || raw.Length > MaxResponseBytes) {
-                                Diag("body", raw == null || raw.Length == 0 ? "empty" : "too-large");
+                            if (rawBytes == null || rawBytes.Length == 0) {
+                                Diag(rawBytes == null ? "body-too-large" : "empty-body",
+                                    rawBytes == null ? "limit=2097152" : null);
                                 if (fail != null) fail.Splittable = true;
                                 return null;
                             }
+                            string raw = Encoding.UTF8.GetString(rawBytes);
                             string content = ExtractContent(raw);
                             if (content == null) {
                                 Diag("missing-content", null);
@@ -392,8 +424,12 @@ namespace DstServerCs
             if (arr == null || arr.Count != expected) return null;
             var outArr = new string[expected];
             for (int i = 0; i < expected; i++) {
+                // 外部模型可能返回等长但混入 null/数字的数组；上游无法约束其输出。
+                // 拒绝整批并交给现有 batch-shape 诊断和拆分重试，不把坏元素缓存为译文。
+                var item = arr[i] as string;
+                if (item == null) return null;
                 outArr[i] = TextRules.NormalizeTranslationResult(
-                    TextRules.NormalizeTranslation(arr[i] as string));
+                    TextRules.NormalizeTranslation(item));
                 if (outArr[i] == null) return null;
             }
             return outArr;

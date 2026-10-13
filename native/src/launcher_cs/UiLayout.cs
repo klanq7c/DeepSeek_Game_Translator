@@ -64,26 +64,26 @@ namespace DstLauncher
             Win32.GetClientRect(hwnd, out r);
 
             var ui = new UiLayout();
-            ui.rail = Sc(Theme.RAIL_W);
-            ui.pad = Sc(28);
+            ui.rail = 0;
+            ui.pad = Sc(40);
             ui.x = ui.rail + ui.pad;
             ui.w = MaxI(r.right - ui.x - ui.pad, Sc(560));
-            ui.hero_right = Sc(220);
+            ui.hero_right = ui.w / 2 - Sc(20);
 
-            int pickerTop = Sc(136);
-            int pickerH = Sc(188);
+            int pickerTop = Sc(262);
+            int pickerH = Sc(166);
             ui.picker.left = ui.x;
             ui.picker.top = pickerTop;
             ui.picker.right = ui.x + ui.w;
             ui.picker.bottom = pickerTop + pickerH;
 
             ui.path_label_x = ui.x + Sc(24);
-            ui.path_label_y = pickerTop + Sc(24);
+            ui.path_label_y = pickerTop + Sc(18);
             ui.path_label_w = Sc(240);
             ui.path_label_h = Sc(24);
 
             ui.path_x = ui.x + Sc(24);
-            ui.path_y = pickerTop + Sc(72);
+            ui.path_y = pickerTop + Sc(56);
             ui.path_h = Sc(38);
             ui.side_button_w = Sc(112);
             ui.side_gap = Sc(12);
@@ -91,8 +91,8 @@ namespace DstLauncher
             ui.browse_x = ui.open_x - ui.side_gap - ui.side_button_w;
             ui.path_w = MaxI(ui.browse_x - ui.path_x - ui.side_gap, Sc(180));
 
-            ui.action_y = pickerTop + Sc(128);
-            ui.action_h = Sc(42);
+            ui.action_y = pickerTop + Sc(108);
+            ui.action_h = Sc(40);
             ui.action_gap = Sc(12);
             int actionInnerW = ui.w - Sc(48);
             ui.action_button_w = (actionInnerW - ui.action_gap * 3) / 4;
@@ -102,17 +102,17 @@ namespace DstLauncher
             ui.action_x2 = actionLeft + 2 * (ui.action_button_w + ui.action_gap);
             ui.action_x3 = actionLeft + 3 * (ui.action_button_w + ui.action_gap);
 
-            ui.metric_gap = Sc(16);
+            ui.metric_gap = Sc(14);
             ui.metric_w = MaxI((ui.w - ui.metric_gap * 2) / 3, Sc(150));
-            ui.metric_y = ui.picker.bottom + Sc(20);
-            ui.metric_h = Sc(100);
-            ui.metric_value_y = ui.metric_y + Sc(40);
-            ui.metric_value_h = Sc(34);
+            ui.metric_y = ui.picker.bottom + Sc(14);
+            ui.metric_h = Sc(76);
+            ui.metric_value_y = ui.metric_y + Sc(34);
+            ui.metric_value_h = Sc(30);
 
-            ui.log_top = ui.metric_y + ui.metric_h + Sc(20);
-            ui.log_bottom = MaxI(r.bottom - Sc(24), ui.log_top + Sc(96));
-            ui.log_edit_top = ui.log_top + Sc(56);
-            ui.log_edit_h = MaxI(ui.log_bottom - Sc(18) - ui.log_edit_top, Sc(60));
+            ui.log_top = ui.metric_y + ui.metric_h + Sc(14);
+            ui.log_bottom = MaxI(r.bottom - Sc(32), ui.log_top + Sc(96));
+            ui.log_edit_top = ui.log_top + Sc(40);
+            ui.log_edit_h = MaxI(ui.log_bottom - Sc(18) - ui.log_edit_top, Sc(32));
 
             return ui;
         }
@@ -135,9 +135,9 @@ namespace DstLauncher
 
             /* 英雄标题带 */
             int heroRight = ui.hero_right;
-            PositionControl(MainWindow.Title, x, Sc(18), w - heroRight, Sc(44), positionFlags);
-            PositionControl(MainWindow.Subtitle, x, Sc(66), w - heroRight, Sc(22), positionFlags);
-            PositionControl(MainWindow.Status, x, Sc(94), w - heroRight, Sc(22), positionFlags);
+            PositionControl(MainWindow.Title, x, Sc(112), w - heroRight, Sc(50), positionFlags);
+            PositionControl(MainWindow.Subtitle, x, Sc(170), w - heroRight, Sc(22), positionFlags);
+            PositionControl(MainWindow.Status, x, Sc(204), w - heroRight, Sc(22), positionFlags);
 
             /* 选择器卡片内容 */
             PositionControl(MainWindow.PathLabel, ui.path_label_x, ui.path_label_y, ui.path_label_w, ui.path_label_h, positionFlags);
@@ -173,32 +173,25 @@ namespace DstLauncher
                                Win32.RDW_INVALIDATE | Win32.RDW_ALLCHILDREN | Win32.RDW_NOERASE);
         }
 
-        /* 动画心跳（约 60fps），对应 tick_ui_animation：只失效小条带区域。 */
-        internal static void TickAnimation(IntPtr hwnd)
-        {
-            if (hwnd == IntPtr.Zero || !Win32.IsWindow(hwnd) || Win32.IsIconic(hwnd)) return;
-            UiLayout ui = Compute(hwnd);
-            Win32.RECT client;
-            Win32.GetClientRect(hwnd, out client);
-
-            /* 数据线条带：起始于状态控件之下 */
-            var dataLine = new Win32.RECT(ui.x, Sc(116), ui.x + ui.w, Sc(122));
-            Win32.InvalidateRect(hwnd, ref dataLine, false);
-
-            /* 状态药丸指示灯呼吸区（药丸左端圆点一带） */
-            int pillW = Sc(176);
-            int pillX = client.right - ui.pad - pillW;
-            var pillDot = new Win32.RECT(pillX, Sc(30), pillX + Sc(46), Sc(30) + Sc(36));
-            Win32.InvalidateRect(hwnd, ref pillDot, false);
-
-            /* 日志卡 LIVE 呼吸灯区（自绘圆点，不含文字） */
-            int liveCx = ui.x + ui.w - Sc(74);
-            int liveCy = ui.log_top + Sc(12) + Sc(12);
-            var liveDot = new Win32.RECT(liveCx - Sc(13), liveCy - Sc(11), liveCx + Sc(13), liveCy + Sc(11));
-            Win32.InvalidateRect(hwnd, ref liveDot, false);
-
-            /* 按钮悬停渐变：指数缓动逼近目标，过渡期间重绘按钮 */
-            UiButtons.TickHover(hwnd);
+        /* 动画心跳（约 30fps），后台、最小化和减少动画模式停止装饰刷新。 */
+        internal static void TickAnimation(IntPtr hwnd) {
+            uint now = Win32.GetTickCount();
+            uint elapsed = Theme.MotionLast != 0 ? unchecked(now - Theme.MotionLast) : 33u;
+            Theme.MotionLast = now;
+            if (hwnd == IntPtr.Zero || !Win32.IsWindow(hwnd) || Win32.IsIconic(hwnd) || Win32.GetForegroundWindow() != hwnd || Theme.AnimTickOverride >= 0) return;
+            if (elapsed > 100u) elapsed = 100u;
+            float blend = Theme.MotionEnabled ? 1.0f - (float)Math.Exp(-(float)elapsed / 80.0f) : 1.0f;
+            if (Theme.MotionEnabled) {
+                Theme.MotionTick += elapsed;
+                UiLayout ui = Compute(hwnd);
+                var sky = new Win32.RECT(ui.x + ui.w - ui.hero_right, Sc(75), ui.x + ui.w, Sc(240));
+                var dataLine = new Win32.RECT(ui.x - Sc(4), Sc(230), ui.x + Sc(212), Sc(235));
+                var pillDot = new Win32.RECT(ui.x + ui.w - Sc(158), Sc(27), ui.x + ui.w - Sc(136), Sc(47));
+                Win32.InvalidateRect(hwnd, ref sky, false);
+                Win32.InvalidateRect(hwnd, ref dataLine, false);
+                Win32.InvalidateRect(hwnd, ref pillDot, false);
+            }
+            UiButtons.TickHover(hwnd, blend);
         }
     }
 }

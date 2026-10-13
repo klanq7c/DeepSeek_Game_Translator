@@ -88,6 +88,10 @@ init 999 python:
         try:
             # deque 与字典共同构成有界 FIFO：淘汰为摊还 O(1)，避免后台线程持 GIL 排序。
             with _ds_lock:
+                # 缓存查询与实时请求可以乱序完成；迟到 queued 原文不能覆盖已完成的译文。
+                previous = _ds_memo.get(s)
+                if val == s and previous is not None and previous[0] != s:
+                    return
                 if s not in _ds_memo:
                     _ds_memo_order.append(s)
                 _ds_memo[s] = (val, now)
@@ -196,12 +200,36 @@ init 999 python:
             if _ds_invoke_main is not None:
                 _ds_invoke_main(_ds_refresh_visible_text)
             else:
-                _ds_report_diagnostic('refresh-main-thread-fallback', 'invoke_in_main_thread unavailable')
-                _ds_refresh_visible_text()
+                # Ren'Py 7.2 等旧版本没有主线程派发接口；不能让 HTTP worker 操作布局。
+                # 主线程拥有 periodic/interact 生命周期，在那里消费已标记刷新。
+                # 上游引擎版本不可更改；若回调注册失败，只保留原文并记录诊断，不伪装刷新成功。
+                _ds_report_diagnostic('refresh-main-thread-fallback', 'deferred to engine lifecycle callbacks')
         except Exception as exc:
             with _ds_lock:
                 _ds_state['refresh_scheduled'] = False
             _ds_report_exception(exc, 'refresh-interaction')
+    def _ds_flush_legacy_refresh():
+        with _ds_lock:
+            scheduled = _ds_state['refresh_scheduled']
+        if scheduled:
+            _ds_refresh_visible_text()
+    def _ds_install_legacy_refresh_hook():
+        if getattr(renpy, 'invoke_in_main_thread', None) is not None:
+            return
+        installed = 0
+        for name in ('periodic_callbacks', 'interact_callbacks'):
+            try:
+                callbacks = getattr(renpy.config, name, None)
+                if callbacks is None:
+                    continue
+                if _ds_flush_legacy_refresh not in callbacks:
+                    callbacks.append(_ds_flush_legacy_refresh)
+                installed += 1
+            except Exception as exc:
+                _ds_report_exception(exc, 'register-legacy-refresh-' + name)
+        if not installed:
+            _ds_report_diagnostic('legacy-refresh-unavailable', 'no main-thread lifecycle callback list')
+    _ds_install_legacy_refresh_hook()
     def _ds_queue_live(keys, priority=False):
         queued = False
         target = _ds_fast_live_queue if priority else _ds_live_queue
@@ -234,11 +262,22 @@ init 999 python:
             return True
         return False
     def _ds_select_poll_batch(now, limit=96):
+        batch = []
+        if limit <= 0:
+            return batch
         with _ds_lock:
-            batch = [key for key in _ds_priority_pending if key in _ds_pending and key not in _ds_inflight and _ds_retry_after.get(key, 0.0) <= now][:limit]
-            if len(batch) < limit:
-                batch.extend(key for key in list(_ds_pending.keys()) if key not in _ds_priority_set and key not in _ds_inflight and _ds_retry_after.get(key, 0.0) <= now and key not in batch)
-                del batch[limit:]
+            # 取满即停止；锁内没有队列写入，可直接遍历字典，兼容 Ren'Py 7 的 Python 2。
+            for key in _ds_priority_pending:
+                if key in _ds_pending and key not in _ds_inflight and _ds_retry_after.get(key, 0.0) <= now:
+                    batch.append(key)
+                    if len(batch) >= limit:
+                        return batch
+            # 优先集合与列表在同一把锁下维护，剩余字典键不会与已选优先项重复。
+            for key in _ds_pending:
+                if key not in _ds_priority_set and key not in _ds_inflight and _ds_retry_after.get(key, 0.0) <= now:
+                    batch.append(key)
+                    if len(batch) >= limit:
+                        break
         return batch
     def _ds_next_poll_delay():
         now = _ds_time.time()

@@ -14,9 +14,35 @@ and runtime. The important design shape is:
   concurrently through the live worker pool. Provider results enter the cache
   in batches so one remote response needs one map-lock interval and one TSV
   flush rather than one flush per translated string.
+- Both servers confirm new batch persistence only after all writes and the
+  final flush succeed. A write/flush failure keeps the batch dirty for a later
+  same-value retry, including repeated keys with A/B/A values. Cache export
+  keeps its existing consistent view: native JSON copies ordinary UTF-8 runs
+  in bulk, while the C# HTTP layer encodes the body directly into its final
+  send buffer instead of creating another full response string.
+- When reopening a cache for append, both servers check its final byte and
+  append a separator if needed, preserving every existing byte. This prevents
+  an interrupted tail from absorbing a later successfully persisted record;
+  recovery is diagnosed as `persist-tail`.
 - Engine adapters own renderer compatibility. Font coverage, rich text, glyph
   punctuation, typewriter behavior, overlays, and resource parsing belong in
   the closest Ren'Py, RPG Maker, Unity, or Godot layer.
+- Godot control and menu-item discovery parses each source once per operation.
+  Filtering and queueing read that text plan before rendering consumes its parts;
+  plans are never retained across frames. Cache-only redraw still performs no HTTP.
+- The C# launcher retains only the latest 2000 log lines, matching the window's
+  display limit. Its diagnostic sink receives every line independently of history
+  eviction, preserving complete stdout for C/C# parity checks.
+- Both launchers reuse a UI-thread-owned GDI back buffer, repainting every dirty
+  region. Size, DPI, display-device changes and window destruction release it;
+  the render probe compares buffered full/partial redraws with direct painting.
+- Unity Mono shares TMP/UGUI discovery only within one synchronous group of
+  scene, activation and periodic cache consumers. Snapshot references are released
+  in `finally`; scene reset and even throttled activation invalidate them. Scan
+  budgets, immediate activation and new-translation full scans remain unchanged.
+  TMP `OnEnable`, successful cache applications and queued UI writes also
+  invalidate discovery: a game's setter/layout callback can create another text
+  object without calling `GameObject.SetActive`. Failed writes invalidate it too.
 - Translation memory, cache files, API keys, user config, logs, third-party
   runtimes, Unity/game assemblies, and generated build products are user or
   build artifacts. Do not commit or rewrite them unless explicitly requested.
@@ -71,25 +97,53 @@ and runtime. The important design shape is:
   `--ui-probe <w> <h> <alive> <bmp>` (C#) paint the launcher window off-screen
   into a 32bpp bitmap and print a layout report (client size, DPI, every control
   id/rect/text). To make two machines and two languages comparable the probe
-  pins DPI to 96, freezes the animation clock at tick 0, takes the server state
+  pins DPI to 96, freezes the animation clock (tick 0 by default, diagnostic
+  DST_UI_PROBE_TICK supports 0–30000ms), takes the server state
   from an argument, and skips the `WM_CREATE` side effects (payload sync, saved
-  directory, timers). The rail footer tag and hero subtitle intentionally differ
+  directory, timers). The log-card runtime tag intentionally differs
   between the two binaries (`C native runtime` vs `C# managed runtime`); the
-  probe renders neutral placeholders for them and `--ui-identity*` asserts the
-  real strings separately.
+  probe renders a neutral placeholder and `--ui-identity*` asserts the real
+  identity separately. The player-facing subtitle is identical in both versions.
 - **Local server**: `native/src/server/dst_server.exe` (C) or the parallel
   `native/dst_server_cs.exe` (C#, selected with `launcher.ini [server]
   binary=cs`). Both implement the same HTTP contract: `/health`,
   `/capabilities`, `/translate`, `/batch`, `/prefetch`, `/cache/import`,
   `/cache/lookup`, `/cache/export`, `/cache/dump`, `/shutdown`. The contract is
   pinned by `tests/server_contract/run_contract_tests.ps1`, which runs the same
-  50 checks against each binary with a fake OpenAI-compatible provider.
+  74 checks against each binary with a fake OpenAI-compatible provider,
+  including cache write-failure recovery, duplicate imports, batch confirmation,
+  and restart durability.
 - **Shared core (`DstCore`)**: `native/src/core/*.cs` — `TextRules` (prompt echo
   stripping, CJK detection), `Json` (strict parser/escaper), `CacheCodec` (TSV
   + base64 cache line format), `Contract` (paths, JSON field names, `source`
   values). Source-linked (not a DLL) into the C# server, the XUnity endpoint
   payload, the C# launcher port, and `tests/core_tests`, which pins C parity
   with golden cases.
+- **Provider model catalog**: the API configuration dialog fetches the current
+  provider's `/models` catalog in a background worker (`api_models.c` / `ApiModels.cs`).
+  An editable combo preserves the chosen model across refreshes. Opening a saved
+  keyed configuration, or the local presets, refreshes once; after changing
+  endpoint/key the user explicitly refreshes. Stale responses are discarded and
+  closing the dialog never leaves a worker referencing its window. This only
+  discovers model IDs; saving still writes endpoint/model/key and the server
+  reads them at startup. Discovery never translates, writes cache, or silently
+  chooses a replacement model.
+  Provider presets contain addresses only; a missing launcher model stays blank
+  until selected or entered. Changing provider address clears the previous
+  provider's model; selecting the same address or "custom" preserves it. A fresh
+  directory records its fetch time and reports exact membership of the current
+  ID, including a visible warning for unlisted IDs (aliases may still be valid).
+  Empty/whitespace endpoint or model cannot be saved by the dialog.
+  Anthropic cursor pages and DashScope `output.models` pages are fetched with
+  bounded requests; any page failure discards the entire result. SiliconFlow's
+  official directory is filtered to chat models. Provider protocol adapters
+  preserve the configured host and never infer a workspace or a newer model ID.
+  The DeepSeek server compatibility default/example uses the stable `deepseek-flash` API ID
+  (V4.1 Flash as of 2026-09-18), not an invented version-shaped identifier.
+  Existing explicitly configured IDs are retained; official `deepseek-chat`
+  retirement migration targets this stable ID in memory only. Translation
+  requests disable thinking for this exact official ID as well as the supported
+  legacy V4 family, with custom endpoints left untouched.
 - **Embedded engine scripts**: the Ren'Py hook (`payloads/RenPy/iron_deepseek.rpy`),
   the RPG Maker hook (`payloads/RPGMaker/hook_rpgm_mv.js`) and the Godot 3/4
   runtime sidecars (`payloads/Godot/dst_godot_runtime_g{3,4}.gd`) are real
@@ -108,7 +162,9 @@ and runtime. The important design shape is:
   writing speculative translations as successful cache entries. The C# mirror
   in `native/src/launcher_cs/Warmup*.cs` treats every `string` as a C byte
   string (one char per byte) so that filters, limits, and JSON serialization
-  stay byte-identical with the C scanner.
+  stay byte-identical with the C scanner. For RPG Maker MV/MZ, enabled
+  `js/plugins.js` display parameters are scanned ahead of external text and
+  `data/*.json`, because save/help windows can draw their labels from plugins.
 - **Runtime payload**: engine-specific code used inside a game, such as the
   Ren'Py hook, RPG Maker hook, UnityTranslator plugin, XUnity endpoint, or TMP
   font fallback.
@@ -162,7 +218,9 @@ and runtime. The important design shape is:
 - **RPG Maker display acceptance**: renderer-local results must retain ordered
   control tokens and must not contain a copied run of three or more source
   English words inside an otherwise CJK translation. Isolated names, acronyms,
-  key labels, and game terms remain valid. Rejection affects only the RPG Maker
+  key labels, and game terms remain valid. A short source label also rejects a
+  much longer English-only answer; numbered save slots can use the translated
+  base label plus the original slot number. Rejection affects only the RPG Maker
   display cache and never rewrites shared translation memory.
 - **Renderer control sequence**: engine markup whose order is part of the
   display contract, such as RPG Maker `\c[]`, `\v[]`, `\i[]`, `<WordWrap>`,
@@ -172,8 +230,11 @@ and runtime. The important design shape is:
   redraw only a window that actually rendered translatable text and is still
   open. Persistence scenes (`Scene_File`, save/load modes, and plugin-defined
   equivalents), closed/closing windows, and unrelated `Window_Base` instances
-  must not be refreshed by the translation adapter; their `refresh()` methods
-  may read saves or schedule delayed renderer work. A visible window in its
+  must not receive a generic `refresh()` call from the translation adapter;
+  their methods may read saves or schedule delayed renderer work. In a save/load
+  scene, a cache hit instead repaints the help source, visible selectable rows,
+  and the already parsed YEP save-info columns from memory. Queued first misses
+  use a bounded cache-only poll and never wait on remote API work. A visible window in its
   opening transition remains a valid redraw target, including the first frame
   where `_opening` is true and `openness` is still zero.
 - **Unity Mono pump ownership**: the disposable BepInEx manager component
@@ -288,5 +349,35 @@ and runtime. The important design shape is:
   Godot 4 scans newly tracked controls in bounded 256-node slices every 80 ms
   and runs the compatibility whole-tree fallback every 25 ticks, avoiding a
   duplicate full traversal on every refresh.
+  Both runtime HTTP pools use a 12-second request deadline and accept only
+  successful transfers with a translations dictionary containing string values.
+  Malformed/nonstring results stay unresolved with rate-limited diagnostics and
+  the existing retry backoff. Godot 3 HTTP nodes and the scan timer use
+  `PAUSE_MODE_PROCESS`, matching Godot 4's pause-independent request/scan owners,
+  so a paused menu can still translate and a stalled request can release its slot.
   Older exports retain the sidecar command-line path. Original game `.pck` or
   embedded packs are not rewritten.
+
+Godot exported PCK v4 uses the same ordinary directory layout as v3. The Godot
+adapter supports both, including embedded packs, while refusing unsupported
+sparse/encrypted/delta patch inputs. A first launch prepares a separate runtime
+pack before opening the game, without translation requests; resource warmup and
+static patch refresh remain background work. Original game packs stay unchanged.
+
+RPG Maker visible text completion stays in the renderer hook. Static UI polls
+only local cache after an immediate `queued` response, and failed local requests
+can retry within the existing cooldown. A cache connection failure permits
+re-enqueue after a server restart loses its queue. Poll ownership is the current
+scene with a visible refresh target, capped at 128 keys and 60 seconds per key;
+late retry callbacks cannot extend that deadline. Completed message pages still
+awaiting player input retain their separate bounded cache poll and preserve pause
+when repainted. Cache misses/faults never become successful translated text.
+
+Ren'Py legacy engines without `invoke_in_main_thread` drain translation refresh
+from their periodic/interaction callbacks; HTTP workers cannot touch Text layout.
+Memo publication cannot replace an already translated value with a late queued
+identity reply. Unity punctuation compatibility shares one renderer tag-boundary
+helper (`TmpRichText.cs`, source-linked into Mono and both IL2CPP payloads), so
+link/sprite attributes remain intact. Atlas readability is an optional diagnosed
+reflection boundary for stripped APIs. The XUnity endpoint source-links the
+shared JSON parser and rejects incomplete, blank or normalized identity results.

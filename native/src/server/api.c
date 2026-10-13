@@ -76,16 +76,19 @@ static int is_official_deepseek_endpoint(const char *endpoint) {
 static void migrate_deprecated_deepseek_model(ApiConfig *cfg) {
     if (!is_official_deepseek_endpoint(cfg->endpoint)) return;
     if (strcmp(cfg->model, "deepseek-chat") != 0) return;
-    snprintf(cfg->model, sizeof cfg->model, "%s", "deepseek-v4-flash");
+    snprintf(cfg->model, sizeof cfg->model, "%s", "deepseek-flash");
     fprintf(stderr,
             "[api] migrated retired official model deepseek-chat to "
-            "deepseek-v4-flash for this process; api.ini was not rewritten\n");
+            "deepseek-flash for this process; api.ini was not rewritten\n");
     fflush(stderr);
 }
 
 static int should_disable_deepseek_thinking(const ApiConfig *cfg) {
+    /* V4.1 Flash 使用稳定 ID deepseek-flash；保持游戏翻译的非思考模式，
+       同时保留 V4 别名/Pro 的兼容行为。第三方端点完全拥有自己的参数。 */
     return cfg && is_official_deepseek_endpoint(cfg->endpoint) &&
-           !strncmp(cfg->model, "deepseek-v4-", strlen("deepseek-v4-"));
+           (!strcmp(cfg->model, "deepseek-flash") ||
+            !strncmp(cfg->model, "deepseek-v4-", strlen("deepseek-v4-")));
 }
 
 /* 安全默认值：15s 超时、并发上限、DeepSeek 官方端点与模型。
@@ -95,7 +98,7 @@ void api_config_init(ApiConfig *cfg) {
     cfg->timeout_ms = 15000;
     cfg->concurrency = API_CONCURRENCY_MAX;
     snprintf(cfg->endpoint, sizeof cfg->endpoint, "%s", "https://api.deepseek.com/v1/chat/completions");
-    snprintf(cfg->model, sizeof cfg->model, "%s", "deepseek-v4-flash");
+    snprintf(cfg->model, sizeof cfg->model, "%s", "deepseek-flash");
 }
 
 /* 从 ini [api] 段加载配置。GetPrivateProfileString 的默认值传当前字段值，
@@ -109,7 +112,17 @@ int api_config_load(ApiConfig *cfg, const char *path) {
     api_config_init(cfg);
     if (!path || !*path) return 0;
     GetPrivateProfileStringA("api", "endpoint", cfg->endpoint, cfg->endpoint, sizeof cfg->endpoint, path);
-    GetPrivateProfileStringA("api", "model", cfg->model, cfg->model, sizeof cfg->model, path);
+    /* Profile A 返回系统代码页，不能直接拼入 UTF-8 JSON。先宽字符读取，按实际
+       UTF-8 字节数校验；非法或超长配置禁用 API 并记录，绝不截断模型 ID。 */
+    WCHAR wide_path[MAX_PATH * 4], wide_model[257];
+    if (!MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, path, -1, wide_path, MAX_PATH * 4)) {
+        fprintf(stderr, "[api] model config path decode failed (Windows error %lu)\n", GetLastError()); return 0;
+    }
+    GetPrivateProfileStringW(L"api", L"model", L"deepseek-flash", wide_model, 257, wide_path);
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide_model, -1, cfg->model, sizeof cfg->model, NULL, NULL)) {
+        cfg->model[0] = 0;
+        fprintf(stderr, "[api] invalid Unicode model or UTF-8 model exceeds 255 bytes\n"); return 0;
+    }
     GetPrivateProfileStringA("api", "key", "", cfg->key, sizeof cfg->key, path);
     /* loopback 判定须在 endpoint 读取之后；timeout 未配置时按端点类型取默认。 */
     int loopback = endpoint_is_loopback(cfg->endpoint);

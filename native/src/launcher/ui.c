@@ -5,9 +5,8 @@
  *
  *   1. 日志/状态管理：append_log 带时间戳追加并自动裁剪，
  *      支持水平滚动宽度计算
- *   2. 暗色主题绘制：paint_background 绘制左侧导航栏（品牌标识、
- *      导航项、功能要点、版本标签）和主区域卡片（选择器卡片、
- *      指标卡片、日志卡片、状态药丸）
+ *   2. 星夜主题绘制：paint_background 绘制品牌、星轨与月亮，
+ *      下方暖白操作区包含选择器、指标卡片和日志卡片
  *   3. 布局计算：compute_layout 根据 DPI 缩放和窗口尺寸计算
  *      所有控件的精确坐标，layout 应用这些坐标
  *   4. 按钮自绘：draw_button 区分主按钮（强调色填充）、
@@ -61,6 +60,7 @@ static int g_log_extent_px = 0;
    避免重复部署、并发 patch worker 写同一 pck 或争抢服务器进程状态。
    UI 线程置 1，工作线程结束时清 0。 */
 static volatile int g_start_flow_running = 0;
+static int g_godot_runtime_verified = 0;
 
 int translation_flow_running(void) {
     return g_start_flow_running;
@@ -100,9 +100,30 @@ static ButtonHover *button_hover_for(int id) {
     return NULL;
 }
 
+/* 系统减少动画设置只影响装饰和缓动，不改变任何操作结果。 */
+static int g_motion_enabled = 1;
+static DWORD g_motion_tick = 0;
+static int g_motion_warning = 0;
+static DWORD g_motion_last = 0;
+
+void refresh_ui_motion(void) {
+    BOOL enabled = FALSE;
+    if (!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &enabled, 0)) {
+        /* 设置由 Windows 所有，无法在上游恢复；读取失败时静态显示，
+           不掩盖功能错误，并在每次设置刷新失败时记录系统错误码。 */
+        if (!g_motion_warning) {
+            WCHAR diagnostic[160];
+            swprintf(diagnostic, 160, L"ds launcher: animation preference unavailable (%lu); using static decoration.\n", GetLastError());
+            OutputDebugStringW(diagnostic);
+            g_motion_warning = 1;
+        }
+    } else { g_motion_warning = 0; }
+    g_motion_enabled = enabled != FALSE;
+}
+
 static float button_hover_value(int id) {
     ButtonHover *h = button_hover_for(id);
-    return h ? h->t : 0.0f;
+    return h ? (g_motion_enabled ? h->t : (h->target ? 1.0f : 0.0f)) : 0.0f;
 }
 
 static LRESULT CALLBACK button_hover_proc(HWND btn, UINT msg, WPARAM wp, LPARAM lp,
@@ -120,12 +141,14 @@ static LRESULT CALLBACK button_hover_proc(HWND btn, UINT msg, WPARAM wp, LPARAM 
             TrackMouseEvent(&tme);
             h->tracking = 1;
             h->target = 1;
+            InvalidateRect(btn, NULL, FALSE);
         }
         break;
     case WM_MOUSELEAVE:
         if (h) {
             h->tracking = 0;
             h->target = 0;
+            InvalidateRect(btn, NULL, FALSE);
         }
         break;
     case WM_NCDESTROY:
@@ -177,21 +200,19 @@ int g_ui_probe = 0;
 int g_ui_probe_neutral = 0;
 int g_anim_tick_override = -1;
 
-/* 侧边栏底部的运行时标签与英雄区副标题。两版故意不同：它们标识这一帧由哪个
-   实现画出。--ui-probe-and-exit 下改用中性文案，使其余像素可逐字节比对。 */
+/* 日志卡片的运行时标签标识窗口实现，探针使用中性标签进行像素对照。
+   玩家可见副标题在两版中保持一致。 */
 const WCHAR *ui_runtime_tag(void) {
     return g_ui_probe_neutral ? L"runtime" : L"C native runtime";
 }
 
 const WCHAR *ui_subtitle_text(void) {
-    return g_ui_probe_neutral
-        ? L"local cache + live batch API - tags / vars / color safe"
-        : L"C native - local cache + live batch API - tags / vars / color safe";
+    return L"选择一个游戏，让熟悉的语言带你继续探索。";
 }
 
 /* 动画时钟：探针冻结后两版取到同一相位。 */
 static DWORD anim_tick(void) {
-    return g_anim_tick_override >= 0 ? (DWORD)g_anim_tick_override : GetTickCount();
+    return g_anim_tick_override >= 0 ? (DWORD)g_anim_tick_override : g_motion_tick;
 }
 
 void write_stdout_utf8(const WCHAR *text) {
@@ -446,7 +467,7 @@ void apply_fonts(void) {
         HWND button = GetDlgItem(g_main, button_ids[i]);
         if (button && IsWindow(button)) SendMessageW(button, WM_SETFONT, (WPARAM)g_font_body, TRUE);
     }
-    if (IsWindow(g_status))   SendMessageW(g_status,   WM_SETFONT, (WPARAM)g_font_mono_small, TRUE);
+    if (IsWindow(g_status))   SendMessageW(g_status,   WM_SETFONT, (WPARAM)g_font_small, TRUE);
     if (IsWindow(g_log)) {
         SendMessageW(g_log, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
         HDC dc = GetDC(g_log);
@@ -477,7 +498,7 @@ void apply_window_chrome(HWND hwnd) {
             }
             COLORREF caption = C_PAGE;
             COLORREF border = C_LINE;
-            COLORREF text = C_TEXT;
+            COLORREF text = RGB(245, 240, 229);
             (void)set_attr(hwnd, 35, &caption, sizeof caption);
             (void)set_attr(hwnd, 34, &border, sizeof border);
             (void)set_attr(hwnd, 36, &text, sizeof text);
@@ -490,8 +511,8 @@ void apply_window_chrome(HWND hwnd) {
         SetWindowThemeFn set_theme =
             (SetWindowThemeFn)(void *)GetProcAddress(ux, "SetWindowTheme");
         if (set_theme) {
-            if (g_log && IsWindow(g_log)) (void)set_theme(g_log, L"DarkMode_Explorer", NULL);
-            if (g_path && IsWindow(g_path)) (void)set_theme(g_path, L"DarkMode_CFD", NULL);
+            if (g_log && IsWindow(g_log)) (void)set_theme(g_log, L"Explorer", NULL);
+            if (g_path && IsWindow(g_path)) (void)set_theme(g_path, L"Explorer", NULL);
         }
         FreeLibrary(ux);
     }
@@ -555,48 +576,18 @@ static void draw_vgradient(HDC dc, int x, int y, int w, int h, COLORREF top, COL
     GradientFill(dc, v, 2, &gr, 1, GRADIENT_FILL_RECT_V);
 }
 
-/* 细腻的深色科技网格——大间距、低对比，仅作背景纹理 */
-static void draw_tech_grid(HDC dc, int left, int top, int right, int bottom) {
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(14, 20, 30));
-    HGDIOBJ old = SelectObject(dc, pen);
-    int step = sc(56);
-    for (int x = left + step; x < right; x += step) {
-        MoveToEx(dc, x, top, NULL);
-        LineTo(dc, x, bottom);
-    }
-    for (int y = top + step; y < bottom; y += step) {
-        MoveToEx(dc, left, y, NULL);
-        LineTo(dc, right, y);
-    }
-    SelectObject(dc, old);
-    DeleteObject(pen);
-}
-
-/* 页面背景色：顶部标题区与 C_PAGE 一致（不透明静态文字无缝衔接），向下缓慢加深 */
-static COLORREF page_color_at(int y, int height) {
-    if (height < 1) height = 1;
-    int flat_top = sc(116);
-    float t = (float)(y - flat_top) / (float)(height - flat_top);
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
-    return mix(C_PAGE, RGB(3, 5, 8), t * 0.85f);
-}
-
 /* ----------------------------------------------------------------
  * card_text_brush — 卡片内静态文字的不透明底色画刷
  * 主窗口带 WS_CLIPCHILDREN，父窗口不会绘制子控件背后的区域，
- * 透明背景的文字控件将无人铺底。静态文字保持不透明，底色取
- * 其所在高度处的面板渐变色，使文本框与渐变卡片无缝衔接。
- * picker_label=1：选择器卡片标签（顶部 19% 高度处）；
- * picker_label=0：指标卡片数值（57% 高度处）。
+ * 透明背景的文字控件将无人铺底。静态文字保持不透明，底色与
+ * 暖白面板一致，避免文字矩形露出不同底色。
+ * picker_label 用于区分选择器标签与指标数值的画刷生命周期。
  * ---------------------------------------------------------------- */
 static HBRUSH g_card_brush_label = NULL;
 static HBRUSH g_card_brush_value = NULL;
 
 HBRUSH card_text_brush(int picker_label, COLORREF *out_color) {
-    COLORREF top_col = mix(C_CARD, C_CARD_ELEV, 0.45f);
-    COLORREF col = picker_label ? mix(top_col, C_CARD, 0.19f)
-                                : mix(top_col, C_CARD, 0.57f);
+    COLORREF col = C_CARD;
     if (out_color) *out_color = col;
     HBRUSH *slot = picker_label ? &g_card_brush_label : &g_card_brush_value;
     if (!*slot) *slot = CreateSolidBrush(col);
@@ -624,77 +615,16 @@ static void draw_hgradient(HDC dc, int x, int y, int w, int h, COLORREF left, CO
     GradientFill(dc, v, 2, &gr, 1, GRADIENT_FILL_RECT_H);
 }
 
-/* 柔光光晕：同心椭圆由外到内逐步接近光源色（GDI 无 alpha，用预混合模拟弥散） */
-static void draw_soft_glow(HDC dc, int cx, int cy, int radius, COLORREF color, COLORREF base) {
-    const int steps = 6;
-    HGDIOBJ old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-    for (int i = steps; i >= 1; i--) {
-        float f = (float)i / (float)steps;          /* 1 = 最外圈 */
-        float k = 0.20f * f * f;                    /* 内圈最强 */
-        int rr = (int)((float)radius * (1.05f - f) + (float)radius * 0.05f);
-        if (rr < 1) rr = 1;
-        HBRUSH b = CreateSolidBrush(mix(base, color, k));
-        HGDIOBJ ob = SelectObject(dc, b);
-        Ellipse(dc, cx - rr, cy - rr, cx + rr, cy + rr);
-        SelectObject(dc, ob);
-        DeleteObject(b);
-    }
-    SelectObject(dc, old_pen);
-}
-
-/* 渐变圆角面板：圆角裁剪 + 垂直渐变填充 + 发丝边框 + 顶部高光 */
-static void draw_panel_gradient(HDC dc, RECT rc, COLORREF top, COLORREF bot, COLORREF line, int radius) {
-    HRGN rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, radius, radius);
-    if (rgn) {
-        int saved = SaveDC(dc);
-        SelectClipRgn(dc, rgn);
-        draw_vgradient(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, top, bot);
-        RestoreDC(dc, saved);
-        DeleteObject(rgn);
-    } else {
-        draw_vgradient(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, top, bot);
-    }
-
-    HPEN p = CreatePen(PS_SOLID, 1, line);
-    HGDIOBJ ob = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-    HGDIOBJ op = SelectObject(dc, p);
-    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    DeleteObject(p);
-
-    /* 顶部内侧高光线，营造玻璃质感 */
-    HPEN hl = CreatePen(PS_SOLID, 1, mix(line, C_TEXT, 0.09f));
-    op = SelectObject(dc, hl);
-    MoveToEx(dc, rc.left + radius / 2 + sc(2), rc.top + sc(1), NULL);
-    LineTo(dc, rc.right - radius / 2 - sc(2), rc.top + sc(1));
-    SelectObject(dc, op);
-    DeleteObject(hl);
-}
-
-/* 现代卡片：柔影 + 渐变面板 + 顶部强调短线 */
+/* 暖白卡片：薄边框与轻柔阴影 */
 static void draw_panel_shell(HDC dc, RECT rc, COLORREF accent, int elevated) {
-    /* 两层偏移深色圆角矩形模拟弥散柔影 */
-    RECT sh2 = rc;
-    OffsetRect(&sh2, 0, sc(4));
-    draw_round(dc, sh2, RGB(4, 6, 10), RGB(4, 6, 10), sc(16));
-    RECT sh1 = rc;
-    OffsetRect(&sh1, 0, sc(2));
-    draw_round(dc, sh1, RGB(6, 9, 14), RGB(6, 9, 14), sc(15));
-
-    COLORREF top_col = elevated ? C_CARD_ELEV : mix(C_CARD, C_CARD_ELEV, 0.45f);
-    draw_panel_gradient(dc, rc, top_col, C_CARD, C_LINE, sc(14));
-
-    /* 顶部强调短线（保留各卡片的多 accent 语义色） */
-    HPEN accent_pen = CreatePen(PS_SOLID, sc(2), accent);
-    HGDIOBJ old = SelectObject(dc, accent_pen);
-    MoveToEx(dc, rc.left + sc(16), rc.top + sc(1), NULL);
-    LineTo(dc, rc.left + sc(52), rc.top + sc(1));
-    SelectObject(dc, old);
-    DeleteObject(accent_pen);
+    (void)accent; (void)elevated;
+    RECT shadow = rc;
+    OffsetRect(&shadow, 0, sc(2));
+    draw_round(dc, shadow, RGB(231, 224, 210), RGB(231, 224, 210), sc(18));
+    draw_round(dc, rc, C_CARD, C_LINE, sc(18));
 }
 
-/* 英雄区数据线：发丝基线 + 正弦缓动往返的渐隐光束，尾部带紫色残影。
+/* 英雄区数据线：发丝基线 + 正弦缓动往返的渐隐光束，尾部带暖灰残影。
  * base 为该行处的页面背景色，用于光束两端的无缝渐隐。 */
 static void draw_hero_data_line(HDC dc, int left, int right, int y, COLORREF base) {
     HPEN base_pen = CreatePen(PS_SOLID, 1, mix(C_LINE, base, 0.35f));
@@ -716,7 +646,7 @@ static void draw_hero_data_line(HDC dc, int left, int right, int y, COLORREF bas
     if (travel < 1) travel = 1;
     int bx = left + (int)(eased * (float)travel);
 
-    /* 紫色拖尾（暗一档、短一截，反方向偏移） */
+    /* 暖灰拖尾（暗一档、短一截，反方向偏移） */
     int tail_w = sc(40);
     int tail_x = bx - (int)((eased - 0.5f) * (float)sc(48));
     draw_hgradient(dc, tail_x - tail_w / 2, y, tail_w / 2, 1, base, mix(C_VIOLET, base, 0.55f));
@@ -782,7 +712,7 @@ static int max_i(int a, int b) {
  * compute_layout — 根据窗口尺寸和 DPI 计算所有 UI 元素坐标
  *
  * 所有尺寸通过 sc() 做 DPI 缩放。布局分区：
- *   - 左侧导航栏（rail 宽度固定）
+ *   - 顶部星夜主题区（旧 rail 字段保留为 0，保持布局报告兼容）
  *   - 主区域：英雄标题带 + 选择器卡片 + 指标卡片 + 日志卡片
  * 主区域最小宽度 560（缩放后），保证小窗口下仍可用。
  * ---------------------------------------------------------------- */
@@ -791,26 +721,26 @@ static UiLayout compute_layout(HWND hwnd) {
     GetClientRect(hwnd, &r);
 
     UiLayout ui;
-    ui.rail = sc(RAIL_W);
-    ui.pad = sc(28);
+    ui.rail = 0;
+    ui.pad = sc(40);
     ui.x = ui.rail + ui.pad;
     ui.w = max_i(r.right - ui.x - ui.pad, sc(560));
-    ui.hero_right = sc(220);
+    ui.hero_right = ui.w / 2 - sc(20);
 
-    int picker_top = sc(136);
-    int picker_h = sc(188);
+    int picker_top = sc(262);
+    int picker_h = sc(166);
     ui.picker.left = ui.x;
     ui.picker.top = picker_top;
     ui.picker.right = ui.x + ui.w;
     ui.picker.bottom = picker_top + picker_h;
 
     ui.path_label_x = ui.x + sc(24);
-    ui.path_label_y = picker_top + sc(24);
+    ui.path_label_y = picker_top + sc(18);
     ui.path_label_w = sc(240);
     ui.path_label_h = sc(24);
 
     ui.path_x = ui.x + sc(24);
-    ui.path_y = picker_top + sc(72);
+    ui.path_y = picker_top + sc(56);
     ui.path_h = sc(38);
     ui.side_button_w = sc(112);
     ui.side_gap = sc(12);
@@ -818,8 +748,8 @@ static UiLayout compute_layout(HWND hwnd) {
     ui.browse_x = ui.open_x - ui.side_gap - ui.side_button_w;
     ui.path_w = max_i(ui.browse_x - ui.path_x - ui.side_gap, sc(180));
 
-    ui.action_y = picker_top + sc(128);
-    ui.action_h = sc(42);
+    ui.action_y = picker_top + sc(108);
+    ui.action_h = sc(40);
     ui.action_gap = sc(12);
     int action_inner_w = ui.w - sc(48);
     ui.action_button_w = (action_inner_w - ui.action_gap * 3) / 4;
@@ -827,54 +757,50 @@ static UiLayout compute_layout(HWND hwnd) {
     for (int i = 0; i < 4; i++)
         ui.action_x[i] = action_left + i * (ui.action_button_w + ui.action_gap);
 
-    ui.metric_gap = sc(16);
+    ui.metric_gap = sc(14);
     ui.metric_w = max_i((ui.w - ui.metric_gap * 2) / 3, sc(150));
-    ui.metric_y = ui.picker.bottom + sc(20);
-    ui.metric_h = sc(100);
-    ui.metric_value_y = ui.metric_y + sc(40);
-    ui.metric_value_h = sc(34);
+    ui.metric_y = ui.picker.bottom + sc(14);
+    ui.metric_h = sc(76);
+    ui.metric_value_y = ui.metric_y + sc(34);
+    ui.metric_value_h = sc(30);
 
-    ui.log_top = ui.metric_y + ui.metric_h + sc(20);
-    ui.log_bottom = max_i(r.bottom - sc(24), ui.log_top + sc(96));
-    ui.log_edit_top = ui.log_top + sc(56);
-    ui.log_edit_h = max_i(ui.log_bottom - sc(18) - ui.log_edit_top, sc(60));
+    ui.log_top = ui.metric_y + ui.metric_h + sc(14);
+    ui.log_bottom = max_i(r.bottom - sc(32), ui.log_top + sc(96));
+    ui.log_edit_top = ui.log_top + sc(40);
+    ui.log_edit_h = max_i(ui.log_bottom - sc(18) - ui.log_edit_top, sc(32));
 
     return ui;
 }
 
-/* 动画心跳（约 60fps）。只失效小条带区域：
+/* 动画心跳（约 30fps）。后台、最小化与减少动画模式停止装饰刷新：
  *   - 英雄区数据线（位于状态文本之下，不与任何子控件重叠）
- *   - 状态药丸指示灯、日志卡 LIVE 指示灯（呼吸光晕，均为自绘区域）
+ *   - 状态药丸指示灯与右侧星轨（均为自绘区域）
  *   - 悬停过渡中的按钮（推进指数缓动并重绘按钮本身）
  * 文本控件不被定时器触碰，避免明暗闪烁。 */
 void tick_ui_animation(HWND hwnd) {
-    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return;
-    UiLayout ui = compute_layout(hwnd);
-    RECT client;
-    GetClientRect(hwnd, &client);
-
-    /* 数据线条带：起始于状态控件之下 */
-    RECT data_line = {ui.x, sc(116), ui.x + ui.w, sc(122)};
-    InvalidateRect(hwnd, &data_line, FALSE);
-
-    /* 状态药丸指示灯呼吸区（药丸左端圆点一带） */
-    int pill_w = sc(176);
-    int pill_x = client.right - ui.pad - pill_w;
-    RECT pill_dot = {pill_x, sc(30), pill_x + sc(46), sc(30) + sc(36)};
-    InvalidateRect(hwnd, &pill_dot, FALSE);
-
-    /* 日志卡 LIVE 呼吸灯区（自绘圆点，不含文字） */
-    int live_cx = ui.x + ui.w - sc(74);
-    int live_cy = ui.log_top + sc(12) + sc(12);
-    RECT live_dot = {live_cx - sc(13), live_cy - sc(11), live_cx + sc(13), live_cy + sc(11)};
-    InvalidateRect(hwnd, &live_dot, FALSE);
+    DWORD now = GetTickCount();
+    DWORD elapsed = g_motion_last ? now - g_motion_last : 33u;
+    g_motion_last = now;
+    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd) || GetForegroundWindow() != hwnd || g_ui_probe) return;
+    if (elapsed > 100u) elapsed = 100u;
+    float blend = g_motion_enabled ? 1.0f - expf(-(float)elapsed / 80.0f) : 1.0f;
+    if (g_motion_enabled) {
+        g_motion_tick += elapsed;
+        UiLayout ui = compute_layout(hwnd);
+        RECT sky = {ui.x + ui.w - ui.hero_right, sc(75), ui.x + ui.w, sc(240)};
+        RECT data_line = {ui.x - sc(4), sc(230), ui.x + sc(212), sc(235)};
+        RECT pill_dot = {ui.x + ui.w - sc(158), sc(27), ui.x + ui.w - sc(136), sc(47)};
+        InvalidateRect(hwnd, &sky, FALSE);
+        InvalidateRect(hwnd, &data_line, FALSE);
+        InvalidateRect(hwnd, &pill_dot, FALSE);
+    }
 
     /* 按钮悬停渐变：指数缓动逼近目标，过渡期间重绘按钮 */
     for (size_t i = 0; i < BTN_HOVER_COUNT; i++) {
         ButtonHover *h = &g_btn_hover[i];
         float target = h->target ? 1.0f : 0.0f;
         if (h->t == target) continue;
-        float next = h->t + (target - h->t) * 0.22f;
+        float next = h->t + (target - h->t) * blend;
         if (fabsf(next - target) < 0.012f) next = target;
         if (next == h->t) continue;
         h->t = next;
@@ -883,175 +809,151 @@ void tick_ui_animation(HWND hwnd) {
     }
 }
 
-/* ----------------------------------------------------------------
- * paint_background — 绘制主窗口背景（WM_ERASEBKGND / WM_PAINT 调用）
- *
- * 绘制内容：
- *   - 页面纵向渐变底色 + 细腻科技网格 + 主区域环境柔光
- *   - 导航栏：品牌标识（应用图标+ds游戏翻译器）、导航项（运行时汉化）、
- *     功能要点（本地缓存优先/运行时不等待API/标签变量保护）、版本标签
- *   - 主区域：状态药丸（ONLINE/OFFLINE，呼吸灯）、选择器卡片、
- *     指标卡片（×3）、日志卡片（含 ACTIVITY LOG 标题和 LIVE 呼吸灯）、
- *     路径输入框边框
- * ---------------------------------------------------------------- */
+/* 星轨以固定种子生成，30 秒缓慢流动；只绘制右侧无子控件的插画区域。 */
+static void draw_nocturne_sky(HDC dc, int left, int top, int right, int bottom) {
+    RECT bounds = {left, top, right, bottom};
+    if (!RectVisible(dc, &bounds)) return;
+    int saved = SaveDC(dc);
+    IntersectClipRect(dc, left, top, right, bottom);
+    int width = right - left;
+    int height = bottom - top;
+    double phase = (double)(anim_tick() % 30000u) / 30000.0 * 6.283185307179586;
+    int cx = left + width * 3 / 5;
+    int cy = top + height / 2;
+    HGDIOBJ old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+    /* 暗蓝色光晕与成束笔触形成星云，不使用外部图像或额外后台线程。 */
+    for (int i = 9; i >= 1; i--) {
+        int rx = sc(12 + i * 15);
+        int ry = sc(6 + i * 7);
+        HBRUSH b = CreateSolidBrush(mix(C_PAGE, RGB(27, 76, 123), (float)(10 - i) * 0.035f));
+        HGDIOBJ ob = SelectObject(dc, b);
+        Ellipse(dc, cx - rx, cy - ry, cx + rx, cy + ry);
+        SelectObject(dc, ob);
+        DeleteObject(b);
+    }
+    SelectObject(dc, old_pen);
+    for (int band = 0; band < 14; band++) {
+        COLORREF color = mix(C_PAGE, band % 4 == 0 ? C_ACCENT : RGB(68, 126, 173), band % 4 == 0 ? 0.42f : 0.38f);
+        HPEN p = CreatePen(PS_SOLID, 1, color);
+        HGDIOBJ op = SelectObject(dc, p);
+        for (int j = 0; j <= 70; j++) {
+            double angle = (double)j * 0.085 + (double)band * 0.026 + sin(phase) * 0.12;
+            double radius = (double)sc(15 + band * 7) + (double)j * (double)sc(1) * 0.60;
+            int px = cx + (int)(cos(angle) * radius * 1.40);
+            int py = cy + (int)(sin(angle) * radius * 0.48);
+            if (j == 0) MoveToEx(dc, px, py, NULL);
+            else LineTo(dc, px, py);
+        }
+        SelectObject(dc, op);
+        DeleteObject(p);
+    }
+    for (int i = 0; i < 38; i++) {
+        int sx = left + (width * ((i * 73 + 19) % 997)) / 997;
+        int sy = top + sc(6) + ((height - sc(12)) * ((i * 151 + 61) % 991)) / 991;
+        float glow = 0.46f + (float)(0.18 * sin(phase + (double)i));
+        COLORREF star = mix(C_PAGE, C_ACCENT, glow);
+        HPEN p = CreatePen(PS_SOLID, 1, star);
+        HGDIOBJ op = SelectObject(dc, p);
+        int size = sc(i % 9 == 0 ? 4 : 1);
+        MoveToEx(dc, sx - size, sy, NULL); LineTo(dc, sx + size + 1, sy);
+        MoveToEx(dc, sx, sy - size, NULL); LineTo(dc, sx, sy + size + 1);
+        SelectObject(dc, op);
+        DeleteObject(p);
+    }
+    /* 月亮使用实心暖金色与夜色遮片，不叠加高频闪烁。 */
+    HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
+    int mx = right - sc(62), my = top + sc(36);
+    HBRUSH moon = CreateSolidBrush(C_ACCENT);
+    HGDIOBJ ob = SelectObject(dc, moon);
+    Ellipse(dc, mx - sc(15), my - sc(15), mx + sc(15), my + sc(15));
+    HBRUSH shade = CreateSolidBrush(C_PAGE);
+    SelectObject(dc, shade);
+    Ellipse(dc, mx - sc(6), my - sc(19), mx + sc(20), my + sc(7));
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(moon); DeleteObject(shade);
+    RestoreDC(dc, saved);
+}
+
+/* 星夜首页：深蓝主题区、暖白操作区，以及独立的状态与活动记录。 */
 void paint_background(HWND hwnd, HDC dc) {
     RECT r;
     GetClientRect(hwnd, &r);
-
     UiLayout ui = compute_layout(hwnd);
-    int rail = ui.rail;
-    int pad = ui.pad;
-
-    /* 页面底色：自上而下的深邃渐变 */
-    draw_vgradient(dc, 0, 0, r.right, r.bottom, page_color_at(0, r.bottom), page_color_at(r.bottom, r.bottom));
-
-    /* 主区域环境柔光（右上角青、中下部紫，被卡片覆盖形成层次） */
-    draw_soft_glow(dc, r.right - sc(60), sc(40), sc(300), C_ACCENT, page_color_at(sc(40), r.bottom));
-    draw_soft_glow(dc, ui.x + ui.w / 3, r.bottom - sc(40), sc(340), C_VIOLET, page_color_at(r.bottom - sc(40), r.bottom));
-
-    draw_tech_grid(dc, rail, 0, r.right, r.bottom);
-
-    /* 侧边导航栏：克制的石墨色渐变 */
-    draw_vgradient(dc, 0, 0, rail, r.bottom, mix(C_CARD, C_RAIL, 0.35f), C_RAIL);
-
-    /* 侧边栏右侧分隔线 */
-    HPEN dvpen = CreatePen(PS_SOLID, 1, C_LINE);
-    HGDIOBJ odv = SelectObject(dc, dvpen);
-    MoveToEx(dc, rail, 0, NULL);
-    LineTo(dc, rail, r.bottom);
-    SelectObject(dc, odv);
-    DeleteObject(dvpen);
-
+    int x = ui.x, w = ui.w;
+    int alive = g_server_started;
+    draw_vgradient(dc, 0, 0, r.right, r.bottom, C_PAGE, C_PAGE);
+    draw_vgradient(dc, 0, sc(246), r.right, r.bottom - sc(246), RGB(245, 240, 229), RGB(249, 245, 235));
     SetBkMode(dc, TRANSPARENT);
 
-    /* 品牌铭牌使用实际的应用图标 */
-    RECT brand_plate = {sc(18), sc(18), sc(66), sc(66)};
-    draw_panel_gradient(dc, brand_plate, C_CARD_ELEV, C_CARD, mix(C_VIOLET, C_LINE, 0.45f), sc(12));
-    HICON brand_icon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_APP_ICON),
-                                         IMAGE_ICON, sc(38), sc(38), LR_SHARED);
-    if (brand_icon) DrawIconEx(dc, sc(23), sc(23), brand_icon, sc(38), sc(38), 0, NULL, DI_NORMAL);
-    draw_text_x(dc, L"ds\u6E38\u620F", sc(78), sc(20), rail - sc(92), sc(28), C_TEXT, g_font_heading, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    draw_text_x(dc, L"\u7FFB\u8BD1\u5668", sc(78), sc(46), rail - sc(92), sc(20), C_TEXT_DIM, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    HICON icon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, sc(28), sc(28), LR_SHARED);
+    if (icon) DrawIconEx(dc, x, sc(20), icon, sc(28), sc(28), 0, NULL, DI_NORMAL);
+    draw_text_x(dc, L"ds 游戏翻译器", x + sc(40), sc(17), sc(190), sc(24), RGB(245, 240, 229), g_font_heading, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, L"每一段故事，都值得抵达", x + sc(40), sc(40), sc(260), sc(16), RGB(162, 180, 200), g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, L"Ren'Py   /   RPG Maker   /   Unity   /   Godot", x + w - sc(480), sc(24), sc(290), sc(24), RGB(174, 190, 207), g_font_small, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    RECT pill = {x + w - sc(166), sc(21), x + w, sc(53)};
+    draw_round(dc, pill, C_PAGE, RGB(70, 81, 96), sc(32));
+    COLORREF status_color = alive ? RGB(148, 206, 166) : C_ACCENT;
+    draw_dot(dc, pill.left + sc(18), sc(37), sc(3), status_color, mix(C_PAGE, status_color, 0.20f + 0.12f * pulse01(4200)));
+    draw_text_x(dc, alive ? L"翻译服务已就绪" : L"等待开始", pill.left + sc(34), pill.top, sc(120), sc(32), status_color, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    HPEN line = CreatePen(PS_SOLID, 1, RGB(38, 54, 76));
+    HGDIOBJ old = SelectObject(dc, line);
+    MoveToEx(dc, x, sc(70), NULL); LineTo(dc, x + w, sc(70));
+    SelectObject(dc, old); DeleteObject(line);
 
-    /* 分区分隔线 */
-    HPEN sd = CreatePen(PS_SOLID, 1, C_LINE);
-    HGDIOBJ osd = SelectObject(dc, sd);
-    MoveToEx(dc, sc(24), sc(90), NULL);
-    LineTo(dc, rail - sc(24), sc(90));
-    SelectObject(dc, osd);
-    DeleteObject(sd);
+    draw_text_x(dc, L"游 戏 无 界  /  PLAY BEYOND WORDS", x, sc(84), sc(480), sc(20), C_ACCENT, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    draw_nocturne_sky(dc, x + w - ui.hero_right, sc(75), x + w, sc(240));
+    draw_hero_data_line(dc, x, x + sc(208), sc(232), C_PAGE);
 
-    /* 活动导航项：左侧强调色竖条 */
-    int navY = sc(112);
-    int navH = sc(42);
-    RECT navBg = {sc(16), navY, rail - sc(16), navY + navH};
-    draw_panel_shell(dc, navBg, C_ACCENT, 1);
-    RECT navAcc = {sc(16), navY + sc(8), sc(19), navY + navH - sc(8)};
-    HBRUSH ab2 = CreateSolidBrush(C_ACCENT);
-    FillRect(dc, &navAcc, ab2);
-    DeleteObject(ab2);
-    draw_text_x(dc, L"运行时汉化", sc(34), navY, rail - sc(50), navH, C_TEXT, g_font_body, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    /* 功能要点列表 */
-    int capY = navY + sc(64);
-    int capStep = sc(28);
-    const WCHAR *caps[] = {L"本地缓存优先", L"运行时不等待 API", L"标签/变量保护"};
-    const COLORREF cap_colors[] = {C_ACCENT, C_BLUE, C_VIOLET};
+    RECT clip;
+    GetClipBox(dc, &clip);
+    if (clip.bottom <= sc(246)) return;
+    draw_panel_shell(dc, ui.picker, C_ACCENT, 0);
+    draw_text_x(dc, L"拖入游戏 EXE 或文件夹，即可开始汉化", x + sc(200), ui.picker.top + sc(18), w - sc(224), sc(24), C_MUTED, g_font_small, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    const WCHAR *labels[] = {L"游戏引擎", L"本地服务", L"翻译记忆"};
+    const WCHAR *numbers[] = {L"01", L"02", L"03"};
     for (int i = 0; i < 3; i++) {
-        int yy = capY + i * capStep;
-        HBRUSH marker = CreateSolidBrush(cap_colors[i]);
-        RECT marker_rect = {sc(24), yy + sc(9), sc(32), yy + sc(11)};
-        FillRect(dc, &marker_rect, marker);
-        DeleteObject(marker);
-        draw_text_x(dc, caps[i], sc(40), yy, rail - sc(56), sc(22), C_TEXT_DIM, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        int cx = x + (ui.metric_w + ui.metric_gap) * i;
+        RECT card = {cx, ui.metric_y, cx + ui.metric_w, ui.metric_y + ui.metric_h};
+        draw_panel_shell(dc, card, C_ACCENT, 0);
+        draw_text_x(dc, labels[i], cx + sc(18), ui.metric_y + sc(12), ui.metric_w - sc(70), sc(20), C_TEXT_DIM, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        draw_text_x(dc, numbers[i], cx + ui.metric_w - sc(48), ui.metric_y + sc(12), sc(28), sc(20), C_AMBER, g_font_mono_small, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     }
+    RECT log_card = {x, ui.log_top, x + w, ui.log_bottom};
+    draw_panel_shell(dc, log_card, C_ACCENT, 0);
+    draw_text_x(dc, L"旅程记录", x + sc(18), ui.log_top + sc(10), sc(110), sc(24), C_TEXT, g_font_heading, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, L"准备、部署与翻译进度，都在这里。", x + sc(124), ui.log_top + sc(10), w - sc(380), sc(24), C_MUTED, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, ui_runtime_tag(), x + w - sc(190), ui.log_top + sc(10), sc(170), sc(24), C_MUTED, g_font_small, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, L"本地记忆  ·  即时翻译  ·  保留原有格式", x, r.bottom - sc(22), sc(430), sc(16), C_TEXT_DIM, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    draw_text_x(dc, DS_TRANSLATOR_VERSION_W, x + w - sc(130), r.bottom - sc(22), sc(130), sc(16), C_AMBER, g_font_mono_small, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    RECT border = {ui.path_x - sc(2), ui.path_y - sc(2), ui.path_x + ui.path_w + sc(2), ui.path_y + ui.path_h + sc(2)};
+    draw_round(dc, border, C_LOG, C_LINE, sc(10));
+}
 
-    /* 侧边栏底栏：版本徽章 + 运行时标签 */
-    int footY = r.bottom - sc(58);
-    int footH = sc(26);
-    RECT chip = {sc(20), footY, sc(104), footY + footH};
-    draw_round(dc, chip, C_CARD_ELEV, mix(C_VIOLET, C_LINE, 0.45f), sc(6));
-    draw_text_x(dc, DS_TRANSLATOR_VERSION_W, sc(20), footY, sc(84), footH, C_ACCENT, g_font_mono_small, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-    draw_text_x(dc, ui_runtime_tag(), sc(112), footY, rail - sc(120), footH, C_MUTED, g_font_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+/* 缓冲只归主窗口的 UI 线程所有；仅复用存储，每次仍重绘整个脏区。
+   调整尺寸、DPI、显示设备或销毁窗口时释放，不保留旧画面内容。 */
+static HDC background_dc;
+static HBITMAP background_bitmap;
+static HWND background_owner;
+static int background_width, background_height;
+static unsigned background_failures;
 
-    /* 主区域几何参数 */
-    int x = ui.x;
-    int w = ui.w;
+static void report_background_failure(void) {
+    /* GDI 资源不足或设备状态失效由 Windows 决定，上游无法保证分配/绘制成功。
+       直接绘制可能恢复闪烁，但不会冒充双缓冲成功；按首次及 2 的幂次向调试器
+       记录失败，避免动画反复触发时刷屏。释放失败也走相同诊断。 */
+    unsigned count = ++background_failures;
+    if (count == 1 || (count & (count - 1)) == 0)
+        OutputDebugStringW(L"ds launcher: GDI back buffer operation failed; using direct paint when needed.\n");
+}
 
-    draw_hero_data_line(dc, x, x + w, sc(119), page_color_at(sc(119), r.bottom));
-
-    int alive = g_server_started;
-
-    /* Status pill：胶囊形玻璃药丸 + 呼吸指示灯 */
-    int pillW = sc(176);
-    int pillH = sc(36);
-    int pillX = r.right - pad - pillW;
-    int pillY = sc(30);
-    RECT pill = {pillX, pillY, pillX + pillW, pillY + pillH};
-    COLORREF pill_fill = mix(C_CARD_ELEV, C_PAGE, 0.30f);
-    draw_round(dc, pill, pill_fill, alive ? mix(C_GREEN, C_LINE, 0.40f) : C_LINE, sc(18));
-    float pulse = pulse01(2600);
-    COLORREF status_color = alive ? C_GREEN : C_DANGER;
-    COLORREF dot_core = mix(status_color, C_TEXT, 0.22f * pulse);
-    COLORREF status_halo = mix(pill_fill, status_color, 0.24f + 0.38f * pulse);
-    draw_dot(dc, pillX + sc(20), pillY + pillH / 2, sc(4), dot_core, status_halo);
-    draw_text_x(dc, alive ? L"ONLINE" : L"OFFLINE", pillX + sc(36), pillY, pillW - sc(46), pillH,
-                alive ? C_GREEN : C_DANGER, g_font_mono_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    /* 选择器卡片 */
-    draw_panel_shell(dc, ui.picker, C_BLUE, 0);
-
-    /* 指标卡片 */
-    int gap = ui.metric_gap;
-    int cardW = ui.metric_w;
-    int mY = ui.metric_y;
-    int mH = ui.metric_h;
-    const WCHAR *labels[3] = {L"ENGINE", L"SERVER", L"CACHE"};
-    COLORREF metric_colors[3] = {C_ACCENT, alive ? C_GREEN : C_BLUE, C_AMBER};
-    for (int i = 0; i < 3; i++) {
-        int cx = x + (cardW + gap) * i;
-        RECT m = {cx, mY, cx + cardW, mY + mH};
-        draw_panel_shell(dc, m, metric_colors[i], 0);
-        /* Accent left bar（圆角短棒） */
-        RECT bar = {cx + sc(12), mY + sc(16), cx + sc(15), mY + sc(30)};
-        HBRUSH bb = CreateSolidBrush(metric_colors[i]);
-        FillRect(dc, &bar, bb);
-        DeleteObject(bb);
-        draw_text_x(dc, labels[i], cx + sc(24), mY + sc(14), cardW - sc(36), sc(20), C_MUTED, g_font_mono_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    }
-
-    /* 日志卡片（含标题栏） */
-    int logCardTop = ui.log_top;
-    RECT log_card = {x, logCardTop, x + w, ui.log_bottom};
-    draw_panel_shell(dc, log_card, C_VIOLET, 0);
-
-    /* 日志标题栏 */
-    int hdrY = logCardTop + sc(12);
-    int hdrH = sc(24);
-    draw_text_x(dc, L"ACTIVITY LOG", x + sc(18), hdrY, w - sc(140), hdrH, C_TEXT_DIM, g_font_mono_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    int liveCX = x + w - sc(74);
-    int liveCY = hdrY + hdrH / 2;
-    float live_pulse = pulse01(3000);
-    COLORREF live_core = mix(C_VIOLET, C_TEXT, 0.20f * live_pulse);
-    COLORREF live_halo = mix(C_CARD, C_VIOLET, 0.20f + 0.32f * live_pulse);
-    draw_dot(dc, liveCX, liveCY, sc(4), live_core, live_halo);
-    draw_text_x(dc, L"LIVE", liveCX + sc(12), hdrY, sc(60), hdrH, C_VIOLET, g_font_mono_small, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    HPEN hp = CreatePen(PS_SOLID, 1, C_LINE);
-    HGDIOBJ ohp = SelectObject(dc, hp);
-    MoveToEx(dc, x + sc(18), hdrY + sc(30), NULL);
-    LineTo(dc, x + w - sc(18), hdrY + sc(30));
-    SelectObject(dc, ohp);
-    DeleteObject(hp);
-
-    /* 路径输入框（EDIT）外框 */
-    int peX = ui.path_x;
-    int peY = ui.path_y;
-    int peH = ui.path_h;
-    int peW = ui.path_w;
-    RECT peBorder = {peX - sc(2), peY - sc(2), peX + peW + sc(2), peY + peH + sc(2)};
-    draw_round(dc, peBorder, C_LOG, mix(C_BLUE, C_LINE, 0.40f), sc(8));
+void free_background_buffer(void) {
+    /* 先销毁 DC，解除所有已选对象和保存状态，再删除自有位图。 */
+    if (background_dc && !DeleteDC(background_dc)) report_background_failure();
+    if (background_bitmap && !DeleteObject(background_bitmap)) report_background_failure();
+    background_dc = NULL;
+    background_bitmap = NULL;
+    background_owner = NULL;
+    background_width = background_height = 0;
 }
 
 void paint_background_buffered(HWND hwnd, HDC dc, const RECT *dirty) {
@@ -1059,31 +961,32 @@ void paint_background_buffered(HWND hwnd, HDC dc, const RECT *dirty) {
 
     int width = dirty->right - dirty->left;
     int height = dirty->bottom - dirty->top;
-    HDC buffer_dc = CreateCompatibleDC(dc);
-    HBITMAP buffer_bitmap = buffer_dc ? CreateCompatibleBitmap(dc, width, height) : NULL;
-
-    /* 当 Windows 耗尽进程级 GDI 资源时，CreateCompatibleDC/CreateCompatibleBitmap
-       可能失败。该分配归操作系统所有，无法在上游修复。直接绘制可保持启动器
-       可用，但可能重新暴露原始的闪烁问题；诊断信息对调试器可见。 */
-    if (!buffer_dc || !buffer_bitmap) {
-        OutputDebugStringW(L"ds launcher: GDI back buffer unavailable; using direct paint.\n");
-        if (buffer_bitmap) DeleteObject(buffer_bitmap);
-        if (buffer_dc) DeleteDC(buffer_dc);
-        paint_background(hwnd, dc);
-        return;
+    if (background_owner != hwnd || width > background_width || height > background_height) {
+        int capacity_width = background_owner == hwnd && background_width > width ? background_width : width;
+        int capacity_height = background_owner == hwnd && background_height > height ? background_height : height;
+        free_background_buffer();
+        background_dc = CreateCompatibleDC(dc);
+        background_bitmap = background_dc ? CreateCompatibleBitmap(dc, capacity_width, capacity_height) : NULL;
+        if (!background_dc || !background_bitmap) goto failed;
+        HGDIOBJ previous = SelectObject(background_dc, background_bitmap);
+        if (!previous || previous == HGDI_ERROR) goto failed;
+        background_owner = hwnd;
+        background_width = capacity_width;
+        background_height = capacity_height;
     }
 
-    HGDIOBJ old_bitmap = SelectObject(buffer_dc, buffer_bitmap);
-    int saved = SaveDC(buffer_dc);
-    SetViewportOrgEx(buffer_dc, -dirty->left, -dirty->top, NULL);
-    IntersectClipRect(buffer_dc, dirty->left, dirty->top, dirty->right, dirty->bottom);
-    paint_background(hwnd, buffer_dc);
-    RestoreDC(buffer_dc, saved);
-    BitBlt(dc, dirty->left, dirty->top, width, height, buffer_dc, 0, 0, SRCCOPY);
+    int saved = SaveDC(background_dc);
+    if (!saved || !SetViewportOrgEx(background_dc, -dirty->left, -dirty->top, NULL) ||
+        IntersectClipRect(background_dc, dirty->left, dirty->top, dirty->right, dirty->bottom) == ERROR) goto failed;
+    paint_background(hwnd, background_dc);
+    if (!RestoreDC(background_dc, saved) ||
+        !BitBlt(dc, dirty->left, dirty->top, width, height, background_dc, 0, 0, SRCCOPY)) goto failed;
+    return;
 
-    SelectObject(buffer_dc, old_bitmap);
-    DeleteObject(buffer_bitmap);
-    DeleteDC(buffer_dc);
+failed:
+    report_background_failure();
+    free_background_buffer();
+    paint_background(hwnd, dc);
 }
 
 static void position_control(HWND ctl, int x, int y, int w, int h, UINT flags) {
@@ -1106,9 +1009,9 @@ void layout(HWND hwnd) {
 
     /* 英雄标题带 */
     int hero_right = ui.hero_right;
-    position_control(g_title,    x, sc(18), w - hero_right, sc(44), position_flags);
-    position_control(g_subtitle, x, sc(66), w - hero_right, sc(22), position_flags);
-    position_control(g_status,   x, sc(94), w - hero_right, sc(22), position_flags);
+    position_control(g_title,    x, sc(112), w - hero_right, sc(50), position_flags);
+    position_control(g_subtitle, x, sc(170), w - hero_right, sc(22), position_flags);
+    position_control(g_status,   x, sc(204), w - hero_right, sc(22), position_flags);
 
     /* 选择器卡片内容 */
     position_control(g_path_label, ui.path_label_x, ui.path_label_y, ui.path_label_w, ui.path_label_h, position_flags);
@@ -1239,34 +1142,34 @@ void draw_button(const DRAWITEMSTRUCT *di) {
 
     COLORREF fill_top, fill_bot, edge, fg;
     if (primary) {
-        /* 主按钮：青绿渐变，悬停提亮，按下压暗 */
-        fill_top = mix(C_ACCENT, C_TEXT, 0.08f + 0.14f * hover);
+        /* 主按钮：暖金渐变，悬停提亮，按下压暗 */
+        fill_top = mix(C_ACCENT, C_CARD, 0.08f + 0.14f * hover);
         fill_bot = mix(C_ACCENT_DARK, C_ACCENT, 0.55f + 0.25f * hover);
         if (pressed) {
             fill_top = C_ACCENT_DARK;
             fill_bot = mix(C_ACCENT_DARK, C_ACCENT_DEEP, 0.55f);
         }
         edge = mix(C_ACCENT_DARK, C_ACCENT, 0.40f);
-        fg = RGB(6, 26, 26);
+        fg = RGB(22, 37, 57);
     } else if (server_running) {
-        /* 服务器运行中：深绿玻璃态 */
-        fill_top = mix(RGB(21, 58, 48), RGB(28, 74, 61), hover);
-        fill_bot = mix(RGB(14, 40, 34), RGB(18, 52, 43), hover);
-        if (pressed) { fill_top = RGB(13, 36, 30); fill_bot = RGB(11, 30, 26); }
+        /* 服务器运行中：浅绿状态色 */
+        fill_top = mix(RGB(237, 247, 239), RGB(224, 240, 228), hover);
+        fill_bot = mix(RGB(230, 242, 232), RGB(214, 234, 219), hover);
+        if (pressed) { fill_top = RGB(207, 229, 214); fill_bot = RGB(199, 222, 206); }
         edge = mix(mix(C_LINE, C_GREEN, 0.45f), C_GREEN, hover);
         fg = C_GREEN;
     } else if (restore_btn || clear_cache_btn) {
-        /* 危险操作：暗红玻璃态 */
-        fill_top = mix(RGB(48, 25, 35), RGB(62, 30, 43), hover);
-        fill_bot = mix(RGB(36, 19, 27), RGB(46, 23, 33), hover);
-        if (pressed) { fill_top = RGB(30, 16, 23); fill_bot = RGB(26, 14, 20); }
+        /* 危险操作：浅红提示色 */
+        fill_top = mix(RGB(255, 249, 245), RGB(253, 237, 231), hover);
+        fill_bot = mix(RGB(252, 244, 238), RGB(249, 232, 224), hover);
+        if (pressed) { fill_top = RGB(242, 222, 212); fill_bot = RGB(237, 214, 204); }
         edge = mix(mix(C_LINE, C_DANGER, 0.45f), C_DANGER, hover);
         fg = C_DANGER;
     } else {
-        /* 普通按钮：深色玻璃态，悬停抬升并点亮语义色边框 */
+        /* 普通按钮：暖白底色，悬停时加深语义色边框 */
         fill_top = mix(C_CARD_ELEV, mix(C_CARD_ELEV, C_TEXT, 0.05f), hover);
         fill_bot = mix(mix(C_CARD, C_CARD_ELEV, 0.35f), C_CARD_ELEV, hover);
-        if (pressed) { fill_top = C_CARD; fill_bot = mix(C_CARD, C_PAGE, 0.4f); }
+        if (pressed) { fill_top = C_CARD; fill_bot = mix(C_CARD, C_LINE, 0.4f); }
         COLORREF accent = C_LINE_BRIGHT;
         if (di->CtlID == IDC_API_CONFIG) accent = C_VIOLET;
         else if (di->CtlID == IDC_BROWSE || di->CtlID == IDC_OPEN) accent = C_BLUE;
@@ -1275,7 +1178,8 @@ void draw_button(const DRAWITEMSTRUCT *di) {
     }
 
     /* 圆角渐变填充 + 发丝边框 */
-    int radius = sc(10);
+            FillRect(di->hDC, &di->rcItem, g_brush_card);
+    int radius = sc(32);
     HRGN rgn = CreateRoundRectRgn(di->rcItem.left, di->rcItem.top,
                                   di->rcItem.right + 1, di->rcItem.bottom + 1, radius, radius);
     if (rgn) {
@@ -1301,7 +1205,7 @@ void draw_button(const DRAWITEMSTRUCT *di) {
 
     /* 顶部内侧高光，强化玻璃质感（主按钮更明显） */
     {
-        COLORREF gloss = primary ? mix(fill_top, C_TEXT, 0.35f) : mix(edge, C_TEXT, 0.18f);
+        COLORREF gloss = primary ? mix(fill_top, C_CARD, 0.35f) : mix(edge, C_CARD, 0.18f);
         HPEN gl = CreatePen(PS_SOLID, 1, gloss);
         HGDIOBJ ogl = SelectObject(di->hDC, gl);
         MoveToEx(di->hDC, di->rcItem.left + radius / 2 + sc(2), di->rcItem.top + sc(1), NULL);
@@ -1373,26 +1277,28 @@ void browse_folder(void) {
 }
 
 /* 启动游戏进程：在指定目录中查找可执行文件并用 ShellExecuteW 打开 */
-static void launch_game_with_params(const WCHAR *dir, const WCHAR *params) {
+static int launch_game_with_params(const WCHAR *dir, const WCHAR *params) {
     WCHAR exe[MAX_PATH * 4];
     if (!find_exe(dir, exe, MAX_PATH * 4)) {
         append_log(L"未找到游戏 exe。");
-        return;
+        return 0;
     }
     append_log(L"启动游戏：%s", exe);
     if (g_launch_dry_run) {
         write_spawn_plan(L"shell", exe, params, dir);
-        return;
+        return 1;
     }
     HINSTANCE exec_result = ShellExecuteW(g_main, L"open", exe, params, dir, SW_SHOWNORMAL);
     /* ShellExecuteW 返回值 <=32 表示失败（2=文件未找到、5=拒绝访问等） */
     if ((INT_PTR)exec_result <= 32) {
         append_log(L"启动游戏失败：%s（ShellExecuteW 错误码：%d）", exe, (int)(INT_PTR)exec_result);
+        return 0;
     }
+    return 1;
 }
 
-void launch_game(const WCHAR *dir) {
-    launch_game_with_params(dir, NULL);
+int launch_game(const WCHAR *dir) {
+    return launch_game_with_params(dir, NULL);
 }
 
 void restore_selected_game(void) {
@@ -1433,8 +1339,9 @@ void restore_selected_game(void) {
    桥接脚本持有一个私有参数：脚本真正加载后立即退出，从而让一个短暂的
    隐藏进程即可验证该支持是否可用。 */
 static int godot_runtime_sidecar_preflight(const WCHAR *dir, const WCHAR *runtime_exe,
-                                           const WCHAR *pack,
-                                           const WCHAR *script, int loose_project) {
+                                           const WCHAR *pack, const WCHAR *sig_pack,
+                                           const WCHAR *script, int loose_project,
+                                           int require_proof) {
     WCHAR exe[MAX_PATH * 4];
     if (!dir || !script || !script[0]) return 0;
     if (runtime_exe && runtime_exe[0]) {
@@ -1450,11 +1357,12 @@ static int godot_runtime_sidecar_preflight(const WCHAR *dir, const WCHAR *runtim
     godot_preflight_sig_init(sig, MAX_PATH * 8);
     godot_preflight_sig_add_file(sig, MAX_PATH * 8, exe);
     godot_preflight_sig_add_text(sig, MAX_PATH * 8, dir);
-    if (pack && pack[0]) godot_preflight_sig_add_file(sig, MAX_PATH * 8, pack);
+    if (sig_pack && sig_pack[0]) godot_preflight_sig_add_file(sig, MAX_PATH * 8, sig_pack);
     else godot_preflight_sig_add_text(sig, MAX_PATH * 8, L"nopack");
     if (wcsncmp(script, L"res://", 6) == 0) godot_preflight_sig_add_text(sig, MAX_PATH * 8, script);
     else godot_preflight_sig_add_file(sig, MAX_PATH * 8, script);
     godot_preflight_sig_add_text(sig, MAX_PATH * 8, loose_project ? L"loose" : L"export");
+    godot_preflight_sig_add_text(sig, MAX_PATH * 8, require_proof ? L"proof73" : L"legacy0");
     int cached = godot_preflight_cache_get(L"sidecar", sig);
     if (cached >= 0) {
         append_log(cached
@@ -1500,7 +1408,8 @@ static int godot_runtime_sidecar_preflight(const WCHAR *dir, const WCHAR *runtim
 
     DWORD waited = WaitForSingleObject(pi.hProcess, 5000);
     DWORD exit_code = 1;
-    int ok = waited == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &exit_code) && exit_code == 0;
+    int ok = waited == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &exit_code) &&
+             exit_code == (require_proof ? 73u : 0u);
     if (waited == WAIT_TIMEOUT) {
         TerminateProcess(pi.hProcess, 1);
         WaitForSingleObject(pi.hProcess, 1000);
@@ -1517,14 +1426,17 @@ static int godot_runtime_sidecar_preflight(const WCHAR *dir, const WCHAR *runtim
 /* 某些导出的 Godot 模板会同时拒绝 --main-pack 与 --script。Format 3 补丁包
    把翻译器注册为 autoload，因此匹配的启动器自有可执行文件只需一个私有
    用户参数即可验证该路径可用。 */
-static int godot_runtime_autoload_preflight(const WCHAR *dir, const WCHAR *runtime_exe) {
+static int godot_runtime_autoload_preflight(const WCHAR *dir, const WCHAR *runtime_exe,
+                                           const WCHAR *pack) {
     if (!dir || !runtime_exe || !runtime_exe[0]) return 0;
 
     /* 预检结论缓存（引擎 exe 特征为键；只有成功结论入缓存）。 */
     WCHAR sig[MAX_PATH * 8];
     godot_preflight_sig_init(sig, MAX_PATH * 8);
     godot_preflight_sig_add_file(sig, MAX_PATH * 8, runtime_exe);
+    if (pack) godot_preflight_sig_add_file(sig, MAX_PATH * 8, pack);
     godot_preflight_sig_add_text(sig, MAX_PATH * 8, dir);
+    godot_preflight_sig_add_text(sig, MAX_PATH * 8, L"autoload-ready-v1");
     int cached = godot_preflight_cache_get(L"autoload", sig);
     if (cached >= 0) {
         append_log(cached
@@ -1535,7 +1447,7 @@ static int godot_runtime_autoload_preflight(const WCHAR *dir, const WCHAR *runti
 
     WCHAR cmd[MAX_PATH * 12];
     if (!wide_format_checked(cmd, MAX_PATH * 12,
-                             L"\"%s\" --headless -- --dst-preflight",
+                             L"\"%s\" --headless -- --dst-autoload-preflight",
                              runtime_exe)) {
         append_log(L"Godot: runtime autoload preflight command is too long.");
         return 0;
@@ -1546,27 +1458,93 @@ static int godot_runtime_autoload_preflight(const WCHAR *dir, const WCHAR *runti
     memset(&si, 0, sizeof si);
     memset(&pi, 0, sizeof pi);
     si.cb = sizeof si;
-    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
     si.wShowWindow = SW_HIDE;
-    if (!CreateProcessW(runtime_exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+    WCHAR temp_dir[MAX_PATH * 4], capture_path[MAX_PATH * 4];
+    HANDLE capture = INVALID_HANDLE_VALUE, reader = INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES inherit = {sizeof inherit, NULL, TRUE};
+    DWORD temp_len = GetTempPathW(MAX_PATH * 4, temp_dir);
+    if (temp_len && temp_len < MAX_PATH * 4 && GetTempFileNameW(temp_dir, L"dsa", 0, capture_path)) {
+        capture = CreateFileW(capture_path, GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &inherit, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+        if (capture != INVALID_HANDLE_VALUE)
+            reader = CreateFileW(capture_path, GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        else DeleteFileW(capture_path);
+    }
+    if (capture == INVALID_HANDLE_VALUE || reader == INVALID_HANDLE_VALUE) {
+        append_log(L"Godot: runtime autoload preflight output capture failed (Windows error %lu).", GetLastError());
+        if (capture != INVALID_HANDLE_VALUE) CloseHandle(capture);
+        if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
+        return 0;
+    }
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = capture; si.hStdError = capture;
+    if (!CreateProcessW(runtime_exe, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
                         NULL, dir, &si, &pi)) {
         append_log(L"Godot: runtime autoload preflight could not start. Windows error: %lu",
                    GetLastError());
+        CloseHandle(reader); CloseHandle(capture);
         return 0;
     }
     CloseHandle(pi.hThread);
-
-    DWORD waited = WaitForSingleObject(pi.hProcess, 5000);
+    /* _ready 的证明由探测脚本输出；不让 SceneTree.quit 与游戏的后台资源加载竞争。
+       独立读取句柄避免与子进程 stdout 共用文件位置。只接受完整证明行且进程仍存活。 */
+    ULONGLONG started = GetTickCount64();
+    DWORD waited;
+    int ok = 0;
+    do {
+        waited = WaitForSingleObject(pi.hProcess, 50);
+        char output[16385]; DWORD got = 0;
+        LARGE_INTEGER zero; zero.QuadPart = 0;
+        if (!SetFilePointerEx(reader, zero, NULL, FILE_BEGIN) ||
+            !ReadFile(reader, output, sizeof(output) - 1, &got, NULL)) {
+            append_log(L"Godot: runtime autoload preflight output read failed (Windows error %lu).", GetLastError());
+            break;
+        }
+        output[got] = 0;
+        const char *proof = strstr(output, "DST_GODOT_AUTOLOAD_READY_V1");
+        if (proof && (proof == output || proof[-1] == '\n')) {
+            const char *end = proof + strlen("DST_GODOT_AUTOLOAD_READY_V1");
+            if (*end == '\r') end++;
+            if (*end == '\n' && waited == WAIT_TIMEOUT) { ok = 1; break; }
+        }
+    } while (waited == WAIT_TIMEOUT && GetTickCount64() - started < 5000);
     DWORD exit_code = 1;
-    int ok = waited == WAIT_OBJECT_0 &&
-             GetExitCodeProcess(pi.hProcess, &exit_code) && exit_code == 0;
+    /* 游戏进程可能在等待返回后、读取证明时自行退出；这是外部进程生命周期，
+       无法由脚本保证。收尾前重新核对，停止失败时再区分自行退出与真正的拒绝。
+       已退出的证明作废且不入缓存，日志记录真实退出码或查询错误。 */
+    if (waited == WAIT_TIMEOUT) waited = WaitForSingleObject(pi.hProcess, 0);
     if (waited == WAIT_TIMEOUT) {
-        TerminateProcess(pi.hProcess, 1);
-        WaitForSingleObject(pi.hProcess, 1000);
-        append_log(L"Godot: runtime autoload preflight timed out.");
-    } else if (!ok) {
-        append_log(L"Godot: runtime autoload preflight exited with code %lu.", exit_code);
+        if (!TerminateProcess(pi.hProcess, 1)) {
+            DWORD stop_error = GetLastError();
+            ok = 0;
+            if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) waited = WAIT_OBJECT_0;
+            else append_log(L"Godot: runtime autoload preflight probe termination failed (Windows error %lu).", stop_error);
+        } else {
+            DWORD stopped = WaitForSingleObject(pi.hProcess, 1000);
+            if (stopped != WAIT_OBJECT_0) {
+                DWORD stop_error = stopped == WAIT_FAILED ? GetLastError() : stopped;
+                append_log(L"Godot: runtime autoload preflight probe termination failed (Windows error %lu).", stop_error);
+                ok = 0;
+            }
+        }
+        if (waited == WAIT_TIMEOUT) {
+            if (ok) append_log(L"Godot: runtime autoload load proof confirmed; independent probe stopped.");
+            else append_log(L"Godot: runtime autoload preflight timed out without a load proof.");
+        }
     }
+    if (waited == WAIT_OBJECT_0) {
+        ok = 0;
+        if (GetExitCodeProcess(pi.hProcess, &exit_code))
+            append_log(L"Godot: runtime autoload preflight exited with code %lu.", exit_code);
+        else append_log(L"Godot: runtime autoload preflight exit code read failed (Windows error %lu).", GetLastError());
+    } else if (waited != WAIT_TIMEOUT) {
+        ok = 0;
+        append_log(L"Godot: runtime autoload preflight wait failed (Windows error %lu).", GetLastError());
+    }
+    CloseHandle(reader); CloseHandle(capture);
     CloseHandle(pi.hProcess);
     /* 只有成功结论入缓存；超时/非零退出可能是瞬态或游戏侧问题，不缓存。 */
     if (ok) godot_preflight_cache_put(L"autoload", sig, 1);
@@ -1704,7 +1682,7 @@ static int launch_godot_with_pack(const WCHAR *dir, const WCHAR *pack) {
     int embedded_runtime_autoload = has_patch_launcher &&
                                     godot_patch_pack_has_runtime_autoload(pack);
     int has_runtime_autoload = embedded_runtime_autoload &&
-                               godot_runtime_autoload_preflight(dir, runtime_exe);
+                               godot_runtime_autoload_preflight(dir, runtime_exe, pack);
     if (embedded_runtime_autoload && !has_runtime_autoload) {
         append_log(L"Godot: runtime autoload preflight failed; trying script-launch compatibility.");
     }
@@ -1712,12 +1690,15 @@ static int launch_godot_with_pack(const WCHAR *dir, const WCHAR *pack) {
     int prepared_runtime_bridge = embedded_runtime_bridge ||
                                   (godot_prepare_runtime_sidecar(dir) && exists_path(script));
     if (embedded_runtime_bridge) runtime_script = L"res://dst_godot_runtime.gd";
+    WCHAR source_marker[MAX_PATH * 4];
+    int require_proof = path_append_suffix(source_marker, MAX_PATH * 4, pack, L".dst-source") &&
+                        exists_path(source_marker);
     int has_runtime_bridge = !has_runtime_autoload && prepared_runtime_bridge &&
                              godot_runtime_sidecar_preflight(
                                  dir, runtime_exe,
-                                 has_patch_launcher ? NULL : pack,
-                                 runtime_script, 0);
-    if (prepared_runtime_bridge && !has_runtime_bridge) {
+                                 has_patch_launcher ? NULL : pack, pack,
+                                 runtime_script, 0, require_proof);
+    if (prepared_runtime_bridge && !has_runtime_bridge && !has_runtime_autoload) {
         append_log(L"Godot: runtime sidecar preflight failed; falling back to the static launch path.");
     }
 
@@ -1767,6 +1748,7 @@ static int launch_godot_with_pack(const WCHAR *dir, const WCHAR *pack) {
         : L"Launching Godot export with static patch pack: %s", runtime_exe);
     if (g_launch_dry_run) {
         write_spawn_plan(L"proc", runtime_exe, cmd, dir);
+        g_godot_runtime_verified = has_runtime_autoload || (has_runtime_bridge && require_proof);
         return 1;
     }
     if (!CreateProcessW(runtime_exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
@@ -1775,6 +1757,7 @@ static int launch_godot_with_pack(const WCHAR *dir, const WCHAR *pack) {
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    g_godot_runtime_verified = has_runtime_autoload || (has_runtime_bridge && require_proof);
     return 1;
 }
 
@@ -1786,7 +1769,7 @@ static int launch_godot_export_with_runtime_sidecar(const WCHAR *dir) {
     }
     if (!godot_prepare_runtime_sidecar(dir)) return 0;
     path_join(script, MAX_PATH * 4, dir, L"dst_godot_runtime.gd");
-    if (!exists_path(script) || !godot_runtime_sidecar_preflight(dir, exe, NULL, script, 0)) {
+    if (!exists_path(script) || !godot_runtime_sidecar_preflight(dir, exe, NULL, NULL, script, 0, 1)) {
         append_log(L"Godot: runtime sidecar preflight failed; falling back to the static launch path.");
         return 0;
     }
@@ -1808,6 +1791,7 @@ static int launch_godot_export_with_runtime_sidecar(const WCHAR *dir) {
     append_log(L"Launching Godot export with runtime translator before static patch is ready: %s", exe);
     if (g_launch_dry_run) {
         write_spawn_plan(L"proc", exe, cmd, dir);
+        g_godot_runtime_verified = 1;
         return 1;
     }
     if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
@@ -1816,6 +1800,7 @@ static int launch_godot_export_with_runtime_sidecar(const WCHAR *dir) {
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    g_godot_runtime_verified = 1;
     return 1;
 }
 
@@ -1826,7 +1811,7 @@ static int launch_godot_with_runtime_sidecar(const WCHAR *dir) {
         return 0;
     }
     path_join(script, MAX_PATH * 4, dir, L"dst_godot_runtime.gd");
-    if (!exists_path(script) || !godot_runtime_sidecar_preflight(dir, exe, NULL, script, 1)) {
+    if (!exists_path(script) || !godot_runtime_sidecar_preflight(dir, exe, NULL, NULL, script, 1, 1)) {
         append_log(L"Godot: runtime sidecar preflight failed; falling back to the normal launch path.");
         return 0;
     }
@@ -1849,6 +1834,7 @@ static int launch_godot_with_runtime_sidecar(const WCHAR *dir) {
     append_log(L"Launching Godot loose project with runtime translator: %s", exe);
     if (g_launch_dry_run) {
         write_spawn_plan(L"proc", exe, cmd, dir);
+        g_godot_runtime_verified = 1;
         return 1;
     }
     if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi)) {
@@ -1857,36 +1843,41 @@ static int launch_godot_with_runtime_sidecar(const WCHAR *dir) {
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    g_godot_runtime_verified = 1;
     return 1;
 }
 
-static void launch_game_for_engine(const WCHAR *dir, Engine engine) {
+static int launch_game_for_engine(const WCHAR *dir, Engine engine) {
     if (engine == ENGINE_GODOT) {
+        g_godot_runtime_verified = 0;
         if (godot_is_loose_project(dir)) {
             if (godot_prepare_runtime_sidecar(dir)) {
                 append_log(L"Godot: loose project detected; launching with runtime translation sidecar.");
-                if (launch_godot_with_runtime_sidecar(dir)) return;
+                if (launch_godot_with_runtime_sidecar(dir)) return 1;
                 append_log(L"Godot: runtime-sidecar launch failed; falling back to normal game launch.");
             } else {
                 append_log(L"Godot: runtime sidecar could not be prepared; falling back to normal game launch.");
             }
-            launch_game(dir);
-            return;
+            return launch_game(dir);
         }
         godot_promote_staged_patch_pack(dir);
         WCHAR pack[MAX_PATH * 4];
         path_join(pack, MAX_PATH * 4, dir, L"dst_godot_patch.pck");
-        if (exists_path(pack)) {
+        if (exists_path(pack) && godot_patch_source_current(dir, pack)) {
             append_log(L"Godot: launching with external translation patch pack.");
-            if (launch_godot_with_pack(dir, pack)) return;
+            if (launch_godot_with_pack(dir, pack)) return 1;
             append_log(L"Godot: patch-pack launch failed; falling back to normal game launch.");
         } else {
+            if (godot_prepare_runtime_pack(dir, pack, MAX_PATH * 4)) {
+                if (launch_godot_with_pack(dir, pack)) return 1;
+                append_log(L"Godot: initial runtime-pack launch failed; trying the generic sidecar.");
+            }
             append_log(L"Godot: no patch pack yet; using the generic runtime translator for this launch.");
-            if (launch_godot_export_with_runtime_sidecar(dir)) return;
+            if (launch_godot_export_with_runtime_sidecar(dir)) return 1;
             append_log(L"Godot: export runtime-sidecar launch failed; falling back to normal game launch.");
         }
     }
-    launch_game(dir);
+    return launch_game(dir);
 }
 
 /* 独立的补丁工作进程没有窗口，其 append_log 只会到达 OutputDebugStringW。
@@ -1961,25 +1952,29 @@ typedef struct {
     Engine engine;
 } WarmupLaunchArgs;
 
-void run_engine_launch_flow(const WCHAR *dir, Engine engine) {
+int run_engine_launch_flow(const WCHAR *dir, Engine engine) {
+    int launched = 0;
     if (engine == ENGINE_RENPY) {
         /* Ren'Py 渲染回调从不等待 HTTP；守护线程负责缓存与实时查询，因此
            游戏可以在整本剧本预热的后台排队期间先启动。Unity/XUnity 保持
            先导入后启动：其插件发出的实时查询应当命中已导入的行。 */
-        launch_game_for_engine(dir, engine);
+        launched = launch_game_for_engine(dir, engine);
+        if (!launched) goto launch_failed;
         set_status(L"已启动 · 正在后台预热剧本...");
         warmup_translations(dir, engine);
     } else if (engine == ENGINE_GODOT) {
         WCHAR patch[MAX_PATH * 4];
         path_join(patch, MAX_PATH * 4, dir, L"dst_godot_patch.pck");
-        int had_patch = exists_path(patch);
+        int had_patch = exists_path(patch) && godot_patch_source_current(dir, patch);
         if (had_patch) {
             append_log(L"Godot: existing patch pack found; launching before cache warmup and patch refresh.");
-            launch_game_for_engine(dir, engine);
+            launched = launch_game_for_engine(dir, engine);
+            if (!launched) goto launch_failed;
             set_status(L"Godot: 已启动，正在后台预热缓存...");
         } else {
             append_log(L"Godot: no patch pack yet; launching first, then warming resources for patch preparation.");
-            launch_game_for_engine(dir, engine);
+            launched = launch_game_for_engine(dir, engine);
+            if (!launched) goto launch_failed;
             set_status(L"Godot: 已启动，正在后台准备翻译补丁...");
         }
         /* 本工作线程扫描并入队资源时游戏已经可以响应。在分离式重建之前
@@ -1993,9 +1988,21 @@ void run_engine_launch_flow(const WCHAR *dir, Engine engine) {
         }
     } else {
         warmup_translations(dir, engine);
-        launch_game_for_engine(dir, engine);
+        launched = launch_game_for_engine(dir, engine);
+        if (!launched) goto launch_failed;
     }
-    set_status(L"已启动 · 本地缓存 + 实时批量 API");
+    if (engine == ENGINE_GODOT && !g_godot_runtime_verified)
+        set_status(L"Godot: 游戏已启动，但实时翻译模块未确认加载；请查看日志。");
+    else if (engine == ENGINE_UNKNOWN || engine == ENGINE_RPGM_LEGACY)
+        set_status(L"游戏已启动；当前引擎未部署实时翻译模块，请查看日志。");
+    else if (engine == ENGINE_GODOT)
+        set_status(L"已启动 · 本地缓存 + 实时批量 API");
+    else set_status(L"游戏已启动；翻译组件已部署，游戏内加载待确认。");
+    return 1;
+
+launch_failed:
+    set_status(L"游戏启动失败；请查看日志。");
+    return 0;
 }
 
 /* 本地翻译服务未就绪时取消部署与游戏启动（工作线程与同步回退共用）。 */
@@ -2019,6 +2026,17 @@ int deploy_for_engine(const WCHAR *dir, Engine e) {
     return deployed;
 }
 
+int run_deploy_launch_flow(const WCHAR *dir, Engine engine) {
+    int deployed = deploy_for_engine(dir, engine);
+    if (!deployed && engine != ENGINE_UNKNOWN && engine != ENGINE_RPGM_LEGACY) {
+        append_log(L"翻译组件部署失败，已取消游戏启动；请查看上方具体错误。");
+        set_status(L"翻译组件部署失败，未启动游戏；请查看日志。");
+        return 0;
+    }
+    set_status(L"正在预热缓存并启动游戏...");
+    return run_engine_launch_flow(dir, engine);
+}
+
 /* start_server 的就绪轮询最长 15 秒、deploy 是同步文件 I/O、warmup 扫描
    数十 MB 资源并做同步 HTTP，全部在工作线程执行以保持 UI 响应。launch_game
    使用 ShellExecuteW (COM)，因此 CoInitializeEx。调用的 UI 辅助函数
@@ -2029,9 +2047,7 @@ static DWORD WINAPI warmup_launch_thread(LPVOID p) {
     if (!start_server()) {
         report_server_start_failure();
     } else {
-        deploy_for_engine(a->dir, a->engine);
-        set_status(L"正在预热缓存并启动游戏...");
-        run_engine_launch_flow(a->dir, a->engine);
+        run_deploy_launch_flow(a->dir, a->engine);
     }
     if (SUCCEEDED(hr)) CoUninitialize();
     free(a);
@@ -2083,8 +2099,6 @@ void start_translation(void) {
         g_start_flow_running = 0;
         return;
     }
-    deploy_for_engine(g_game, e);
-    set_status(L"正在预热缓存并启动游戏...");
-    run_engine_launch_flow(g_game, e);
+    run_deploy_launch_flow(g_game, e);
     g_start_flow_running = 0;
 }

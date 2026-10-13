@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Version = "",
     [switch]$NoZip
 )
@@ -6,6 +6,18 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+function Get-Sha256Hex([string]$path) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($path)
+    try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
+$reviewedFontSha = '2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b'
+$reviewedLicenseSha = '6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2'
+if ((Get-Sha256Hex (Join-Path $repo 'assets\fonts\NotoSansCJKsc-Regular.otf')) -ine $reviewedFontSha -or
+    (Get-Sha256Hex (Join-Path $repo 'assets\fonts\OFL.txt')) -ine $reviewedLicenseSha) {
+    throw 'Reviewed Noto CJK font or OFL license bytes changed; update license review before release.'
+}
 $versionFile = Join-Path $repo "VERSION"
 if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
     throw "Missing VERSION file: $versionFile"
@@ -86,24 +98,25 @@ $includeFiles = @(
 $includeDirs = @(
     "assets",
     "native\src",
-    # Engine runtime scripts embedded into the launcher (build_native.bat RCDATA 301-304).
+    # 嵌入启动器的引擎运行时脚本（build_native.bat 中的 RCDATA 301-304）。
     "payloads\RenPy",
     "payloads\RPGMaker",
     "payloads\Godot",
-    # Managed payload fingerprints: build_native.bat refuses to package stale DLLs without them.
+    # 托管组件指纹：缺少指纹时，build_native.bat 拒绝打包过期 DLL。
     "payloads\ManagedBuildStamps",
     "payloads\UnityTranslator\src",
     "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src",
     "payloads\UnityIL2CPP\DeepSeekTMPFontFallback\src",
     "scripts",
     "docs",
-    # build_native.bat runs tests\core_tests; the contract/payload checks live here too.
+    # build_native.bat 运行 tests\core_tests；此处也包含契约和组件检查。
     "tests"
 )
 
 $excludedPathParts = @(
     "\bin\",
     "\obj\",
+    "\__pycache__\",
     "\UnityManagedRefs\",
     "\UnityInteropRefs\",
     "\_launcher_fixtures\"
@@ -111,19 +124,20 @@ $excludedPathParts = @(
 
 $excludedExtensions = @(
     ".dll", ".exe", ".pdb", ".mdb", ".otf", ".ttf", ".ttc", ".woff", ".woff2",
-    ".zip", ".7z", ".rar", ".tsv", ".log"
+    ".zip", ".7z", ".rar", ".tsv", ".log", ".pyc"
 )
 
 $binaryAssetExtensions = @(".ico", ".png")
 
 function Is-SafeSourceFile([System.IO.FileInfo]$file) {
     $relative = $file.FullName.Substring($repo.Length).TrimStart("\", "/")
+    $reviewedFont = $relative -ieq "assets\fonts\NotoSansCJKsc-Regular.otf"
     foreach ($part in $excludedPathParts) {
         if ($file.FullName.IndexOf($part, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
             return $false
         }
     }
-    if ($excludedExtensions -contains $file.Extension.ToLowerInvariant()) {
+    if ($excludedExtensions -contains $file.Extension.ToLowerInvariant() -and -not $reviewedFont) {
         return $false
     }
     if ($relative -match '(^|\\)(api|launcher)\.ini$') {
@@ -167,7 +181,8 @@ foreach ($dir in $includeDirs) {
 
 $allowedExampleTsv = "config\glossary.example.tsv"
 $forbiddenFiles = Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object {
-    if ($_.FullName.Substring($stage.Length).TrimStart("\", "/") -replace "/", "\" -ieq $allowedExampleTsv) {
+    $relative = $_.FullName.Substring($stage.Length).TrimStart("\", "/") -replace "/", "\"
+    if ($relative -ieq $allowedExampleTsv -or $relative -ieq "assets\fonts\NotoSansCJKsc-Regular.otf") {
         return $false
     }
     $excludedExtensions -contains $_.Extension.ToLowerInvariant()
@@ -191,7 +206,9 @@ $scanPatterns = @(
 )
 
 foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) {
-    if ($binaryAssetExtensions -contains $file.Extension.ToLowerInvariant()) {
+    $stagedRelative = $file.FullName.Substring($stage.Length).TrimStart("\", "/").Replace('/', '\')
+    if ($binaryAssetExtensions -contains $file.Extension.ToLowerInvariant() -or
+        $stagedRelative -ieq "assets\fonts\NotoSansCJKsc-Regular.otf") {
         continue
     }
     try {

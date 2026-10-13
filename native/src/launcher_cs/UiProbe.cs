@@ -152,6 +152,33 @@ namespace DstLauncher
 
             UiPaint.PaintBackground(hwnd, dc);
 
+            // 独立比较直接绘制和复用缓冲，防止两版同时留下残影而通过像素对照。
+            Win32.GdiFlush();
+            int pixelBytes = checked(width * height * 4);
+            var reference = new byte[pixelBytes];
+            var actual = new byte[pixelBytes];
+            Marshal.Copy(pixels, reference, 0, pixelBytes);
+            var regions = new[] { client,
+                new Win32.RECT(width / 3, 20, width - 7, height / 2),
+                new Win32.RECT(5, height / 2, width / 2, height - 3), client };
+            bool bufferOk = true;
+            foreach (Win32.RECT region in regions) {
+                Win32.RECT clear = region;
+                Win32.FillRect(dc, ref clear, Win32.GetStockObject(Win32.BLACK_BRUSH));
+                UiPaint.PaintBackgroundBuffered(hwnd, dc, region);
+                Win32.GdiFlush();
+                Marshal.Copy(pixels, actual, 0, pixelBytes);
+                for (int i = 0; i < pixelBytes; i++) {
+                    if (reference[i] != actual[i]) { bufferOk = false; break; }
+                }
+            }
+            UiPaint.FreeBackgroundBuffer();
+            Line("buffer_pixels=" + (bufferOk ? 1 : 0) + "\n");
+            if (!bufferOk) {
+                Win32.SelectObject(dc, oldBmp); Win32.DeleteObject(bmp); Win32.DeleteDC(dc);
+                return false;
+            }
+
             foreach (ProbeControl pc in Controls) {
                 IntPtr ctl = Win32.GetDlgItem(hwnd, pc.id);
                 if (ctl == IntPtr.Zero || !Win32.IsWindow(ctl)) continue;
@@ -201,7 +228,7 @@ namespace DstLauncher
             }
         }
 
-        /* --ui-probe <w> <h> <alive> <out.bmp> */
+        /* 窗口探针参数：--ui-probe <w> <h> <alive> <out.bmp> */
         internal static int Run(int width, int height, bool alive, string bmpPath, Action<string> writer)
         {
             if (width <= 0 || height <= 0 || string.IsNullOrEmpty(bmpPath)) return 2;
@@ -209,6 +236,16 @@ namespace DstLauncher
 
             MainWindow.ProbeMode = true;
             Theme.AnimTickOverride = 0;
+            /* 仅诊断模式接受冻结相位；生产动画不读取此环境变量。 */
+            string tickText = Environment.GetEnvironmentVariable("DST_UI_PROBE_TICK");
+            if (!string.IsNullOrEmpty(tickText)) {
+                int tick;
+                if (!int.TryParse(tickText, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out tick) || tick < 0 || tick > 30000 || tickText.Length >= 16) {
+                    writer("invalid_animation_tick\nresult=0\n");
+                    return 2;
+                }
+                Theme.AnimTickOverride = tick;
+            }
             ServerProcess.SetStartedForProbe(alive);
 
             var ic = new Win32.INITCOMMONCONTROLSEX();
@@ -262,6 +299,72 @@ namespace DstLauncher
             Win32.DestroyWindow(hwnd);
             MainWindow.Hwnd = IntPtr.Zero;
             return ok ? 0 : 1;
+        }
+
+        /* 进程内 HDROP 探针：经过真实窗口/子控件过程，但不启动服务或游戏。 */
+        internal static int RunDrop(string path, int targetId, Action<string> writer)
+        {
+            if (string.IsNullOrEmpty(path) || path.Length >= Win32.MAX_PATH * 4) return 2;
+            _out = writer;
+            MainWindow.ProbeMode = true;
+            MainWindow.ProbeDropStartRequested = false;
+            var ic = new Win32.INITCOMMONCONTROLSEX();
+            ic.dwSize = (uint)Marshal.SizeOf(typeof(Win32.INITCOMMONCONTROLSEX));
+            ic.dwICC = Win32.ICC_STANDARD_CLASSES;
+            Win32.InitCommonControlsEx(ref ic);
+            MainWindow.Instance = Win32.GetModuleHandleW(null);
+
+            var wc = new Win32.WNDCLASSEXW();
+            wc.cbSize = (uint)Marshal.SizeOf(typeof(Win32.WNDCLASSEXW));
+            wc.lpfnWndProc = MainWindow.WndProcPointer;
+            wc.hInstance = MainWindow.Instance;
+            wc.hCursor = Win32.LoadCursorW(IntPtr.Zero, (IntPtr)32512);
+            wc.lpszClassName = Marshal.StringToHGlobalUni(ProbeClass);
+            if (Win32.RegisterClassExW(ref wc) == 0) {
+                Line("class_error=" + Marshal.GetLastWin32Error() + "\nresult=0\n");
+                return 1;
+            }
+            IntPtr hwnd = Win32.CreateWindowExW(0, ProbeClass, "ds drop probe",
+                                                unchecked((uint)(Win32.WS_POPUP | Win32.WS_CLIPCHILDREN)),
+                                                0, 0, 1200, 780, IntPtr.Zero, IntPtr.Zero,
+                                                MainWindow.Instance, IntPtr.Zero);
+            if (hwnd == IntPtr.Zero) {
+                Line("window_error=" + Marshal.GetLastWin32Error() + "\nresult=0\n");
+                return 1;
+            }
+            MainWindow.Hwnd = hwnd;
+            IntPtr block = IntPtr.Zero;
+            try {
+                IntPtr target = targetId == 0 ? hwnd : Win32.GetDlgItem(hwnd, targetId);
+                if (target == IntPtr.Zero) {
+                    Line("target_error=" + targetId + "\nresult=0\n");
+                    return 1;
+                }
+                bool accept = (Win32.GetWindowLongW(target, -20) & (int)Win32.WS_EX_ACCEPTFILES) != 0;
+                byte[] pathBytes = Encoding.Unicode.GetBytes(path + "\0\0");
+                int bytes = 20 + pathBytes.Length;
+                block = Win32.GlobalAlloc(0x42, new UIntPtr((uint)bytes));
+                IntPtr mem = block == IntPtr.Zero ? IntPtr.Zero : Win32.GlobalLock(block);
+                if (mem == IntPtr.Zero) {
+                    Line("drop_alloc_error=" + Marshal.GetLastWin32Error() + "\nresult=0\n");
+                    return 1;
+                }
+                Marshal.WriteInt32(mem, 0, 20);  /* DROPFILES.pFiles */
+                Marshal.WriteInt32(mem, 16, 1);  /* fWide */
+                Marshal.Copy(pathBytes, 0, IntPtr.Add(mem, 20), pathBytes.Length);
+                Win32.GlobalUnlock(block);
+                Win32.SendMessageW(target, Win32.WM_DROPFILES, block, IntPtr.Zero);
+                block = IntPtr.Zero;  /* 接收端 DragFinish 已释放 */
+                var selected = new StringBuilder(Win32.MAX_PATH * 4);
+                Win32.GetWindowTextW(MainWindow.Path, selected, selected.Capacity);
+                Line("accept=" + (accept ? 1 : 0) + "\nselected=" + selected +
+                     "\nstart=" + (MainWindow.ProbeDropStartRequested ? 1 : 0) + "\nresult=1\n");
+                return 0;
+            } finally {
+                if (block != IntPtr.Zero) Win32.GlobalFree(block);
+                Win32.DestroyWindow(hwnd);
+                MainWindow.Hwnd = IntPtr.Zero;
+            }
         }
     }
 }

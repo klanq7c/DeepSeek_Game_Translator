@@ -41,7 +41,7 @@ namespace DstLauncher
             return false;
         }
 
-        /* ---------------- find_exe ---------------- */
+        /* ---------------- 查找游戏程序：find_exe ---------------- */
 
         private static bool IgnoredExeName(string name)
         {
@@ -113,7 +113,7 @@ namespace DstLauncher
             return ok ? PathUtil.Join(dir, bestName) : null;
         }
 
-        /* ---------------- Unity ---------------- */
+        /* ---------------- Unity 检测 ---------------- */
 
         /* unity_is_il2cpp：GameAssembly.dll 或任一 *_Data\il2cpp_data 目录。 */
         public static bool UnityIsIl2cpp(string dir)
@@ -127,7 +127,7 @@ namespace DstLauncher
             return false;
         }
 
-        /* ---------------- Godot ---------------- */
+        /* ---------------- Godot 检测 ---------------- */
 
         private static bool GodotProjectMarker(string dir)
         {
@@ -227,7 +227,7 @@ namespace DstLauncher
             return HasFilePattern(dir, "*.pck") || GodotProjectMarker(dir) || HasGodotEmbeddedExe(dir);
         }
 
-        /* ---------------- RPG Maker MV/MZ ---------------- */
+        /* ---------------- RPG Maker MV/MZ 检测 ---------------- */
 
         private static bool RpgmIndexOrOwnedBackup(string contentRoot)
         {
@@ -261,7 +261,7 @@ namespace DstLauncher
             return dir;
         }
 
-        /* ---------------- detect_engine ---------------- */
+        /* ---------------- 引擎检测：detect_engine ---------------- */
 
         public static Engine Detect(string dir)
         {

@@ -4,6 +4,18 @@
 
 后续更新请继续把最新更新日志放在本节最上方。
 
+### 20261013（0.4.0.0 后续源码更新）
+
+1. **启动页重新设计**：加入星夜主题、暖白操作卡片和更平滑的悬停动画；后台、最小化或系统关闭动画时停止装饰刷新，保留目录选择、拖放、API 配置、缓存管理和还原游戏等功能。
+2. **Godot 翻译修复**：处理菜单动画反复写回英文、设置选项被链接标签拆成半词、部分未命中导致整块文字不显示译文等问题；改进动态控件、场景切换、暂停菜单、导出包识别与启动预检。
+3. **其他引擎兼容性**：修复 Ren'Py 旧版本刷新线程及迟到响应覆盖译文、RPG Maker 菜单补译和断线恢复、Unity 动态菜单扫描与富文本标签保护，完善 IL2CPP 响应校验和中文字体回退。
+4. **API 与缓存稳定性**：支持从提供商实时刷新模型目录并保留手动选择；修复部分 Unicode 模型名保存、响应体超时、缓存写入失败恢复和不完整末行追加问题。
+5. **性能与维护**：复用启动器绘图缓冲，限制日志历史长度，减少 Godot 重复文本解析和 Unity 同轮重复控件枚举；补充跨引擎回归测试并统一核心模块的中文说明注释。
+
+最近完整验证：启动器 C/C# 一致性 **267 项通过**、双服务契约 **152 项通过**、Unity 运行契约 **72 项通过**。验证范围与更多说明见 [本次更新详情](docs/UPDATE_2026-10-13.md)。
+
+本节对应源码分支更新；下方 `v0.4.0.0` 下载链接仍指向已有发布包。
+
 ### 20260909（0.4.0.0）
 
 1、启动器配置 API 改成了提供商下拉，DeepSeek、硅基流动、Kimi、智谱、阿里百炼都能直接选，也可以接本机的 Ollama / LM Studio。
@@ -67,7 +79,11 @@ https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.4.0.0
    - `config\launcher.ini.example`
    - `config\glossary.example.tsv`
    - 本项目自有 Unity 插件 DLL
-3. 在启动器里点击“配置 API”，选择提供商并填写自己的 API key。支持任意 OpenAI 兼容服务（DeepSeek、硅基流动、Moonshot、智谱、阿里百炼、OpenAI、Claude、Gemini 及本地 Ollama/LM Studio 等），本地回环服务的 key 可留空。
+3. 在启动器里点击“配置 API”，选择提供商并填写自己的 API key。点击“刷新模型”从当前厂商获取最新目录，在可编辑下拉框中自主选择模型，也可以直接填写模型 ID。已有 Key 的配置打开时自动刷新；更换厂商、地址或 Key 后请重新刷新。支持任意 OpenAI 兼容服务（DeepSeek、硅基流动、Moonshot、智谱、阿里百炼、OpenAI、Claude、Gemini 及本地 Ollama/LM Studio 等），本地回环服务的 key 可留空。
+
+   提供商预设只填写地址，不再内置容易过期的模型名。切换到不同厂商地址后需重新选模型；刷新目录保留当前选择，显示获取时间，并提示当前模型是否仍在目录中。未列出的别名仍可手动保存。请选用支持聊天补全的模型，保存后重启翻译服务生效。
+
+   Claude、百炼的目录会读取后续分页，硅基流动会筛选聊天模型。百炼使用所填地址对应的目录；如果账号要求业务空间地址，请填写控制台提供的兼容接口完整地址。厂商未开放目录、Key 无权限、分页不完整或网络失败时，窗口会显示原因并保留手动输入，不会用旧列表伪装刷新成功。目录来自当前 API 地址和账号权限，不代表所有厂商公开发布的模型。
 4. 如需翻译 Unity 游戏，在程序所在目录运行：
 
 ```powershell
@@ -81,6 +97,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -A
 Ren'Py、RPG Maker 和 Godot 路径不需要下载 BepInEx/XUnity。Unity 路径如果缺少 payload，启动器日志会提示对应的安装命令。Godot 会扫描工程/导出包里的可翻译文本做缓存预热，并对导出的 `.pck` 生成外部补丁包（不改原包）。
 
 完整用户说明见 `docs/USER_GUIDE.md`。
+源码目录可运行 `scripts/audit_game_translation.ps1 -GamePath '游戏目录'` 做只读覆盖率与标记检查；它会给出原目录游戏 exe 的完整路径，并明确标记人工校对、字形排版和实际启动尚未验证。
 
 本地服务默认监听：
 
@@ -123,13 +140,13 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -U
 ```ini
 [api]
 endpoint=https://api.deepseek.com/v1/chat/completions
-model=deepseek-v4-flash
+model=deepseek-flash
 key=YOUR_API_KEY_HERE
 timeout_ms=15000
 concurrency=4
 ```
 
-以上以 DeepSeek 为例；任意 OpenAI 兼容端点均可使用，更多提供商地址见 `config\api.ini.example` 的注释。
+以上以 DeepSeek 为例；`deepseek-flash` 是 DeepSeek V4.1 Flash 当前的官方 API ID，模型显示版本不一定包含在 API ID 中。可通过“刷新模型”读取厂商当前提供的 ID。任意 OpenAI 兼容端点均可使用，更多提供商地址见 `config\api.ini.example` 的注释。
 
 真实的 `config/api.ini` 不要提交到仓库，也不要发给别人。
 

@@ -7,11 +7,12 @@
  *   - RPG Maker MV/MZ JavaScript hook（RCDATA 资源 payloads/RPGMaker/hook_rpgm_mv.js，运行时写入 .js 文件）
  *   - Unity Mono BepInEx 插件部署（DLL 复制 + BepInEx 运行时安装）
  *   - Unity IL2CPP BepInEx be.755 + XUnity AutoTranslator 全套部署
- *   - CJK 字体部署（从系统 Fonts 复制到游戏目录供 hook 使用）
+ *   - CJK 字体部署（优先系统 Fonts，缺失时使用带 OFL 的内置备用字体）
  * ================================================================ */
 
 #include "deploy.h"
 #include "embedded.h"
+#include "font_bundle.h"
 #include "fsutil.h"
 #include "resource.h"
 #include "ui.h"
@@ -60,29 +61,97 @@
  * 回退 msyh.ttc 微软雅黑）到游戏的 game/ 目录，hook 脚本的
  * style 覆盖会引用此字体。
  * ---------------------------------------------------------------- */
+static const char *DST_FONT_TTF_OWNER = "DST_FONT_OWNED_V1:simhei.ttf\n";
+static const char *DST_FONT_TTC_OWNER = "DST_FONT_OWNED_V1:msyh.ttc\n";
+static const char *DST_BUNDLED_FONT_OWNER = "DST_FONT_OWNED_V1:NotoSansCJKsc-Regular.otf\n";
+static const char *DST_BUNDLED_LICENSE_OWNER = "DST_FONT_OWNED_V1:NotoSansCJKsc-Regular.otf:OFL\n";
+
+/* 游戏已有 ds_font.* 时不认领；只有本次新复制的字体才写所有权标记。
+   写标记失败时保留仍可用的字体，但还原时会将它当成用户文件保留。 */
+static int copy_owned_cjk_font(const WCHAR *src, const WCHAR *dst,
+                               const char *owner_text) {
+    WCHAR marker[MAX_PATH * 4];
+    if (!path_append_suffix(marker, MAX_PATH * 4, dst, L".dst-owned")) {
+        append_log(L"CJK font ownership path is too long: %s", dst);
+        return 0;
+    }
+    if (exists_path(marker)) {
+        append_log(L"CJK font ownership marker already exists; preserved: %s", marker);
+        return 0;
+    }
+    if (!copy_file_if_absent_safe(src, dst)) {
+        append_log(L"CJK font copy failed (Windows error %lu): %s", GetLastError(), dst);
+        return 0;
+    }
+    if (!write_text_file_utf8(marker, owner_text)) {
+        DWORD error = GetLastError();
+        if (exists_path(marker) && !delete_file_safe(marker))
+            append_log(L"CJK font ownership marker cleanup failed (Windows error %lu): %s", GetLastError(), marker);
+        append_log(L"CJK font was copied but ownership could not be recorded (Windows error %lu); restore will preserve it: %s", error, dst);
+    }
+    return 1;
+}
+
+/* 系统缺少可用 CJK 字体时，拷贝随启动器分发的原版 OTF 与 OFL。
+   两个文件各自带所有权标记；遇到用户同名文件时不覆盖。 */
+static int deploy_bundled_cjk_font(const WCHAR *dst) {
+    WCHAR source[MAX_PATH * 4], license[MAX_PATH * 4], license_dst[MAX_PATH * 4];
+    if (!font_bundle_source(source, MAX_PATH * 4, license, MAX_PATH * 4) ||
+        !path_append_suffix(license_dst, MAX_PATH * 4, dst, L".OFL.txt")) return 0;
+    if (exists_path(license_dst)) {
+        if (!files_equal_safe(license_dst, license)) {
+            append_log(L"CJK font: existing license file differs; bundled font was not installed: %s", license_dst);
+            return 0;
+        }
+    } else if (!copy_owned_cjk_font(license, license_dst, DST_BUNDLED_LICENSE_OWNER)) {
+        return 0;
+    }
+    if (!copy_owned_cjk_font(source, dst, DST_BUNDLED_FONT_OWNER)) return 0;
+    append_log(L"CJK font: deployed bundled Noto Sans CJK SC with OFL license: %s", dst);
+    return 1;
+}
+
+static int deploy_unity_cjk_font_if_needed(const WCHAR *dir) {
+    WCHAR windir[MAX_PATH], font_dir[MAX_PATH * 4], src[MAX_PATH * 4];
+    const WCHAR *names[] = { L"simhei.ttf", L"msyh.ttf", L"msyh.ttc", L"simsun.ttc" };
+    if (GetWindowsDirectoryW(windir, MAX_PATH)) {
+        path_join(font_dir, MAX_PATH * 4, windir, L"Fonts");
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            path_join(src, MAX_PATH * 4, font_dir, names[i]);
+            if (exists_path(src)) return 1;
+        }
+    }
+    WCHAR dst[MAX_PATH * 4];
+    path_join(dst, MAX_PATH * 4, dir, L"TranslationFonts\\NotoSansCJKsc-Regular.otf");
+    if (exists_path(dst)) return 1; /* 用户自行配置的同名字体不得覆盖 */
+    return deploy_bundled_cjk_font(dst);
+}
+
 static void deploy_renpy_font(const WCHAR *game) {
-    WCHAR ttc_dst[MAX_PATH * 4], ttf_dst[MAX_PATH * 4];
+    WCHAR ttc_dst[MAX_PATH * 4], ttf_dst[MAX_PATH * 4], otf_dst[MAX_PATH * 4];
     path_join(ttc_dst, MAX_PATH * 4, game, L"ds_font.ttc");
     path_join(ttf_dst, MAX_PATH * 4, game, L"ds_font.ttf");
-    if (exists_path(ttc_dst) || exists_path(ttf_dst)) return;
+    path_join(otf_dst, MAX_PATH * 4, game, L"ds_font.otf");
+    if (exists_path(ttc_dst) || exists_path(ttf_dst) || exists_path(otf_dst)) return;
 
     WCHAR windir[MAX_PATH];
-    if (!GetWindowsDirectoryW(windir, MAX_PATH)) return;
+    if (!GetWindowsDirectoryW(windir, MAX_PATH)) windir[0] = 0;
 
     /* 优先 TTF 格式："0@file.ttc" 集合索引语法并非所有 Ren'Py 版本都支持，
        而普通 TTF 文件名在任何版本都可以工作。 */
     WCHAR src[MAX_PATH * 4];
     path_join(src, MAX_PATH * 4, windir, L"Fonts\\simhei.ttf");
-    if (exists_path(src) && copy_file_safe(src, ttf_dst)) {
+    if (windir[0] && exists_path(src) && copy_owned_cjk_font(src, ttf_dst, DST_FONT_TTF_OWNER)) {
         append_log(L"Ren'Py：已部署中文字体（黑体）：%s", ttf_dst);
         return;
     }
     path_join(src, MAX_PATH * 4, windir, L"Fonts\\msyh.ttc");
-    if (exists_path(src) && copy_file_safe(src, ttc_dst)) {
+    if (windir[0] && exists_path(src) && copy_owned_cjk_font(src, ttc_dst, DST_FONT_TTC_OWNER)) {
         append_log(L"Ren'Py：已部署中文字体（微软雅黑）：%s", ttc_dst);
         return;
     }
-    append_log(L"Ren'Py：未找到系统中文字体（simhei.ttf/msyh.ttc），翻译文本可能显示为方块。");
+    if (!deploy_bundled_cjk_font(otf_dst))
+        append_log(L"Ren'Py：系统字体和内置中文备用字体均不可用，翻译文本可能显示为方块。");
 }
 
 /* ----------------------------------------------------------------
@@ -92,30 +161,32 @@ static void deploy_renpy_font(const WCHAR *game) {
  * 将系统 CJK 字体复制到已解析内容根的 fonts/ 目录供 hook 脚本引用。
  * ---------------------------------------------------------------- */
 static void deploy_rpgm_font(const WCHAR *content_root) {
-    WCHAR font_dir[MAX_PATH * 4], ttf_dst[MAX_PATH * 4], ttc_dst[MAX_PATH * 4];
+    WCHAR font_dir[MAX_PATH * 4], ttf_dst[MAX_PATH * 4], ttc_dst[MAX_PATH * 4], otf_dst[MAX_PATH * 4];
     path_join(font_dir, MAX_PATH * 4, content_root, L"fonts");
     ensure_dir(font_dir);
     path_join(ttf_dst, MAX_PATH * 4, font_dir, L"ds_font.ttf");
     path_join(ttc_dst, MAX_PATH * 4, font_dir, L"ds_font.ttc");
-    if (exists_path(ttf_dst) || exists_path(ttc_dst)) return;
+    path_join(otf_dst, MAX_PATH * 4, font_dir, L"ds_font.otf");
+    if (exists_path(ttf_dst) || exists_path(ttc_dst) || exists_path(otf_dst)) return;
 
     WCHAR windir[MAX_PATH];
-    if (!GetWindowsDirectoryW(windir, MAX_PATH)) return;
+    if (!GetWindowsDirectoryW(windir, MAX_PATH)) windir[0] = 0;
 
     WCHAR src[MAX_PATH * 4];
     path_join(src, MAX_PATH * 4, windir, L"Fonts\\simhei.ttf");
-    if (exists_path(src) && copy_file_safe(src, ttf_dst)) {
+    if (windir[0] && exists_path(src) && copy_owned_cjk_font(src, ttf_dst, DST_FONT_TTF_OWNER)) {
         append_log(L"RPGM MV/MZ: deployed CJK font: %s", ttf_dst);
         return;
     }
 
     path_join(src, MAX_PATH * 4, windir, L"Fonts\\msyh.ttc");
-    if (exists_path(src) && copy_file_safe(src, ttc_dst)) {
+    if (windir[0] && exists_path(src) && copy_owned_cjk_font(src, ttc_dst, DST_FONT_TTC_OWNER)) {
         append_log(L"RPGM MV/MZ: deployed CJK font: %s", ttc_dst);
         return;
     }
 
-    append_log(L"RPGM MV/MZ: no system CJK font found (simhei.ttf/msyh.ttc); translated text may render as boxes.");
+    if (!deploy_bundled_cjk_font(otf_dst))
+        append_log(L"RPGM MV/MZ: neither a system nor the bundled CJK font is available; translated text may render as boxes.");
 }
 
 /* ----------------------------------------------------------------
@@ -402,13 +473,47 @@ static int is_bundled_unity_mono_plugin(const WCHAR *path) {
     return 0;
 }
 
-/* 将文件重命名为 .disabled 后缀（不删除，保留备份） */
+/* 记录上次确实由启动器部署的字节；升级后的旧版 DLL 不能只与当前模板比较。 */
+static int is_owned_unity_mono_plugin(const WCHAR *path, const WCHAR *marker) {
+    return is_bundled_unity_mono_plugin(path) ||
+           (marker && exists_path(marker) && files_equal(path, marker));
+}
+
+/* 一次性备份若已存在，只有与当前文件完全相同才可再次覆盖当前文件。
+   否则用户在上次备份后新增的修改将没有可恢复副本。 */
+static int backup_unity_current_if_safe(const WCHAR *path) {
+    WCHAR backup[MAX_PATH * 4];
+    if (!path_append_suffix(backup, MAX_PATH * 4, path, L".dst-backup")) return 0;
+    if (exists_path(backup)) {
+        if (path_has_reparse_point(backup, 1)) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return 0;
+        }
+        if (!files_equal(path, backup)) {
+            SetLastError(ERROR_ALREADY_EXISTS);
+            return 0;
+        }
+        return 1;
+    }
+    if (copy_file_if_absent_safe(path, backup)) return 1;
+    if (GetLastError() == ERROR_FILE_EXISTS &&
+        !path_has_reparse_point(backup, 1) && files_equal(path, backup)) return 1;
+    return 0;
+}
+
+/* 将文件重命名为 .disabled；已有目标可能是用户备份，不得删除或覆盖。 */
 static int disable_existing_file(const WCHAR *path) {
-    if (!exists_path(path)) return 0;
+    if (!exists_path(path)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
     WCHAR disabled[MAX_PATH * 4];
     if (!path_append_suffix(disabled, MAX_PATH * 4, path, L".disabled")) return 0;
-    if (exists_path(disabled) && !delete_file_safe(disabled)) return 0;
-    return move_file_safe(path, disabled, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+    if (exists_path(disabled)) {
+        SetLastError(ERROR_ALREADY_EXISTS);
+        return 0;
+    }
+    return move_file_safe(path, disabled, MOVEFILE_COPY_ALLOWED);
 }
 
 /* 二进制比较两个文件是否完全相同 */
@@ -1340,7 +1445,7 @@ static int ensure_bepinex_mono(const WCHAR *dir) {
  *   4. 复制 TMP 字体资源包（如有）到 BepInEx/font/
  * ---------------------------------------------------------------- */
 int deploy_unity(const WCHAR *dir) {
-    WCHAR plugins[MAX_PATH * 4], dll[MAX_PATH * 4], src[MAX_PATH * 4], json_src[MAX_PATH * 4], json_dst[MAX_PATH * 4], fontfix[MAX_PATH * 4];
+    WCHAR plugins[MAX_PATH * 4], dll[MAX_PATH * 4], dll_marker[MAX_PATH * 4], src[MAX_PATH * 4], json_src[MAX_PATH * 4], json_dst[MAX_PATH * 4], json_marker[MAX_PATH * 4], fontfix[MAX_PATH * 4];
     path_join(plugins, MAX_PATH * 4, dir, L"BepInEx\\plugins");
 
     if (!ensure_bepinex_mono(dir)) return 0;
@@ -1359,13 +1464,18 @@ int deploy_unity(const WCHAR *dir) {
         return 0;
     }
     path_join(dll, MAX_PATH * 4, plugins, L"UnityTranslator.dll");
-    if (exists_path(dll) && !is_bundled_unity_mono_plugin(dll) &&
-        !backup_file_once(dll, L".dst-backup")) {
-        append_log(L"Unity: could not back up the existing UnityTranslator.dll before overwriting it (Windows error %lu).", GetLastError());
+    if (!path_append_suffix(dll_marker, MAX_PATH * 4, dll, L".dst-owned")) return 0;
+    if (exists_path(dll) && !is_owned_unity_mono_plugin(dll, dll_marker) &&
+        !backup_unity_current_if_safe(dll)) {
+        append_log(L"Unity：现有 UnityTranslator.dll 备份与当前文件不一致或无法保存，已保留当前文件并取消部署（Windows 错误 %lu）。", GetLastError());
         return 0;
     }
     if (!copy_file_safe(src, dll)) {
         append_log(L"Unity：无法部署 UnityTranslator.dll（Windows 错误 %lu）。", GetLastError());
+        return 0;
+    }
+    if (!copy_file_safe(src, dll_marker)) {
+        append_log(L"Unity: could not record the deployed UnityTranslator.dll version (Windows error %lu).", GetLastError());
         return 0;
     }
     if (!find_unity_payload_file(json_src, MAX_PATH * 4, L"Newtonsoft.Json.dll")) {
@@ -1374,13 +1484,19 @@ int deploy_unity(const WCHAR *dir) {
         return 0;
     }
     path_join(json_dst, MAX_PATH * 4, plugins, L"Newtonsoft.Json.dll");
+    if (!path_append_suffix(json_marker, MAX_PATH * 4, json_dst, L".dst-owned")) return 0;
     if (exists_path(json_dst) && !files_equal(json_dst, json_src) &&
-        !backup_file_once(json_dst, L".dst-backup")) {
-        append_log(L"Unity: could not back up the existing Newtonsoft.Json.dll before overwriting it (Windows error %lu).", GetLastError());
+        !(exists_path(json_marker) && files_equal(json_dst, json_marker)) &&
+        !backup_unity_current_if_safe(json_dst)) {
+        append_log(L"Unity：现有 Newtonsoft.Json.dll 备份与当前文件不一致或无法保存，已保留当前文件并取消部署（Windows 错误 %lu）。", GetLastError());
         return 0;
     }
     if (!copy_file_safe(json_src, json_dst)) {
         append_log(L"Unity：无法部署 Newtonsoft.Json.dll（Windows 错误 %lu）。", GetLastError());
+        return 0;
+    }
+    if (!copy_file_safe(json_src, json_marker)) {
+        append_log(L"Unity：无法记录已部署的 Newtonsoft.Json.dll 版本（Windows 错误 %lu）。", GetLastError());
         return 0;
     }
     if (find_il2cpp_payload(fontfix, MAX_PATH * 4, L"TMPFontAssetBundles")) {
@@ -1391,6 +1507,7 @@ int deploy_unity(const WCHAR *dir) {
     } else {
         append_log(L"Unity Mono: TMP font asset bundle payload missing; Chinese TMP glyphs may use overlay fallback.");
     }
+    if (!deploy_unity_cjk_font_if_needed(dir)) return 0;
     append_log(use_bepinex6
         ? L"Unity: deployed BepInEx 6 compatible Unity plugin: %s"
         : L"Unity: deployed BepInEx 5 compatible Unity plugin: %s", dll);
@@ -1423,9 +1540,9 @@ int deploy_godot(const WCHAR *dir) {
 }
 
 int deploy_unity_il2cpp(const WCHAR *dir) {
-    WCHAR dll[MAX_PATH * 4], pdb[MAX_PATH * 4], il2cpp_mscorlib[MAX_PATH * 4], runtime[MAX_PATH * 4], xunity[MAX_PATH * 4], fontfix[MAX_PATH * 4], fontplugin[MAX_PATH * 4], gameasm[MAX_PATH * 4], endpoint_src[MAX_PATH * 4], endpoint_dst[MAX_PATH * 4], xunity_plugin_dir[MAX_PATH * 4], xunity_owner_marker[MAX_PATH * 4];
+    WCHAR dll[MAX_PATH * 4], dll_marker[MAX_PATH * 4], il2cpp_mscorlib[MAX_PATH * 4], runtime[MAX_PATH * 4], xunity[MAX_PATH * 4], fontfix[MAX_PATH * 4], fontplugin[MAX_PATH * 4], gameasm[MAX_PATH * 4], endpoint_src[MAX_PATH * 4], endpoint_dst[MAX_PATH * 4], xunity_plugin_dir[MAX_PATH * 4], xunity_owner_marker[MAX_PATH * 4];
     path_join(dll, MAX_PATH * 4, dir, L"BepInEx\\plugins\\UnityTranslator.dll");
-    path_join(pdb, MAX_PATH * 4, dir, L"BepInEx\\plugins\\UnityTranslator.pdb");
+    if (!path_append_suffix(dll_marker, MAX_PATH * 4, dll, L".dst-owned")) return 0;
     path_join(il2cpp_mscorlib, MAX_PATH * 4, dir, L"BepInEx\\core\\Il2Cppmscorlib.dll");
     path_join(gameasm, MAX_PATH * 4, dir, L"GameAssembly.dll");
 
@@ -1441,13 +1558,13 @@ int deploy_unity_il2cpp(const WCHAR *dir) {
 
     /* 如果存在旧的 Mono 版插件，禁用它避免冲突 */
     if (exists_path(dll)) {
-        if (!is_bundled_unity_mono_plugin(dll)) {
+        if (!is_owned_unity_mono_plugin(dll, dll_marker)) {
             append_log(L"Unity IL2CPP：保留现有 UnityTranslator.dll（不是内置 Mono 模板）。");
         } else if (disable_existing_file(dll)) {
             append_log(L"Unity IL2CPP：已禁用旧的 Mono UnityTranslator.dll：%s.disabled", dll);
-            disable_existing_file(pdb);
         } else {
-            append_log(L"Unity IL2CPP：警告：无法禁用内置 Mono UnityTranslator.dll（Windows 错误 %lu），它可能与 IL2CPP 插件冲突：%s", GetLastError(), dll);
+            append_log(L"Unity IL2CPP：无法禁用内置 Mono UnityTranslator.dll（Windows 错误 %lu），已取消部署以避免插件冲突：%s", GetLastError(), dll);
+            return 0;
         }
     }
 
@@ -1517,12 +1634,14 @@ int deploy_unity_il2cpp(const WCHAR *dir) {
         if (disable_existing_file(il2cpp_mscorlib)) {
             append_log(L"Unity IL2CPP：已禁用旧的 core\\Il2Cppmscorlib.dll，避免遮挡新 interop。");
         } else {
-            append_log(L"Unity IL2CPP：警告：无法禁用旧的 core\\Il2Cppmscorlib.dll（Windows 错误 %lu），它可能遮挡新 interop 层。", GetLastError());
+            append_log(L"Unity IL2CPP：无法禁用旧的 core\\Il2Cppmscorlib.dll（Windows 错误 %lu），已取消部署以避免遮挡新 interop 层。", GetLastError());
+            return 0;
         }
     }
 
     /* 生成 XUnity 配置文件 */
     if (!write_xunity_config(dir)) return 0;
+    if (!deploy_unity_cjk_font_if_needed(dir)) return 0;
     append_log(L"Unity IL2CPP: deployed TMP Chinese system font fallback.");
     append_log(L"Unity IL2CPP：已部署 BepInEx be.755 + XUnity AutoTranslator。");
     append_log(L"Unity IL2CPP：XUnity 已配置为使用本地 DeepSeek 批量端点 http://127.0.0.1:19999。");
@@ -1598,6 +1717,74 @@ static int restore_file_equals_text(const WCHAR *path, const char *text) {
     }
     free(bytes);
     return equal;
+}
+
+/* 只删除有本启动器标记、且字节仍等于部署时系统来源的字体。
+   旧版没有标记的字体、用户预置/修改的字体和来源已更新的字体均保留。 */
+static void restore_owned_cjk_font(const WCHAR *installed, const WCHAR *source_name,
+                                   const char *owner_text, RestoreStats *stats) {
+    if (!exists_path(installed)) return;
+    WCHAR marker[MAX_PATH * 4], windir[MAX_PATH], source[MAX_PATH * 4];
+    if (!path_append_suffix(marker, MAX_PATH * 4, installed, L".dst-owned")) {
+        stats->failed++;
+        append_log(L"Restore CJK font: ownership path is too long: %s", installed);
+        return;
+    }
+    if (!exists_path(marker) || !restore_file_equals_text(marker, owner_text)) {
+        stats->preserved++;
+        append_log(L"还原：中文字体没有有效的启动器所有权标记，已保留：%s", installed);
+        return;
+    }
+    if (!GetWindowsDirectoryW(windir, MAX_PATH)) {
+        stats->preserved++;
+        append_log(L"还原：无法定位中文字体来源，已保留：%s", installed);
+        return;
+    }
+    WCHAR font_dir[MAX_PATH * 4];
+    path_join(font_dir, MAX_PATH * 4, windir, L"Fonts");
+    path_join(source, MAX_PATH * 4, font_dir, source_name);
+    if (!exists_path(source) || !files_equal_safe(installed, source)) {
+        stats->preserved++;
+        append_log(L"还原：中文字体部署后已修改或系统来源已变化，已保留：%s", installed);
+        return;
+    }
+    if (restore_delete_file(installed, stats)) restore_delete_file(marker, stats);
+}
+
+/* 只还原启动器认领且与内嵌原件逐字节一致的文件；字体被修改时授权文件随字体保留。 */
+static int restore_owned_bundled_file(const WCHAR *installed, const WCHAR *source,
+                                       const char *owner_text, RestoreStats *stats) {
+    if (!exists_path(installed)) return 1;
+    WCHAR marker[MAX_PATH * 4];
+    if (!path_append_suffix(marker, MAX_PATH * 4, installed, L".dst-owned")) {
+        stats->failed++;
+        append_log(L"Restore bundled font: ownership path is too long: %s", installed);
+        return 0;
+    }
+    if (!exists_path(marker) || !restore_file_equals_text(marker, owner_text) ||
+        !files_equal_safe(installed, source)) {
+        stats->preserved++;
+        append_log(L"还原：内置中文字体或许可证已修改/无有效所有权标记，已保留：%s", installed);
+        return 0;
+    }
+    if (!restore_delete_file(installed, stats)) return 0;
+    return restore_delete_file(marker, stats);
+}
+
+static void restore_bundled_cjk_font(const WCHAR *font, RestoreStats *stats) {
+    WCHAR license_dst[MAX_PATH * 4], source[MAX_PATH * 4], license_src[MAX_PATH * 4];
+    if (!path_append_suffix(license_dst, MAX_PATH * 4, font, L".OFL.txt")) {
+        stats->failed++;
+        return;
+    }
+    if (!exists_path(font) && !exists_path(license_dst)) return;
+    if (!font_bundle_source(source, MAX_PATH * 4, license_src, MAX_PATH * 4)) {
+        stats->failed++;
+        append_log(L"还原：无法验证内置中文字体及许可证：%s", font);
+        return;
+    }
+    if (restore_owned_bundled_file(font, source, DST_BUNDLED_FONT_OWNER, stats))
+        restore_owned_bundled_file(license_dst, license_src, DST_BUNDLED_LICENSE_OWNER, stats);
 }
 
 /* 只移除字节仍与对应载荷完全一致的文件。启动器标记只能证明初始所有权；
@@ -1741,16 +1928,20 @@ static void restore_xunity_plugin(const WCHAR *dir, RestoreStats *stats) {
 static void restore_renpy(const WCHAR *dir, RestoreStats *stats) {
     static const WCHAR *files[] = {
         L"game\\iron_deepseek.rpy",
-        L"game\\iron_deepseek.rpyc",
-        L"game\\ds_font.ttf",
-        L"game\\ds_font.ttc",
-        L"game\\ds_font.otf"
+        L"game\\iron_deepseek.rpyc"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         WCHAR path[MAX_PATH * 4];
         path_join(path, MAX_PATH * 4, dir, files[i]);
         restore_delete_file(path, stats);
     }
+    WCHAR font[MAX_PATH * 4];
+    path_join(font, MAX_PATH * 4, dir, L"game\\ds_font.ttf");
+    restore_owned_cjk_font(font, L"simhei.ttf", DST_FONT_TTF_OWNER, stats);
+    path_join(font, MAX_PATH * 4, dir, L"game\\ds_font.ttc");
+    restore_owned_cjk_font(font, L"msyh.ttc", DST_FONT_TTC_OWNER, stats);
+    path_join(font, MAX_PATH * 4, dir, L"game\\ds_font.otf");
+    restore_bundled_cjk_font(font, stats);
 }
 
 static void restore_rpgm(const WCHAR *dir, RestoreStats *stats) {
@@ -1818,23 +2009,40 @@ static void restore_rpgm(const WCHAR *dir, RestoreStats *stats) {
     if (index_ok && exists_path(index)) restore_delete_file(backup, stats);
 
     static const WCHAR *files[] = {
-        L"js\\hook_rpgm_mv.js",
-        L"fonts\\ds_font.ttf",
-        L"fonts\\ds_font.ttc",
-        L"fonts\\ds_font.otf"
+        L"js\\hook_rpgm_mv.js"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         WCHAR path[MAX_PATH * 4];
         path_join(path, MAX_PATH * 4, content_root, files[i]);
         restore_delete_file(path, stats);
     }
+    WCHAR font[MAX_PATH * 4];
+    path_join(font, MAX_PATH * 4, content_root, L"fonts\\ds_font.ttf");
+    restore_owned_cjk_font(font, L"simhei.ttf", DST_FONT_TTF_OWNER, stats);
+    path_join(font, MAX_PATH * 4, content_root, L"fonts\\ds_font.ttc");
+    restore_owned_cjk_font(font, L"msyh.ttc", DST_FONT_TTC_OWNER, stats);
+    path_join(font, MAX_PATH * 4, content_root, L"fonts\\ds_font.otf");
+    restore_bundled_cjk_font(font, stats);
 }
 
 static void restore_godot(const WCHAR *dir, RestoreStats *stats) {
+    WCHAR game_license[MAX_PATH * 4];
+    path_join(game_license, MAX_PATH * 4, dir, L"dst_godot_patch.OFL.txt");
+    if (exists_path(game_license)) {
+        WCHAR font_source[MAX_PATH * 4], license_source[MAX_PATH * 4];
+        if (font_bundle_source(font_source, MAX_PATH * 4, license_source, MAX_PATH * 4))
+            restore_owned_bundled_file(game_license, license_source, FONT_BUNDLE_GODOT_LICENSE_OWNER, stats);
+        else {
+            stats->failed++;
+            append_log(L"还原 Godot：无法验证内置字体许可证，已保留：%s", game_license);
+        }
+    }
     static const WCHAR *files[] = {
         L"dst_godot_runtime.gd",
         L"dst_godot_patch.pck",
+        L"dst_godot_patch.pck.dst-source",
         L"dst_godot_patch.next.pck",
+        L"dst_godot_patch.next.pck.dst-source",
         L"dst_godot_patch.building"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
@@ -1884,23 +2092,39 @@ static void restore_unity_plugin_with_backup(const WCHAR *installed, int matches
 }
 
 static void restore_unity_mono_plugin(const WCHAR *dir, RestoreStats *stats) {
-    WCHAR installed[MAX_PATH * 4];
+    WCHAR installed[MAX_PATH * 4], marker[MAX_PATH * 4];
     path_join(installed, MAX_PATH * 4, dir, L"BepInEx\\plugins\\UnityTranslator.dll");
-    restore_unity_plugin_with_backup(installed, is_bundled_unity_mono_plugin(installed), stats);
+    if (!path_append_suffix(marker, MAX_PATH * 4, installed, L".dst-owned")) {
+        stats->failed++;
+        append_log(L"Restore Unity Mono: UnityTranslator.dll ownership path is too long.");
+        return;
+    }
+    int owned = exists_path(installed) && is_owned_unity_mono_plugin(installed, marker);
+    int marker_matches = exists_path(installed) && exists_path(marker) && files_equal(installed, marker);
+    int failed_before = stats->failed;
+    restore_unity_plugin_with_backup(installed, owned, stats);
+    if (marker_matches && stats->failed == failed_before)
+        restore_delete_file(marker, stats);
 }
 
 /* Newtonsoft.Json.dll 是共享依赖：没有备份说明部署时未覆盖用户文件，保持原样；
    有备份说明部署时覆盖了用户自带版本，还原时把它换回来。 */
 static void restore_unity_mono_newtonsoft(const WCHAR *dir, RestoreStats *stats) {
-    WCHAR installed[MAX_PATH * 4], backup[MAX_PATH * 4], payload[MAX_PATH * 4];
+    WCHAR installed[MAX_PATH * 4], backup[MAX_PATH * 4], marker[MAX_PATH * 4], payload[MAX_PATH * 4];
     path_join(installed, MAX_PATH * 4, dir, L"BepInEx\\plugins\\Newtonsoft.Json.dll");
     if (!path_append_suffix(backup, MAX_PATH * 4, installed, L".dst-backup")) {
         stats->failed++;
         append_log(L"Restore Unity: Newtonsoft.Json.dll recovery path is too long.");
         return;
     }
+    if (!path_append_suffix(marker, MAX_PATH * 4, installed, L".dst-owned")) {
+        stats->failed++;
+        append_log(L"Restore Unity: Newtonsoft.Json.dll ownership path is too long.");
+        return;
+    }
     if (!exists_path(backup)) return;
-    if (exists_path(installed) &&
+    int marker_matches = exists_path(installed) && exists_path(marker) && files_equal(installed, marker);
+    if (exists_path(installed) && !marker_matches &&
         (!find_unity_payload_file(payload, MAX_PATH * 4, L"Newtonsoft.Json.dll") ||
          !files_equal(installed, payload))) {
         stats->preserved++;
@@ -1911,6 +2135,7 @@ static void restore_unity_mono_newtonsoft(const WCHAR *dir, RestoreStats *stats)
     if (move_file_safe(backup, installed, flags)) {
         stats->restored++;
         append_log(L"还原 Unity：已从备份恢复原 Newtonsoft.Json.dll。");
+        if (marker_matches) restore_delete_file(marker, stats);
     } else {
         stats->failed++;
         append_log(L"还原 Unity：无法恢复 Newtonsoft.Json.dll 备份（Windows 错误 %lu）。", GetLastError());
@@ -1974,6 +2199,9 @@ static void restore_stripped_ini_config(const WCHAR *path, const WCHAR *label,
 }
 
 static void restore_unity_mono(const WCHAR *dir, RestoreStats *stats) {
+    WCHAR bundled_font[MAX_PATH * 4];
+    path_join(bundled_font, MAX_PATH * 4, dir, L"TranslationFonts\\NotoSansCJKsc-Regular.otf");
+    restore_bundled_cjk_font(bundled_font, stats);
     restore_unity_mono_plugin(dir, stats);
     restore_unity_mono_newtonsoft(dir, stats);
     restore_stripped_unity_font_patcher(dir, stats);
@@ -2028,6 +2256,9 @@ static void restore_xunity_config(const WCHAR *dir, RestoreStats *stats) {
 }
 
 static void restore_unity_il2cpp(const WCHAR *dir, RestoreStats *stats) {
+    WCHAR bundled_font[MAX_PATH * 4];
+    path_join(bundled_font, MAX_PATH * 4, dir, L"TranslationFonts\\NotoSansCJKsc-Regular.otf");
+    restore_bundled_cjk_font(bundled_font, stats);
     WCHAR installed[MAX_PATH * 4], payload[MAX_PATH * 4];
 
     path_join(installed, MAX_PATH * 4, dir, L"BepInEx\\plugins\\XUnity.AutoTranslator\\Translators\\DeepSeekTranslate.dll");
@@ -2045,16 +2276,29 @@ static void restore_unity_il2cpp(const WCHAR *dir, RestoreStats *stats) {
     restore_remove_owned_tree(tree, installed_marker, payload_tree, payload_marker,
                               L"DeepSeek TMP 字体回退", stats);
 
-    WCHAR disabled[MAX_PATH * 4], disabled_pdb[MAX_PATH * 4];
+    WCHAR disabled[MAX_PATH * 4], disabled_pdb[MAX_PATH * 4], dll[MAX_PATH * 4], dll_marker[MAX_PATH * 4];
     path_join(disabled, MAX_PATH * 4, dir, L"BepInEx\\plugins\\UnityTranslator.dll.disabled");
     path_join(disabled_pdb, MAX_PATH * 4, dir, L"BepInEx\\plugins\\UnityTranslator.pdb.disabled");
+    path_join(dll, MAX_PATH * 4, dir, L"BepInEx\\plugins\\UnityTranslator.dll");
+    if (!path_append_suffix(dll_marker, MAX_PATH * 4, dll, L".dst-owned")) {
+        stats->failed++;
+        append_log(L"Restore Unity IL2CPP: UnityTranslator.dll ownership path is too long.");
+        return;
+    }
     if (exists_path(disabled)) {
-        if (is_bundled_unity_mono_plugin(disabled)) {
-            if (restore_delete_file(disabled, stats)) restore_delete_file(disabled_pdb, stats);
+        if (is_owned_unity_mono_plugin(disabled, dll_marker)) {
+            int marker_matches = exists_path(dll_marker) && files_equal(disabled, dll_marker);
+            if (restore_delete_file(disabled, stats)) {
+                if (marker_matches) restore_delete_file(dll_marker, stats);
+            }
         } else {
             stats->preserved++;
             append_log(L"还原 Unity IL2CPP：禁用的 UnityTranslator.dll 无法确认归属，已保留。");
         }
+    }
+    if (exists_path(disabled_pdb)) {
+        stats->preserved++;
+        append_log(L"还原 Unity IL2CPP：UnityTranslator.pdb.disabled 无法确认归属，已保留。");
     }
 
     WCHAR mscorlib[MAX_PATH * 4], mscorlib_disabled[MAX_PATH * 4];

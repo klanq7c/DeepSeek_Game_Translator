@@ -34,8 +34,10 @@ extern int g_launch_dry_run;
    动画定时器。这些副作用会让同一台机器上两次渲染不同，而它们各自都已有对应的
    parity 场景（--sync-payloads / --launch-flow / --server-smoke）覆盖。 */
 extern int g_ui_probe;
+/* 进程内拖放诊断：真实窗口过程完成路径选择后记录将调用一键流程的分支。 */
+extern int g_drop_probe_start_requested;
 
-/* --ui-probe-and-exit 置 1：侧边栏底部的运行时标签与副标题改用中性文案。
+/* --ui-probe-and-exit 置 1：日志卡片的运行时标签改用中性文案。
    两个实现在这两处故意不同（它们就是用来标识"这一帧由哪版启动器画出"的），
    探针把真实值单独打印成 runtime_tag= / subtitle= 供断言，其余像素仍逐字节比对。 */
 extern int g_ui_probe_neutral;
@@ -44,7 +46,7 @@ extern int g_ui_probe_neutral;
    取 0 可让 sinf/cosf 落在精确可表示的 -1/1 上，两版结果逐位一致。 */
 extern int g_anim_tick_override;
 
-/* 侧边栏底部的运行时标签与英雄区副标题（探针中性化后的取值也在这里决定）。 */
+/* 日志卡片的运行时标签与英雄区副标题（探针中性化后的取值也在这里决定）。 */
 const WCHAR *ui_runtime_tag(void);
 const WCHAR *ui_subtitle_text(void);
 
@@ -55,10 +57,11 @@ WNDPROC ui_probe_wndproc(void);
 /* --ui-probe-and-exit <w> <h> <alive> <out.bmp>：见 ui_probe.c 顶部说明。
    返回进程退出码（0 成功、1 渲染失败、2 参数错误）。 */
 int run_ui_probe(int width, int height, int alive, const WCHAR *bmp_path);
+int run_ui_drop_probe(const WCHAR *path, int target_id);
 
 /* 运行一键流程中"服务器已就绪之后"的部分：按引擎决定启动/预热/补丁刷新的
    先后顺序。start_translation 的工作线程与 --launch-flow-and-exit 共用。 */
-void run_engine_launch_flow(const WCHAR *dir, Engine engine);
+int run_engine_launch_flow(const WCHAR *dir, Engine engine);
 
 /* 缓存卡片显示的文本（"%.1f MB"，文件不存在时 "0.0 MB"）。
    返回是否读到了文件属性。 */
@@ -73,6 +76,8 @@ void write_stdout_utf8(const WCHAR *text);
 
 /* 按引擎部署翻译钩子（ui.c 的一键流程与诊断子命令共用），返回 deploy_* 的结果。 */
 int deploy_for_engine(const WCHAR *dir, Engine e);
+/* 服务器就绪后的部署+启动；受支持引擎部署失败时不启动未翻译游戏。 */
+int run_deploy_launch_flow(const WCHAR *dir, Engine e);
 
 /* 更新顶部状态栏文本 */
 void set_status(const WCHAR *text);
@@ -96,6 +101,7 @@ void paint_background(HWND hwnd, HDC dc);
 
 /* 通过脏矩形双缓冲绘制父窗口，避免动画和调整窗口时出现撕裂。 */
 void paint_background_buffered(HWND hwnd, HDC dc, const RECT *dirty);
+void free_background_buffer(void);
 
 /* 根据窗口大小重新布局所有子控件 */
 void layout(HWND hwnd);
@@ -103,11 +109,12 @@ void layout(HWND hwnd);
 /* 应用原生深色窗口铬框（DWM 暗色标题栏），并刷新小幅动画的失效区域。 */
 void apply_window_chrome(HWND hwnd);
 void tick_ui_animation(HWND hwnd);
+void refresh_ui_motion(void);
 
 /* 为所有自绘按钮安装鼠标悬停跟踪（配合 tick_ui_animation 做渐变过渡） */
 void install_button_hover_tracking(HWND hwnd);
 
-/* 卡片内静态文字的不透明底色画刷（与所在高度的面板渐变一致） */
+/* 卡片内静态文字的不透明底色画刷（与暖白面板一致） */
 HBRUSH card_text_brush(int picker_label, COLORREF *out_color);
 void free_card_text_brushes(void);
 
@@ -120,7 +127,7 @@ void draw_button(const DRAWITEMSTRUCT *di);
 void browse_folder(void);
 
 /* 启动指定目录下的游戏 exe */
-void launch_game(const WCHAR *dir);
+int launch_game(const WCHAR *dir);
 
 /* 主翻译流程入口：部署 hook + 启动服务器 + 预热 + 启动游戏 */
 void start_translation(void);

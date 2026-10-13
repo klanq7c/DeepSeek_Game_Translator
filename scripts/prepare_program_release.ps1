@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Version = ""
 )
 
@@ -22,7 +22,7 @@ if (-not [string]::Equals($Version, $versionFileContent, [StringComparison]::Ord
     throw "Release version '$Version' must match VERSION '$versionFileContent'."
 }
 
-# Verify the complete artifact set before creating any release output.
+# 创建任何发布产物之前，先验证整套构建产物。
 $artifactVerifier = Join-Path $PSScriptRoot "verify_build_artifacts.ps1"
 if (-not (Test-Path -LiteralPath $artifactVerifier -PathType Leaf)) {
     throw "Missing build artifact verifier: $artifactVerifier"
@@ -121,6 +121,9 @@ function Test-StagedLauncherPayloads([string]$LauncherPath) {
             @("config\api.ini.example", "config\api.ini.example"),
             @("config\launcher.ini.example", "config\launcher.ini.example"),
             @("config\glossary.example.tsv", "config\glossary.example.tsv"),
+            @("assets\fonts\NotoSansCJKsc-Regular.otf", "assets\fonts\NotoSansCJKsc-Regular.otf"),
+            @("assets\fonts\OFL.txt", "assets\fonts\OFL.txt"),
+            @("assets\fonts\manifest.json", "assets\fonts\manifest.json"),
             @("payloads\UnityTranslator\UnityTranslator.dll", "payloads\UnityTranslator\UnityTranslator.dll"),
             @("payloads\UnityTranslator\UnityTranslator.BepInEx6.dll", "payloads\UnityTranslator\UnityTranslator.BepInEx6.dll"),
             @("payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll", "payloads\UnityIL2CPP\DeepSeekXUnityTranslator\DeepSeekTranslate.dll"),
@@ -171,8 +174,8 @@ if ($versionFileContent) {
     if ($fileVersion -ne $versionFileContent -or $productVersion -ne $versionFileContent) {
         throw "$DsName.exe version metadata does not match VERSION '$versionFileContent'; rebuild with build_native.bat before releasing."
     }
-    # Keep checking the compile-time footer string as a separate guard against
-    # a launcher whose VERSIONINFO was edited without rebuilding the program.
+    # 单独检查编译时写入的页脚字符串，防止仅修改
+    # VERSIONINFO 却未重新构建启动器的情况漏检。
     $exeText = [System.Text.Encoding]::Unicode.GetString([System.IO.File]::ReadAllBytes($stagedExe))
     if (-not $exeText.Contains($versionFileContent)) {
         throw "$DsName.exe does not contain the compile-time VERSION string '$versionFileContent'; rebuild with build_native.bat before releasing."
