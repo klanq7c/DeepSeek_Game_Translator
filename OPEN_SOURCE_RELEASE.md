@@ -1,5 +1,8 @@
 # Open Source Release Checklist
 
+完整发布流程、玩家更新日志写法及 GitHub About 同步要求见
+[开发与发布约定](docs/DEVELOPMENT.md)。本文件补充源码和程序包的分发边界。
+
 Use this checklist before publishing the project or creating a public archive.
 The working directory contains local runtime payloads and user data, so do not
 publish it directly.
@@ -66,8 +69,10 @@ rg -n "C:\\Users\\[A-Za-z0-9._-]+|E:\\Projects\\[^\\\r\n]+|/Users/[A-Za-z0-9._-]
 Get-ChildItem build\open_source -Recurse -Include *.dll,*.exe,*.pdb,*.otf,*.ttf,*.tsv,*.zip,*.7z
 ```
 
-All three checks must be empty except for harmless source-code strings that are
-documented in the release notes.
+Review every match. Any harmless source-code strings or reviewed font/license
+exceptions must be documented in the developer release record under
+`docs/development/`, not in player-facing release notes. All actual secrets,
+user data, unreviewed binaries and local paths must be excluded.
 
 ## Notes
 

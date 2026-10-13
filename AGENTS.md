@@ -6,6 +6,9 @@ repository. Read it before making changes.
 After this file, read `CONTEXT.md` for the shared domain vocabulary and
 `docs/MAINTENANCE_MAP.md` for the fastest code/test lookup table.
 
+开发、验证、清理或发布前，还必须阅读 [开发与发布约定](docs/DEVELOPMENT.md)。
+完成发布前逐项核对其中的程序下载、更新日志、About、附件及校验清单要求。
+
 ## Agent skills
 
 ### Issue tracker
@@ -136,7 +139,8 @@ If a verification step cannot be run, report that clearly and explain why.
 ## Modification Guidance
 
 - 面向用户的 README 更新日志、GitHub 发布说明和 About 只写功能变化、修复与使用信息；
-  不放“已完成验证”、测试数量或内部验收过程。验证记录留在本地工作报告中。
+  不放“已完成验证”、测试数量或内部验收过程。可公开的验证摘要放在
+  `docs/development/`，原始日志留在本地 `.scratch/`；详见 `docs/DEVELOPMENT.md`。
 - Prefer small, engine-aware changes over broad rewrites.
 - 翻译核心运行模块的说明性代码注释统一使用中文；技术标识、协议字段以及
   第三方版权或许可证原文保持原样，不要为了注释语言改动外部接口与测试名称。

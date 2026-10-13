@@ -1,5 +1,8 @@
 # Maintenance Map
 
+开发流程及发布必读：[开发与发布约定](DEVELOPMENT.md)。玩家日志写法、About、
+下载附件和验证记录的归属以该文档为准；历史结果放在 `docs/development/`。
+
 程序发布（2026-10-13）：`VERSION` 同时驱动 EXE 元数据、页脚、C# 编译信息和
 Godot 预检版本。`prepare_program_release.ps1` 使用 `ds-translator_<版本>` 下载文件名，
 包内仍保留中文程序名，并包含 README 引用的 `docs/UPDATE_*.md`、字体许可及清单。

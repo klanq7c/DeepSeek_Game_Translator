@@ -3,6 +3,12 @@
 This project accepts only original source code, synthetic test fixtures, and
 documentation that can be redistributed openly.
 
+## 开发文档入口
+
+开始工作前阅读 [开发与发布约定](docs/DEVELOPMENT.md)，其中包含文档分工、
+回归要求、发布清单、GitHub About 同步和清理边界。
+历史检查结果见 [0.4.1.0 开发记录](docs/development/VERIFICATION_0.4.1.0.md)。
+
 ## Do Not Commit
 
 - API keys, tokens, cookies, credentials, or private endpoints.
@@ -56,7 +62,9 @@ powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1
 `tests\launcher_parity` as build gates; the two explicit test scripts above
 cover the server HTTP contract (both binaries) and the extracted hook scripts.
 The generated source package must pass the release audit with no secrets,
-binary payloads, fonts, caches, or local paths.
+runtime binaries, unreviewed fonts, caches, or local paths. The reviewed Noto
+CJK font is allowed only with the exact license and manifest required by
+`docs/DEPENDENCY_POLICY.md`.
 
 The former `tests\run_all.ps1` regression suites were removed on 2026-09-06
 and rebuilt on 2026-09-08 as the guards above (see `AGENTS.md`, "Expected
