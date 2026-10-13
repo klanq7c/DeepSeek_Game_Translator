@@ -70,10 +70,10 @@ and runtime. The important design shape is:
   BepInEx + XUnity with config ownership), server lifecycle
   (`ServerProcess`), and the warmup scanners for all five engines
   (`Warmup.cs`, `WarmupRenPy.cs`, `WarmupRpgm.cs`, `WarmupUnity.cs`,
-  `WarmupGodot.cs` incl. PCK 1/2/3 directory parsing and embedded-EXE packs;
+  `WarmupGodot.cs` incl. PCK 1/2/3/4 directory parsing and embedded-EXE packs;
   batch bodies compared byte for byte through the `--warmup-and-exit`/
   `--warmup` dump modes), embedded payload self-update (`SelfUpdate.cs`;
-  the same eleven first-party payloads are embedded as `EmbeddedResource` items
+  the same fourteen first-party payloads and reviewed font resources are embedded as `EmbeddedResource` items
   named after the RCDATA macros, released trees compared through
   `--sync-payloads-and-exit`/`--sync-payloads`), and the Godot patch pack
   (`GodotPatch.cs`/`GodotPatchResources.cs`/`GodotPatchPack.cs`; the built

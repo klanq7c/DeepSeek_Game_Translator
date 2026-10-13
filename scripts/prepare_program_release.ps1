@@ -44,7 +44,8 @@ if ($verifyExitCode -ne 0) {
 $distRoot = Join-Path $repo "build\dist"
 $DsName = "ds" + [string][char]0x6e38 + [string][char]0x620f + [string][char]0x7ffb + [string][char]0x8bd1 + [string][char]0x5668
 $UsageName = "README_" + [string][char]0x4f7f + [string][char]0x7528 + [string][char]0x8bf4 + [string][char]0x660e + ".txt"
-$stageName = "${DsName}_$Version"
+# 下载资源使用稳定的 ASCII 文件名，避免 GitHub 重写中文名称；包内程序名保留中文。
+$stageName = "ds-translator_$Version"
 $stage = Join-Path $distRoot $stageName
 $zipPath = Join-Path $distRoot "$stageName.zip"
 $singleExePath = Join-Path $distRoot "$stageName.exe"
@@ -98,6 +99,7 @@ function Copy-ReleaseFile([string]$SourceRelative, [string]$DestRelative = $Sour
 function Test-StagedLauncherPayloads([string]$LauncherPath) {
     $smokeRoot = Join-Path ([IO.Path]::GetTempPath()) `
         ("ds program release smoke with spaces " + [Guid]::NewGuid().ToString("N"))
+    Assert-Under $smokeRoot ([IO.Path]::GetTempPath())
     $smokeProcess = $null
     try {
         New-Item -ItemType Directory -Path $smokeRoot | Out-Null
@@ -105,7 +107,7 @@ function Test-StagedLauncherPayloads([string]$LauncherPath) {
         Copy-Item -LiteralPath $LauncherPath -Destination $smokeLauncher -Force
 
         $smokeProcess = Start-Process -FilePath $smokeLauncher `
-            -ArgumentList "--sync-payloads-and-exit" -PassThru
+            -ArgumentList "--sync-payloads-and-exit" -WindowStyle Hidden -PassThru
         if (-not $smokeProcess.WaitForExit(30000)) {
             Stop-Process -Id $smokeProcess.Id -Force -ErrorAction SilentlyContinue
             throw "Standalone launcher payload sync exceeded 30 seconds."
@@ -160,6 +162,7 @@ function Test-StagedLauncherPayloads([string]$LauncherPath) {
             Stop-Process -Id $smokeProcess.Id -Force -ErrorAction SilentlyContinue
         }
         if (Test-Path -LiteralPath $smokeRoot) {
+            Assert-Under $smokeRoot ([IO.Path]::GetTempPath())
             Remove-Item -LiteralPath $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
@@ -189,6 +192,12 @@ Copy-ReleaseFile "docs\DEPENDENCY_POLICY.md" "docs\DEPENDENCY_POLICY.md"
 Copy-ReleaseFile "docs\RUNTIME_PAYLOADS.md" "docs\RUNTIME_PAYLOADS.md"
 Copy-ReleaseFile "docs\USER_GUIDE.md" "docs\USER_GUIDE.md"
 Copy-ReleaseFile "docs\USER_GUIDE.md" $UsageName
+Copy-ReleaseFile "assets\fonts\OFL.txt"
+Copy-ReleaseFile "assets\fonts\manifest.json"
+# README 中的历史更新链接也必须在离线程序包内可用。
+foreach ($update in Get-ChildItem -LiteralPath (Join-Path $repo 'docs') -Filter 'UPDATE_*.md' -File) {
+    Copy-ReleaseFile ("docs\" + $update.Name)
+}
 
 $allowedBinaries = @("$DsName.exe")
 $forbidden = @()
@@ -243,6 +252,11 @@ if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
 Compress-Archive -LiteralPath $stage -DestinationPath $zipPath -Force
+
+& python (Join-Path $repo 'tests\build_artifacts\test_program_package.py') --archive $zipPath --exe $singleExePath
+if ($LASTEXITCODE -ne 0) {
+    throw 'Program package regression checks failed; do not publish these artifacts.'
+}
 
 Write-Host "Created program archive: $zipPath"
 Write-Host "Created standalone launcher: $singleExePath"

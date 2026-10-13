@@ -1,5 +1,11 @@
 # Maintenance Map
 
+程序发布（2026-10-13）：`VERSION` 同时驱动 EXE 元数据、页脚、C# 编译信息和
+Godot 预检版本。`prepare_program_release.ps1` 使用 `ds-translator_<版本>` 下载文件名，
+包内仍保留中文程序名，并包含 README 引用的 `docs/UPDATE_*.md`、字体许可及清单。
+打包后运行 `tests/build_artifacts/test_program_package.py`，检查真实 ZIP 的本地说明链接、
+版本下载链接、许可字节、用户数据排除，以及 ZIP/单文件/当前构建的程序哈希一致性。
+
 运行开销优化（2026-10-13）：`ui.c` / `UiPaint.cs` 复用主窗口 UI 线程的绘图缓冲，
 只复用存储，每次仍完整绘制脏区；尺寸、DPI、显示设备变化与窗口销毁时释放。
 `test_background_buffer.py` 源链接两版缓冲代码，验证 1000 次绘制只分配一次、

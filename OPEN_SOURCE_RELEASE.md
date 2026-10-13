@@ -21,7 +21,8 @@ publish it directly.
 For the downloadable Windows program package, run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\prepare_program_release.ps1 -Version 0.4.0.0
+powershell -ExecutionPolicy Bypass -File scripts\prepare_program_release.ps1 -Version 0.4.1.0
+python tests\build_artifacts\test_program_package.py --archive build\dist\ds-translator_0.4.1.0.zip --exe build\dist\ds-translator_0.4.1.0.exe
 ```
 
 The generated program package should contain the launcher and documentation

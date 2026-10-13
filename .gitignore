@@ -23,6 +23,8 @@ build/
 *.runtimeconfig.json
 bin/
 obj/
+__pycache__/
+*.py[cod]
 
 # Archives and generated artifacts
 artifacts/

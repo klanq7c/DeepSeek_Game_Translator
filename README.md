@@ -4,7 +4,7 @@
 
 后续更新请继续把最新更新日志放在本节最上方。
 
-### 20261013（0.4.0.0 后续源码更新）
+### 20261013（0.4.1.0）
 
 1. **启动页重新设计**：加入星夜主题、暖白操作卡片和更平滑的悬停动画；后台、最小化或系统关闭动画时停止装饰刷新，保留目录选择、拖放、API 配置、缓存管理和还原游戏等功能。
 2. **Godot 翻译修复**：处理菜单动画反复写回英文、设置选项被链接标签拆成半词、部分未命中导致整块文字不显示译文等问题；改进动态控件、场景切换、暂停菜单、导出包识别与启动预检。
@@ -14,7 +14,7 @@
 
 最近完整验证：启动器 C/C# 一致性 **267 项通过**、双服务契约 **152 项通过**、Unity 运行契约 **72 项通过**。验证范围与更多说明见 [本次更新详情](docs/UPDATE_2026-10-13.md)。
 
-本节对应源码分支更新；下方 `v0.4.0.0` 下载链接仍指向已有发布包。
+版本：`0.4.1.0`。下载文件统一使用 `ds-translator` 前缀，压缩包内仍为 `ds游戏翻译器.exe`。
 
 ### 20260909（0.4.0.0）
 
@@ -58,19 +58,19 @@ ds游戏翻译器是一个本地游戏翻译工具，目标是支持：
 
 最新下载地址：
 
-https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.4.0.0
+https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.4.1.0
 
 推荐下载：
 
-- `ds游戏翻译器_0.4.0.0.exe`：单文件启动器。首次运行会自动释放/更新本项目自有服务端、脚本、示例配置和自有 Unity 插件。
-- `ds游戏翻译器_0.4.0.0.zip`：带说明文档和许可文件的 Windows 程序包，核心仍是 `ds游戏翻译器.exe`。
-- `DeepSeek_Game_Translator_source_0.4.0.0.zip`：源码包，只包含自有源码、测试和文档。
+- `ds-translator_0.4.1.0.exe`：单文件启动器。首次运行会自动释放/更新本项目自有服务端、脚本、示例配置、自有 Unity 插件及已审核的中文字体资源。
+- `ds-translator_0.4.1.0.zip`：带更新日志、说明文档和许可文件的 Windows 程序包，核心仍是 `ds游戏翻译器.exe`。
+- `DeepSeek_Game_Translator_source_0.4.1.0.zip`：源码包，包含源码、测试、文档及带完整许可的 Noto CJK 字体资源。
 
 为了降低侵权和授权风险，下载包不直接内置 BepInEx、XUnity、Unity 官方 DLL、游戏文件、TMP 字体包、翻译记忆或 API key。Unity 第三方运行时和 XUnity TMP 字体 AssetBundle 由用户通过命令行脚本从上游项目下载。
 
 ## 使用方式
 
-1. 下载 `ds游戏翻译器_0.4.0.0.exe`，或解压 `ds游戏翻译器_0.4.0.0.zip` 后运行里面的 `ds游戏翻译器.exe`。
+1. 下载 `ds-translator_0.4.1.0.exe`，或解压 `ds-translator_0.4.1.0.zip` 后运行里面的 `ds游戏翻译器.exe`。更新已有安装时，将单文件启动器改名为 `ds游戏翻译器.exe`，替换原目录中的同名程序，再重新启动翻译器及游戏。
 2. 首次运行时，启动器会自动生成/更新这些自有组件：
    - `native\dst_server.exe`
    - `native\dst_server_cs.exe`
@@ -152,7 +152,7 @@ concurrency=4
 
 ## 当前状态
 
-这是 `0.4.0.0` 预览版。主要源码路径：
+这是 `0.4.1.0` 预览版。主要源码路径：
 
 - `native/src/server/`、`native/src/launcher/`：本地 C 服务端和 Windows 启动器（当前发布主线）。
 - `native/src/core/`：`DstCore` 共享核心（文本规则、JSON、缓存编解码、HTTP 契约常量），
@@ -162,9 +162,9 @@ concurrency=4
 - `native/src/launcher_cs/`：C# 启动器移植（功能已齐全，仍非发布主线）。已移植引擎识别、五种引擎
   （Ren'Py / RPG Maker MV/MZ / Unity Mono / Unity IL2CPP / Godot）的部署与还原、
   服务端进程管理、五种引擎的预热扫描（Ren'Py 脚本、RPG Maker 数据/外部文本、
-  Unity XUnity 译文文件 + 资源/bundle、Godot 工程资源 + .translation + PCK 1/2/3 +
+  Unity XUnity 译文文件 + 资源/bundle、Godot 工程资源 + .translation + PCK 1/2/3/4 +
   内嵌 pck 的 EXE；两侧通过 `--warmup-and-exit`/`--warmup` 转储模式逐字节比对批次
-  请求体）、内嵌 payload 自更新（同一批十个自有文件以 `EmbeddedResource` 嵌入，
+  请求体）、内嵌 payload 自更新（同一批 14 个自有组件与已审核字体资源以 `EmbeddedResource` 嵌入，
   `--sync-payloads-and-exit`/`--sync-payloads` 释放出的目录树逐字节一致）、
   Godot 外部补丁包（`.pck`/内嵌包复制后修补文本资源、GDScript 字节码、
   OptimizedTranslation 与字体条目，格式 3 追加运行时 autoload；两侧构建出的
@@ -228,7 +228,7 @@ build_native.bat
 发布源码包前运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version 0.4.0.0
+powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version 0.4.1.0
 ```
 
 该脚本会生成 source-only 包，并自动检查是否误带：
