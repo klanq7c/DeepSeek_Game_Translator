@@ -135,6 +135,8 @@ If a verification step cannot be run, report that clearly and explain why.
 
 ## Modification Guidance
 
+- 面向用户的 README 更新日志、GitHub 发布说明和 About 只写功能变化、修复与使用信息；
+  不放“已完成验证”、测试数量或内部验收过程。验证记录留在本地工作报告中。
 - Prefer small, engine-aware changes over broad rewrites.
 - 翻译核心运行模块的说明性代码注释统一使用中文；技术标识、协议字段以及
   第三方版权或许可证原文保持原样，不要为了注释语言改动外部接口与测试名称。
