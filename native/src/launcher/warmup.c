@@ -24,6 +24,7 @@
  *      查询本地缓存补全翻译并回写文件
  * ================================================================ */
 
+#include "../core/mixed_text.h"
 #include "warmup.h"
 #include "fsutil.h"
 #include "warmup_internal.h"
@@ -130,9 +131,9 @@ static int has_cjk_utf8(const char *s) {
  *   - 长度过短（<2）或过长（>1200字节）
  *   - 含路径分隔符、URL、媒体文件扩展名（.png/.ogg/.m4a）
  *   - 不含任何字母或非 ASCII 字符（纯数字/符号）
- *   - 已含 CJK 汉字（不需要翻译）
+ *   - 已含 CJK 且没有待补译的可见英文
  * ---------------------------------------------------------------- */
-int should_warm_text(const char *s) {
+static int should_warm_text_format(const char *s, int renpy) {
     size_t len = strlen(s);
     if (len < 2 || len > WARMUP_MAX_TEXT_BYTES) return 0;
     if (strchr(s, '\\') || strstr(s, "://") || strstr(s, ".png") || strstr(s, ".ogg") || strstr(s, ".m4a")) return 0;
@@ -147,8 +148,10 @@ int should_warm_text(const char *s) {
             p++;
         }
     }
-    return signal && !has_cjk_utf8(s);
+    return signal && (!has_cjk_utf8(s) || (renpy ? dst_mixed_latin_renpy(s) : dst_mixed_latin(s)));
 }
+
+int should_warm_text(const char *s) { return should_warm_text_format(s, 0); }
 
 /* RPG Maker 文本允许 \C[20]、\n[1]、\I[3]、\FS[24]、\\ 等显示控制码。
    通用过滤会把所有反斜杠视为文件路径，因此这里先验证并移除合法控制码，
@@ -319,22 +322,22 @@ int starts_with_word_i(const char *s, const char *word) {
 /* ----------------------------------------------------------------
  * should_warm_renpy_text — Ren'Py 专用文本过滤
  *
- * 在通用过滤基础上增加：
- *   - 排除过短（<3）的字符串
- *   - 排除不含标点且太短（<18）的字符串（可能是变量名）
- *   - 排除各种资源文件扩展名
+ * 语句分类已排除字体/样式等技术字段，保留短菜单及带字体标签的正文。
+ * 只过滤明显路径、资源名和纯中文；不修剪已解码的缓存键。
  * ---------------------------------------------------------------- */
 static int should_warm_renpy_text(const char *s) {
-    if (!should_warm_text(s)) return 0;
     size_t len = strlen(s);
-    if (len < 3) return 0;
-    if (!contains_any(s, " \t.?!,:;'-\"") && len < 18) return 0;
-    if (strstr(s, "://") || strstr(s, ".rpy") || strstr(s, ".png") ||
-        strstr(s, ".jpg") || strstr(s, ".webp") || strstr(s, ".ogg") ||
-        strstr(s, ".mp3") || strstr(s, ".wav")) {
-        return 0;
+    if (len < 2 || len > WARMUP_MAX_TEXT_BYTES) return 0;
+    if (strstr(s, "://") || (len >= 3 && s[1] == ':' && (s[2] == '\\' || s[2] == '/'))) return 0;
+    if (strstr(s, ".rpy") || strstr(s, ".png") || strstr(s, ".jpg") || strstr(s, ".webp") ||
+        strstr(s, ".ogg") || strstr(s, ".mp3") || strstr(s, ".wav")) return 0;
+    if (has_cjk_utf8(s)) return dst_mixed_latin_renpy(s);
+    int latin = 0;
+    for (size_t i = 0; s[i]; i++) {
+        if ((unsigned char)s[i] >= 128) return 1;
+        if ((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) latin++;
     }
-    return 1;
+    return latin >= 2;
 }
 
 /* ----------------------------------------------------------------
@@ -526,8 +529,7 @@ static void collect_string(char *s, TextList *prefetch) {
 
 /* Ren'Py 使用更严格的过滤，避免把脚本标识符和资源名加入预热队列。 */
 static void collect_renpy_string(char *s, TextList *prefetch) {
-    char *t = trim_ascii(s);
-    if (should_warm_renpy_text(t)) textlist_add(prefetch, t);
+    if (should_warm_renpy_text(s)) textlist_add(prefetch, s);
 }
 
 /* ----------------------------------------------------------------
@@ -704,75 +706,7 @@ char *renpy_string_at(const char **pp) {
     return b.data;
 }
 
-/* 找到一行中最先出现的单引号或双引号。 */
-static const char *renpy_first_quote(const char *line) {
-    const char *single = strchr(line, '\'');
-    const char *dbl = strchr(line, '"');
-    if (!single) return dbl;
-    if (!dbl) return single;
-    return single < dbl ? single : dbl;
-}
-
-/* ----------------------------------------------------------------
- * renpy_skip_statement — 判断 Ren'Py 行是否应跳过（非对话语句）
- *
- * 跳过注释、三引号、赋值语句、以及所有 Ren'Py 指令关键字
- * （image/scene/show/hide/play/jump/call/screen/python/if/...）。
- * first_quote 用于判断赋值号是否在引号之前（= 在引号前 → 赋值语句）。
- * ---------------------------------------------------------------- */
-static int renpy_skip_statement(const char *line, const char *first_quote) {
-    if (!line || !*line || *line == '#') return 1;
-    if (strstr(line, "\"\"\"") || strstr(line, "'''")) return 1;
-    const char *eq = strchr(line, '=');
-    if (eq && first_quote && eq < first_quote) return 1;
-    return starts_with_word_i(line, "image") ||
-           starts_with_word_i(line, "scene") ||
-           starts_with_word_i(line, "show") ||
-           starts_with_word_i(line, "hide") ||
-           starts_with_word_i(line, "play") ||
-           starts_with_word_i(line, "queue") ||
-           starts_with_word_i(line, "stop") ||
-           starts_with_word_i(line, "with") ||
-           starts_with_word_i(line, "jump") ||
-           starts_with_word_i(line, "call") ||
-           starts_with_word_i(line, "return") ||
-           starts_with_word_i(line, "label") ||
-           starts_with_word_i(line, "define") ||
-           starts_with_word_i(line, "default") ||
-           starts_with_word_i(line, "style") ||
-           starts_with_word_i(line, "transform") ||
-           starts_with_word_i(line, "screen") ||
-           starts_with_word_i(line, "init") ||
-           starts_with_word_i(line, "python") ||
-           starts_with_word_i(line, "if") ||
-           starts_with_word_i(line, "elif") ||
-           starts_with_word_i(line, "else") ||
-           starts_with_word_i(line, "for") ||
-           starts_with_word_i(line, "while") ||
-           *line == '#';
-}
-
-/* 有效的 Ren'Py 对话或菜单行可以包含相邻字符串字面量。在保留现有语句过滤
-   规则的同时，收集同一已接受行中的每个字面量，让预热键覆盖渲染器可能显示
-   的全部文本。 */
-static void collect_renpy_line_strings(const char *line, TextList *prefetch) {
-    if (!line || !prefetch || prefetch->n >= textlist_limit(prefetch)) return;
-    const char *cursor = renpy_first_quote(line);
-    if (!cursor || renpy_skip_statement(line, cursor)) return;
-
-    size_t seen = 0;
-    while (*cursor && seen < 16u && prefetch->n < textlist_limit(prefetch)) {
-        char *text = renpy_string_at(&cursor);
-        if (!text) break;
-        collect_renpy_string(text, prefetch);
-        free(text);
-        seen++;
-
-        const char *next = renpy_first_quote(cursor);
-        if (!next) break;
-        cursor = next;
-    }
-}
+#include "renpy_source_scan.h"
 
 /* ----------------------------------------------------------------
  * bb_json — 将字符串 JSON 转义后追加到 ByteBuf
@@ -1420,6 +1354,7 @@ static int post_prefetch_batch(LocalHttp *http, TextList *l, size_t start, size_
         }
         bb_add(&b, "]", 1);
     }
+    if (l->renpy) bb_add(&b, ",\"engine\":\"renpy\"", 17);
     bb_add(&b, "}", 1);
     int ok = local_http_post(http, L"/prefetch", b.data, 1500);
     free(b.data);
@@ -2011,10 +1946,16 @@ static int rpgm_map_data_file_name(const WCHAR *name) {
  * parse_rpgm_json_file — 解析 RPG Maker 数据 JSON 文件
  *
  * 解析 www/data/ 下的 JSON 文件，提取以下字段的文本：
- *   - code 字段：记录事件命令码，用于判断是否为对话/选项
- *   - parameters 数组：当 code 为对话命令（101/102/401/405）时采集
+ *   - code 与 parameters 只在同一对象内配对，属性次序不限
  *   - 文本字段（name/nickname/description/profile/displayName/message1-4）
  * ---------------------------------------------------------------- */
+static const char *rpgm_plugin_value_end(const char *p, const char *end);
+
+typedef struct {
+    int code;
+    const char *parameters;
+} RpgmCommandFields;
+
 static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
     if (!file_size_at_most(path, RPGM_JSON_SCAN_MAX_BYTES)) return;
     char *buf = NULL;
@@ -2027,12 +1968,41 @@ static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
     int is_map_data = rpgm_map_data_file_name(base);
     const char *p = buf;
     if (size >= 3 && (unsigned char)p[0] == 0xef && (unsigned char)p[1] == 0xbb && (unsigned char)p[2] == 0xbf) p += 3;
-    int last_code = -1;
+    /* 限制恶意嵌套占用；正常地图的事件/页/命令结构远低于此深度。 */
+    RpgmCommandFields objects[128];
+    size_t depth = 0;
     RpgmMessageBlock message_block = {0};
 
     while (*p) {
         p = json_ws(p);
         if (!*p) break; /* 尾部空白后即终止符：不能再 p++ 越过缓冲末尾 */
+        if (*p == '{') {
+            if (depth == sizeof objects / sizeof objects[0]) {
+                append_log(L"RPGM JSON 预热未完成：对象嵌套超过 128 层：%ls", path);
+                break;
+            }
+            objects[depth++] = (RpgmCommandFields){-1, NULL};
+            p++;
+            continue;
+        }
+        if (*p == '}') {
+            if (depth) {
+                RpgmCommandFields fields = objects[--depth];
+                if (fields.parameters) {
+                    if (fields.code == 101) {
+                        rpgm_message_block_flush(&message_block, prefetch);
+                        rpgm_message_block_begin(&message_block);
+                    } else if (fields.code != 401) {
+                        rpgm_message_block_flush(&message_block, prefetch);
+                    }
+                    if (rpgm_text_command(fields.code))
+                        collect_rpgm_command_parameters(fields.code, &fields.parameters, prefetch, &message_block);
+                }
+            }
+            p++;
+            if (prefetch->n >= textlist_limit(prefetch)) break;
+            continue;
+        }
         if (*p != '"') {
             p++;
             continue;
@@ -2048,18 +2018,16 @@ static void parse_rpgm_json_file(const WCHAR *path, TextList *prefetch) {
         v = json_ws(v + 1);
 
         if (!strcmp(key, "code")) {
-            last_code = atoi(v);
+            if (depth) objects[depth - 1].code = atoi(v);
         } else if (!strcmp(key, "parameters")) {
-            if (last_code == 101) {
-                rpgm_message_block_flush(&message_block, prefetch);
-                rpgm_message_block_begin(&message_block);
-            } else if (last_code != 401) {
-                rpgm_message_block_flush(&message_block, prefetch);
+            const char *after = rpgm_plugin_value_end(v, buf + size);
+            if (!after || after == v) {
+                append_log(L"RPGM JSON 预热未完成：parameters 格式不完整或嵌套过深：%ls", path);
+                free(key);
+                break;
             }
-            if (rpgm_text_command(last_code)) {
-                collect_rpgm_command_parameters(last_code, &v, prefetch, &message_block);
-            }
-            last_code = -1;
+            if (depth && *v == '[') objects[depth - 1].parameters = v;
+            v = after;
         } else if (rpgm_text_key(key)) {
             rpgm_message_block_flush(&message_block, prefetch);
             if (is_map_data && !strcmp(key, "name")) {
@@ -2610,8 +2578,8 @@ static size_t post_prefetch_all(TextList *prefetch) {
 /* ----------------------------------------------------------------
  * scan_renpy_script_dir — 递归扫描目录中的 .rpy 脚本文件
  *
- * 逐行解析 Ren'Py 脚本，用 renpy_skip_statement 过滤非对话行，
- * 提取对话行中引号内的文本加入 prefetch 列表。
+ * 按逻辑语句解码 Ren'Py 字面量，排除 Python/ATL 技术字段，
+ * 提取正文、菜单及屏幕文本加入 prefetch 列表。
  * depth 控制递归深度（上限 RENPY_SCAN_MAX_DEPTH），
  * 超大的 .rpy 文件（> RENPY_SCRIPT_SCAN_MAX_BYTES）会被跳过。
  *
@@ -2632,49 +2600,33 @@ static void scan_renpy_script_dir(const WCHAR *dir, TextList *prefetch, int dept
     WCHAR pat[MAX_PATH * 4];
     path_join(pat, MAX_PATH * 4, dir, L"*.rpy");
     WIN32_FIND_DATAW fd;
-    HANDLE hf = FindFirstFileW(pat, &fd);
-    if (hf == INVALID_HANDLE_VALUE) return;
-    do {
-        if (prefetch->n >= textlist_limit(prefetch)) { FindClose(hf); return; }
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (!wide_ends_with_i(fd.cFileName, L".rpy")) continue;
-        /* 启动器自带钩子的字面量属于实现细节，不是游戏文本。扫描它们可能在
-           首个真实菜单出现前占满远程队列。 */
-        if (!_wcsicmp(fd.cFileName, L"iron_deepseek.rpy")) continue;
-        /* 跳过超过大小上限的文件 */
-        ULARGE_INTEGER fsz = {0};
-        fsz.LowPart = fd.nFileSizeLow;
-        fsz.HighPart = fd.nFileSizeHigh;
-        if (fsz.QuadPart > (ULONGLONG)RENPY_SCRIPT_SCAN_MAX_BYTES) continue;
-        WCHAR full[MAX_PATH * 4];
-        path_join(full, MAX_PATH * 4, dir, fd.cFileName);
-        char *buf = NULL; DWORD size = 0;
-        if (!read_file_bytes(full, &buf, &size)) continue;
-        char *prev_last = NULL; /* 上一条采集文本（借用 items 内的字符串，文件内有效） */
-        char *line = buf;
-        while (*line && prefetch->n < textlist_limit(prefetch)) {
-            char *nl = strchr(line, '\n');
-            if (nl) { *nl = 0; nl++; } else nl = line + strlen(line);
-            size_t before = prefetch->n;
-            collect_renpy_line_strings(line, prefetch);
-            size_t added = prefetch->n - before;
-            if (added) {
-                renpy_prevs_ensure(prefetch);
-                if (prefetch->prev_items) {
-                    for (size_t k = before; k < prefetch->n; k++) {
-                        prefetch->prev_items[k] = prev_last;
-                    }
-                    prev_last = prefetch->items[prefetch->n - 1];
-                }
-            }
-            line = nl;
-        }
-        free(buf);
-    } while (FindNextFileW(hf, &fd));
-    FindClose(hf);
-    /* 递归扫描子目录 */
+    /* 根目录可以很短，章节子目录仍可能超过传统路径上限；枚举与读取同用文件边界。 */
+    HANDLE hf = file_find_first(pat, &fd);
+    if (hf != INVALID_HANDLE_VALUE) {
+        do {
+            if (prefetch->n >= textlist_limit(prefetch)) { FindClose(hf); return; }
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (!wide_ends_with_i(fd.cFileName, L".rpy")) continue;
+            /* 启动器自带钩子的字面量属于实现细节，不是游戏文本。扫描它们可能在
+               首个真实菜单出现前占满远程队列。 */
+            if (!_wcsicmp(fd.cFileName, L"iron_deepseek.rpy")) continue;
+            /* 跳过超过大小上限的文件 */
+            ULARGE_INTEGER fsz = {0};
+            fsz.LowPart = fd.nFileSizeLow;
+            fsz.HighPart = fd.nFileSizeHigh;
+            if (fsz.QuadPart > (ULONGLONG)RENPY_SCRIPT_SCAN_MAX_BYTES) continue;
+            WCHAR full[MAX_PATH * 4];
+            path_join(full, MAX_PATH * 4, dir, fd.cFileName);
+            char *buf = NULL; DWORD size = 0;
+            if (!read_file_bytes(full, &buf, &size)) continue;
+            scan_renpy_source(buf, prefetch);
+            free(buf);
+        } while (FindNextFileW(hf, &fd));
+        FindClose(hf);
+    }
+    /* 本目录可能只有编译脚本；仍需扫描子目录中的源码。 */
     path_join(pat, MAX_PATH * 4, dir, L"*");
-    hf = FindFirstFileW(pat, &fd);
+    hf = file_find_first(pat, &fd);
     if (hf == INVALID_HANDLE_VALUE) return;
     do {
         if (prefetch->n >= textlist_limit(prefetch)) { FindClose(hf); return; }
@@ -2717,6 +2669,7 @@ static void warmup_godot(const WCHAR *dir) {
 static void warmup_renpy(const WCHAR *dir) {
     TextList prefetch = {0};
     prefetch.max_items = RENPY_WARMUP_MAX_ITEMS;
+    prefetch.renpy = 1;
     WCHAR game[MAX_PATH * 4];
     path_join(game, MAX_PATH * 4, dir, L"game");
     scan_renpy_script_dir(game, &prefetch, 0);

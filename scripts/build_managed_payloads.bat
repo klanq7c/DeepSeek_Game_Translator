@@ -103,8 +103,30 @@ if exist "%UT%" (
         )
     )
     if not defined UT_MANAGED (
-        if exist "%ROOT%payloads\UnityTranslator\src\bin\Release\net472\UnityEngine.CoreModule.dll" (
-            set "UT_MANAGED=%ROOT%payloads\UnityTranslator\src\bin\Release\net472"
+        set "UT_STAGE_REFERENCES=0"
+        if exist "%ROOT%payloads\UnityTranslator\src\bin\Release\net472\UnityEngine.CoreModule.dll" set "UT_STAGE_REFERENCES=1"
+        if exist "%ROOT%build\unity-managed-refs\current.txt" set "UT_STAGE_REFERENCES=1"
+        if "!UT_STAGE_REFERENCES!"=="1" (
+            set "UT_REFERENCE_KEY="
+            set "UT_REFERENCE_OK=0"
+            set "UT_REFERENCE_LINES=0"
+            set "UT_REFERENCE_INVALID=0"
+            rem FOR /F does not propagate the child exit code. Require its success marker too.
+            for /f "usebackq delims=" %%R in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\stage_unity_references.ps1" -RepoRoot "%ROOT%." ^&^& echo DST_STAGE_OK`) do (
+                set /a UT_REFERENCE_LINES+=1 >nul
+                if "%%R"=="DST_STAGE_OK" (set "UT_REFERENCE_OK=1") else set "UT_REFERENCE_KEY=%%R"
+            )
+            if not "!UT_REFERENCE_OK!"=="1" set "UT_REFERENCE_INVALID=1"
+            if not "!UT_REFERENCE_LINES!"=="2" set "UT_REFERENCE_INVALID=1"
+            if "!UT_REFERENCE_KEY:~63,1!"=="" set "UT_REFERENCE_INVALID=1"
+            if not "!UT_REFERENCE_KEY:~64!"=="" set "UT_REFERENCE_INVALID=1"
+            for /f "delims=0123456789ABCDEF" %%R in ("!UT_REFERENCE_KEY!") do set "UT_REFERENCE_INVALID=1"
+            if "!UT_REFERENCE_INVALID!"=="1" (
+                echo Unity reference staging failed: expected one content key and a successful helper exit. See diagnostics above.
+                exit /b 1
+            )
+            set "UT_MANAGED=%ROOT%build\unity-managed-refs\!UT_REFERENCE_KEY!"
+            echo Verified Unity build references outside the output directory: !UT_MANAGED!
         )
     )
 

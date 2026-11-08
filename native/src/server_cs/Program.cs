@@ -34,8 +34,6 @@ namespace DstServerCs
         private const int AsyncQueueLimit = 65536;
         private const int AsyncByteLimit = 32 * 1024 * 1024;
         private const int LiveByteLimit = 32 * 1024 * 1024;
-        private const int BatchMax = 48;
-        private const int BatchCharBudget = 9600;
         private const int AsyncCoalesceMs = 25;
         private const int LiveCoalesceMs = 35;
         private const int PathCap = 8192;
@@ -91,9 +89,16 @@ namespace DstServerCs
         private static readonly HashSet<string> asyncKnown = new HashSet<string>();
         private static long asyncMemoryBytes;
 
-        private static bool AsyncEnqueueMissCtx(string text, string prev)
+        private static bool ShouldTranslateTextFormat(string text, bool renpy)
         {
-            if (api == null || !api.Enabled || !TextRules.ShouldTranslate(text)) return false;
+            return !string.IsNullOrEmpty(text) && TextRules.HasTranslationSignal(text)
+                && (!TextRules.HasCjk(text) || (renpy
+                    ? MixedText.HasUntranslatedLatinRenPy(text) : MixedText.HasUntranslatedLatin(text)));
+        }
+
+        private static bool AsyncEnqueueMissCtx(string text, string prev, bool renpy = false)
+        {
+            if (api == null || !api.Enabled || !ShouldTranslateTextFormat(text, renpy)) return false;
             if (cache.Contains(text)) return false;
             long bytes = 64 + (text.Length + 1) * 2
                 + (!string.IsNullOrEmpty(prev) ? (prev.Length + 1) * 2 : 0);
@@ -158,18 +163,19 @@ namespace DstServerCs
                 }
                 if (asyncQueue.Count == 0 || stopping) return null;
                 jobs.Add(asyncQueue.Dequeue());
-                long chars = jobs[0].Text.Length;
-                while (jobs.Count < BatchMax) {
+                long textBytes = Encoding.UTF8.GetByteCount(jobs[0].Text);
+                while (jobs.Count < api.BatchMaxItems) {
                     if (asyncQueue.Count == 0) {
                         // 合批窗口：等待窗口内可能到达的新任务（持锁等待）。
                         Monitor.Wait(asyncLock, AsyncCoalesceMs);
                     }
                     if (asyncQueue.Count == 0) break;
                     var next = asyncQueue.Peek();
-                    if (chars + next.Text.Length > BatchCharBudget) break;
+                    int nextBytes = Encoding.UTF8.GetByteCount(next.Text);
+                    if (textBytes + nextBytes > api.BatchCharBudget) break;
                     asyncQueue.Dequeue();
                     jobs.Add(next);
-                    chars += next.Text.Length;
+                    textBytes += nextBytes;
                 }
             }
             return jobs;
@@ -195,9 +201,21 @@ namespace DstServerCs
             if (stopping) return;
             // 二分重试：范围失败时对半拆分定位最小失败单元（≤4 条逐条兜底），
             // 取代旧的"整批失败→逐条重发"降级。NULL 槽位计 miss，绝不伪装成功。
-            var translated = ApiClient.TranslateSplitRetry(api, texts, prevs, apiGate).Result;
+            // 让路回调保证拆分树的每个子请求前仍执行前台让位与关停检查——
+            // 单通道（concurrency=1，本地模型推荐配置）下实时请求才不会被
+            // 拆分树连续抢占。
+            var translated = ApiClient.TranslateSplitRetry(
+                api, texts, prevs, apiGate, AsyncSplitYield).Result;
             if (translated == null) return;
             PersistResolved(texts, translated);
+        }
+
+        /* 拆分重试的让路回调：等前台清空后复查关停/禁用。返回 true = 停止拆分，
+           剩余条目按 miss 遗忘（下次 miss 重新排队）。 */
+        private static bool AsyncSplitYield()
+        {
+            ApiClient.WaitForForegroundAsync().Wait();
+            return stopping || api == null || !api.Enabled;
         }
 
         private static void PersistResolved(string[] keys, string[] values)
@@ -217,6 +235,8 @@ namespace DstServerCs
         private sealed class LiveJob
         {
             public string Text;
+            public bool RenPy;
+            public bool SplitRetry;
             public long Bytes;
             public TaskCompletionSource<string> Done =
                 new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -230,35 +250,51 @@ namespace DstServerCs
         /* 与 C 的 live_translate_batched 对齐：从入队到拿到结果的整个等待期都
            标记为前台，使后台预热批次在实时请求排队时就让路，而不是等到远程
            调用真正发出。预算耗尽按 miss 处理并限频诊断。 */
-        private static async Task<string> LiveTranslateBatched(string text)
+        private static async Task<string> LiveTranslateBatched(string text, bool renpy)
         {
-            var job = new LiveJob { Text = text, Bytes = (text.Length + 1) * 2 + 64 };
-            lock (liveLock) {
-                // 关停后 live worker 已退出并清空队列；此时再入队没有人会完成它。
-                if (stopping) return null;
-                if (liveMemoryBytes + job.Bytes > LiveByteLimit) {
-                    long n = Interlocked.Increment(ref liveBudgetRejections);
-                    if (n <= 3 || (n & (n - 1)) == 0) {
-                        Console.Error.WriteLine(
-                            "[http] live queue byte budget rejected #" + n
-                            + " (used=" + liveMemoryBytes + ", limit=" + LiveByteLimit + ")");
-                    }
-                    return null;
-                }
-                liveMemoryBytes += job.Bytes;
-                liveQueue.Enqueue(job);
-                Monitor.Pulse(liveLock);
-            }
+            var values = await LiveTranslateGroupAsync(new[] { text }, renpy, false).ConfigureAwait(false);
+            return values[0];
+        }
+
+        // 所有实时入口使用同一准入预算；只有专用 worker 构造提供商请求，避免 HTTP
+        // 批次按分块数堆积等待通道的任务和完整提示词。整组准入失败保留原文回退语义。
+        private static async Task<string[]> LiveTranslateGroupAsync(IList<string> texts, bool renpy, bool splitRetry)
+        {
+            var values = new string[texts.Count];
+            long bytes = 0;
+            foreach (var text in texts) bytes += ((long)text.Length + 1) * 2 + 64;
             ApiClient.ForegroundEnter();
             try {
-                return await job.Done.Task.ConfigureAwait(false);
+                LiveJob[] jobs;
+                lock (liveLock) {
+                    if (stopping) return values;
+                    if (bytes > LiveByteLimit - liveMemoryBytes) {
+                        long n = Interlocked.Increment(ref liveBudgetRejections);
+                        if (n <= 3 || (n & (n - 1)) == 0) {
+                            Console.Error.WriteLine("[http] live queue byte budget rejected #" + n
+                                + " (used=" + liveMemoryBytes + ", limit=" + LiveByteLimit + ")");
+                        }
+                        return values;
+                    }
+                    jobs = new LiveJob[texts.Count];
+                    for (int i = 0; i < jobs.Length; i++) {
+                        jobs[i] = new LiveJob { Text = texts[i], RenPy = renpy, SplitRetry = splitRetry,
+                            Bytes = ((long)texts[i].Length + 1) * 2 + 64 };
+                    }
+                    liveMemoryBytes += bytes;
+                    foreach (var job in jobs) liveQueue.Enqueue(job);
+                    Monitor.PulseAll(liveLock);
+                }
+                // 全组已入队，逐项等待不会阻塞其他 worker；返回次序仍与原始索引一致。
+                for (int i = 0; i < jobs.Length; i++) values[i] = await jobs[i].Done.Task.ConfigureAwait(false);
+                return values;
             } finally {
                 ApiClient.ForegroundLeave();
             }
         }
 
         /* 与 C 的 live_pop_batch 对齐：队空时阻塞等待；弹出首个后在合批窗口内
-           继续攒，受条目数与字符预算约束。持锁等待（Monitor.Wait 会临时释放锁），
+           继续攒，受配置的条目数与 UTF-8 字节预算约束。持锁等待（Monitor.Wait 会临时释放锁），
            不再用信号量计数——信号量许可数与队列长度会在合批时失同步。 */
         private static List<LiveJob> LivePopBatch()
         {
@@ -269,17 +305,20 @@ namespace DstServerCs
                 }
                 if (liveQueue.Count == 0) return null;
                 jobs.Add(liveQueue.Dequeue());
-                long chars = jobs[0].Text.Length;
-                while (jobs.Count < BatchMax) {
+                long textBytes = Encoding.UTF8.GetByteCount(jobs[0].Text);
+                while (jobs.Count < api.BatchMaxItems) {
                     if (liveQueue.Count == 0) {
                         Monitor.Wait(liveLock, LiveCoalesceMs);
                     }
                     if (liveQueue.Count == 0) break;
                     var next = liveQueue.Peek();
-                    if (chars + next.Text.Length > BatchCharBudget) break;
+                    // 单条入口与显式批量入口保留各自原有的失败拆分策略。
+                    if (next.SplitRetry != jobs[0].SplitRetry) break;
+                    int nextBytes = Encoding.UTF8.GetByteCount(next.Text);
+                    if (textBytes + nextBytes > api.BatchCharBudget) break;
                     liveQueue.Dequeue();
                     jobs.Add(next);
-                    chars += next.Text.Length;
+                    textBytes += nextBytes;
                 }
             }
             return jobs;
@@ -313,7 +352,9 @@ namespace DstServerCs
             string[] results = null;
             if (api != null && api.Enabled && !stopping) {
                 // 本方法运行在专用线程上，同步等待不会占用线程池线程。
-                if (jobs.Count == 1) {
+                if (jobs[0].SplitRetry) {
+                    results = ApiClient.TranslateSplitRetry(api, texts, null, apiGate).Result;
+                } else if (jobs.Count == 1) {
                     var one = ApiClient.TranslateSingle(api, texts[0], apiGate).Result;
                     if (one != null) results = new[] { one };
                 } else {
@@ -333,7 +374,7 @@ namespace DstServerCs
                 }
                 // 实时批量失败的条目转入后台队列（与 C 的 live 路径一致）：
                 // 下次由后台批量+二分重试填充缓存，而不是让英文永久漏出。
-                AsyncEnqueueMissCtx(texts[i], null);
+                AsyncEnqueueMissCtx(texts[i], null, jobs[i].RenPy);
                 jobs[i].Done.TrySetResult(null);
             }
         }
@@ -348,19 +389,19 @@ namespace DstServerCs
         /* 全程异步：连接处理运行在线程池上，这里若同步阻塞等待实时结果，
            128 条并发连接会把线程池占满并饿死自己所等待的任务。 */
         private static async Task<TranslateOutcome> TranslateValueAsync(
-            string text, bool cacheOnly, bool queueMiss)
+            string text, bool cacheOnly, bool queueMiss, bool renpy = false)
         {
             var v = cache.Get(text);
             if (v != null) return new TranslateOutcome { Value = v, Source = "cache" };
-            if (!TextRules.ShouldTranslate(text)) {
+            if (!ShouldTranslateTextFormat(text, renpy)) {
                 return new TranslateOutcome { Value = text, Source = "pass" };
             }
             if (cacheOnly) {
-                bool queued = queueMiss && AsyncEnqueueMissCtx(text, null);
+                bool queued = queueMiss && AsyncEnqueueMissCtx(text, null, renpy);
                 return new TranslateOutcome { Value = text, Source = queued ? "queued" : "miss" };
             }
             if (api != null && api.Enabled) {
-                var live = await LiveTranslateBatched(text).ConfigureAwait(false);
+                var live = await LiveTranslateBatched(text, renpy).ConfigureAwait(false);
                 if (live != null && TextRules.IsResolvedTranslation(text, live)) {
                     var persisted = cache.SetManyPersist(new[] { text }, new[] { live });
                     if (persisted.Accepted > 0) {
@@ -413,9 +454,9 @@ namespace DstServerCs
             return list;
         }
 
-        private static async Task<string> RespTranslateSingleAsync(string text, bool cacheOnly)
+        private static async Task<string> RespTranslateSingleAsync(string text, bool cacheOnly, bool renpy)
         {
-            var outcome = await TranslateValueAsync(text, cacheOnly, cacheOnly).ConfigureAwait(false);
+            var outcome = await TranslateValueAsync(text, cacheOnly, cacheOnly, renpy).ConfigureAwait(false);
             var sb = new StringBuilder(64);
             sb.Append("{\"translation\":").Append(Json.Escape(outcome.Value));
             sb.Append(",\"translated_text\":").Append(Json.Escape(outcome.Value));
@@ -432,8 +473,9 @@ namespace DstServerCs
                 if (one != null) texts.Add(one);
             }
             bool cacheOnly = Json.TopBool(req.Dom, "cache_only");
+            bool renpy = Json.TopString(req.Dom, "engine") == "renpy";
             bool single = req.Path == "/translate" && texts.Count == 1;
-            if (single) return await RespTranslateSingleAsync(texts[0], cacheOnly).ConfigureAwait(false);
+            if (single) return await RespTranslateSingleAsync(texts[0], cacheOnly, renpy).ConfigureAwait(false);
             if (texts.Count == 0) return null; // 由路由层回 400
 
             int n = texts.Count;
@@ -457,7 +499,7 @@ namespace DstServerCs
                 if (v != null) {
                     results[i] = v;
                     sources[i] = "cache";
-                } else if (!TextRules.ShouldTranslate(t)) {
+                } else if (!ShouldTranslateTextFormat(t, renpy)) {
                     results[i] = t;
                     sources[i] = "pass";
                 } else {
@@ -469,63 +511,24 @@ namespace DstServerCs
             if (missIdx.Count > 0) {
                 if (cacheOnly) {
                     foreach (var i in missIdx) {
-                        bool queued = AsyncEnqueueMissCtx(texts[i], null);
+                        bool queued = AsyncEnqueueMissCtx(texts[i], null, renpy);
                         sources[i] = queued ? "queued" : "miss";
                         results[i] = texts[i];
                     }
                 } else if (api != null && api.Enabled) {
-                    ApiClient.ForegroundEnter();
-                    try {
-                        // 切块并按字符预算分组，多块经通道池并行发出（与 C 的
-                        // foreground 多通道行为一致）。
-                        var chunks = new List<int[]>();
-                        var current = new List<int>();
-                        long chars = 0;
-                        foreach (var i in missIdx) {
-                            var t = texts[i];
-                            if (current.Count > 0
-                                && (current.Count >= BatchMax
-                                    || chars + t.Length > BatchCharBudget)) {
-                                chunks.Add(current.ToArray());
-                                current.Clear();
-                                chars = 0;
-                            }
-                            current.Add(i);
-                            chars += t.Length;
+                    var pending = new string[missIdx.Count];
+                    for (int k = 0; k < pending.Length; k++) pending[k] = texts[missIdx[k]];
+                    var translated = await LiveTranslateGroupAsync(pending, renpy, true).ConfigureAwait(false);
+                    for (int k = 0; k < pending.Length; k++) {
+                        if (TextRules.IsResolvedTranslation(pending[k], translated[k])) {
+                            results[missIdx[k]] = translated[k];
+                            sources[missIdx[k]] = "api_batch";
                         }
-                        if (current.Count > 0) chunks.Add(current.ToArray());
-
-                        var chunkTasks = new Task[chunks.Count];
-                        for (int c = 0; c < chunks.Count; c++) {
-                            var idxs = chunks[c];
-                            chunkTasks[c] = Task.Run(async () => {
-                                var batch = new string[idxs.Length];
-                                for (int k = 0; k < idxs.Length; k++) {
-                                    batch[k] = texts[idxs[k]];
-                                }
-                                // 二分重试：批量失败时对半拆分定位最小失败单元。
-                                var translated = await ApiClient.TranslateSplitRetry(
-                                    api, batch, null, apiGate).ConfigureAwait(false);
-                                for (int k = 0; k < idxs.Length; k++) {
-                                    if (translated[k] != null
-                                        && TextRules.IsResolvedTranslation(
-                                            batch[k], translated[k])) {
-                                        results[idxs[k]] = translated[k];
-                                        sources[idxs[k]] = "api_batch";
-                                    }
-                                }
-                            });
-                        }
-                        // await 而不是 Task.WaitAll：不能在线程池线程上同步等待
-                        // 排在同一个线程池里的分块任务。
-                        await Task.WhenAll(chunkTasks).ConfigureAwait(false);
-                    } finally {
-                        ApiClient.ForegroundLeave();
                     }
                     // 与 C 的 live_translate_jobs 一致：实时路径仍未解析的条目排入
                     // 后台补译，让缓存能为下次填充，而不是让英文永久漏出。
                     foreach (var i in missIdx) {
-                        if (results[i] == null) AsyncEnqueueMissCtx(texts[i], null);
+                        if (results[i] == null) AsyncEnqueueMissCtx(texts[i], null, renpy);
                     }
                 }
                 foreach (var i in missIdx) {
@@ -585,6 +588,7 @@ namespace DstServerCs
 
         private static string RespPrefetch(Request req)
         {
+            bool renpy = Json.TopString(req.Dom, "engine") == "renpy";
             var texts = TopStringList(req.Dom, "texts");
             if (texts.Count == 0) {
                 var one = Json.TopString(req.Dom, "text");
@@ -595,7 +599,7 @@ namespace DstServerCs
             int queued = 0;
             for (int i = 0; i < texts.Count; i++) {
                 var p = usePrevs ? prevs[i] : null;
-                if (AsyncEnqueueMissCtx(texts[i], p)) queued++;
+                if (AsyncEnqueueMissCtx(texts[i], p, renpy)) queued++;
             }
             return "{\"status\":\"queued\",\"queued\":" + queued + "}";
         }
@@ -876,16 +880,16 @@ namespace DstServerCs
                 using (var stream = new NetworkStream(s, ownsSocket: false)) {
                     int len = 0;
                     int headerEnd = -1;
+                    int headerScanCursor = 0;
                     long contentLength = 0;
                     string headerBlock = null;
 
                     while (true) {
                         if (headerEnd < 0 && len >= 4) {
-                            var probe = Encoding.ASCII.GetString(buffer, 0, len);
-                            int idx = probe.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                            int idx = HttpRequestFraming.FindHeaderEnd(buffer, len, ref headerScanCursor);
                             if (idx >= 0) {
-                                headerEnd = idx + 4;
-                                headerBlock = probe.Substring(0, idx);
+                                headerEnd = idx;
+                                headerBlock = Encoding.ASCII.GetString(buffer, 0, headerEnd - 4);
                                 var cl = ParseContentLength(headerBlock);
                                 if (cl < 0) {
                                     await SendAsync(s, null, 400, "Bad Request",
@@ -976,7 +980,7 @@ namespace DstServerCs
                     }
 
                     // ---- 解析请求行 ----
-                    var head = Encoding.ASCII.GetString(buffer, 0, headerEnd);
+                    var head = headerBlock;
                     var lineEnd = head.IndexOf("\r\n", StringComparison.Ordinal);
                     var requestLine = lineEnd >= 0 ? head.Substring(0, lineEnd) : head;
                     var parts = requestLine.Split(' ');
@@ -1316,8 +1320,11 @@ namespace DstServerCs
                 Die("bind failed");
             }
 
-            var liveThread = new Thread(LiveWorkerLoop) { IsBackground = true };
-            liveThread.Start();
+            // 与 C 的实时 worker 池一致：一个批次等待提供商时，后到文本仍能使用空余通道。
+            for (int i = 0; i < api.Concurrency; i++) {
+                var liveThread = new Thread(LiveWorkerLoop) { IsBackground = true };
+                liveThread.Start();
+            }
             // 后台预热 worker 池：concurrency-1 个线程占满除前台保留通道之外的
             // 全部远程通道（与 C 的 async_worker_pool_size 语义一致）。
             int bgWorkers = api.Concurrency > 1 ? api.Concurrency - 1 : 1;

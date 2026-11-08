@@ -9,7 +9,7 @@ namespace DstLauncher
      * EmbeddedScripts —— embedded.c 的对等实现。
      *
      * C 版把 payloads/RenPy、payloads/RPGMaker、payloads/Godot 下的脚本以 RCDATA
-     * 301..304 嵌入；C# 版用 EmbeddedResource 嵌入同一批文件（见 launcher_cs.csproj，
+     * 301..306 嵌入；C# 版用 EmbeddedResource 嵌入同一批文件（见 launcher_cs.csproj，
      * LogicalName 与资源 ID 同名）。部署时按字节原样写出，两版产物逐字节一致。
      *
      * 缺失资源不是可恢复状态：记录日志并返回 null，调用方负责向用户说明后果
@@ -19,6 +19,8 @@ namespace DstLauncher
     {
         public const string RenPyHook = "IDR_SCRIPT_RENPY_HOOK";
         public const string RpgmHook = "IDR_SCRIPT_RPGM_HOOK";
+        public const string RpgmImageOcr = "IDR_SCRIPT_RPGM_IMAGE_OCR";
+        public const string RpgmImageText = "IDR_SCRIPT_RPGM_IMAGE_TEXT";
         public const string GodotRuntimeG3 = "IDR_SCRIPT_GODOT_RUNTIME_G3";
         public const string GodotRuntimeG4 = "IDR_SCRIPT_GODOT_RUNTIME_G4";
 

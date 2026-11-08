@@ -1,0 +1,55 @@
+
+public sealed class DeepPrefetchSeam {
+    // 仅隔离 Unity 对象发现、时钟、配置、网络和候选文本筛选边界。
+    // 收集、首次扫描标记、文本上限、调度门禁与异步排队均取生产方法。
+    public class Object {
+        public static int NullChecks, IdReads;
+        public static readonly List<int> ReadIds = new List<int>();
+        public int Id;
+        public int GetInstanceID() { IdReads++; ReadIds.Add(Id); return Id; }
+        public static bool operator ==(Object a, Object b) { NullChecks++; return ReferenceEquals(a, b); }
+        public static bool operator !=(Object a, Object b) { return !(a == b); }
+        public override bool Equals(object other) { return ReferenceEquals(this, other); }
+        public override int GetHashCode() { return Id; }
+    }
+    public class TextAsset : Object {
+        public string Content;
+        public bool ThrowOnRead;
+        public string text { get { if (ThrowOnRead) throw new InvalidOperationException("fixture text getter failure"); return Content; } }
+    }
+    public class ScriptableObject : Object { public string Content; }
+    public class MonoBehaviour : Object { public string Content; public bool Active = true; }
+    private static class AccessTools { public static PropertyInfo Property(Type type, string name) { return type.GetProperty(name); } }
+    public sealed class ConfigEntry<T> { public T Value; public ConfigEntry(T value) { Value = value; } }
+    public static class Time { public static float realtimeSinceStartup; }
+    private Type _textAssetTypeCache = typeof(TextAsset);
+    private readonly object _pendingLock = new object();
+    public Object[] Assets = new Object[0];
+    public ScriptableObject[] Scripts = new ScriptableObject[0];
+    public MonoBehaviour[] Behaviours = new MonoBehaviour[0];
+    public int Discovered, DiscoveryCalls, ScannerInitializations;
+    public bool Eco, Pending;
+    public readonly List<Exception> Errors = new List<Exception>();
+    public readonly List<string[]> Batches = new List<string[]>();
+    public readonly List<string> Priorities = new List<string>();
+    public TaskCompletionSource<bool> Provider;
+    private Object[] FindObjectsOfTypeAllSafe(Type type) { DiscoveryCalls++; Discovered += Assets.Length; return Assets; }
+    private T[] FindObjectsOfTypeAllSafe<T>() {
+        T[] items = typeof(T) == typeof(ScriptableObject) ? (T[])(object)Scripts : (T[])(object)Behaviours;
+        DiscoveryCalls++; Discovered += items.Length; return items;
+    }
+    private void EnsureScannerInitialized(string context) { ScannerInitializations++; }
+    private static bool IsComponentActive(MonoBehaviour obj) { return obj.Active; }
+    private bool HasPendingClientTranslationWork() { return Pending; }
+    private bool IsEcoPerformance() { return Eco; }
+    private void ReportCaughtException(Exception error) { Errors.Add(error); }
+    private void LogVerbose(string text) { }
+    private Task QueueWarmupTextsAsync(List<string> texts, string priority) {
+        Batches.Add(texts.ToArray()); Priorities.Add(priority);
+        return Provider == null ? Task.CompletedTask : Provider.Task;
+    }
+    private void TryAddDeepPrefetchCandidate(string text, List<string> output) {
+        if (!string.IsNullOrEmpty(text) && _deepPrefetchSeen.Add(text)) output.Add(text);
+    }
+    public void BeginSample() { Discovered = DiscoveryCalls = Object.NullChecks = Object.IdReads = 0; Object.ReadIds.Clear(); }
+    public int Inspected { get { return Object.NullChecks - Object.IdReads; } }

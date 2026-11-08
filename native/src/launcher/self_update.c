@@ -80,7 +80,9 @@ static int ensure_parent_dir(const WCHAR *path) {
 
 /* 流式比较磁盘文件与嵌入资源，避免为大型 payload 再分配一份完整副本。 */
 static int file_matches_bytes(const WCHAR *path, const unsigned char *data, DWORD size) {
-    HANDLE h = CreateFileW(path, GENERIC_READ,
+    WCHAR native_path[FS_FILE_API_PATH_CAP];
+    if (!path_for_file_api(native_path, FS_FILE_API_PATH_CAP, path)) return 0;
+    HANDLE h = CreateFileW(native_path, GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;

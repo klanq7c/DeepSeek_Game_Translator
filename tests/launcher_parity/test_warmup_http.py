@@ -124,6 +124,7 @@ def run_case(server, exe, root, name, original, expected=None, hits=None, mode="
     lookups = [r for r in requests if r[1] == "/cache/lookup"]
     for method, route, body, data in requests:
         assert not route.startswith("/translate"), (name, "individual GET lookup returned")
+        assert data is None or 'engine' not in data, (name, 'RenPy hint leaked into adjacent engine')
         if route == "/cache/lookup":
             assert method == "POST" and len(data["texts"]) <= 128 and len(body) <= 65536, (name, "lookup budget")
     if mode in ("reject", "truncated", "malformed", "invalid_utf8", "invalid_escape", "nul"):
@@ -131,6 +132,31 @@ def run_case(server, exe, root, name, original, expected=None, hits=None, mode="
         assert b"cache lookup failed" in proc.stdout, (name, "missing failure diagnostic")
         assert all(r[1] != "/cache/import" for r in requests), (name, "fault imported as translation")
     return requests, proc.stdout
+
+
+def run_renpy_case(server, exe, root, dump=False):
+    game = root / ('renpy_dump' if dump else 'renpy_http')
+    script = game / 'game/script.rpy'
+    script.parent.mkdir(parents=True, exist_ok=True)
+    expected = ['请 <Continue>', '请 [[Continue]', '请 {{Continue}', '请 __DS_TOKEN_0__Continue__DS_TOKEN_1__']
+    skipped = ['中文 [player]', '中文 {b}请{/b}', '中文 %(player)s', '已经是中文。', '中文 [' + '中' * 90 + 'Save]']
+    original = ('label start:\n' + '\n'.join('    "' + text + '"' for text in expected + skipped)).encode()
+    script.write_bytes(original)
+    server.requests.clear()
+    server.mode = 'normal'
+    extra = ['dump'] if dump else []
+    proc = subprocess.run([str(exe), str(game), '1'] + extra, capture_output=True, timeout=15)
+    assert proc.returncode == 0 and script.read_bytes() == original, (proc.returncode, proc.stdout, proc.stderr)
+    if dump:
+        assert not server.requests, 'RenPy dump unexpectedly contacted server'
+        posts = [('/prefetch', line.split(' ', 1)[1].encode()) for line in proc.stdout.decode('utf-8-sig').splitlines() if line.startswith('post=/prefetch ')]
+    else:
+        posts = [(route, body) for method, route, body, data in server.requests if method == 'POST']
+    assert len(posts) == 1 and posts[0][0] == '/prefetch', posts
+    data = json.loads(posts[0][1])
+    assert data['texts'] == expected and data['engine'] == 'renpy', data
+    assert data['prevs'] == ['', *expected[:-1]], data
+    return posts
 
 
 def main():
@@ -154,6 +180,10 @@ def main():
         for label, exe in (("c", args.c), ("cs", args.cs)):
             root = args.root / label
             result = []
+            renpy_requests = run_renpy_case(server, exe, root)
+            assert run_renpy_case(server, exe, root, dump=True) == renpy_requests, 'RenPy HTTP and dump request bytes differ'
+            result.append(renpy_requests)
+            checks += 2
             original = b'\xef\xbb\xbf# Keep comment\r\n  Welcome, traveler.=  \r\nMissing dialogue.=\nIdentity dialogue.=Identity dialogue.\rAlready done.=Existing translation.\n<color\\=red>Hello</color>\\nNext\\tline\\=yes=\r\n'
             hits = {"Welcome, traveler.": "你好，旅人。", "Identity dialogue.": "Identity dialogue.", "<color=red>Hello</color>\nNext\tline=yes": "<color=red>你好</color>\n下一行\t=是\\"}
             expected = original.replace(b"  Welcome, traveler.=  ", "Welcome, traveler.=你好，旅人。".encode()).replace(b"<color\\=red>Hello</color>\\nNext\\tline\\=yes=", (xescape("<color=red>Hello</color>\nNext\tline=yes") + "=" + xescape(hits["<color=red>Hello</color>\nNext\tline=yes"])).encode())

@@ -8,6 +8,15 @@
 
 #include "globals.h"
 
+/* 内部文件 API 路径最多为原有 1040 字符缓冲加 UNC 前缀；不扩大用户路径上限。 */
+#define FS_FILE_API_PATH_CAP (260 * 4 + 8)
+int path_for_file_api(WCHAR *out, size_t cap, const WCHAR *path);
+/* 只统一文件 API 的路径语义；部署调用方仍须先检查重解析点和文件所有权。 */
+DWORD file_attributes(const WCHAR *path);
+BOOL file_set_attributes(const WCHAR *path, DWORD attrs);
+HANDLE file_find_first(const WCHAR *path, WIN32_FIND_DATAW *data);
+BOOL file_remove_directory(const WCHAR *path);
+
 /* 简单字节缓冲（类似 server 的 Buf，但 C 运行时不共享，launcher 独立一份）。 */
 typedef struct {
     char *data;

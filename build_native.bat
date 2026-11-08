@@ -34,6 +34,8 @@ call "%ROOT%scripts\build_managed_payloads.bat"
 if errorlevel 1 exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\build_artifacts\test_managed_stamp_write.ps1"
 if errorlevel 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\build_artifacts\test_unity_reference_staging.ps1"
+if errorlevel 1 exit /b 1
 
 set "SVR=%ROOT%native\src\server"
 set SVR_SRC="%SVR%\main.c" "%SVR%\util.c" "%SVR%\buf.c" "%SVR%\b64.c" "%SVR%\json.c" "%SVR%\cache.c" "%SVR%\api.c" "%SVR%\http.c"
@@ -93,6 +95,14 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\server_buffers\run_buffer_tests.ps1"
 if errorlevel 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\server_contract\cache_export\run_cache_export_tests.ps1"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\server_contract\http_framing\run_framing_tests.py"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\server_contract\http_framing\test_wire.py"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\server_contract\test_cache_decode.py"
+if errorlevel 1 exit /b 1
 
 set "RES_RC=%ROOT%build\launcher_payloads.rc"
 set "RES_OBJ=%ROOT%build\launcher_payloads.o"
@@ -142,7 +152,7 @@ set "ROOT_RC=%ROOT:\=/%"
 >> "%RES_RC%" echo 109 RCDATA "%ROOT_RC%assets/fonts/manifest.json"
 rem Engine runtime scripts (first-party sources, always present). IDs match
 rem native\src\launcher\resource.h; deploy.c/godot_patch.c write them verbatim.
-for %%S in (payloads\RenPy\iron_deepseek.rpy payloads\RPGMaker\hook_rpgm_mv.js payloads\Godot\dst_godot_runtime_g3.gd payloads\Godot\dst_godot_runtime_g4.gd) do (
+for %%S in (payloads\RenPy\iron_deepseek.rpy payloads\RPGMaker\hook_rpgm_mv.js payloads\RPGMaker\dst_rpgm_ocr.ps1 payloads\RPGMaker\rpgm_image_text.js payloads\Godot\dst_godot_runtime_g3.gd payloads\Godot\dst_godot_runtime_g4.gd) do (
     if not exist "%ROOT%%%S" (
         echo Missing engine runtime script: %%S
         exit /b 1
@@ -150,6 +160,8 @@ for %%S in (payloads\RenPy\iron_deepseek.rpy payloads\RPGMaker\hook_rpgm_mv.js p
 )
 >> "%RES_RC%" echo 301 RCDATA "%ROOT_RC%payloads/RenPy/iron_deepseek.rpy"
 >> "%RES_RC%" echo 302 RCDATA "%ROOT_RC%payloads/RPGMaker/hook_rpgm_mv.js"
+>> "%RES_RC%" echo 305 RCDATA "%ROOT_RC%payloads/RPGMaker/dst_rpgm_ocr.ps1"
+>> "%RES_RC%" echo 306 RCDATA "%ROOT_RC%payloads/RPGMaker/rpgm_image_text.js"
 >> "%RES_RC%" echo 303 RCDATA "%ROOT_RC%payloads/Godot/dst_godot_runtime_g3.gd"
 >> "%RES_RC%" echo 304 RCDATA "%ROOT_RC%payloads/Godot/dst_godot_runtime_g4.gd"
 if exist "%ROOT%payloads\UnityTranslator\UnityTranslator.dll" (
@@ -171,7 +183,7 @@ windres "%RES_RC%" -O coff -o "%RES_OBJ%"
 if errorlevel 1 exit /b 1
 
 set "LCH=%ROOT%native\src\launcher"
-set LCH_SRC="%LCH%\main.c" "%LCH%\globals.c" "%LCH%\fsutil.c" "%LCH%\font_bundle.c" "%LCH%\engine.c" "%LCH%\deploy.c" "%LCH%\server_proc.c" "%LCH%\api_config.c" "%LCH%\api_models.c" "%LCH%\warmup.c" "%LCH%\godot_warmup.c" "%LCH%\godot_patch.c" "%LCH%\godot_encrypted_pack.c" "%LCH%\godot_probe.c" "%LCH%\godot_preflight_cache.c" "%LCH%\ui.c" "%LCH%\ui_probe.c" "%LCH%\self_update.c" "%LCH%\embedded.c"
+set LCH_SRC="%LCH%\main.c" "%LCH%\globals.c" "%LCH%\fsutil.c" "%LCH%\font_bundle.c" "%LCH%\engine.c" "%LCH%\deploy.c" "%LCH%\server_proc.c" "%LCH%\dialog_theme.c" "%LCH%\api_config.c" "%LCH%\api_models.c" "%LCH%\warmup.c" "%LCH%\godot_warmup.c" "%LCH%\godot_patch.c" "%LCH%\godot_encrypted_pack.c" "%LCH%\godot_probe.c" "%LCH%\godot_preflight_cache.c" "%LCH%\ui.c" "%LCH%\ui_operation.c" "%LCH%\ui_probe.c" "%LCH%\self_update.c" "%LCH%\embedded.c"
 set "LAUNCHER_TMP=%ROOT%build\launcher_build.exe"
 
 rem Build to an ASCII temp path first; gcc/binutils handle the final binary
@@ -202,6 +214,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity
 if errorlevel 1 exit /b 1
 python "%ROOT%tests\launcher_parity\test_godot_preflight_exit.py"
 if errorlevel 1 exit /b 1
+python "%ROOT%tests\launcher_parity\test_godot_preflight_handshake.py"
+if errorlevel 1 exit /b 1
 python "%ROOT%tests\launcher_parity\test_background_buffer.py"
 if errorlevel 1 exit /b 1
 python "%ROOT%tests\launcher_parity\test_godot_encrypted_pack.py" --c-root "%ROOT%." --cs "%ROOT%build\launcher_cs\dst_launcher_cs.exe"
@@ -211,11 +225,18 @@ if errorlevel 1 (
     echo Launcher parity check failed: C# port diverges from the C launcher.
     exit /b 1
 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\run_renpy_warmup_tests.ps1" -CsLauncher "%ROOT%build\launcher_cs\dst_launcher_cs.exe"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\launcher_parity\test_renpy_long_scan.py"
+if errorlevel 1 exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\run_font_bundle_tests.ps1"
 if errorlevel 1 (
     echo Bundled CJK font fallback check failed.
     exit /b 1
 )
+
+python "%ROOT%tests\launcher_parity\test_ui_operations.py"
+if errorlevel 1 exit /b 1
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\run_server_lifecycle_tests.ps1" -CsLauncher "%ROOT%build\launcher_cs\dst_launcher_cs.exe"
 if errorlevel 1 (
@@ -231,13 +252,43 @@ if errorlevel 1 (
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\run_api_models_tests.ps1" -CsLauncher "%ROOT%build\launcher_cs\dst_launcher_cs.exe"
 if errorlevel 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\launcher_parity\run_api_connection_tests.ps1" -CsLauncher "%ROOT%build\launcher_cs\dst_launcher_cs.exe"
+if errorlevel 1 exit /b 1
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\server_contract\run_model_defaults_tests.ps1"
+if errorlevel 1 exit /b 1
+
+rem Local model budgets apply to prefetch, live and synchronous batches.
+python "%ROOT%tests\server_contract\test_local_batch_limits.py"
 if errorlevel 1 exit /b 1
 
 rem A provider can send headers then stall its body; both servers must release
 rem the remote channel at timeout and translate the next request.
 python "%ROOT%tests\server_contract\test_provider_body_timeout.py"
+if errorlevel 1 exit /b 1
+
+python "%ROOT%tests\server_contract\test_api_boundaries.py"
+if errorlevel 1 exit /b 1
+
+python "%ROOT%tests\server_contract\test_mixed_text.py"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\server_contract\test_context_dedup.py"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\server_contract\test_provider_envelope.py"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\server_contract\test_mixed_prefix.py"
+if errorlevel 1 exit /b 1
+
+python "%ROOT%tests\launcher_parity\test_exe_selection.py"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\launcher_parity\test_rpgm_command_fields.py"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\launcher_parity\test_long_payload_paths.py"
+if errorlevel 1 exit /b 1
+python "%ROOT%tests\launcher_parity\test_file_api_paths.py"
+if errorlevel 1 exit /b 1
+
+python "%ROOT%tests\launcher_parity\test_godot_text_format.py"
 if errorlevel 1 exit /b 1
 
 echo Built native server, C# server and launcher.

@@ -6,13 +6,16 @@ int main(int argc, char **argv) {
     api_config_init(&cfg);
     printf("%s\n", cfg.model);
     if (!api_config_load(&cfg, argv[1])) return 3;
+    fprintf(stderr, "CONFIG {\"timeout_ms\":%d,\"concurrency\":%d,"
+            "\"batch_max_items\":%d,\"batch_char_budget\":%d}\n",
+            cfg.timeout_ms, cfg.concurrency, cfg.batch_max_items, cfg.batch_char_budget);
     char *texts[] = { "Hello {name}.", "\\C[1]Open menu." };
     const char *prevs[] = { "Previous line.", "Hello {name}." };
     for (int mode = 0; mode < 3; mode++) {
         Buf body; buf_init(&body);
         if (mode == 0) build_request(&cfg, texts[0], &body);
         else if (mode == 1) build_batch_request(&cfg, texts, 2, &body);
-        else build_ctx_request(&cfg, texts, prevs, 2, &body);
+        else build_ctx_request(&cfg, texts, texts, prevs, 2, &body);
         puts(body.data); buf_free(&body);
     }
     return 0;

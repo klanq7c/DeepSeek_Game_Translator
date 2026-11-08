@@ -1,0 +1,59 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <ctype.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+typedef int SOCKET;
+#define SOCKET_ERROR -1
+#define SOL_SOCKET 0
+#define SO_RCVTIMEO 0
+#define SO_SNDTIMEO 1
+#define IPPROTO_TCP 0
+#define TCP_NODELAY 0
+#define HTTP_RECV_INITIAL 65536
+#define HTTP_MAX_REQ (2 * 1024 * 1024)
+#define HTTP_RECV_TIMEOUT_MS 5000
+static char *input;
+static size_t input_len, pos, chunk;
+static int status, reads;
+static unsigned long long search_calls, search_bytes, parse_calls, body_hash;
+static size_t body_len;
+static int setsockopt(int s,int a,int b,const char*c,int d) { (void)s;(void)a;(void)b;(void)c;(void)d;return 0; }
+static void closesocket(int s) { (void)s; }
+static void resp(int s,int code,const char* reason,const char* body) { (void)s;(void)reason;(void)body;status=code; }
+static void *xrealloc(void *p,size_t n) { void *q=realloc(p,n); if(!q) abort(); return q; }
+static char *request_buffer_acquire(void) { return malloc(HTTP_RECV_INITIAL+1); }
+static void request_buffer_release(char *p,size_t cap) { (void)cap;free(p); }
+static int recv(int s,char *out,int capacity,int flags) {
+    (void)s;(void)flags;reads++;
+    size_t n=input_len-pos;
+    if(n>chunk)n=chunk;
+    if(n>(size_t)capacity)n=(size_t)capacity;
+    memcpy(out,input+pos,n);pos+=n;return (int)n;
+}
+static char *measured_strstr(const char *s,const char *needle) {
+    char *found=strstr(s,needle);
+    if(!strcmp(needle,"\r\n\r\n")) { search_calls++; search_bytes += found ? (size_t)(found-s)+4 : strlen(s); }
+    return found;
+}
+#define strstr measured_strstr
+@METHODS@
+@RECEIVER@
+#undef strstr
+int main(int argc,char **argv) {
+    if(argc!=4)return 2;
+    FILE *f=fopen(argv[1],"rb");if(!f)return 3;
+    fseek(f,0,SEEK_END);input_len=(size_t)ftell(f);rewind(f);
+    input=malloc(input_len+1);if(fread(input,1,input_len,f)!=input_len)return 4;fclose(f);
+    input[input_len]=0;chunk=(size_t)strtoull(argv[2],NULL,10);
+    int rounds=atoi(argv[3]); if(!chunk||rounds<1)return 5;
+    LARGE_INTEGER start,end,freq;QueryPerformanceFrequency(&freq);QueryPerformanceCounter(&start);
+    for(int i=0;i<rounds;i++) { pos=0;status=200;reads=0;body_len=0;body_hash=0;search_calls=search_bytes=parse_calls=0;probe_receive(0); }
+    QueryPerformanceCounter(&end);
+    printf("{\"status\":%d,\"bodyBytes\":%llu,\"bodyHash\":%llu,\"reads\":%d,\"searchCalls\":%llu,\"searchBytes\":%llu,\"parseCalls\":%llu,\"decodedBytes\":0,\"ms\":%.6f}\n",
+        status,(unsigned long long)body_len,body_hash,reads,search_calls,search_bytes,parse_calls,
+        1000.0*(double)(end.QuadPart-start.QuadPart)/(double)freq.QuadPart/rounds);
+    free(input);return 0;
+}

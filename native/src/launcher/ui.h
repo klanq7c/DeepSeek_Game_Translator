@@ -132,8 +132,7 @@ int launch_game(const WCHAR *dir);
 /* 主翻译流程入口：部署 hook + 启动服务器 + 预热 + 启动游戏 */
 void start_translation(void);
 
-/* 一键翻译流程是否正在进行（后台线程执行服务启动/部署/预热期间为 1），
-   用于拒绝并发的开始/还原/清缓存/服务器切换操作 */
+/* UI 生命周期操作是否正在进行（包含确认与完成弹窗），用于阻止并发拖放。 */
 int translation_flow_running(void);
 
 /* 只移除由本启动器部署的翻译文件。 */

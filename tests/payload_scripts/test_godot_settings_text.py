@@ -32,8 +32,16 @@ func _ready():
 	PROCESS
 	runtime = RUNTIME
 	var hits = {"Category":"类别", "General":"通用", "Language":"语言", "English":"英语", "Smooth Animations":"流畅动画", "Off":"关闭", "Save":"保存", "Return":"返回"}
+	if not runtime._dst_plain_wanted("请 Open the door.") or runtime._dst_plain_wanted("已翻译 HP 100"):
+		failures.append("half-localized text eligibility is wrong")
+	runtime._dst_cache_put("请 Open the door.", "请 打开门。")
+	if runtime.RENDER("请 Open the door.") != "请 打开门。":
+		failures.append("half-localized text did not use its completed cache")
 	for key in hits:
 		runtime._dst_cache_put(key, hits[key])
+	_deliver("请 Hello John.", "请 你好 John。")
+	if runtime._dst_plain_wanted("请 你好 John。"):
+		failures.append("completed translation with a Latin name was queued again")
 	# 旧半词命中不能遮挡完整词；模拟真实缓存里的错误半词译文，不改用户缓存。
 	runtime._dst_cache_put("< Gen", "< 将军 >")
 	runtime._dst_cache_put("eral >", "< 工程")
@@ -52,7 +60,48 @@ func _begin():
 	_check_single_plan()
 	warm = true
 	FRAME
+func _deliver(query, translated):
+	# 经过正式响应回调，模拟正常译文后到达带有新标签的外部结果。
+	runtime._dst_busy[9100] = [query]
+	runtime._dst_pending[query] = true
+	var payload = {"translations": {query: translated}}
+	runtime.DONE(HTTPRequest.RESULT_SUCCESS, 200, [], ENCODE, 9100)
 func _check_single_plan():
+	for mixed in ["请 __DS_TOKEN_0__Continue__DS_TOKEN_1__", "请访问 https://example.com，Continue"]:
+		if not runtime._dst_plain_wanted(mixed):
+			failures.append("protected span swallowed visible English: " + mixed)
+	for localized in ["请 __DS_TOKEN_0__ 继续。", "请访问 https://example.com/Continue，继续。"]:
+		if runtime._dst_plain_wanted(localized):
+			failures.append("protected metadata became visible work: " + localized)
+	_deliver("Hello John", "你好 John")
+	var styled_completed = runtime.RENDER("Hel[color=red]lo John[/color]")
+	if styled_completed != "你好[color=red] John[/color]":
+		failures.append("completed translation changed style partition: " + styled_completed)
+	if runtime._dst_wanted(styled_completed):
+		failures.append("styled completed Latin name was rediscovered")
+	runtime._dst_queue_text(styled_completed)
+	if runtime._dst_pending.has("John"):
+		failures.append("styled completed Latin name was queued again")
+	var partial_completed = styled_completed + "[url=missing]Still missing option[/url]"
+	runtime._dst_queue_text(partial_completed)
+	if not runtime._dst_pending.has("Still missing option"):
+		failures.append("completed style fragments hid an untranslated adjacent option")
+	for unsafe in ["[color=white]错误颜色[/color]", "[url=changed]错误链接[/url]", "[custom_fx]错误效果[/custom_fx]"]:
+		_deliver("Uncached unsafe result", unsafe)
+		if runtime._dst_cache.has("Uncached unsafe result") or not runtime._dst_recent_miss("Uncached unsafe result"):
+			failures.append("new renderer markup became a successful cache hit")
+	if not runtime._dst_error_counts.has("batch-markup"):
+		failures.append("renderer markup rejection lacks diagnostic")
+	for literal in ["[提示] 保留字面括号", "按 [Esc] 退出", "按 [Ctrl] 和 [F1] 继续", "按 [B] 打开背包", "按 [I] 和 [U] 继续", "[b option] 是字面说明"]:
+		$Rich.set("RICH", literal)
+		if $Rich.PARSED != literal:
+			failures.append("literal fixture is interpreted as markup by the real engine: " + literal)
+		_deliver("Literal bracket label", literal)
+		if runtime.RENDER("Literal bracket label") != literal:
+			failures.append("literal translated brackets were rejected: " + literal)
+	_deliver("Uncached unsafe result", "恢复后的正常译文")
+	if runtime.RENDER("Uncached unsafe result") != "恢复后的正常译文":
+		failures.append("valid later translation did not recover")
 	runtime._dst_cache_put("Plan cache hit", "计划命中")
 	$Text.text = "Plan cache hit"
 	runtime.SCAN_COUNT = 0
@@ -109,6 +158,9 @@ func _observe():
 			failures.append("miss became successful cache entry")
 	frames += 1
 	if frames == 30:
+		_deliver("Category", "[color=white]类别[/color]")
+		if runtime._dst_cache["Category"] != "类别":
+			failures.append("late markup result replaced an earlier safe translation")
 		runtime._dst_cache_put("Untranslated new option", "新选项")
 	if frames >= 60:
 		# 相邻链接具有不同语义，空格和标签必须原样保留；路径不应入队。
@@ -144,13 +196,16 @@ func _force_frame():
 	SERVER.force_draw()
 '''.replace('PROCESS', 'pause_mode = Node.PAUSE_MODE_PROCESS' if major == 3 else 'process_mode = Node.PROCESS_MODE_ALWAYS').replace('RUNTIME', runtime).replace('RICH', rich).replace('CONNECT_DRAW', connect_draw).replace('CONNECT_POST', connect_post).replace('FRAME', frame).replace('SERVER', server).replace('EMPTY', 'empty' if major == 3 else 'is_empty').replace('RENDER', '_dst_render_cached' if major == 3 else '_dst_render')
     driver = driver.replace('SCAN_COUNT', '_dst_seen_this_scan' if major == 3 else '_dst_seen')
+    driver = driver.replace('DONE', '_dst_http_done' if major == 3 else '_dst_done')
+    driver = driver.replace('PARSED', 'get_text()' if major == 3 else 'get_parsed_text()')
+    driver = driver.replace('ENCODE', 'to_json(payload).to_utf8()' if major == 3 else 'JSON.stringify(payload).to_utf8_buffer()')
     driver = driver.replace('APPLY_PROPERTY', '_dst_apply_property' if major == 3 else '_dst_apply')
     files['driver.gd'] = driver
     return files
 
 
 def check_sources():
-    functions = ('_dst_text_plan', '_dst_inline_tag', '_dst_picker_end', '_dst_latin_edge', '_dst_query', '_dst_render_plan', '_dst_render_groups', '_dst_plan_wanted', '_dst_path_text', '_dst_numeric_text')
+    functions = ('_dst_translation_has_markup', '_dst_text_plan', '_dst_inline_tag', '_dst_picker_end', '_dst_latin_edge', '_dst_query', '_dst_render_plan', '_dst_render_groups', '_dst_plan_wanted', '_dst_path_text', '_dst_numeric_text')
     implementations = []
     for major in (3, 4):
         source = (ROOT / f'payloads/Godot/dst_godot_runtime_g{major}.gd').read_text(encoding='utf-8')

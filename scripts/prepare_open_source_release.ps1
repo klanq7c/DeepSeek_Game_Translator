@@ -4,8 +4,10 @@
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'release_content_scan.ps1')
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+& (Join-Path $repo 'tests\build_artifacts\test_release_content_scan.ps1')
 function Get-Sha256Hex([string]$path) {
     $sha = [Security.Cryptography.SHA256]::Create()
     $stream = [IO.File]::OpenRead($path)
@@ -195,9 +197,9 @@ if ($forbiddenFiles) {
 $secretHits = @()
 $scanPatterns = @(
     "sk-[A-Za-z0-9]{16,}",
-    "(?i)(?<![A-Za-z0-9_])api[_-]?key\s*=\s*[^<\s][^\r\n]+",
-    "(?i)(?<![A-Za-z0-9_])password\s*=\s*[^<\s][^\r\n]+",
-    "(?i)(?<![A-Za-z0-9_])secret\s*=\s*[^<\s][^\r\n]+",
+    "(?i)(?<![A-Za-z0-9_])api[_-]?key\s*=\s*[^<\s][^\r\n]*",
+    "(?i)(?<![A-Za-z0-9_])password\s*=\s*[^<\s][^\r\n]*",
+    "(?i)(?<![A-Za-z0-9_])secret\s*=\s*[^<\s][^\r\n]*",
     "(?i)Authorization:\s*Bearer\s+[A-Za-z0-9._-]+",
     "C:\\Users\\[A-Za-z0-9._-]+",
     "E:\\Projects\\[^\\\r\n]+",
@@ -217,6 +219,7 @@ foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) {
         $secretHits += "$($file.FullName): unreadable or non-text file"
         continue
     }
+    $text = Get-ReleaseContentScanText -RelativePath $stagedRelative -Text $text
     foreach ($pattern in $scanPatterns) {
         if ($text -match $pattern) {
             $secretHits += "$($file.FullName): $pattern"

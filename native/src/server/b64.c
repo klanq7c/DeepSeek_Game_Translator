@@ -8,7 +8,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* 把单个 Base64 字符映射为 0..63 的值，非法字符返回 -1（解码时跳过）。 */
+/* 把单个 Base64 字符映射为 0..63 的值，非法字符返回 -1。 */
 static int b64v(int c) {
     if ('A' <= c && c <= 'Z') return c - 'A';
     if ('a' <= c && c <= 'z') return c - 'a' + 26;
@@ -53,26 +53,45 @@ void b64enc_append(Buf *out, const char *s) {
     buf_commit(out, out_n);
 }
 
-/* 流式解码：把字符值逐个压入 6 位累加器 acc，每凑够 8 位输出一字节。
-   遇到 '='（填充）立即结束；非法字符跳过，保证对带空白/换行的输入也稳健。
-   末尾 realloc 收紧到实际长度，减少内存浪费。 */
+/* 缓存文本要求完整的四字符组与合法尾部填充，只忽略 Base64 允许的 ASCII
+   空白。损坏输入或解码后的 NUL 返回 NULL，由加载边界记录诊断；不能跳过
+   坏字符或截断文本后，把另一条键值当成有效缓存。 */
 char *b64dec(const char *s, size_t n) {
     Buf b;
     buf_init(&b);
-    uint32_t acc = 0;
-    int bits = 0;
+    int group[4], count = 0, finished = 0;
     for (size_t i = 0; i < n; i++) {
-        if (s[i] == '=') break;
-        int v = b64v((unsigned char)s[i]);
-        if (v < 0) continue;
-        acc = (acc << 6) | (uint32_t)v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            buf_ch(&b, (char)((acc >> bits) & 255));
+        unsigned char c = (unsigned char)s[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        if (finished) goto invalid;
+        int v = c == '=' ? -2 : b64v(c);
+        if (v == -1) goto invalid;
+        group[count++] = v;
+        if (count == 4) {
+            if (group[0] < 0 || group[1] < 0 ||
+                (group[2] == -2 && group[3] != -2)) goto invalid;
+            unsigned a = (unsigned)((group[0] << 2) | (group[1] >> 4));
+            if (!a) goto invalid;
+            buf_ch(&b, (char)a);
+            if (group[2] >= 0) {
+                unsigned c2 = (unsigned)(((group[1] & 15) << 4) | (group[2] >> 2));
+                if (!c2) goto invalid;
+                buf_ch(&b, (char)c2);
+                if (group[3] >= 0) {
+                    unsigned c3 = (unsigned)(((group[2] & 3) << 6) | group[3]);
+                    if (!c3) goto invalid;
+                    buf_ch(&b, (char)c3);
+                }
+            }
+            finished = group[3] == -2;
+            count = 0;
         }
     }
+    if (count) goto invalid;
     char *tight = realloc(b.data, b.len + 1);
     if (tight) b.data = tight;
     return b.data;
+invalid:
+    buf_free(&b);
+    return NULL;
 }

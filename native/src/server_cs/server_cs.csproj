@@ -29,6 +29,8 @@
 
   <ItemGroup>
     <Compile Include="..\core\*.cs" Link="core\%(Filename)%(Extension)" />
+    <!-- 只读审计从现有程序集中调用 Unity 纯解析器；服务端翻译/缓存不使用此规则。 -->
+    <Compile Include="..\..\..\payloads\UnityTranslator\src\TmpRichText.cs" Link="audit\TmpRichText.cs" />
   </ItemGroup>
 
   <ItemGroup>

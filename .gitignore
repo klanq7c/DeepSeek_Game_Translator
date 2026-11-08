@@ -72,6 +72,8 @@ payloads/UnityIL2CPP/DeepSeekTMPFontFallback/src/UnityInteropRefs/
 .vscode/
 .cursor/
 .claude/
+.workbuddy/
+.workbuddy-ai/
 
 # dotnet build regenerates this app.config next to the C# server; runtime does not need it
 native/dst_server_cs.exe.config

@@ -58,9 +58,11 @@ namespace DstLauncher
         /* file_matches_bytes：大小相同且逐块（64 KiB）比较相同。打不开/读不满/不同都为 false。 */
         private static bool FileMatchesBytes(string path, byte[] data)
         {
+            string native;
+            if (!SafeFs.TryFileApiPath(path, out native)) return false;
             FileStream fs;
             try {
-                fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                fs = new FileStream(native, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             } catch (IOException) {
                 return false; /* CreateFileW 失败：不存在或被独占 */
             } catch (UnauthorizedAccessException) {

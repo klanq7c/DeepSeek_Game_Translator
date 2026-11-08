@@ -1,6 +1,7 @@
 using System;
 using System.Text;
 using DstLauncher;
+[assembly: System.Runtime.Versioning.TargetFramework(".NETFramework,Version=v4.7.2")]
 class ApiModelsProbe
 {
     static int Main(string[] args)
@@ -12,7 +13,11 @@ class ApiModelsProbe
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static).Invoke(null,
             new object[] { args[1], args[2], int.Parse(args[3]) }) : ApiModels.Fetch(args[1], args.Length > 2 ? args[2] : "");
         Console.WriteLine("count=" + r.Items.Length); Console.WriteLine(r.Message);
-        foreach (string id in r.Items) Console.WriteLine(id);
+        for (int i = 0; i < r.Items.Length; i++) {
+            if (args[0] == "labels") {
+                Console.WriteLine(r.Items[i] + "\t" + r.Names[i]);
+            } else Console.WriteLine(r.Items[i]);
+        }
         return 0;
     }
 }

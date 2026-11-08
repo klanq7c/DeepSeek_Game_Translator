@@ -9,6 +9,7 @@
 #include "server_proc.h"
 #include "fsutil.h"
 #include "ui.h"
+#include "ui_operation.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -389,13 +390,8 @@ void stop_server(void) {
  *
  * 服务器按钮的回调：运行中则停止，否则启动。
  * ---------------------------------------------------------------- */
-void toggle_server(void) {
-    /* 一键翻译流程的工作线程正在执行 start_server/deploy 期间，拒绝并发
-       切换，避免与后台线程争抢 g_server_pi / g_server_started。 */
-    if (translation_flow_running()) {
-        set_status(L"\u72B6\u6001\uFF1A\u7FFB\u8BD1\u6D41\u7A0B\u6B63\u5728\u8FDB\u884C\uFF0C\u8BF7\u7A0D\u5019\u518D\u64CD\u4F5C\u670D\u52A1\u5668");
-        return;
-    }
+static void toggle_server_work(void *context) {
+    (void)context;
     if (g_server_started && server_alive()) {
         stop_server();
         if (g_server_started && server_alive()) {
@@ -408,4 +404,9 @@ void toggle_server(void) {
     set_status(L"\u6B63\u5728\u542F\u52A8\u670D\u52A1\u5668...");
     if (start_server()) set_status(L"\u72B6\u6001\uFF1A\u670D\u52A1\u5668\u8FD0\u884C\u4E2D");
     else set_status(L"\u72B6\u6001\uFF1A\u670D\u52A1\u5668\u542F\u52A8\u5931\u8D25");
+}
+
+void toggle_server(void) {
+    if (!ui_operation_reserve()) return;
+    ui_operation_start(toggle_server_work, NULL, NULL);
 }

@@ -43,6 +43,18 @@ var _dst_scene_controls = {}
 var _dst_scene_refresh_pending = 0
 var _dst_scene_draw_attempts = {}
 
+# 已完成的译文可保留英文人名，不能被巡检当作新的混合原文。
+var _dst_completed_outputs = {}
+var _dst_completed_order = []
+
+func _dst_note_completed_output(output):
+	if _dst_completed_outputs.has(output):
+		return
+	_dst_completed_outputs[output] = true
+	_dst_completed_order.append(output)
+	while _dst_completed_order.size() > DST_MAX_CACHE:
+		_dst_completed_outputs.erase(_dst_completed_order.pop_front())
+
 func _dst_scene_added(node):
 	_dst_track_control(node)
 	# 重用已 ready 的节点不会再次发出 ready，仍需在本次入树后恢复。
@@ -434,7 +446,15 @@ func _dst_done(result, response_code, headers, body, request_id):
 			_dst_report_error("batch-value", "request_id=%d query_chars=%d type=%d" % [request_id, query.length(), typeof(translated)])
 			_dst_mark_miss(query)
 		elif translated.strip_edges() != "" and translated != query:
-			_dst_cache_put(query, translated)
+			# 请求仅包含拆掉 BBCode 的正文；外部译文新增标签会覆盖当前颜色或链接。
+			# 共享缓存也供其他引擎使用，不能在上游改写；这里只拒绝显示缓存写入，
+			# 保留已有安全译文并按原有退避重试，batch-markup 记录请求上下文。
+			if _dst_translation_has_markup(translated):
+				_dst_report_error("batch-markup", "request_id=%d query_chars=%d translated_chars=%d" % [request_id, query.length(), translated.length()])
+				_dst_mark_miss(query)
+			else:
+				_dst_cache_put(query, translated)
+				_dst_note_completed_output(translated)
 		else:
 			_dst_mark_miss(query)
 	_dst_pump()
@@ -471,6 +491,30 @@ func _dst_render(source):
 
 func _dst_text_parts(source):
 	return _dst_split(source)
+
+# 与资源补丁层采用同一判定：保留字面括号，只拒绝引擎标签及自定义效果。
+func _dst_translation_has_markup(translated):
+	var known = ["b", "i", "u", "s", "code", "url", "img", "font", "font_size",
+		"color", "bgcolor", "fgcolor", "outline_size", "outline_color", "center", "left", "right",
+		"fill", "indent", "table", "cell", "ul", "ol", "li", "lb", "rb", "br", "p", "lang",
+		"opentype_features", "dropcap", "paragraph", "tab", "hr", "fade", "shake", "wave",
+		"tornado", "rainbow", "pulse"]
+	for part in _dst_text_parts(translated):
+		if not part.tag:
+			continue
+		# BBCode 内置标签区分大小写且名称必须完整；[B]、[b option] 属于字面提示。
+		var body = str(part.text).substr(1, str(part.text).length() - 2)
+		var closing = body.begins_with("/")
+		if closing:
+			body = body.substr(1, body.length() - 1)
+		if body == "" or "abcdefghijklmnopqrstuvwxyz".find(body.substr(0, 1).to_lower()) < 0:
+			continue
+		var name = body.split("=")[0].split(" ")[0]
+		if closing or body.find("=") >= 0 or body in known:
+			return true
+		if translated.find("[/" + name + "]") >= 0:
+			return true
+	return false
 
 # 只组合被内联样式拆开的可见词；不同链接之间仅组合带左右箭头的选择器。
 # 标签和链接标识原样保留，渲染与排队共用同一份逻辑文本，避免请求半词。
@@ -583,6 +627,11 @@ func _dst_render_groups(plan):
 				var suffix = max(0, end - cursor)
 				replacement += slot.substr(suffix, slot.length() - suffix)
 			plan.parts[index].text = replacement
+			# 长度改变会把保留的人名分到独立样式槽；按下一次扫描的实际键记住终态。
+			# 这里只记录当前已命中组的片段，未命中相邻组仍能继续发现和排队。
+			var completed_fragment = _dst_query(replacement)
+			if completed_fragment != "":
+				_dst_note_completed_output(completed_fragment)
 			cursor = slot_end
 		changed = true
 	var out = ""
@@ -658,13 +707,57 @@ func _dst_numeric_text(s):
 	return digit
 
 func _dst_plain_wanted(s):
-	if s.length() < 2 or s.length() > DST_MAX_TEXT or _dst_path_text(s) or _dst_numeric_text(s):
+	if _dst_completed_outputs.has(s):
+		return false
+	if s.length() < 2 or s.length() > DST_MAX_TEXT or _dst_numeric_text(s):
 		return false
 	var latin = false
 	for i in range(s.length()):
 		var c = s.unicode_at(i)
 		if c >= 0x4e00 and c <= 0x9fff:
-			return false
+			return _dst_mixed_latin(s)
 		if (c >= 65 and c <= 90) or (c >= 97 and c <= 122):
 			latin = true
-	return latin
+	return latin and not _dst_path_text(s)
+
+# 普通查询已由文本计划移除 BBCode；额外跳过字面按键和变量中的英文。
+func _dst_mixed_latin(s):
+	var i = 0
+	while i < s.length():
+		if s.substr(i, 2) == "__" or s.substr(i, 2) == "%(":
+			var marker = "__" if s.substr(i, 2) == "__" else ")"
+			var marker_end = s.find(marker, i + 2)
+			if marker_end >= 0:
+				i = marker_end + marker.length()
+				continue
+		var c = s.unicode_at(i)
+		if c == 91 or c == 123 or c == 60:
+			var delimiter = "]" if c == 91 else ("}" if c == 123 else ">")
+			var delimiter_end = s.find(delimiter, i + 1)
+			if delimiter_end >= 0:
+				i = delimiter_end + 1
+				continue
+		if (c >= 65 and c <= 90) or (c >= 97 and c <= 122):
+			var end = i
+			var lower = false
+			while end < s.length():
+				var letter = s.unicode_at(end)
+				if not ((letter >= 65 and letter <= 90) or (letter >= 97 and letter <= 122)):
+					break
+				lower = lower or (letter >= 97 and letter <= 122)
+				end += 1
+			var scheme = end
+			while scheme < s.length() and "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-".find(s.substr(scheme, 1)) >= 0:
+				scheme += 1
+			if s.substr(scheme, 1) == ":" and (s.substr(scheme + 1, 1) == "/" or s.substr(scheme + 1, 1) == "\\"):
+				# 与共享服务一致：URL/路径只延伸到可打印 ASCII 边界，全角标点后仍能补译。
+				i = scheme + 1
+				while i < s.length() and s.unicode_at(i) >= 33 and s.unicode_at(i) <= 126:
+					i += 1
+				continue
+			if (end - i >= 3 and lower) or end - i >= 4:
+				return true
+			i = end
+			continue
+		i += 1
+	return false

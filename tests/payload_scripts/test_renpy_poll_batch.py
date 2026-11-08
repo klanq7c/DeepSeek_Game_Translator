@@ -1,6 +1,7 @@
 """执行正式 Ren'Py 队列函数，不启动游戏或工作线程。"""
 
 import ast
+import json
 import random
 import sys
 import threading
@@ -13,6 +14,8 @@ HOOK = Path(__file__).resolve().parents[2] / "payloads/RenPy/iron_deepseek.rpy"
 FUNCTIONS = {
     "_ds_select_poll_batch", "_ds_queue_live", "_ds_forget_pending_locked",
     "_ds_live_loop", "_ds_note_pending_many", "_ds_evict_nonpriority_pending_locked",
+    "_ds_http", "_ds_prefetch_script_menus",
+    "_ds_poll_loop",
 }
 body = "\n".join(line[4:] if line else "" for line in HOOK.read_text(encoding="utf-8").splitlines()[1:])
 tree = ast.parse(body, str(HOOK))
@@ -104,6 +107,43 @@ def make_state(pending=(), priority=(), inflight=(), retry=()):
 
 
 class RenpyPollBatchTests(unittest.TestCase):
+    def test_real_live_and_prefetch_requests_preserve_original_keys_and_engine_hint(self):
+        class StopWorker(BaseException):
+            pass
+
+        class Wake:
+            def __init__(self): self.waits = 0
+            def wait(self):
+                self.waits += 1
+                if self.waits > 1: raise StopWorker()
+            def clear(self): pass
+
+        requests = []
+        source, translated = '请按 [[Continue]，保留[player]。', '请按 [[继续]，保留[player]。'
+        def request(url, data, headers):
+            requests.append((url, json.loads(data.decode('utf-8'))))
+            return SimpleNamespace(url=url)
+        def open_request(req, timeout):
+            reply = {'translations': {source: translated}, 'sources': ['api_batch']} if req.url.endswith('/batch') else {'status': 'queued'}
+            return SimpleNamespace(read=lambda: json.dumps(reply).encode('utf-8'))
+        ns = make_state([source], [source], [source])
+        memo, errors = [], []
+        ns.update({'_ds_json': json, '_ds_Request': request, '_ds_urlopen': open_request,
+                   '_ds_memo_put': lambda key, value, now: memo.append((key, value)),
+                   '_ds_restore_renpy_tokens': lambda key, value: value,
+                   '_ds_refresh_interaction': lambda keys: None,
+                   '_ds_report_exception': lambda *args: errors.append(args),
+                   '_ds_collect_script_menu_labels': lambda: [source]})
+        with self.assertRaises(StopWorker):
+            ns['_ds_live_loop']([source], Wake(), 16)
+        ns['_ds_prefetch_script_menus']()
+        self.assertEqual(requests, [
+            ('http://127.0.0.1:19999/batch', {'texts': [source], 'engine': 'renpy'}),
+            ('http://127.0.0.1:19999/prefetch', {'texts': [source], 'engine': 'renpy'}),
+        ])
+        self.assertEqual(memo, [(source, translated)])
+        self.assertEqual(errors, [])
+
     def test_priority_order_and_retry_deadline_before_background(self):
         ns = make_state(
             pending=["background-first", "priority-late", "priority-first", "busy", "future", "background-last"],
@@ -176,7 +216,7 @@ class RenpyPollBatchTests(unittest.TestCase):
 
     def test_promotion_keeps_existing_retry_and_deduplicates_priority(self):
         ns = make_state(["background", "dialogue"], retry=[("dialogue", 11.0)])
-        ns.update({"_ds_string_types": (str,), "_ds_has_cjk": lambda _: False,
+        ns.update({"_ds_string_types": (str,), "_ds_has_cjk": lambda _: False, "_ds_is_localized": lambda _: False,
                    "_ds_is_terminal_negative": lambda *_: False, "_ds_memo": {},
                    "_ds_memo_put": lambda *_: None})
         ns["_ds_note_pending_many"](["dialogue", "dialogue"], True)
@@ -208,7 +248,7 @@ class RenpyPollBatchTests(unittest.TestCase):
             "_ds_memo_put": lambda key, value, now: memo.append((key, value)),
             "_ds_mark_terminal_negative": terminal.append,
             "_ds_restore_renpy_tokens": lambda key, value: value,
-            "_ds_refresh_interaction": lambda: refresh.append(True),
+            "_ds_refresh_interaction": lambda keys: refresh.append(list(keys)),
         })
         with self.assertRaises(StopWorker):
             ns["_ds_live_loop"](keys[:], Wake(), 16)
@@ -218,7 +258,35 @@ class RenpyPollBatchTests(unittest.TestCase):
         self.assertEqual(ns["_ds_select_poll_batch"](10.0), [])
         self.assertEqual(ns["_ds_select_poll_batch"](10.5), ["queued", "miss"])
         self.assertEqual(ns["_ds_pending"], {"queued": 1, "miss": 1})
-        self.assertEqual(refresh, [True])
+        self.assertEqual(refresh, [["translated"]])
+
+    def test_cache_poller_notifies_only_valid_restored_keys(self):
+        class StopWorker(BaseException):
+            pass
+        class Wake:
+            waits = 0
+            def wait(self):
+                self.waits += 1
+                if self.waits > 1: raise StopWorker()
+            def clear(self): pass
+        ns = make_state(['valid', 'invalid', 'missing'])
+        memo, terminal, refresh, errors = [], [], [], []
+        ns.update({
+            '_ds_wake': Wake(), '_ds_next_poll_delay': lambda: None,
+            '_ds_http': lambda *_: {'hits': {'valid': '译文', 'invalid': 'broken'}},
+            '_ds_restore_renpy_tokens': lambda key, value: key if key == 'invalid' else value,
+            '_ds_memo_put': lambda key, value, now: memo.append((key, value)),
+            '_ds_mark_terminal_negative': terminal.append,
+            '_ds_refresh_interaction': lambda keys: refresh.append(list(keys)),
+            '_ds_report_exception': lambda *args: errors.append(args),
+        })
+        with self.assertRaises(StopWorker): ns['_ds_poll_loop']()
+        self.assertEqual(memo, [('valid', '译文')])
+        self.assertEqual(terminal, ['invalid'])
+        self.assertEqual(refresh, [['valid']])
+        with ns['_ds_lock']:
+            self.assertEqual(set(ns['_ds_pending']), {'missing'})
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

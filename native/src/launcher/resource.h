@@ -15,5 +15,7 @@
 #define IDR_SCRIPT_RPGM_HOOK         302   /* 部署路径：payloads/RPGMaker/hook_rpgm_mv.js -> <content>/js/hook_rpgm_mv.js */
 #define IDR_SCRIPT_GODOT_RUNTIME_G3  303   /* payloads/Godot/dst_godot_runtime_g3.gd -> Godot 3 运行时侧车/补丁包 */
 #define IDR_SCRIPT_GODOT_RUNTIME_G4  304   /* payloads/Godot/dst_godot_runtime_g4.gd -> Godot 4 运行时侧车/补丁包 */
+#define IDR_SCRIPT_RPGM_IMAGE_OCR    305   /* RPG Maker 图片 OCR 工作进程 */
+#define IDR_SCRIPT_RPGM_IMAGE_TEXT   306   /* RPG Maker 通用图片文字模块 */
 
 #endif

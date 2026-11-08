@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 $ErrorActionPreference = 'Stop'
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $tokens = $null
@@ -6,7 +6,8 @@ $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $workspace 'scripts\verify_build_artifacts.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-$wanted = @('Get-FileSha256', 'Get-SourceFingerprint', 'Write-ManagedPayloadStamp')
+$wanted = @('Get-FileSha256', 'Get-SourceFingerprint', 'Write-ManagedPayloadStamp',
+    'Get-SourceFiles', 'Get-LinkedCompileSources', 'Get-ManagedPayloadDefinitions', 'Assert-ManagedPayloadFingerprint')
 $functions = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $false)
 foreach ($name in $wanted) {
     $function = @($functions | Where-Object Name -eq $name)
@@ -32,6 +33,7 @@ $mapping = $null
 $view = $null
 $mappedFile = $null
 $exclusive = $null
+$recipeRoot = Join-Path $fixtureRoot 'recipe'
 try {
     Write-ManagedPayloadStamp $definition
     $original = [IO.File]::ReadAllText($stampPath)
@@ -85,6 +87,38 @@ try {
         throw 'Write after lock release did not recover'
     }
     Write-Host '[PASS] next explicit write succeeds after lock ownership is released'
+
+    # 使用生产定义，而不是在夹具里手工假定 RecipeInputs 已包含新 helper。
+    $repo = $recipeRoot
+    [void][IO.Directory]::CreateDirectory((Join-Path $repo 'scripts'))
+    foreach ($name in @('build_managed_payloads.bat', 'stage_unity_references.ps1', 'install_runtime_payloads.ps1')) {
+        [IO.File]::Copy((Join-Path $workspace "scripts\$name"), (Join-Path $repo "scripts\$name"))
+    }
+    foreach ($relative in @('payloads\UnityTranslator\src', 'payloads\UnityTranslator\src\FontPatcher',
+        'payloads\UnityIL2CPP\DeepSeekXUnityTranslator\src', 'payloads\UnityIL2CPP\DeepSeekTMPFontFallback\src')) {
+        $directory = Join-Path $repo $relative
+        [void][IO.Directory]::CreateDirectory($directory)
+        [IO.File]::WriteAllText((Join-Path $directory 'Fixture.cs'), 'owned recipe fixture')
+    }
+    $definitions = @(Get-ManagedPayloadDefinitions)
+    if ($definitions.Count -ne 5) { throw 'Managed recipe definition coverage changed' }
+    foreach ($item in $definitions) {
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $item.Output))
+        [IO.File]::WriteAllText($item.Output, 'owned output')
+        Write-ManagedPayloadStamp $item
+    }
+    $script:errors = [Collections.Generic.List[string]]::new()
+    foreach ($item in $definitions) { Assert-ManagedPayloadFingerprint $item @($item.Inputs) }
+    if ($script:errors.Count) { throw ($script:errors -join '; ') }
+    $helperPath = Join-Path $repo 'scripts\stage_unity_references.ps1'
+    $helperTime = [IO.File]::GetLastWriteTimeUtc($helperPath)
+    [IO.File]::AppendAllText($helperPath, "`n# recipe fixture change`n")
+    [IO.File]::SetLastWriteTimeUtc($helperPath, $helperTime)
+    foreach ($item in (Get-ManagedPayloadDefinitions)) { Assert-ManagedPayloadFingerprint $item @($item.Inputs) }
+    if ($script:errors.Count -ne 5 -or @($script:errors | Where-Object { $_ -notmatch 'build recipe fingerprint does not match' }).Count) {
+        throw "Helper change did not invalidate exactly five real recipes: $($script:errors -join '; ')"
+    }
+    Write-Host '[PASS] helper content change invalidates all five production recipe definitions despite unchanged mtime'
 } finally {
     if ($exclusive) { $exclusive.Dispose() }
     if ($view) { $view.Dispose() }
@@ -94,6 +128,15 @@ try {
     $resolved = [IO.Path]::GetFullPath($fixtureRoot)
     if (-not $resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
         -not (Split-Path -Leaf $resolved).StartsWith('dst_stamp_write_')) { throw "Unexpected fixture root: $resolved" }
+    if (Test-Path -LiteralPath $recipeRoot) {
+        $resolvedRecipe = [IO.Path]::GetFullPath($recipeRoot)
+        if ($resolvedRecipe -ne (Join-Path $resolved 'recipe') -or
+            (Get-Item -LiteralPath $resolvedRecipe -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
+            @(Get-ChildItem -LiteralPath $resolvedRecipe -Recurse -Force | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) {
+            throw 'Unexpected recipe fixture path or reparse point; retained'
+        }
+        Remove-Item -LiteralPath $resolvedRecipe -Recurse -Force
+    }
     foreach ($entry in (Get-ChildItem -LiteralPath $resolved -Force)) {
         if ($entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             throw "Unexpected fixture entry, retained: $($entry.FullName)"

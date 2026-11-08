@@ -1,5 +1,5 @@
 ﻿# check_payload_scripts.ps1：检查由 build_native.bat 嵌入启动器的
-# 引擎运行时脚本（resource.h 301-304）；这些脚本由
+# 引擎运行时脚本（resource.h 301-306）；这些脚本由
 # deploy.c / godot_patch.c 原样写入游戏目录。
 #
 # 检查内容：
@@ -29,7 +29,9 @@ $scripts = @(
     @{ Id = 301; Path = 'payloads\RenPy\iron_deepseek.rpy';        Kind = 'renpy' },
     @{ Id = 302; Path = 'payloads\RPGMaker\hook_rpgm_mv.js';       Kind = 'js' },
     @{ Id = 303; Path = 'payloads\Godot\dst_godot_runtime_g3.gd';  Kind = 'gd3' },
-    @{ Id = 304; Path = 'payloads\Godot\dst_godot_runtime_g4.gd';  Kind = 'gd4' }
+    @{ Id = 304; Path = 'payloads\Godot\dst_godot_runtime_g4.gd';  Kind = 'gd4' },
+    @{ Id = 305; Path = 'payloads\RPGMaker\dst_rpgm_ocr.ps1';      Kind = 'ps1' },
+    @{ Id = 306; Path = 'payloads\RPGMaker\rpgm_image_text.js';    Kind = 'js' }
 )
 
 # --- 资源表一致性：resource.h、build_native.bat、verify_build_artifacts.ps1 ---
@@ -86,11 +88,17 @@ if ($python) {
     Check "renpy: bounded poll and shared-server pending behavior" ($LASTEXITCODE -eq 0) "$out"
     $out = & python (Join-Path $PSScriptRoot 'test_renpy_refresh_thread.py') 2>&1
     Check "renpy: legacy main-thread drain and late queued cache ownership" ($LASTEXITCODE -eq 0) "$out"
+    $out = & python (Join-Path $PSScriptRoot 'test_renpy_tokens.py') 2>&1
+    Check "renpy: escaped literals and interpolation survive worker/display restoration" ($LASTEXITCODE -eq 0) "$out"
+    $out = & python (Join-Path $PSScriptRoot 'test_renpy_inventory.py') 2>&1
+    Check "renpy: compiled dialogue, native language and main-thread inventory snapshot" ($LASTEXITCODE -eq 0) "$out"
     foreach ($runtimeName in @('RENPY7_RUNTIME', 'RENPY8_RUNTIME')) {
         $runtime = [Environment]::GetEnvironmentVariable($runtimeName)
         if ($runtime) {
             $out = & python (Join-Path $PSScriptRoot 'test_renpy_engine_runtime.py') --runtime $runtime 2>&1
             Check "renpy: actual Text lifecycle ($runtimeName)" ($LASTEXITCODE -eq 0) "$out"
+            $out = & python (Join-Path $PSScriptRoot 'test_renpy_fonts.py') --runtime $runtime 2>&1
+            Check "renpy: actual FontGroup and glyph pixels ($runtimeName)" ($LASTEXITCODE -eq 0) "$out"
         } else {
             Write-Host "  note actual RenPy Text checks require $runtimeName; boundary tests still run."
         }
@@ -99,6 +107,7 @@ if ($python) {
     Check "renpy: hook body parses as Python" $false "python not found on PATH"
     Check "renpy: bounded poll and shared-server pending behavior" $false "python not found on PATH"
     Check "renpy: legacy main-thread drain and late queued cache ownership" $false "python not found on PATH"
+    Check "renpy: escaped literals and interpolation survive worker/display restoration" $false "python not found on PATH"
 }
 # Ren'Py 7.x 使用 Python 2.7；拒绝仅 Python 3 支持的语法。
 $py3Only = @(
@@ -124,12 +133,31 @@ if ($node) {
     Check "rpgm: save display redraw and polluted slot guard" ($LASTEXITCODE -eq 0) "$out"
     $out = & node (Join-Path $repo 'tests\payload_scripts\test_rpgm_runtime_refresh.js') 2>&1
     Check "rpgm: queued UI, reconnect, completed dialogue and lifecycle bounds" ($LASTEXITCODE -eq 0) "$out"
+    $out = & node (Join-Path $repo 'tests\payload_scripts\test_rpgm_rich_renderer.js') 2>&1
+    Check "rpgm: custom character renderers and rich style preservation" ($LASTEXITCODE -eq 0) "$out"
+    $out = & node (Join-Path $repo 'tests\payload_scripts\test_rpgm_image_overrides.js') 2>&1
+    Check "rpgm: fingerprinted image text, original geometry and refresh stability" ($LASTEXITCODE -eq 0) "$out"
+    $out = & node --check (Join-Path $repo 'payloads\RPGMaker\rpgm_image_text.js') 2>&1
+    Check "rpgm: automatic image text module syntax" ($LASTEXITCODE -eq 0) "$out"
+    $out = & node (Join-Path $PSScriptRoot 'test_rpgm_auto_image_text.js') 2>&1
+    Check "rpgm: automatic OCR regions, rendering isolation and refresh ownership" ($LASTEXITCODE -eq 0) "$out"
+    $out = & node (Join-Path $PSScriptRoot 'test_rpgm_ocr_worker.js') 2>&1
+    Check "rpgm: actual Windows OCR protocol and independent synthetic layout" ($LASTEXITCODE -eq 0) "$out"
+    if ("$out" -match 'SKIP') { Write-Host "  note $out" }
 } else {
     Check "rpgm: hook passes node --check" $false "node not found on PATH"
     Check "rpgm: late plugin and CJK font guard" $false "node not found on PATH"
     Check "rpgm: save display redraw and polluted slot guard" $false "node not found on PATH"
     Check "rpgm: queued UI, reconnect, completed dialogue and lifecycle bounds" $false "node not found on PATH"
+    Check "rpgm: custom character renderers and rich style preservation" $false "node not found on PATH"
+    Check "rpgm: fingerprinted image text, original geometry and refresh stability" $false "node not found on PATH"
+    Check "rpgm: automatic image text module syntax" $false "node not found on PATH"
+    Check "rpgm: automatic OCR regions, rendering isolation and refresh ownership" $false "node not found on PATH"
+    Check "rpgm: actual Windows OCR protocol and independent synthetic layout" $false "node not found on PATH"
 }
+$ocrTokens = $null; $ocrErrors = $null
+$null = [Management.Automation.Language.Parser]::ParseInput((Get-Utf8Text 'payloads\RPGMaker\dst_rpgm_ocr.ps1'), [ref]$ocrTokens, [ref]$ocrErrors)
+Check "rpgm: Windows OCR worker PowerShell syntax" ($ocrErrors.Count -eq 0) "$ocrErrors"
 $rpgm = Get-Utf8Text 'payloads\RPGMaker\hook_rpgm_mv.js'
 Check "rpgm: hook is an IIFE in strict mode" ($rpgm.StartsWith("(function(){`n  'use strict';"))
 
@@ -174,6 +202,8 @@ if ($python) {
     Check "godot: logical picker words, partial hits and preserved links (source + configured runtimes)" ($LASTEXITCODE -eq 0) "$out"
     $out = & python (Join-Path $PSScriptRoot 'test_godot_http_contract.py') 2>&1
     Check "godot: HTTP response validation and paused request-pool recovery (configured runtimes)" ($LASTEXITCODE -eq 0) "$out"
+    $out = & python (Join-Path $PSScriptRoot 'test_godot_autoload_handshake.py') 2>&1
+    Check "godot: actual C/C# autoload generation and preloaded stdin handshake (configured runtimes)" ($LASTEXITCODE -eq 0) "$out"
     if (!$env:GODOT3_EXE -or !$env:GODOT4_EXE) {
         Write-Host '  note Godot scene runtime checks require GODOT3_EXE and GODOT4_EXE; only configured engines were run.'
     }
@@ -192,7 +222,11 @@ foreach ($s in $scripts) {
     if ($s.Kind -eq 'renpy') {
         foreach ($m in [Regex]::Matches($text, "_ds_http\('(/[A-Za-z_/]+)'")) { [void]$paths.Add($m.Groups[1].Value) }
     }
-    Check "$($s.Path): calls at least one server endpoint" ($paths.Count -gt 0)
+    if ($s.Id -eq 305 -or $s.Id -eq 306) {
+        Check "$($s.Path): OCR helper has no direct server or remote HTTP calls" ($paths.Count -eq 0 -and $text -notmatch 'https?://|Invoke-WebRequest|Invoke-RestMethod|XMLHttpRequest')
+    } else {
+        Check "$($s.Path): calls at least one server endpoint" ($paths.Count -gt 0)
+    }
     foreach ($p in $paths) {
         Check "$($s.Path): endpoint $p routed by C server" ($httpC.Contains("`"$p`""))
         Check "$($s.Path): endpoint $p routed by C# server" ($programCs.Contains("`"$p`""))

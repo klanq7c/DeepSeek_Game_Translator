@@ -25,11 +25,7 @@ namespace DstLauncher
         internal static IntPtr Title, Subtitle, PathLabel, Path, EngineLabel, ServerLabel, CacheLabel, Status, LogList;
         internal static IntPtr BtnServer, BtnApi, BtnRestore, BtnClearCache;
 
-        /* 一键翻译流程进行中标志（g_start_flow_running）：期间拒绝重复的开始/还原/
-           清缓存/服务器切换，避免重复部署或并发 patch worker 争抢同一个 pck。 */
-        private static volatile bool _startFlowRunning;
-
-        internal static bool TranslationFlowRunning { get { return _startFlowRunning; } }
+        internal static bool TranslationFlowRunning { get { return UiOperation.Busy; } }
 
         /* 日志水平滚动的最大像素宽度（随最长行动态增长） */
         private static int _logExtentPx;
@@ -261,20 +257,19 @@ namespace DstLauncher
         /* 只移除由本启动器部署的翻译文件（restore_selected_game）。 */
         internal static void RestoreSelectedGame()
         {
-            if (_startFlowRunning) {
-                Win32.MessageBoxW(Hwnd, "翻译流程正在进行中，请完成后再还原游戏。", "ds游戏翻译器", MbIconWarning);
-                return;
-            }
+            if (!UiOperation.Reserve()) return;
             string game = GetPathText();
             if (!SafeFs.IsDir(game)) {
-                Win32.MessageBoxW(Hwnd, "请先选择游戏目录。", "ds游戏翻译器", MbIconWarning);
+                ThemedMessage.Show(Hwnd, "请先选择游戏目录。", "ds游戏翻译器", MbIconWarning);
+                UiOperation.Cancel();
                 return;
             }
 
             Engine engine = EngineDetector.Detect(game);
             RefreshEngine();
             if (engine == Engine.Unknown) {
-                Win32.MessageBoxW(Hwnd, "无法识别游戏引擎，未执行还原。", "ds游戏翻译器", MbIconWarning);
+                ThemedMessage.Show(Hwnd, "无法识别游戏引擎，未执行还原。", "ds游戏翻译器", MbIconWarning);
+                UiOperation.Cancel();
                 return;
             }
 
@@ -282,32 +277,29 @@ namespace DstLauncher
                 "请先完全退出游戏，然后再执行还原。\n\n" +
                 "此操作只移除启动器部署的翻译文件，不会删除翻译缓存、用户模组或已有的 BepInEx。\n\n" +
                 "确定要还原当前游戏吗？";
-            if (Win32.MessageBoxW(Hwnd, message, "还原游戏", MbIconWarning | MbYesNo | MbDefButton2) != IdYes) return;
+            if (ThemedMessage.Show(Hwnd, message, "还原游戏", MbIconWarning | MbYesNo | MbDefButton2) != IdYes) {
+                UiOperation.Cancel();
+                return;
+            }
 
             LauncherConfig.SaveLastGameDir(game);
             Log.Append("开始还原：" + game + "（" + EngineDetector.Name(engine) + "）");
             Log.Status("正在还原游戏...");
-            bool ok = Deploy.Restore(game, engine) != 0;
-            Log.Status(ok ? "游戏还原完成。" : "游戏还原未完成，请查看日志。");
-            Win32.MessageBoxW(Hwnd,
-                ok ? "还原完成。翻译缓存、用户模组和已有运行时均已保留。"
-                   : "还原未完全完成，请查看启动器日志。未确认归属的文件已保留。",
-                "还原游戏", ok ? MbIconInformation : MbIconWarning);
+            bool ok = false;
+            UiOperation.Start(() => { ok = Deploy.Restore(game, engine) != 0; }, () => {
+                Log.Status(ok ? "游戏还原完成。" : "游戏还原未完成，请查看日志。");
+                ThemedMessage.Show(Hwnd,
+                    ok ? "还原完成。翻译缓存、用户模组和已有运行时均已保留。"
+                       : "还原未完全完成，请查看启动器日志。未确认归属的文件已保留。",
+                    "还原游戏", ok ? MbIconInformation : MbIconWarning);
+            });
         }
 
         /* 确认后删除共享翻译缓存（clear_translation_cache）。 */
-        internal static void ClearTranslationCache()
-        {
-            if (_startFlowRunning) {
-                Win32.MessageBoxW(Hwnd, "翻译流程正在进行中，请完成后再清除缓存。", "ds游戏翻译器", MbIconWarning);
-                return;
-            }
-            const string message =
-                "这会永久删除本机共享翻译缓存 translation_memory_c.tsv。\n\n" +
-                "清除后，已有译文需要重新请求 API。正在运行的游戏可能仍保留进程内存缓存，重启游戏后才会完全生效。\n\n" +
-                "API 配置、日志和游戏目录不会被删除。确定继续吗？";
-            if (Win32.MessageBoxW(Hwnd, message, "清除缓存", MbIconWarning | MbYesNo | MbDefButton2) != IdYes) return;
+        private sealed class ClearCacheResult { internal bool Cleared, Restarted; }
 
+        private static void ClearTranslationCacheWork(ClearCacheResult result)
+        {
             ServerProcess.RefreshStatus();
             bool wasRunning = ServerProcess.Started && ServerProcess.Alive();
             bool serverStopped = true;
@@ -325,29 +317,48 @@ namespace DstLauncher
             }
 
             string cachePath = PathUtil.Join(Launcher.Root, "translation_memory_c.tsv");
-            bool cleared = serverStopped && LaunchFlow.ClearCacheFile();
+            result.Cleared = serverStopped && LaunchFlow.ClearCacheFile();
 
-            bool restarted = true;
+            result.Restarted = true;
             if (wasRunning && serverStopped) {
                 Log.Status("正在重新启动本地服务...");
-                restarted = ServerProcess.Start();
+                result.Restarted = ServerProcess.Start();
             }
+            if (result.Cleared) Log.Append("共享翻译缓存已清除：" + cachePath);
+        }
+
+        private static void ClearTranslationCacheComplete(ClearCacheResult result)
+        {
             UpdateCacheCard();
 
-            if (cleared) Log.Append("共享翻译缓存已清除：" + cachePath);
-            if (cleared && restarted) {
+            if (result.Cleared && result.Restarted) {
                 Log.Status("缓存已清除。");
-                Win32.MessageBoxW(Hwnd, "共享翻译缓存已清除。正在运行的游戏请重启后再使用。",
+                ThemedMessage.Show(Hwnd, "共享翻译缓存已清除。正在运行的游戏请重启后再使用。",
                                   "清除缓存", MbIconInformation);
-            } else if (cleared) {
+            } else if (result.Cleared) {
                 Log.Status("缓存已清除，但本地服务重启失败。");
-                Win32.MessageBoxW(Hwnd, "缓存已清除，但本地服务重启失败，请查看日志。",
+                ThemedMessage.Show(Hwnd, "缓存已清除，但本地服务重启失败，请查看日志。",
                                   "清除缓存", MbIconWarning);
             } else {
                 Log.Status("缓存清除失败，请查看日志。");
-                Win32.MessageBoxW(Hwnd, "缓存清除失败，原缓存文件已保留，请查看日志。",
+                ThemedMessage.Show(Hwnd, "缓存清除失败，原缓存文件已保留，请查看日志。",
                                   "清除缓存", MbIconWarning);
             }
+        }
+
+        internal static void ClearTranslationCache()
+        {
+            if (!UiOperation.Reserve()) return;
+            const string message =
+                "这会永久删除本机共享翻译缓存 translation_memory_c.tsv。\n\n" +
+                "清除后，已有译文需要重新请求 API。正在运行的游戏可能仍保留进程内存缓存，重启游戏后才会完全生效。\n\n" +
+                "API 配置、日志和游戏目录不会被删除。确定继续吗？";
+            if (ThemedMessage.Show(Hwnd, message, "清除缓存", MbIconWarning | MbYesNo | MbDefButton2) != IdYes) {
+                UiOperation.Cancel();
+                return;
+            }
+            var result = new ClearCacheResult();
+            UiOperation.Start(() => ClearTranslationCacheWork(result), () => ClearTranslationCacheComplete(result));
         }
 
         /* 本地翻译服务未就绪时取消部署与游戏启动（report_server_start_failure）。 */
@@ -362,28 +373,21 @@ namespace DstLauncher
         private static void WarmupLaunchThread(object state)
         {
             var a = (Tuple<string, Engine>)state;
-            try {
-                if (!ServerProcess.Start()) {
-                    ReportServerStartFailure();
-                } else {
-                    LaunchFlow.RunAfterDeploy(a.Item1, a.Item2);
-                }
-            } finally {
-                _startFlowRunning = false;
+            if (!ServerProcess.Start()) {
+                ReportServerStartFailure();
+            } else {
+                LaunchFlow.RunAfterDeploy(a.Item1, a.Item2);
             }
         }
 
         /* 开始翻译主流程入口（start_translation）。 */
         internal static void StartTranslation()
         {
-            if (_startFlowRunning) {
-                Log.Append("翻译流程仍在进行中，已忽略重复的开始请求。");
-                Log.Status("翻译流程仍在进行中，请稍候。");
-                return;
-            }
+            if (!UiOperation.Reserve()) return;
             string game = GetPathText();
             if (!SafeFs.IsDir(game)) {
-                Win32.MessageBoxW(Hwnd, "请先选择游戏目录。", "ds游戏翻译器", MbIconWarning);
+                ThemedMessage.Show(Hwnd, "请先选择游戏目录。", "ds游戏翻译器", MbIconWarning);
+                UiOperation.Cancel();
                 return;
             }
             LauncherConfig.SaveLastGameDir(game);
@@ -392,15 +396,11 @@ namespace DstLauncher
             Log.Append("选择目录：" + game);
             Log.Append("识别引擎：" + EngineDetector.Name(e));
             Log.Status("正在启动服务并部署...");
-            _startFlowRunning = true;
 
             /* 把服务器启动、部署、预热（重 I/O + 同步 HTTP）和游戏启动全部放到
                工作线程，避免 UI 冻结。传入路径的私有副本，防止并发的路径框编辑
                在中途改变它。 */
-            var th = new Thread(WarmupLaunchThread);
-            th.IsBackground = true;
-            th.SetApartmentState(ApartmentState.STA);   /* LaunchFlow 用 ShellExecuteW（COM） */
-            th.Start(Tuple.Create(game, e));
+            UiOperation.Start(() => WarmupLaunchThread(Tuple.Create(game, e)));
         }
 
         /* ---------------- 窗口过程 ---------------- */
@@ -467,7 +467,7 @@ namespace DstLauncher
             } finally {
                 Win32.DragFinish(drop);
             }
-            if (_startFlowRunning) {
+            if (TranslationFlowRunning) {
                 Log.Append("拖放已忽略：翻译流程仍在进行中。");
                 Log.Status("翻译流程仍在进行中，请稍候。");
                 return;
@@ -583,6 +583,7 @@ namespace DstLauncher
                         Win32.KillTimer(hwnd, (UIntPtr)1);
                         RefreshEngine();
                     } else if ((long)wp == 2) {
+                        if (UiOperation.Poll()) { Win32.DestroyWindow(hwnd); return IntPtr.Zero; }
                         UiLayout.TickAnimation(hwnd);
                     }
                     return IntPtr.Zero;
@@ -675,7 +676,7 @@ namespace DstLauncher
                     HandleDropFiles(wp);
                     return IntPtr.Zero;
                 case Win32.WM_CLOSE:
-                    Win32.DestroyWindow(hwnd);
+                    if (UiOperation.RequestClose()) Win32.DestroyWindow(hwnd);
                     return IntPtr.Zero;
                 case Win32.WM_DESTROY:
                     UiPaint.FreeBackgroundBuffer();

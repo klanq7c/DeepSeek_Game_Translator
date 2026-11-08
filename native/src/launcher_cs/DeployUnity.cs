@@ -144,7 +144,7 @@ namespace DstLauncher
         /* detect_unity_major：扫描 *_Data\globalgamemanagers 前 4096 字节里形如 "2021." / "6000." 的版本前缀。 */
         private static int DetectUnityMajor(string dir)
         {
-            var entries = Win32Find.EnumerateOrNull(dir, "*_Data");
+            var entries = Win32Find.EnumerateOrNull(dir, "*_Data", true);
             if (entries == null) return 0;
             int major = 0;
             foreach (var fd in entries) {
@@ -277,7 +277,7 @@ namespace DstLauncher
 
         private static string FindUnityMscorlib(string dir)
         {
-            var entries = Win32Find.EnumerateOrNull(dir, "*_Data");
+            var entries = Win32Find.EnumerateOrNull(dir, "*_Data", true);
             if (entries == null) return null;
             foreach (var fd in entries) {
                 if ((fd.Attributes & SafeFs.FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
@@ -1043,7 +1043,7 @@ namespace DstLauncher
                 Log.Append("Restore: refused to enumerate " + label + " through a reparse point: " + installedDir);
                 return;
             }
-            var entries = Win32Find.EnumerateOrNull(payloadDir, "*");
+            var entries = Win32Find.EnumerateOrNull(payloadDir, "*", true);
             if (entries == null) {
                 int error = SafeFs.LastError;
                 stats.Preserved++;
@@ -1085,7 +1085,7 @@ namespace DstLauncher
             if (attr == SafeFs.INVALID_FILE_ATTRIBUTES || (attr & SafeFs.FILE_ATTRIBUTE_DIRECTORY) == 0
                 || (attr & SafeFs.FILE_ATTRIBUTE_REPARSE_POINT) != 0) return;
 
-            var entries = Win32Find.EnumerateOrNull(path, "*");
+            var entries = Win32Find.EnumerateOrNull(path, "*", true);
             if (entries != null) {
                 foreach (var fd in entries) {
                     if ((fd.Attributes & SafeFs.FILE_ATTRIBUTE_DIRECTORY) != 0) {

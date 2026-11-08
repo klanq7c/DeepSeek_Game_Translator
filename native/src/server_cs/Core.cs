@@ -258,6 +258,7 @@ namespace DstServerCs
             if (!File.Exists(path)) return 0;
             int n = 0;
             long oversized = 0;
+            long invalidRecords = 0;
             lock (opsLock) {
                 try {
                     using (var stream = new StreamReader(path, new UTF8Encoding(false))) {
@@ -276,7 +277,16 @@ namespace DstServerCs
                                 continue;
                             }
                             string k, v;
-                            if (!CacheCodec.TryDecodeLine(line, out k, out v)) continue; // 损坏/超长/回显：跳过
+                            bool invalidEncoding;
+                            if (!CacheCodec.TryDecodeLine(line, out k, out v, out invalidEncoding)) {
+                                if (invalidEncoding) {
+                                    invalidRecords++;
+                                    if (invalidRecords <= 3 || (invalidRecords & (invalidRecords - 1)) == 0)
+                                        Console.Error.WriteLine("[cache] load-record-invalid skipped (count="
+                                            + invalidRecords + ", path=" + path + ")");
+                                }
+                                continue;
+                            }
                             map[k] = v;
                             unpersisted.Remove(k);
                             n++;

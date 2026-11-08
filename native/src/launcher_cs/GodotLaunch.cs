@@ -104,6 +104,16 @@ namespace DstLauncher
         private static extern bool ReadFile(SafeFileHandle handle, byte[] buffer, uint toRead,
                                             out uint read, IntPtr overlapped);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreatePipe(out SafeFileHandle reader, out SafeFileHandle writer,
+                                               ref SECURITY_ATTRIBUTES attributes, uint size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool WriteFile(SafeFileHandle handle, byte[] buffer, uint toWrite,
+                                             out uint written, IntPtr overlapped);
+
         private const uint WAIT_OBJECT_0 = 0;
         private const uint WAIT_TIMEOUT = 258;
         private const uint CREATE_NO_WINDOW = 0x08000000;
@@ -117,7 +127,7 @@ namespace DstLauncher
            lpApplicationName = exe，lpCommandLine = 完整命令行（含 argv[0]）。 */
         private static bool CreateProcess(string exe, string cmd, string cwd, uint flags,
                                           bool hideWindow, bool inherit, IntPtr stdOut,
-                                          out PROCESS_INFORMATION pi)
+                                          out PROCESS_INFORMATION pi, IntPtr stdIn = default(IntPtr))
         {
             var si = new STARTUPINFOW();
             si.cb = Marshal.SizeOf(typeof(STARTUPINFOW));
@@ -127,7 +137,7 @@ namespace DstLauncher
             }
             if (stdOut != IntPtr.Zero) {
                 si.dwFlags |= STARTF_USESTDHANDLES;
-                si.hStdInput = GetStdHandle(-10 /* STD_INPUT_HANDLE */);
+                si.hStdInput = stdIn != IntPtr.Zero ? stdIn : GetStdHandle(-10 /* STD_INPUT_HANDLE */);
                 si.hStdOutput = stdOut;
                 si.hStdError = stdOut;
             }
@@ -217,6 +227,46 @@ namespace DstLauncher
             return ok;
         }
 
+        // 只保留短行及 ready 状态，凭据跨读取边界或启动日志很长时也能识别。
+        private sealed class AutoloadProofState
+        {
+            public readonly byte[] Line = new byte[64];
+            public int Used;
+            public bool Dropped, ReadySeen;
+        }
+
+        private static bool ProofLineEquals(AutoloadProofState state, int size, string value)
+        {
+            if (size != value.Length) return false;
+            for (int i = 0; i < size; i++) if (state.Line[i] != value[i]) return false;
+            return true;
+        }
+
+        private static bool ConsumeAutoloadProof(AutoloadProofState state, byte[] output, int count)
+        {
+            const string ready = "DST_GODOT_AUTOLOAD_READY_V1";
+            const string ack = "DST_GODOT_AUTOLOAD_ACK_V2";
+            for (int i = 0; i < count; i++) {
+                byte ch = output[i];
+                if (ch == '\n') {
+                    int size = state.Used;
+                    if (size > 0 && state.Line[size - 1] == '\r') size--;
+                    bool acknowledged = false;
+                    if (!state.Dropped) {
+                        if (ProofLineEquals(state, size, ready)) state.ReadySeen = true;
+                        else if (state.ReadySeen && ProofLineEquals(state, size, ack)) acknowledged = true;
+                    }
+                    state.Used = 0;
+                    state.Dropped = false;
+                    if (acknowledged) return true;
+                } else if (!state.Dropped) {
+                    if (ch == 0 || state.Used == state.Line.Length) { state.Dropped = true; state.Used = 0; }
+                    else state.Line[state.Used++] = ch;
+                }
+            }
+            return false;
+        }
+
         /* godot_runtime_autoload_preflight：format 3 补丁包把翻译器注册为 autoload，
            匹配的启动器自有可执行文件只需一个私有用户参数即可验证该路径可用。 */
         public static bool RuntimeAutoloadPreflight(string dir, string runtimeExe, string pack)
@@ -227,7 +277,7 @@ namespace DstLauncher
             sig.AddFile(runtimeExe);
             if (pack != null) sig.AddFile(pack);
             sig.AddText(dir);
-            sig.AddText("autoload-ready-v1");
+            sig.AddText("autoload-ready-v3-stdio-ack");
             string signature = sig.ToString();
             int cached = GodotPreflightCache.Get("autoload", signature);
             if (cached >= 0) {
@@ -266,64 +316,95 @@ namespace DstLauncher
                 if (capture != null) capture.Dispose();
                 return false;
             }
-            PROCESS_INFORMATION pi;
-            if (!CreateProcess(runtimeExe, cmd, dir, CREATE_NO_WINDOW, true, true, capture.DangerousGetHandle(), out pi)) {
-                Log.Append("Godot: runtime autoload preflight could not start. Windows error: " + SafeFs.LastError);
+            // 子进程创建前写入完整一行并关闭写端，只继承读端，不等待用户输入。
+            SafeFileHandle inputRead, inputWrite;
+            if (!CreatePipe(out inputRead, out inputWrite, ref inherit, 0)) {
+                Log.Append("Godot: runtime autoload preflight input pipe failed (Windows error " + Marshal.GetLastWin32Error() + ").");
+                if (inputRead != null) inputRead.Dispose();
+                if (inputWrite != null) inputWrite.Dispose();
                 reader.Dispose(); capture.Dispose();
                 return false;
             }
+            byte[] input = Encoding.ASCII.GetBytes("DST_GODOT_AUTOLOAD_CONTINUE_V2\n");
+            uint written;
+            if (!WriteFile(inputWrite, input, (uint)input.Length, out written, IntPtr.Zero) || written != input.Length) {
+                Log.Append("Godot: runtime autoload preflight input write failed (Windows error " + Marshal.GetLastWin32Error() + ").");
+                inputWrite.Dispose(); inputRead.Dispose();
+                reader.Dispose(); capture.Dispose();
+                return false;
+            }
+            inputWrite.Dispose();
+            PROCESS_INFORMATION pi;
+            if (!CreateProcess(runtimeExe, cmd, dir, CREATE_NO_WINDOW, true, true, capture.DangerousGetHandle(), out pi, inputRead.DangerousGetHandle())) {
+                Log.Append("Godot: runtime autoload preflight could not start. Windows error: " + SafeFs.LastError);
+                inputRead.Dispose();
+                reader.Dispose(); capture.Dispose();
+                return false;
+            }
+            inputRead.Dispose();
             CloseHandle(pi.hThread);
-            // 只证明脚本实际进入 _ready；探测进程由父进程停止，不触发游戏异步加载的退出竞争。
+            // _ready 后须读取专用输入并确认，才允许父进程停止独立探针。
+            // 避免主动退出与游戏异步加载竞争；握手不证明之后的游戏流程不会崩溃。
             var timer = Stopwatch.StartNew();
             uint waited;
             bool ok = false;
+            var proof = new AutoloadProofState();
+            var output = new byte[16384];
+            bool readFailed = false;
             do {
                 waited = WaitForSingleObject(pi.hProcess, 50);
-                var output = new byte[16384];
-                uint got;
-                if (!SetFilePointerEx(reader.SafeFileHandle, 0, IntPtr.Zero, 0) ||
-                    !ReadFile(reader.SafeFileHandle, output, (uint)output.Length, out got, IntPtr.Zero)) {
-                    Log.Append("Godot: runtime autoload preflight output read failed (Windows error " + Marshal.GetLastWin32Error() + ").");
-                    break;
+                // 读取位置持续前进；每轮至多 512 KiB，不让持续日志挤掉退出/期限检查。
+                for (int batch = 0; batch < 32; batch++) {
+                    uint got;
+                    if (!ReadFile(reader.SafeFileHandle, output, (uint)output.Length, out got, IntPtr.Zero)) {
+                        Log.Append("Godot: runtime autoload preflight output read failed (Windows error " + Marshal.GetLastWin32Error() + ").");
+                        readFailed = true;
+                        break;
+                    }
+                    if (waited == WAIT_TIMEOUT && ConsumeAutoloadProof(proof, output, (int)got)) { ok = true; break; }
+                    if (got < output.Length) break;
                 }
-                string text = Encoding.ASCII.GetString(output, 0, (int)got);
-                const string proof = "DST_GODOT_AUTOLOAD_READY_V1";
-                int pos = text.IndexOf(proof, StringComparison.Ordinal);
-                if (pos >= 0 && (pos == 0 || text[pos - 1] == '\n')) {
-                    int end = pos + proof.Length;
-                    if (end < text.Length && text[end] == '\r') end++;
-                    if (end < text.Length && text[end] == '\n' && waited == WAIT_TIMEOUT) { ok = true; break; }
-                }
+                if (ok || readFailed) break;
             } while (waited == WAIT_TIMEOUT && timer.ElapsedMilliseconds < 5000);
             uint exitCode = 1;
+            const uint probeStopCode = 0x44535450u;
+            bool stopRequested = false;
             // 游戏进程可能在等待返回后、读取证明时自行退出，无法由脚本保证存活。
             // 收尾前核对；停止失败时再区分退出与拒绝。退出证明作废且不入缓存，
-            // 日志保留真实退出码或查询错误，不能把外部崩溃隐藏成翻译模块已加载。
+            // Windows 可能接受对正在退出进程的结束请求；最终退出码必须匹配探针专用码，
+            // 才确认父进程收尾。日志保留真实退出码或查询错误，不确认外部崩溃的证明。
             if (waited == WAIT_TIMEOUT) waited = WaitForSingleObject(pi.hProcess, 0);
             if (waited == WAIT_TIMEOUT) {
-                if (!TerminateProcess(pi.hProcess, 1)) {
+                if (!TerminateProcess(pi.hProcess, probeStopCode)) {
                     int stopError = Marshal.GetLastWin32Error();
                     ok = false;
-                    if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) waited = WAIT_OBJECT_0;
+                    // 退出清理可能先拒绝结束请求、后将进程句柄置为有信号；等待实际退出事件。
+                    // 期限内未完成仍报告原始停止错误，不将就绪证明作为成功。
+                    if (WaitForSingleObject(pi.hProcess, 1000) == WAIT_OBJECT_0) waited = WAIT_OBJECT_0;
                     else Log.Append("Godot: runtime autoload preflight probe termination failed (Windows error " + stopError + ").");
                 } else {
-                    uint stopped = WaitForSingleObject(pi.hProcess, 1000);
-                    if (stopped != WAIT_OBJECT_0) {
-                        uint stopError = stopped == 0xffffffffu ? (uint)Marshal.GetLastWin32Error() : stopped;
+                    stopRequested = true;
+                    waited = WaitForSingleObject(pi.hProcess, 1000);
+                    if (waited != WAIT_OBJECT_0) {
+                        uint stopError = waited == 0xffffffffu ? (uint)Marshal.GetLastWin32Error() : waited;
                         Log.Append("Godot: runtime autoload preflight probe termination failed (Windows error " + stopError + ").");
                         ok = false;
                     }
                 }
-                if (waited == WAIT_TIMEOUT) {
+            }
+            if (waited == WAIT_OBJECT_0) {
+                if (!GetExitCodeProcess(pi.hProcess, out exitCode)) {
+                    ok = false;
+                    Log.Append("Godot: runtime autoload preflight exit code read failed (Windows error " + Marshal.GetLastWin32Error() + ").");
+                } else if (!stopRequested || exitCode != probeStopCode) {
+                    ok = false;
+                    Log.Append("Godot: runtime autoload preflight exited with code " + exitCode + ".");
+                } else {
                     Log.Append(ok ? "Godot: runtime autoload load proof confirmed; independent probe stopped."
                         : "Godot: runtime autoload preflight timed out without a load proof.");
                 }
-            }
-            if (waited == WAIT_OBJECT_0) {
+            } else if (waited == WAIT_TIMEOUT) {
                 ok = false;
-                if (GetExitCodeProcess(pi.hProcess, out exitCode))
-                    Log.Append("Godot: runtime autoload preflight exited with code " + exitCode + ".");
-                else Log.Append("Godot: runtime autoload preflight exit code read failed (Windows error " + Marshal.GetLastWin32Error() + ").");
             } else if (waited != WAIT_TIMEOUT) {
                 ok = false;
                 Log.Append("Godot: runtime autoload preflight wait failed (Windows error " + Marshal.GetLastWin32Error() + ").");

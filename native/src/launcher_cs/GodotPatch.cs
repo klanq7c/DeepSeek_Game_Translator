@@ -693,7 +693,7 @@ namespace DstLauncher
             if (s == null) return false;
             int n = s.Length;
             if (n < 2 || n > MaxSourceTextBytes) return false;
-            if (HasCjkUtf8(s)) return false;
+            if (HasCjkUtf8(s) && !DstCore.MixedText.HasUntranslatedLatin(s)) return false;
             if (s == "RSRC" || s == "OptimizedTranslation" ||
                 s == "Translation" || s == "messages" ||
                 s == "locale" || s == "strings" ||
@@ -744,6 +744,34 @@ namespace DstLauncher
 
         /* 静态文本资源与 GDScript 常量进入同一套 BBCode/格式化渲染器：括号必须配对，
            printf 风格令牌必须与原文一致，否则保留原字符串。 */
+        private static string NextBbcode(string text, ref int cursor)
+        {
+            const string known = "|b|i|u|s|code|url|img|font|font_size|color|bgcolor|fgcolor|outline_size|outline_color|center|left|right|fill|indent|table|cell|ul|ol|li|lb|rb|br|p|lang|opentype_features|dropcap|paragraph|tab|hr|fade|shake|wave|tornado|rainbow|pulse|";
+            int start;
+            while ((start = text.IndexOf('[', cursor)) >= 0) {
+                int end = text.IndexOf(']', start + 1);
+                if (end < 0) { cursor = text.Length; return null; }
+                cursor = end + 1;
+                int nameStart = start + 1;
+                bool closing = nameStart < end && text[nameStart] == '/';
+                if (closing) nameStart++;
+                int p = nameStart;
+                while (p < end && ((text[p] >= 'a' && text[p] <= 'z') || (text[p] >= 'A' && text[p] <= 'Z')
+                    || (text[p] >= '0' && text[p] <= '9') || text[p] == '_')) p++;
+                int n = p - nameStart;
+                if (n == 0 || n > 63 || !((text[nameStart] >= 'a' && text[nameStart] <= 'z')
+                    || (text[nameStart] >= 'A' && text[nameStart] <= 'Z'))) continue;
+                bool tag = closing || (p < end && text.IndexOf('=', p, end - p) >= 0);
+                if (p == end) {
+                    string name = text.Substring(nameStart, n);
+                    tag |= known.IndexOf("|" + name + "|", StringComparison.Ordinal) >= 0
+                        || text.IndexOf("[/" + name + "]", end + 1, StringComparison.Ordinal) >= 0;
+                }
+                if (tag) return text.Substring(start, end - start + 1);
+            }
+            return null;
+        }
+
         internal static bool TextTranslationPreservesFormat(string source, string translated)
         {
             if (source == null || translated == null) return false;
@@ -754,6 +782,12 @@ namespace DstLauncher
                 if (brackets < 0) return false;
             }
             if (brackets != 0) return false;
+            int srcCursor = 0, outCursor = 0;
+            for (;;) {
+                string srcTag = NextBbcode(source, ref srcCursor), outTag = NextBbcode(translated, ref outCursor);
+                if (!string.Equals(srcTag, outTag, StringComparison.Ordinal)) return false;
+                if (srcTag == null) break;
+            }
             if (CountSubstr(source, "%s") != CountSubstr(translated, "%s")) return false;
             if (CountSubstr(source, "%d") != CountSubstr(translated, "%d")) return false;
             return true;

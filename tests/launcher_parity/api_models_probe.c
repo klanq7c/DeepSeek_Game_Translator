@@ -18,6 +18,10 @@ int wmain(int argc, WCHAR **argv) {
     if (!wcscmp(argv[1], L"catalog") && argc == 5) fetch_catalog(argv[2], argv[3], _wtoi(argv[4]), &r);
     else api_models_fetch(argv[2], argc > 3 ? argv[3] : L"", &r);
     printf("count=%d\n", r.count); print(r.message);
-    for (int i = 0; i < r.count; i++) print(r.items[i]);
+    for (int i = 0; i < r.count; i++) {
+        if (!wcscmp(argv[1], L"labels")) {
+            WCHAR label[520]; _snwprintf(label, 520, L"%s\t%s", r.items[i].id, r.items[i].name); print(label);
+        } else print(r.items[i].id);
+    }
     api_models_free(&r); return 0;
 }

@@ -190,6 +190,13 @@ namespace DstCore
             private int ParseHex4()
             {
                 if (i + 4 > s.Length) throw new ParseException("truncated \\u escape");
+                // HexNumber 会接受首尾空白；外部目录/响应的严格模式必须是四个十六进制字符。
+                if (strict) for (int n = 0; n < 4; n++) {
+                    char ch = s[i + n];
+                    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
+                          || (ch >= 'A' && ch <= 'F')))
+                        throw new ParseException("invalid \\u escape");
+                }
                 int v;
                 if (!int.TryParse(s.Substring(i, 4), NumberStyles.HexNumber,
                                   CultureInfo.InvariantCulture, out v)) {

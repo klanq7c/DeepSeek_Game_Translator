@@ -276,7 +276,13 @@ namespace DstLauncher
             return PathUtil.EqualsNoCase(name.Substring(p), ".json");
         }
 
-        /* parse_rpgm_json_file：线性扫描 key/value，不建完整 JSON 树。 */
+        private struct RpgmCommandFields
+        {
+            public int Code;
+            public int Parameters;
+        }
+
+        /* 只暂存当前对象的命令字段，闭合时配对；不依赖 JSON 属性次序。 */
         private static void ParseRpgmJsonFile(string path, TextList prefetch)
         {
             if (!SafeFs.FileSizeAtMost(path, RpgmJsonScanMaxBytes)) return;
@@ -289,11 +295,39 @@ namespace DstLauncher
             int end = ByteStr.CStrLen(buf);
             int p = 0;
             if (buf.Length >= 3 && buf[0] == 0xef && buf[1] == 0xbb && buf[2] == 0xbf) p = 3;
-            int lastCode = -1;
+            var objects = new RpgmCommandFields[128];
+            int depth = 0;
             var block = new RpgmMessageBlock();
 
             while (p < end) {
                 p = JsonWs(buf, end, p);
+                if (ByteStr.At(buf, end, p) == '{') {
+                    if (depth == objects.Length) {
+                        Log.Append("RPGM JSON 预热未完成：对象嵌套超过 128 层：" + path);
+                        break;
+                    }
+                    objects[depth++] = new RpgmCommandFields { Code = -1, Parameters = -1 };
+                    p++;
+                    continue;
+                }
+                if (ByteStr.At(buf, end, p) == '}') {
+                    if (depth > 0) {
+                        var fields = objects[--depth];
+                        if (fields.Parameters >= 0) {
+                            if (fields.Code == 101) {
+                                block.Flush(prefetch);
+                                block.Begin();
+                            } else if (fields.Code != 401) {
+                                block.Flush(prefetch);
+                            }
+                            if (RpgmTextCommand(fields.Code))
+                                CollectRpgmCommandParameters(fields.Code, buf, end, ref fields.Parameters, prefetch, block);
+                        }
+                    }
+                    p++;
+                    if (prefetch.Full) break;
+                    continue;
+                }
                 if (ByteStr.At(buf, end, p) != '"') {
                     p++;
                     continue;
@@ -308,18 +342,15 @@ namespace DstLauncher
                 v = JsonWs(buf, end, v + 1);
 
                 if (key == "code") {
-                    lastCode = Atoi(buf, end, v);
+                    if (depth > 0) objects[depth - 1].Code = Atoi(buf, end, v);
                 } else if (key == "parameters") {
-                    if (lastCode == 101) {
-                        block.Flush(prefetch);
-                        block.Begin();
-                    } else if (lastCode != 401) {
-                        block.Flush(prefetch);
+                    int after = RpgmPluginValueEnd(buf, end, v);
+                    if (after <= v) {
+                        Log.Append("RPGM JSON 预热未完成：parameters 格式不完整或嵌套过深：" + path);
+                        break;
                     }
-                    if (RpgmTextCommand(lastCode)) {
-                        CollectRpgmCommandParameters(lastCode, buf, end, ref v, prefetch, block);
-                    }
-                    lastCode = -1;
+                    if (depth > 0 && ByteStr.At(buf, end, v) == '[') objects[depth - 1].Parameters = v;
+                    v = after;
                 } else if (RpgmTextKey(key)) {
                     block.Flush(prefetch);
                     char vc = ByteStr.At(buf, end, v);

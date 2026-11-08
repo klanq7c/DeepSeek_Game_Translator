@@ -17,6 +17,7 @@
 #include "util.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,18 +92,37 @@ static int should_disable_deepseek_thinking(const ApiConfig *cfg) {
             !strncmp(cfg->model, "deepseek-v4-", strlen("deepseek-v4-")));
 }
 
+/* 只给标准本机 Ollama 路由添加专用参数；其他兼容提供方保留自己的请求形状。
+   回环地址、显式端口与路径一起校验，避免仅凭模型名误判云端或其他本地服务。 */
+static int is_local_ollama_endpoint(const char *endpoint) {
+    static const char path_name[] = "/v1/chat/completions";
+    if (!endpoint_is_loopback(endpoint)) return 0;
+    if (_strnicmp(endpoint, "http://", 7) && _strnicmp(endpoint, "https://", 8)) return 0;
+    const char *host = strstr(endpoint, "://") + 3;
+    const char *port = host + (host[0] == '[' ? 5 : 9);
+    if (strncmp(port, ":11434", 6)) return 0;
+    const char *path = port + 6;
+    size_t len = sizeof path_name - 1;
+    if (strncmp(path, path_name, len)) return 0;
+    const char *tail = path + len;
+    if (*tail == '/') tail++;
+    return *tail == 0 || *tail == '?' || *tail == '#';
+}
+
 /* 安全默认值：15s 超时、并发上限、DeepSeek 官方端点与模型。
    enabled 留给 api_config_load 在读到 key 后再置位。 */
 void api_config_init(ApiConfig *cfg) {
     memset(cfg, 0, sizeof *cfg);
     cfg->timeout_ms = 15000;
     cfg->concurrency = API_CONCURRENCY_MAX;
+    cfg->batch_max_items = 48;
+    cfg->batch_char_budget = 9600;
     snprintf(cfg->endpoint, sizeof cfg->endpoint, "%s", "https://api.deepseek.com/v1/chat/completions");
     snprintf(cfg->model, sizeof cfg->model, "%s", "deepseek-flash");
 }
 
 /* 从 ini [api] 段加载配置。GetPrivateProfileString 的默认值传当前字段值，
-   实现"未配置则沿用默认"。timeout/concurrency 做区间钳制，防止异常值。
+   实现"未配置则沿用默认"。超时、并发及批次预算做区间钳制，防止异常值。
    本地模型（Ollama/LM Studio 等回环端点）单批生成可能远慢于云 API：
    回环端点在未显式配置 timeout_ms 时默认 180s、上限放宽到 300s；
    远程端点维持 15s 默认与 60s 上限，防止慢接口拖垮前台队列。
@@ -140,6 +160,14 @@ int api_config_load(ApiConfig *cfg, const char *path) {
     cfg->concurrency = (int)GetPrivateProfileIntA("api", "concurrency", cfg->concurrency, path);
     if (cfg->concurrency < 1) cfg->concurrency = 1;
     if (cfg->concurrency > API_CONCURRENCY_MAX) cfg->concurrency = API_CONCURRENCY_MAX;
+    /* 回环模型默认缩小单批，减少小模型的生成延迟与 JSON 数组失配；预算按
+       原始输入的 UTF-8 字节累计，远程提供方保留既有 48 条/9600 字节行为。 */
+    cfg->batch_max_items = (int)GetPrivateProfileIntA("api", "batch_max_items", loopback ? 8 : 48, path);
+    if (cfg->batch_max_items < 1) cfg->batch_max_items = 1;
+    if (cfg->batch_max_items > 48) cfg->batch_max_items = 48;
+    cfg->batch_char_budget = (int)GetPrivateProfileIntA("api", "batch_char_budget", loopback ? 2048 : 9600, path);
+    if (cfg->batch_char_budget < 256) cfg->batch_char_budget = 256;
+    if (cfg->batch_char_budget > 9600) cfg->batch_char_budget = 9600;
     cfg->endpoint[sizeof cfg->endpoint - 1] = 0;
     cfg->model[sizeof cfg->model - 1] = 0;
     cfg->key[sizeof cfg->key - 1] = 0;
@@ -170,28 +198,6 @@ static int utf8_to_wide(const char *s, WCHAR *out, int cap) {
     if (!n) n = MultiByteToWideChar(CP_ACP, 0, s ? s : "", -1, out, cap);
     if (!n && cap > 0) out[0] = 0;
     return n != 0;
-}
-
-/* 扫描 UTF-8 判断是否含 CJK 汉字。已是中文的文本不必再翻译，
-   既省 API 调用又避免把中文翻坏。与 http.c 中 utf8_has_cjk 同源逻辑。 */
-static int has_cjk(const char *s) {
-    const unsigned char *p = (const unsigned char *)s;
-    while (*p) {
-        unsigned cp = 0;
-        if (*p < 0x80) {
-            cp = *p++;
-        } else if ((*p & 0xe0) == 0xc0 && p[1]) {
-            cp = ((*p & 0x1f) << 6) | (p[1] & 0x3f);
-            p += 2;
-        } else if ((*p & 0xf0) == 0xe0 && p[1] && p[2]) {
-            cp = ((*p & 0x0f) << 12) | ((p[1] & 0x3f) << 6) | (p[2] & 0x3f);
-            p += 3;
-        } else {
-            p++;
-        }
-        if (cp >= 0x4e00 && cp <= 0x9fff) return 1;
-    }
-    return 0;
 }
 
 /* 原地去掉首尾空白。 */
@@ -330,6 +336,9 @@ static void build_request(ApiConfig *cfg, const char *text, Buf *body) {
     if (should_disable_deepseek_thinking(cfg)) {
         buf_add(body, ",\"thinking\":{\"type\":\"disabled\"}");
     }
+    if (is_local_ollama_endpoint(cfg->endpoint)) {
+        buf_add(body, ",\"reasoning_effort\":\"none\"");
+    }
     buf_ch(body, '}');
     buf_free(&user);
     buf_free(&sys);
@@ -365,6 +374,9 @@ static void build_batch_request(ApiConfig *cfg, char **texts, size_t count, Buf 
     if (should_disable_deepseek_thinking(cfg)) {
         buf_add(body, ",\"thinking\":{\"type\":\"disabled\"}");
     }
+    if (is_local_ollama_endpoint(cfg->endpoint)) {
+        buf_add(body, ",\"reasoning_effort\":\"none\"");
+    }
     buf_ch(body, '}');
     buf_free(&user);
     buf_free(&sys);
@@ -377,8 +389,8 @@ static void build_batch_request(ApiConfig *cfg, char **texts, size_t count, Buf 
       再给出待翻译数组。
    只有至少一条 prev 非空时才会走本函数（调用方保证），无 prev 时上层退回
    build_batch_request，保证旧路径提示词字节级不变。 */
-static void build_ctx_request(ApiConfig *cfg, char **texts, const char *const *prevs,
-                              size_t count, Buf *body) {
+static void build_ctx_request(ApiConfig *cfg, char **texts, char **original_texts,
+                              const char *const *prevs, size_t count, Buf *body) {
     int max_tokens = estimate_max_tokens(texts, count);
 
     Buf user;
@@ -386,12 +398,15 @@ static void build_ctx_request(ApiConfig *cfg, char **texts, const char *const *p
     buf_add(&user, "Previous lines (context only, never translate or output them):\n");
     for (size_t i = 0; i < count; i++) {
         if (!prevs || !prevs[i] || !prevs[i][0]) continue;
-        /* 批内连续文本的 prev 就是前一条本身——已在数组里，跳过重复。 */
-        if (i > 0 && prevs[i - 1] && strcmp(prevs[i], texts[i - 1]) == 0) continue;
+        /* 先按原文去重再保护中文；不同汉字可能映射为相同占位符，不能按保护结果
+           判断相等。前一条是否另有 prev 不影响它已存在于待译数组这一事实。 */
+        if (i > 0 && strcmp(prevs[i], original_texts[i - 1]) == 0) continue;
         char idx[32];
         snprintf(idx, sizeof idx, "%zu: ", i);
         buf_add(&user, idx);
-        buf_add(&user, prevs[i]);
+        char *protected_prev = mixed_text_protect(prevs[i]);
+        buf_add(&user, protected_prev);
+        free(protected_prev);
         buf_ch(&user, '\n');
     }
     buf_add(&user, "\nTexts to translate:\n");
@@ -417,6 +432,9 @@ static void build_ctx_request(ApiConfig *cfg, char **texts, const char *const *p
     buf_int(body, max_tokens);
     if (should_disable_deepseek_thinking(cfg)) {
         buf_add(body, ",\"thinking\":{\"type\":\"disabled\"}");
+    }
+    if (is_local_ollama_endpoint(cfg->endpoint)) {
+        buf_add(body, ",\"reasoning_effort\":\"none\"");
     }
     buf_ch(body, '}');
     buf_free(&user);
@@ -459,6 +477,7 @@ typedef enum {
     API_DIAG_READ_BODY,
     API_DIAG_BODY_TOO_LARGE,
     API_DIAG_EMPTY_BODY,
+    API_DIAG_INVALID_RESPONSE,
     API_DIAG_MISSING_CONTENT,
     API_DIAG_EMPTY_CONTENT,
     API_DIAG_BATCH_SHAPE,
@@ -493,6 +512,7 @@ static ApiFailClass api_fail_class(ApiDiag reason, DWORD winhttp_error, DWORD st
             ? API_FAIL_SPLIT : API_FAIL_TERMINAL;
     case API_DIAG_BODY_TOO_LARGE:
     case API_DIAG_EMPTY_BODY:
+    case API_DIAG_INVALID_RESPONSE:
     case API_DIAG_MISSING_CONTENT:
     case API_DIAG_EMPTY_CONTENT:
     case API_DIAG_BATCH_SHAPE:
@@ -510,7 +530,7 @@ static void api_diag(ApiDiag reason, DWORD winhttp_error, DWORD status, const ch
         "endpoint-encoding", "key-encoding", "crack-url", "open-session",
         "connect", "open-request", "set-timeouts", "send", "receive",
         "query-status", "http-status", "query-body", "read-body",
-        "body-too-large", "empty-body", "missing-content", "empty-content",
+        "body-too-large", "empty-body", "invalid-response", "missing-content", "empty-content",
         "batch-shape"
     };
     g_api_last_fail = api_fail_class(reason, winhttp_error, status);
@@ -648,15 +668,225 @@ static int read_response(HINTERNET req, char **out) {
         buf_free(&b);
         return 0;
     }
+    /* 响应属于外部边界，坏 UTF-8 或原始 NUL 不能被替换/截断后当作成功译文。
+       只记录故障类别，不记录响应正文；原始错误保持失败并由现有拆分策略处理。 */
+    if (memchr(b.data, 0, b.len) ||
+        !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, b.data, (int)b.len, NULL, 0)) {
+        api_diag(API_DIAG_INVALID_RESPONSE, 0, 0, "invalid UTF-8 or NUL");
+        buf_free(&b);
+        return 0;
+    }
     *out = b.data;
     return 1;
+}
+
+/* 提供商响应必须是完整 JSON。仅用于这个外部边界，不改变游戏请求解析规则。
+   有界递归避免恶意嵌套撑爆栈；未知字段也检查语法，不能提取到 content 就忽略
+   截断的后半段。语法扫描保持原始跨度，只在提取协议字段时解码。 */
+static const char *api_json_ws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+static int api_json_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* 未使用的元数据允许 JSON 转义 NUL；实际译文必须可无损写成非 NUL UTF-8。
+   语法扫描不借用 json_str 的文本替换行为，避免合法元数据被误拒绝。 */
+static const char *api_json_string_end(const char *p, int translation) {
+    if (*p++ != '"') return NULL;
+    while (*p) {
+        unsigned char c = (unsigned char)*p++;
+        if (c == '"') return p;
+        if (c < 32) return NULL;
+        if (c != '\\') continue;
+        c = (unsigned char)*p++;
+        if (!c) return NULL;
+        if (c != 'u') {
+            if (!strchr("\"\\/bfnrt", c)) return NULL;
+            continue;
+        }
+        unsigned cp = 0;
+        for (int i = 0; i < 4; i++) {
+            int digit = api_json_hex(*p);
+            if (digit < 0) return NULL;
+            cp = cp * 16 + (unsigned)digit; p++;
+        }
+        if (!translation) continue;
+        if (!cp || (cp >= 0xdc00 && cp <= 0xdfff)) return NULL;
+        if (cp >= 0xd800 && cp <= 0xdbff) {
+            if (p[0] != '\\' || p[1] != 'u') return NULL;
+            p += 2; cp = 0;
+            for (int i = 0; i < 4; i++) {
+                int digit = api_json_hex(*p);
+                if (digit < 0) return NULL;
+                cp = cp * 16 + (unsigned)digit; p++;
+            }
+            if (cp < 0xdc00 || cp > 0xdfff) return NULL;
+        }
+    }
+    return NULL;
+}
+
+typedef struct { const char *object, *start, *end; } ApiJsonKey;
+typedef struct { ApiJsonKey *items; size_t count, cap; } ApiJsonKeys;
+
+/* 属性键按完整解码码点比较，保留 NUL 和非 BMP 字符；不使用固定长度缓冲。
+   输入已通过 UTF-8/JSON 校验，因此此处的转义和续字节均有完整边界。 */
+static unsigned api_json_key_char(const char **read) {
+    const unsigned char *p = (const unsigned char *)*read;
+    unsigned c = *p++;
+    if (c == '\\') {
+        c = *p++;
+        if (c == 'u') {
+            c = 0;
+            for (int k = 0; k < 4; k++) c = c * 16 + (unsigned)api_json_hex((char)*p++);
+            if (c >= 0xd800 && c <= 0xdbff && p[0] == '\\' && p[1] == 'u') {
+                unsigned lo = 0;
+                for (int k = 0; k < 4; k++) lo = lo * 16 + (unsigned)api_json_hex((char)p[k + 2]);
+                if (lo >= 0xdc00 && lo <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + lo - 0xdc00; p += 6; }
+            }
+        } else if (c == 'b') c = '\b'; else if (c == 'f') c = '\f';
+        else if (c == 'n') c = '\n'; else if (c == 'r') c = '\r'; else if (c == 't') c = '\t';
+    } else if (c >= 0xc0) {
+        int remaining = c < 0xe0 ? 1 : c < 0xf0 ? 2 : 3;
+        c &= remaining == 1 ? 31 : remaining == 2 ? 15 : 7;
+        while (remaining--) c = (c << 6) | (*p++ & 63);
+    }
+    *read = (const char *)p;
+    return c;
+}
+
+static int api_json_key_compare(const void *left, const void *right) {
+    const ApiJsonKey *a = left, *b = right;
+    if (a->object != b->object) return a->object < b->object ? -1 : 1;
+    const char *x = a->start, *y = b->start;
+    while (x < a->end && y < b->end) {
+        unsigned xc = api_json_key_char(&x), yc = api_json_key_char(&y);
+        if (xc != yc) return xc < yc ? -1 : 1;
+    }
+    return (x < a->end) - (y < b->end);
+}
+
+static const char *api_json_end(const char *p, int depth, ApiJsonKeys *keys) {
+    if (depth > 64) return NULL;
+    p = api_json_ws(p);
+    if (*p == '"') return api_json_string_end(p, 0);
+    if (*p == '{' || *p == '[') {
+        const char *owner = p;
+        int object = *p == '{';
+        char close = object ? '}' : ']';
+        p = api_json_ws(p + 1);
+        if (*p == close) return p + 1;
+        for (;;) {
+            if (object) {
+                if (*p != '"') return NULL;
+                const char *start = p + 1;
+                p = api_json_string_end(p, 0);
+                if (!p) return NULL;
+                if (keys) {
+                    if (keys->count == keys->cap) {
+                        keys->cap = keys->cap ? keys->cap * 2 : 64;
+                        keys->items = xrealloc(keys->items, keys->cap * sizeof *keys->items);
+                    }
+                    keys->items[keys->count++] = (ApiJsonKey){owner, start, p - 1};
+                }
+                p = api_json_ws(p);
+                if (*p != ':') return NULL;
+                p++;
+            }
+            p = api_json_end(p, depth + 1, keys);
+            if (!p) return NULL;
+            p = api_json_ws(p);
+            if (*p == close) return p + 1;
+            if (*p != ',') return NULL;
+            p = api_json_ws(p + 1);
+        }
+    }
+    if (!strncmp(p, "true", 4) || !strncmp(p, "null", 4)) return p + 4;
+    if (!strncmp(p, "false", 5)) return p + 5;
+    const char *number = p;
+    if (*p == '-') p++;
+    if (*p == '0') p++;
+    else {
+        if (*p < '1' || *p > '9') return NULL;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    if (*p == '.') {
+        p++;
+        if (*p < '0' || *p > '9') return NULL;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (*p < '0' || *p > '9') return NULL;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    /* C# 的数值表示是有限 double；未知数值元数据也不能一端接受、另一端拒绝。 */
+    return isfinite(strtod(number, NULL)) ? p : NULL;
+}
+
+/* 只提取当前对象的直接字段；重复协议字段视为歧义，不能按任意一个值成功。 */
+static const char *api_json_field(const char *p, const char *name) {
+    if (!p || *(p = api_json_ws(p)) != '{') return NULL;
+    const char *found = NULL;
+    p = api_json_ws(p + 1);
+    while (*p && *p != '}') {
+        const char *key_end = api_json_string_end(p, 0);
+        if (!key_end) return NULL;
+        char *key = json_str(&p);
+        int match = key && !strcmp(key, name);
+        free(key);
+        p = key_end;
+        p = api_json_ws(p);
+        if (*p != ':') return NULL;
+        p = api_json_ws(p + 1);
+        if (match) {
+            if (found) return NULL;
+            found = p;
+        }
+        p = api_json_end(p, 0, NULL);
+        if (!p) return NULL;
+        p = api_json_ws(p);
+        if (*p == '}') return found;
+        if (*p != ',') return NULL;
+        p = api_json_ws(p + 1);
+    }
+    return found;
+}
+
+static char *api_response_content(const char *raw) {
+    ApiJsonKeys keys = {0};
+    const char *end = api_json_end(raw, 0, &keys);
+    int valid = end && !*api_json_ws(end);
+    /* 整份响应大小已有 2 MiB 上限；每个键只占一个跨度，排序避免平方级去重。
+       未使用的元数据重复键也拒绝，和 C# ParseStrict 的失败策略一致。 */
+    if (valid && keys.count > 1) {
+        qsort(keys.items, keys.count, sizeof *keys.items, api_json_key_compare);
+        for (size_t i = 1; i < keys.count; i++) {
+            if (!api_json_key_compare(keys.items + i - 1, keys.items + i)) { valid = 0; break; }
+        }
+    }
+    free(keys.items);
+    if (!valid) return NULL;
+    const char *choices = api_json_field(raw, "choices");
+    if (!choices || *choices != '[') return NULL;
+    const char *first = api_json_ws(choices + 1);
+    const char *message = api_json_field(first, "message");
+    const char *content = api_json_field(message, "content");
+    return content && api_json_string_end(content, 1) ? json_str(&content) : NULL;
 }
 
 /* 发送一次 chat completions 请求并解析出 content 文本。
    流程：取通道 -> 准备 -> 开请求 -> 设超时 -> 加鉴权头 -> 发送+收响应 ->
    校验 2xx -> 读体 -> 取 content 字段 -> normalize。
    传输层失败时重置该通道（下次重建句柄）。返回 1=成功拿到非空译文。 */
-static int send_chat_request(ApiConfig *cfg, Buf *body, char **content_out) {
+static int send_chat_request(ApiConfig *cfg, Buf *body, const char *source, char **content_out) {
     ApiChannel *ch = api_acquire_channel(cfg);
     if (!api_prepare_locked(ch, cfg)) {
         ReleaseSRWLockExclusive(&ch->lock);
@@ -713,12 +943,12 @@ static int send_chat_request(ApiConfig *cfg, Buf *body, char **content_out) {
             if (!read_response(req, &raw)) {
                 transport_ok = 0;
             } else {
-                char *content = json_get_str(raw, "content");
+                char *content = api_response_content(raw);
                 if (!content) {
                     api_diag(API_DIAG_MISSING_CONTENT, 0, status, NULL);
                 } else {
                     normalize_translation(content);
-                    normalize_translation_result(content);
+                    normalize_translation_result_for_source(content, source);
                     if (*content) {
                         *content_out = content;
                         content = NULL;
@@ -759,7 +989,6 @@ static int parse_json_string_array(const char *json, List *out) {
             return 0;
         }
         normalize_translation(s);
-        normalize_translation_result(s);
         list_push(out, s);
         p = json_skipws(p);
         if (*p == ',') {
@@ -772,17 +1001,23 @@ static int parse_json_string_array(const char *json, List *out) {
     }
 }
 
-/* 翻译单条文本。前置守卫：未启用/空/已是中文 直接返回 0（不调 API）。
+/* 翻译单条文本。未启用或空文本直接返回 0；语言与引擎格式准入由 HTTP 层负责。
    成功时 *out 为新分配的译文，调用方负责 free。 */
 int api_translate(ApiConfig *cfg, const char *text, char **out) {
-    if (!cfg || !cfg->enabled || !text || !*text || has_cjk(text)) return 0;
+    if (!cfg || !cfg->enabled || !text || !*text) return 0;
 
     Buf body;
     buf_init(&body);
-    build_request(cfg, text, &body);
-
-    int ok = send_chat_request(cfg, &body, out);
+    char *protected_text = mixed_text_protect(text);
+    build_request(cfg, protected_text, &body);
+    int ok = send_chat_request(cfg, &body, protected_text, out);
+    free(protected_text);
     buf_free(&body);
+    if (ok) {
+        char *restored = mixed_text_restore(text, *out);
+        free(*out); *out = restored;
+        if (!restored) { api_diag(API_DIAG_BATCH_SHAPE, 0, 0, "mixed-cjk token mismatch"); ok = 0; }
+    }
     return ok;
 }
 
@@ -803,10 +1038,14 @@ int api_translate_batch(ApiConfig *cfg, char **texts, size_t count, char ***out)
 
     Buf body;
     buf_init(&body);
-    build_batch_request(cfg, texts, count, &body);
+    char **protected_texts = xcalloc(count, sizeof *protected_texts);
+    for (size_t i = 0; i < count; i++) protected_texts[i] = mixed_text_protect(texts[i]);
+    build_batch_request(cfg, protected_texts, count, &body);
+    for (size_t i = 0; i < count; i++) free(protected_texts[i]);
+    free(protected_texts);
 
     char *content = NULL;
-    int ok = send_chat_request(cfg, &body, &content);
+    int ok = send_chat_request(cfg, &body, NULL, &content);
     buf_free(&body);
     if (!ok) return 0;
 
@@ -821,6 +1060,14 @@ int api_translate_batch(ApiConfig *cfg, char **texts, size_t count, char ***out)
         return 0;
     }
 
+    for (size_t i = 0; i < count; i++) {
+        char *protected_source = mixed_text_protect(texts[i]);
+        normalize_translation_result_for_source(parsed.v[i], protected_source);
+        free(protected_source);
+        char *restored = mixed_text_restore(texts[i], parsed.v[i]);
+        if (!restored) { api_diag(API_DIAG_BATCH_SHAPE, 0, 0, "mixed-cjk token mismatch"); list_free(&parsed); return 0; }
+        free(parsed.v[i]); parsed.v[i] = restored;
+    }
     /* 接管 List 内的指针到裸数组，释放 List 容器但保留元素。 */
     char **arr = xmalloc(count * sizeof *arr);
     for (size_t i = 0; i < count; i++) {
@@ -895,10 +1142,15 @@ int api_translate_batch_ctx(ApiConfig *cfg, char **texts, const char *const *pre
 
     Buf body;
     buf_init(&body);
-    build_ctx_request(cfg, texts, prevs, count, &body);
+    char **protected_texts = xcalloc(count, sizeof *protected_texts);
+    for (size_t i = 0; i < count; i++) protected_texts[i] = mixed_text_protect(texts[i]);
+    /* 语境去重使用原文；构造器只在确认保留某条前文后保护其中的中文。 */
+    build_ctx_request(cfg, protected_texts, texts, prevs, count, &body);
+    for (size_t i = 0; i < count; i++) free(protected_texts[i]);
+    free(protected_texts);
 
     char *content = NULL;
-    int ok = send_chat_request(cfg, &body, &content);
+    int ok = send_chat_request(cfg, &body, NULL, &content);
     buf_free(&body);
     if (!ok) return 0;
 
@@ -913,6 +1165,14 @@ int api_translate_batch_ctx(ApiConfig *cfg, char **texts, const char *const *pre
         return 0;
     }
 
+    for (size_t i = 0; i < count; i++) {
+        char *protected_source = mixed_text_protect(texts[i]);
+        normalize_translation_result_for_source(parsed.v[i], protected_source);
+        free(protected_source);
+        char *restored = mixed_text_restore(texts[i], parsed.v[i]);
+        if (!restored) { api_diag(API_DIAG_BATCH_SHAPE, 0, 0, "mixed-cjk token mismatch"); list_free(&parsed); return 0; }
+        free(parsed.v[i]); parsed.v[i] = restored;
+    }
     char **arr = xmalloc(count * sizeof *arr);
     for (size_t i = 0; i < count; i++) {
         arr[i] = parsed.v[i];
@@ -949,9 +1209,15 @@ static void api_split_abort_diag(size_t remaining) {
    且每次都要等满 timeout_ms。最常见的"模型漏/多数组元素"部分失败场景，
    重试请求数仍是约 13 次。 */
 char **api_translate_split_retry(ApiConfig *cfg, char **texts,
-                                 const char *const *prevs, size_t count) {
+                                 const char *const *prevs, size_t count,
+                                 int (*yield_check)(void)) {
     char **arr = xcalloc(count, sizeof *arr);
     if (!arr || !cfg || !cfg->enabled || !texts || !count) return arr;
+
+    /* 每个子请求前让路：函数入口覆盖首次调用与每层递归，逐条兜底循环
+       在每个条目前单独检查。yield 命中时剩余槽位保持 NULL 返回，
+       条目由后台队列收尾遗忘、下次 miss 重新排队，不产生重复翻译。 */
+    if (yield_check && yield_check()) return arr;
 
     int has_prev = 0;
     for (size_t i = 0; i < count; i++) {
@@ -976,6 +1242,11 @@ char **api_translate_split_retry(ApiConfig *cfg, char **texts,
 
     if (count <= API_SPLIT_MIN_ITEMS) {
         for (size_t i = 0; i < count; i++) {
+            if (yield_check && yield_check()) {
+                /* 让路命中：剩余条目按 miss 遗忘（与终止类失败同一收尾语义）。 */
+                api_split_abort_diag(count - i);
+                break;
+            }
             char **one = NULL;
             int one_ok;
             g_api_last_fail = API_FAIL_NONE;
@@ -1002,8 +1273,8 @@ char **api_translate_split_retry(ApiConfig *cfg, char **texts,
     /* prevs 可为 NULL（api.h 未要求非空）：NULL + half 是未定义行为，且递归
        内 prevs[i] 会解引用一个小的伪地址。 */
     const char *const *prevs_right = prevs ? prevs + half : NULL;
-    char **a = api_translate_split_retry(cfg, texts, prevs, half);
-    char **b = api_translate_split_retry(cfg, texts + half, prevs_right, count - half);
+    char **a = api_translate_split_retry(cfg, texts, prevs, half, yield_check);
+    char **b = api_translate_split_retry(cfg, texts + half, prevs_right, count - half, yield_check);
     if (a) {
         memcpy(arr, a, half * sizeof *arr);
         free(a);

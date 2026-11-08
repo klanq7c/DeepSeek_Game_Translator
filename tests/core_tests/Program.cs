@@ -86,8 +86,22 @@ namespace DstCoreTests
             Check("should: japanese yes (non-ascii signal, no han)", TextRules.ShouldTranslate("はじめる"));
             Check("should: chinese no", !TextRules.ShouldTranslate("开始游戏"));
             Check("should: mixed with han no", !TextRules.ShouldTranslate("HP 值"));
+            Check("should: mixed sentence yes", TextRules.ShouldTranslate("请 Open the door."));
+            Check("should: short mixed label yes", TextRules.ShouldTranslate("点击 Continue"));
+            Check("should: uppercase mixed UI word yes", TextRules.ShouldTranslate("点击 SAVE"));
+            Check("should: target with markup only no", !TextRules.ShouldTranslate("<color=red>已翻译</color> [player]"));
             Check("should: numbers no", !TextRules.ShouldTranslate("100%"));
             Check("should: empty no", !TextRules.ShouldTranslate(""));
+            string mixed = "请 <color=red>Open the door</color>，玩家。";
+            string request = MixedText.Protect(mixed);
+            Check("mixed: Chinese is absent from provider request", !TextRules.HasCjk(request));
+            Check("mixed: tags and visible English stay intact", request.Contains("<color=red>Open the door</color>"));
+            string restored;
+            Check("mixed: Chinese restored exactly", MixedText.TryRestore(mixed, request.Replace("Open the door", "打开门"), out restored) && restored == mixed.Replace("Open the door", "打开门"));
+            Check("mixed: lost token rejected", !MixedText.TryRestore(mixed, "打开门", out restored));
+            Check("mixed: duplicate token rejected", !MixedText.TryRestore(mixed, request + request, out restored));
+            string collision = "已有 __DST_HAN0_0__ Continue";
+            Check("mixed: source token collision roundtrip", MixedText.TryRestore(collision, MixedText.Protect(collision).Replace("Continue", "继续"), out restored) && restored == collision.Replace("Continue", "继续"));
 
             // 译文完成判定：is_resolved_translation
             Check("resolved: different", TextRules.IsResolvedTranslation("Hello", "你好"));
@@ -145,6 +159,15 @@ namespace DstCoreTests
             foreach (var number in new[] { "01", "+1", ".1", "1.", "-01", "1e" })
                 Throws<Json.ParseException>("catalog strict number " + number, () => Json.ParseStrict(number));
             Check("catalog strict valid exponent", Json.ParseStrict("-1.25e+2") != null);
+            foreach (var escape in new[] { "\\u 041", "\\u004 ", "\\u+041", "\\u00G1" }) {
+                Throws<Json.ParseException>("strict invalid Unicode value " + escape,
+                    () => Json.ParseStrict("\"" + escape + "\""));
+                Throws<Json.ParseException>("strict invalid Unicode key " + escape,
+                    () => Json.ParseStrict("{\"" + escape + "\":1}"));
+            }
+            Eq("strict valid Unicode escape", "A", (string)Json.ParseStrict("\"\\u0041\""));
+            Eq("legacy Unicode leading space preserved", "A", (string)Json.Parse("\"\\u 041\""));
+            Eq("legacy Unicode trailing space preserved", "\u0004", (string)Json.Parse("\"\\u004 \""));
             Check("catalog strict nesting boundary", Json.ParseStrict(new string('[', 64) + "0" + new string(']', 64)) != null);
             Throws<Json.ParseException>("catalog strict depth rejected", () => Json.ParseStrict(new string('[', 65) + "0" + new string(']', 65)));
 
@@ -186,9 +209,31 @@ namespace DstCoreTests
         {
             Eq("codec: accept normal", "你好", CacheCodec.NormalizeForStore("Hello", "你好"));
             Eq("codec: strips echo before store", "你好", CacheCodec.NormalizeForStore("Hello", "翻译成简体中文：你好"));
+            Eq("codec: preserves Chinese prefix owned by original", "翻译成简体中文：打开门",
+               CacheCodec.NormalizeForStore("翻译成简体中文：Open the door", "翻译成简体中文：打开门"));
+            Eq("codec: preserves nested original prefixes", "翻译成简体中文：简体中文译文：继续",
+               CacheCodec.NormalizeForStore("翻译成简体中文：简体中文译文：Continue", "翻译成简体中文：简体中文译文：继续"));
+            Eq("codec: strips extra echo above original prefix", "翻译成简体中文：打开门",
+               CacheCodec.NormalizeForStore("翻译成简体中文：Open the door", "Simplified Chinese translation: 翻译成简体中文：打开门"));
+            Eq("codec: strips repeated extra echo above original prefix", "翻译成简体中文：打开门",
+               CacheCodec.NormalizeForStore("翻译成简体中文：Open the door", "翻译成简体中文：翻译成简体中文：打开门"));
+            Eq("codec: original English prefix can become Chinese", "简体中文翻译：请继续",
+               CacheCodec.NormalizeForStore("Simplified Chinese translation: 请 Continue", "简体中文翻译：请继续"));
+            Check("codec: original prompt-shaped identity rejected", CacheCodec.NormalizeForStore(
+                "翻译成简体中文：Continue", "翻译成简体中文：Continue") == null);
+            Check("codec: echoed prompt-shaped identity rejected", CacheCodec.NormalizeForStore(
+                "翻译成简体中文：Continue", "简体中文译文：翻译成简体中文：Continue") == null);
+            string ownedKey, ownedValue;
+            Check("codec: disk decode preserves original Chinese prefix", CacheCodec.TryDecodeLine(
+                CacheCodec.EncodeLine("翻译成简体中文：Continue", "翻译成简体中文：继续").TrimEnd('\n'), out ownedKey, out ownedValue)
+                && ownedKey == "翻译成简体中文：Continue" && ownedValue == "翻译成简体中文：继续");
             Check("codec: reject empty key", CacheCodec.NormalizeForStore("", "你好") == null);
             Check("codec: reject null key", CacheCodec.NormalizeForStore(null, "你好") == null);
             Check("codec: reject empty value", CacheCodec.NormalizeForStore("Hello", "") == null);
+            Check("codec: reject NUL key", CacheCodec.NormalizeForStore("Hello\0other", "你好") == null);
+            Check("codec: reject NUL value", CacheCodec.NormalizeForStore("Hello", "你好\0后半句") == null);
+            Check("codec: reject lone high surrogate", CacheCodec.NormalizeForStore("Hello\ud800", "你好") == null);
+            Check("codec: reject lone low surrogate", CacheCodec.NormalizeForStore("Hello", "你好\udc00") == null);
             Check("codec: reject identity (original echoed back)", CacheCodec.NormalizeForStore("Hello", "Hello") == null);
             Check("codec: reject echo that collapses to identity", CacheCodec.NormalizeForStore("Hello", "翻译成简体中文：Hello") == null);
             // 前缀后无余文时不算回显（util.c translation_after_prompt_prefix 返回 NULL），

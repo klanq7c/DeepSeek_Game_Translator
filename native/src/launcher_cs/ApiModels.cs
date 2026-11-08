@@ -12,11 +12,28 @@ namespace DstLauncher
         public sealed class Result
         {
             public string[] Items = new string[0];
+            public string[] Names = new string[0];
+            public int InvalidNames;
             public string Message;
         }
 
         private const int Compatible = 0, Anthropic = 1, DashScope = 2;
         private const string InvalidCatalog = "模型列表格式无效、不完整或超出限制";
+
+        // Uri.Host 会把 127.1、十六进制和八进制 IPv4 改写成 127.0.0.1。
+        // 本机传输权限必须按原始主机判断，保持与 C 启动器及翻译服务器相同的地址契约。
+        internal static bool IsLiteralLoopback(Uri uri)
+        {
+            if (uri.UserInfo.Length != 0) return false;
+            string original = uri.OriginalString;
+            int scheme = original.IndexOf("://", StringComparison.Ordinal);
+            if (scheme < 0) return false;
+            int start = scheme + 3, end = original.IndexOfAny(new[] { '/', '?', '#' }, start);
+            string authority = end < 0 ? original.Substring(start) : original.Substring(start, end - start);
+            foreach (string host in new[] { "localhost", "127.0.0.1", "[::1]" })
+                if (authority.Equals(host, StringComparison.OrdinalIgnoreCase) || authority.StartsWith(host + ":", StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
 
         private static bool DashScopeHost(string host)
         {
@@ -85,6 +102,17 @@ namespace DstLauncher
 
         /* 分页复用同一主机和认证，不接受服务端给出的跳转 URL；任何页失败都丢弃整份目录。
            网络错误保留手工填写路径，并返回诊断；不记录 URL、Key 或响应正文。 */
+        private static string HttpErrorStage(int status)
+        {
+            switch (status) {
+                case 401: return "认证失败：检查当前厂商的 API Key、账号权限或 IP 限制";
+                case 403: return "访问被拒绝：检查模型目录权限或服务地区限制";
+                case 404: return "未找到模型目录：检查 API 地址及厂商的目录支持";
+                case 407: return "代理要求认证：请检查代理连接设置";
+                case 429: return "请求受限：请检查调用频率、额度或账单";
+                default: return status >= 500 ? "服务暂时不可用：请稍后重试" : "厂商返回 HTTP 错误";
+            }
+        }
         private static Result FetchCatalog(string url, string key, int kind)
         {
             var result = new Result();
@@ -93,13 +121,14 @@ namespace DstLauncher
             try {
                 Uri uri;
                 if (!Uri.TryCreate(url, UriKind.Absolute, out uri) || uri.UserInfo.Length != 0) return Failure(result, stage, status, error);
-                bool local = uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) || uri.Host == "127.0.0.1" || uri.Host == "[::1]" || uri.Host == "::1";
+                bool local = IsLiteralLoopback(uri);
                 stage = "远程服务需要 HTTPS";
                 if (uri.Scheme != "https" && !(uri.Scheme == "http" && local)) return Failure(result, stage, status, error);
                 stage = "API Key 含无效字符";
                 if (key.Length > 1023) return Failure(result, stage, status, error);
                 foreach (char c in key) if (c <= 32 || c > 126) return Failure(result, stage, status, error);
                 var models = new List<string>();
+                var names = new List<string>();
                 var seen = new HashSet<string>(StringComparer.Ordinal);
                 int received = 0, total = -1, bytesRead = 0;
                 string cursor = "";
@@ -124,7 +153,7 @@ namespace DstLauncher
                     object dom;
                     using (var response = (HttpWebResponse)request.GetResponse()) {
                         status = (int)response.StatusCode;
-                        stage = "厂商返回 HTTP 错误";
+                        stage = HttpErrorStage(status);
                         if (status != 200) return Failure(result, stage, status, error);
                         long expected = response.ContentLength;
                         stage = "模型列表过大或读取超时";
@@ -175,7 +204,21 @@ namespace DstLauncher
                         string id = Json.TopString(entry, kind == DashScope ? "model" : "id");
                         if (string.IsNullOrEmpty(id) || id.Length > 255 || new UTF8Encoding(false, true).GetByteCount(id) > 255) return Failure(result, stage, status, error);
                         foreach (char c in id) if (c <= 32 || c == 127) return Failure(result, stage, status, error);
-                        if (seen.Add(id)) models.Add(id);
+                        string name = ""; object named = Field(entry, "name");
+                        // 上游可选名称异常时保留可调用 ID；状态及日志报告降级数量，不掩盖目录错误。
+                        if (named != null) {
+                            name = named as string;
+                            bool valid = name != null && name.Length <= 255;
+                            if (valid) foreach (char c in name) if (c < 32 || c == 127) valid = false;
+                            if (valid) {
+                                for (int n = 0; n < name.Length; n++) {
+                                    if (char.IsHighSurrogate(name[n])) { if (++n >= name.Length || !char.IsLowSurrogate(name[n])) { valid = false; break; } }
+                                    else if (char.IsLowSurrogate(name[n])) { valid = false; break; }
+                                }
+                            }
+                            if (!valid) { name = ""; result.InvalidNames++; }
+                        }
+                        if (seen.Add(id)) { models.Add(id); names.Add(name); }
                         if (models.Count > 4096) return Failure(result, stage, status, error);
                     }
                     received += data.Count;
@@ -188,11 +231,13 @@ namespace DstLauncher
                 }
                 if (models.Count == 0) return Failure(result, "厂商未返回可选模型；可手动输入", status, error);
                 result.Items = models.ToArray();
+                result.Names = names.ToArray();
                 result.Message = "已更新 " + models.Count + " 个模型；请选择聊天模型，也可手动输入";
+                if (result.InvalidNames > 0) result.Message = "已更新 " + models.Count + " 个模型；" + result.InvalidNames + " 个显示名称无效，已使用模型 ID";
                 return result;
             } catch (WebException ex) {
                 using (var response = ex.Response as HttpWebResponse) {
-                    if (response != null) { status = (int)response.StatusCode; stage = "厂商返回 HTTP 错误"; }
+                    if (response != null) { status = (int)response.StatusCode; stage = HttpErrorStage(status); }
                     else error = (int)ex.Status;
                 }
             } catch (IOException ex) { error = ex.HResult;

@@ -99,6 +99,11 @@ namespace DstLauncher
            非 ASCII、且不含汉字。 */
         internal static bool ShouldWarmText(string s)
         {
+            return ShouldWarmTextFormat(s, false);
+        }
+
+        private static bool ShouldWarmTextFormat(string s, bool renpy)
+        {
             int len = s.Length;
             if (len < 2 || len > MaxTextBytes) return false;
             if (s.IndexOf('\\') >= 0 || s.Contains("://") || s.Contains(".png") || s.Contains(".ogg") || s.Contains(".m4a")) return false;
@@ -111,7 +116,10 @@ namespace DstLauncher
                     signal = true;
                 }
             }
-            return signal && !HasCjkUtf8(s);
+            // Ren'Py 的变量长度按 Unicode 码点计数，先还原原始 UTF-8 字节串。
+            return signal && (!HasCjkUtf8(s) || (renpy
+                ? MixedText.HasUntranslatedLatinRenPy(Encoding.UTF8.GetString(ByteStr.ToBytes(s)))
+                : MixedText.HasUntranslatedLatin(s)));
         }
 
         internal static bool AsciiOnly(string s)
@@ -304,6 +312,7 @@ namespace DstLauncher
                 }
                 b.Append(']');
             }
+            if (l.RenPy) b.Append(",\"engine\":\"renpy\"");
             b.Append('}');
             return ByteStr.ToBytes(b.ToString());
         }
@@ -456,6 +465,8 @@ namespace DstLauncher
         public List<string> Prev;
         private readonly HashSet<string> _seen = new HashSet<string>(StringComparer.Ordinal);
         public int MaxItems;
+        public bool RenPy;
+        public bool GodotCompressedReported;
 
         public int Limit { get { return MaxItems != 0 ? MaxItems : Warmup.MaxItems; } }
         public int Count { get { return Items.Count; } }

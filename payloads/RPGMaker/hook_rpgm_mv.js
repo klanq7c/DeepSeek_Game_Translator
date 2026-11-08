@@ -12,6 +12,7 @@
   // 达到阈值才线性压缩；版本号可识别删除后重插的同名键，避免旧队列槽误删新值。
   function createBoundedKeyState(limit,onEvict){var values=Object.create(null),versions=Object.create(null),order=[],head=0,count=0,sequence=0,owns=Object.prototype.hasOwnProperty; limit=Math.max(1,Number(limit)||1); function has(key){return owns.call(values,key);} function compact(force){if(!force&&head<256&&order.length<=limit*2) return; var next=[]; for(var i=head;i<order.length;i++){var entry=order[i]; if(versions[entry.key]===entry.version) next.push(entry);} order=next; head=0;} function trim(){while(count>limit&&head<order.length){var entry=order[head++]; if(versions[entry.key]!==entry.version) continue; delete versions[entry.key]; delete values[entry.key]; count--; if(onEvict) onEvict(entry.key);} compact(false);} return {has:has,get:function(key){return has(key)?values[key]:undefined;},put:function(key,value){key=String(key); if(!has(key)) count++; sequence++; versions[key]=sequence; values[key]=value; order.push({key:key,version:sequence}); trim(); compact(false); return value;},remove:function(key){if(!has(key)) return false; delete values[key]; delete versions[key]; count--; compact(false); return true;},size:function(){return count;}};}
   var cache=createBoundedKeyState(MAX_RUNTIME_CACHE,function(key){if(typeof localLookupState!=='undefined'&&localLookupState&&!localLookupPending[key]) localLookupState.remove(key); if(typeof retryAfter!=='undefined'&&retryAfter) retryAfter.remove(key);});
+  var completedOutputs=createBoundedKeyState(MAX_RUNTIME_CACHE);
   var cacheEpoch=0;
   var pending=Object.create(null);
   var pendingCount=0;
@@ -56,8 +57,12 @@
   function hasCjk(s){return /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/.test(String(s||''));}
   function keyOf(s){return String(s==null?'':s).replace(/^[ \t\r\n]+|[ \t\r\n]+$/g,'');}
   function isLayoutOnly(s){var t=String(s==null?'':s); t=t.replace(/(?:<WordWrap>|<br\s*\/?>)/gi,''); t=t.replace(/\\(?:c|i|fs|fr|fb|fi|oc|ow|v|n[1-5]?|nc|nr|nd[1-5]?|ndc|ndr|nt[1-5]?|ntc|ntr)(?:\[[^\]]{0,64}\]|<[^>\n]{0,64}>)|\\(?:fr|fb|fi)/gi,''); t=t.replace(/\\[{}$.|!><^]/g,''); return !/[A-Za-z\u0080-\uffff]/.test(t);}
-  function rpgmControlTokens(s){return String(s==null?'':s).match(/(?:<WordWrap>|<br\s*\/?>|\\(?:c|i|fs|fr|fb|fi|oc|ow|v|n[1-5]?|nc|nr|nd[1-5]?|ndc|ndr|nt[1-5]?|ntc|ntr)(?:\[[^\]]{0,64}\]|<[^>\n]{0,64}>)|\\(?:fr|fb|fi)|\\[{}$.|!><^])/gi)||[];}
-  function rpgmLatinWords(s){var t=String(s==null?'':s); t=t.replace(/(?:<WordWrap>|<br\s*\/?>|\\(?:c|i|fs|fr|fb|fi|oc|ow|v|n[1-5]?|nc|nr|nd[1-5]?|ndc|ndr|nt[1-5]?|ntc|ntr)(?:\[[^\]]{0,64}\]|<[^>\n]{0,64}>)|\\(?:fr|fb|fi)|\\[{}$.|!><^])/gi,' '); return t.toLowerCase().match(/[a-z][a-z'-]{2,}/g)||[];}
+  // 先识别完整的带参插件指令，再兼容 YEP 允许紧贴英文的 FR/FB/FI 字体开关。
+  function rpgmControlTokens(s){return String(s==null?'':s).replace(/\x1b/g,'\\').match(/(?:<WordWrap>|<br\s*\/?>|\\(?:[A-Za-z]+[0-9]*(?:\[[^\]]{0,64}\]|<[^>\n]{0,64}>)|fr|fb|fi|[A-Za-z]+[0-9]*)|\\[{}$.|!><^])/gi)||[];}
+  // URL 原样保留不属于英文漏译，域名的多个词不能触发复制原文残留判定。
+  function rpgmLatinWords(s){var t=String(s==null?'':s); t=t.replace(/(?:<WordWrap>|<br\s*\/?>|\\(?:c|i|fs|fr|fb|fi|oc|ow|v|n[1-5]?|nc|nr|nd[1-5]?|ndc|ndr|nt[1-5]?|ntc|ntr)(?:\[[^\]]{0,64}\]|<[^>\n]{0,64}>)|\\(?:fr|fb|fi)|\\[{}$.|!><^])/gi,' '); t=t.replace(/[A-Za-z][A-Za-z0-9+.-]*:[\\/][!-~]*/g,' '); return t.toLowerCase().match(/[a-z][a-z'-]{2,}/g)||[];}
+  // 中文和缩写保持原值；只为标签与控制码之外的英文开放补译。
+  function isLocalizedText(s){if(completedOutputs.has(keyOf(s))) return true; if(!hasCjk(s)) return false; var visible=String(s||'').replace(/__[A-Za-z0-9_]+?__|%\([^)]+\)[A-Za-z]|<(?:(?:"[^"]*")|(?:'[^']*')|[^'">])*>|\[[^\]\r\n]*\]|\{[^}\r\n]*\}|(?:\\|\x1b)[A-Za-z]+(?:\[[^\]]*\]|<[^>]*>)?|[A-Za-z][A-Za-z0-9+.-]*:[\\/][!-~]*/g,' '), words=visible.match(/[A-Za-z]{3,}/g)||[]; for(var i=0;i<words.length;i++) if(words[i].length>=4||/[a-z]/.test(words[i])) return false; return true;}
   function hasSuspiciousRpgmSourceResidue(src,out){if(!hasCjk(out)) return false; var a=rpgmLatinWords(src),b=rpgmLatinWords(out); if(a.length<4||b.length<3) return false; for(var i=0;i+2<a.length;i++){for(var j=0;j+2<b.length;j++){if(a[i]===b[j]&&a[i+1]===b[j+1]&&a[i+2]===b[j+2]) return true;}} return false;}
   function safeRpgmTranslation(src,out){src=String(src==null?'':src); out=String(out==null?'':out); if(!out||out===src) return out||src; var a=rpgmControlTokens(src),b=rpgmControlTokens(out);
     // 厂商译文可能漏掉 RPG Maker 等待码；上游 API 不能保证保留游戏专用指令。
@@ -69,8 +74,8 @@
     // 短标签的超长纯英文答复通常是模型解释或提示词回显，不能覆盖游戏文字。
     if(/[A-Za-z]/.test(src)&&!hasCjk(src)&&!hasCjk(out)&&out.length>Math.max(80,src.length*4)&&rpgmLatinWords(out).length>=8) return src;
     return out;}
-  function cacheSafeRpgmTranslation(key,value,context){var residue=hasSuspiciousRpgmSourceResidue(key,value),safe=safeRpgmTranslation(key,value); if(safe&&safe!==key){if(cache.get(key)!==safe){cache.put(key,safe); cacheEpoch++;} retryAfter.remove(key); return true;} if(value&&value!==key) reportRpgmLayoutFallback(residue?'mixed-language-guard':(context||'cache-control-guard'),'cache result rejected'); return false;}
-  function markRpgmDisplayTarget(target,text){try{var key=keyOf(text); if(!target||!key||hasCjk(key)||!/[A-Za-z]/.test(key)) return; target._dsRpgmTranslationTarget=true; if(target.contents) target.contents._dsRpgmTranslationTarget=true;}catch(e){reportRpgmError('mark-display-target',e);}}
+  function cacheSafeRpgmTranslation(key,value,context){var residue=hasSuspiciousRpgmSourceResidue(key,value),safe=safeRpgmTranslation(key,value); if(safe&&safe!==key){if(cache.get(key)!==safe){cache.put(key,safe); cacheEpoch++;} if(!completedOutputs.has(keyOf(safe))) completedOutputs.put(keyOf(safe),true); retryAfter.remove(key); return true;} if(value&&value!==key) reportRpgmLayoutFallback(residue?'mixed-language-guard':(context||'cache-control-guard'),'cache result rejected'); return false;}
+  function markRpgmDisplayTarget(target,text){try{var key=keyOf(text); if(!target||!key||isLocalizedText(key)||!/[A-Za-z]/.test(key)) return; target._dsRpgmTranslationTarget=true; if(target.contents) target.contents._dsRpgmTranslationTarget=true;}catch(e){reportRpgmError('mark-display-target',e);}}
   function canAutoRefreshWindow(root){if(!root||root.visible===false||root._destroyed||root._closing) return false; if(typeof root.openness==='number'&&root.openness<=0&&!root._opening) return false; if(root.contents&&root.contents._destroyed) return false; return !!(root._dsRpgmTranslationTarget||(root.contents&&root.contents._dsRpgmTranslationTarget));}
   function isPersistenceScene(scene){try{if(!scene) return false; if(window.Scene_File&&scene instanceof Scene_File) return true; var mode=typeof scene.mode==='function'?scene.mode():scene._mode; return mode==='save'||mode==='load';}catch(e){reportRpgmError('detect-persistence-scene',e); return false;}}
   var refreshQueued=false;
@@ -81,7 +86,7 @@
   // 本地服务会刻意立即返回 queued 原文，稍后才完成远程翻译，因此渲染器没有
   // 可从上游订阅的完成回调。同一原文页仍可见时，只按有界退避轮询 /cache/lookup。
   // 未命中绝不会变成缓存成功；页面变化会取消当前代，超时则记录诊断。
-  function scheduleActiveMessageCachePoll(win,lines){try{if(!isVisibleMessagePage(win)||!lines||!lines.length) return; var signature=activeMessageSourceSignature(lines),now=Date.now(); if(activeMessagePoll.win!==win||activeMessagePoll.signature!==signature){activeMessagePoll.win=win; activeMessagePoll.signature=signature; activeMessagePoll.deadline=now+ACTIVE_MESSAGE_POLL_WINDOW_MS; activeMessagePoll.delay=ACTIVE_MESSAGE_POLL_INITIAL_MS; activeMessagePoll.timer=false; activeMessagePoll.generation++;} if(now>=activeMessagePoll.deadline){reportRpgmError('active-message-cache-poll-timeout',new Error('translation stayed unresolved for visible message page')); stopActiveMessageCachePoll(win); return;} if(activeMessagePoll.timer) return; activeMessagePoll.timer=true; var generation=activeMessagePoll.generation,delay=activeMessagePoll.delay; setTimeout(function(){try{if(generation!==activeMessagePoll.generation) return; activeMessagePoll.timer=false; var gm=window.$gameMessage,current=gm&&gm._texts; if(activeMessagePoll.win!==win||!current||!Array.isArray(current)||activeMessageSourceSignature(current)!==signature||!isVisibleMessagePage(win)){stopActiveMessageCachePoll(win); return;} var plan=planMessagePage(current),keys=[plan.joined].concat(plan.candidates,plan.liveCandidates),seen=Object.create(null),lookupKeys=[]; for(var i=0;i<keys.length;i++){var key=keyOf(keys[i]); if(!key||seen[key]||hasCjk(key)||isLayoutOnly(key)) continue; seen[key]=true; if(!localLookupPending[key]) localLookupState.remove(key); lookupKeys.push(key);} activeMessagePoll.delay=Math.min(ACTIVE_MESSAGE_POLL_MAX_MS,Math.max(ACTIVE_MESSAGE_POLL_INITIAL_MS,delay*2)); if(!requestLocalCacheKeys(lookupKeys,512)) scheduleActiveMessageCachePoll(win,current);}catch(e){reportRpgmError('run-active-message-cache-poll',e); stopActiveMessageCachePoll(win);}},delay);}catch(e){reportRpgmError('schedule-active-message-cache-poll',e); stopActiveMessageCachePoll(win);}}
+  function scheduleActiveMessageCachePoll(win,lines){try{if(!isVisibleMessagePage(win)||!lines||!lines.length) return; var signature=activeMessageSourceSignature(lines),now=Date.now(); if(activeMessagePoll.win!==win||activeMessagePoll.signature!==signature){activeMessagePoll.win=win; activeMessagePoll.signature=signature; activeMessagePoll.deadline=now+ACTIVE_MESSAGE_POLL_WINDOW_MS; activeMessagePoll.delay=ACTIVE_MESSAGE_POLL_INITIAL_MS; activeMessagePoll.timer=false; activeMessagePoll.generation++;} if(now>=activeMessagePoll.deadline){reportRpgmError('active-message-cache-poll-timeout',new Error('translation stayed unresolved for visible message page')); stopActiveMessageCachePoll(win); return;} if(activeMessagePoll.timer) return; activeMessagePoll.timer=true; var generation=activeMessagePoll.generation,delay=activeMessagePoll.delay; setTimeout(function(){try{if(generation!==activeMessagePoll.generation) return; activeMessagePoll.timer=false; var gm=window.$gameMessage,current=gm&&gm._texts; if(activeMessagePoll.win!==win||!current||!Array.isArray(current)||activeMessageSourceSignature(current)!==signature||!isVisibleMessagePage(win)){stopActiveMessageCachePoll(win); return;} var plan=planMessagePage(current),keys=[plan.joined].concat(plan.candidates,plan.liveCandidates),seen=Object.create(null),lookupKeys=[]; for(var i=0;i<keys.length;i++){var key=keyOf(keys[i]); if(!key||seen[key]||isLocalizedText(key)||isLayoutOnly(key)) continue; seen[key]=true; if(!localLookupPending[key]) localLookupState.remove(key); lookupKeys.push(key);} activeMessagePoll.delay=Math.min(ACTIVE_MESSAGE_POLL_MAX_MS,Math.max(ACTIVE_MESSAGE_POLL_INITIAL_MS,delay*2)); if(!requestLocalCacheKeys(lookupKeys,512)) scheduleActiveMessageCachePoll(win,current);}catch(e){reportRpgmError('run-active-message-cache-poll',e); stopActiveMessageCachePoll(win);}},delay);}catch(e){reportRpgmError('schedule-active-message-cache-poll',e); stopActiveMessageCachePoll(win);}}
   function refreshActiveRpgmMessage(win){
     try{
       var gm=window.$gameMessage,original=gm&&gm._texts;
@@ -127,12 +132,13 @@
     try{if(action) redrawPersistenceItems(action);}catch(e){reportRpgmError('refresh-persistence-action',e);}
     try{if(confirm) redrawPersistenceItems(confirm);}catch(e){reportRpgmError('refresh-persistence-confirm',e);}
   }
-  function runWindowRefresh(){try{var scene=window.SceneManager&&SceneManager._scene; if(scene){if(isPersistenceScene(scene)) refreshPersistenceDisplays(scene); else {var seen=createSceneWalkSeen(),state={count:0}; walkSceneWindows(scene,seen,state); walkSceneOwnedWindows(scene,seen,state);}}}catch(e){reportRpgmError('refresh-scene-windows',e);}finally{refreshQueued=false;}}
+  function runWindowRefresh(){try{var scene=window.SceneManager&&SceneManager._scene; if(scene){if(rpgmAutoImageText){rpgmAutoImageText.refresh();rpgmAutoImageText.update(scene,cacheEpoch);}if(isPersistenceScene(scene)) refreshPersistenceDisplays(scene); else {var seen=createSceneWalkSeen(),state={count:0}; walkSceneWindows(scene,seen,state); walkSceneOwnedWindows(scene,seen,state);}}}catch(e){reportRpgmError('refresh-scene-windows',e);}finally{refreshQueued=false;}}
   function requestWindowRefresh(){if(refreshQueued) return; refreshQueued=true; try{if(window.setTimeout){setTimeout(runWindowRefresh,0); return;}}catch(e){reportRpgmError('schedule-window-refresh',e);} runWindowRefresh();}
   function stopVisibleUiCachePoll(){visibleUiPoll.scene=null; visibleUiPoll.keys=Object.create(null); visibleUiPoll.timer=false; visibleUiPoll.generation++;}
   // 第三方场景字段或窗口属性读取器可能抛错，无法要求上游插件改写。
   // 只跳过该对象并记录原始异常；可能漏掉故障窗口，但不能让它禁用其他窗口或伪造命中。
   function hasVisibleUiRefreshTarget(scene){
+    if(rpgmAutoImageText&&rpgmAutoImageText.hasVisibleTargets(scene)) return true;
     var seen=createSceneWalkSeen(),state={count:0};
     function visit(root){
       if(!root||state.count>=2048||!enterSceneWalk(root,seen)) return false;
@@ -210,7 +216,7 @@
     sendRpgmJson(URL,{text:key},12000,'translate',finish);
   }
   function lookup(s){
-    s=String(s==null?'':s); if(!s||hasCjk(s)||isLayoutOnly(s)) return {text:s,hit:true}; var key=keyOf(s); if(!key) return {text:s,hit:true}; var cached=cache.get(key); if(cached) return {text:safeRpgmTranslation(s,cached),hit:true}; var now=Date.now(),retryAt=retryAfter.get(key); if(retryAt&&retryAt>now) return {text:s,hit:false}; if(retryAt) retryAfter.remove(key);
+    s=String(s==null?'':s); if(!s||isLocalizedText(s)||isLayoutOnly(s)) return {text:s,hit:true}; var key=keyOf(s); if(!key) return {text:s,hit:true}; var cached=cache.get(key); if(cached) return {text:safeRpgmTranslation(s,cached),hit:true}; var now=Date.now(),retryAt=retryAfter.get(key); if(retryAt&&retryAt>now) return {text:s,hit:false}; if(retryAt) retryAfter.remove(key);
     if(!suppressLookupRequests) requestLookup(key); cached=cache.get(key); if(cached) return {text:safeRpgmTranslation(s,cached),hit:true};
     return {text:s,hit:false};
   }
@@ -231,7 +237,7 @@
   function primeVisibleQuestText(value){var key=keyOf(value); if(!key||!questPrimeKnown[key]||cache.has(key)||pending[key]||messagePagePending[key]) return; primeMessagePage([key]);}
   function primeGalvQuestCache(){
     if(questPrimePending) return; var qs=window.$gameSystem&&$gameSystem._quests; var list=qs&&qs.quest; if(!list) return; var keys=[],seen=Object.create(null);
-    function add(value){if(keys.length>=MAX_QUEST_PRIME||value==null) return; var raw=keyOf(value); if(!raw||raw.length<3||hasCjk(raw)) return; if(!seen[raw]){seen[raw]=true; keys.push(raw);} var visible=visibleLookupKey(raw); if(visible&&!seen[visible]&&keys.length<MAX_QUEST_PRIME){seen[visible]=true; keys.push(visible);}}
+    function add(value){if(keys.length>=MAX_QUEST_PRIME||value==null) return; var raw=keyOf(value); if(!raw||raw.length<3||isLocalizedText(raw)) return; if(!seen[raw]){seen[raw]=true; keys.push(raw);} var visible=visibleLookupKey(raw); if(visible&&!seen[visible]&&keys.length<MAX_QUEST_PRIME){seen[visible]=true; keys.push(visible);}}
     function addArray(values){if(!values||!values.length) return; for(var i=0;i<values.length&&keys.length<MAX_QUEST_PRIME;i++) add(values[i]);}
     for(var i=0;i<list.length&&keys.length<MAX_QUEST_PRIME;i++){var q=list[i]; if(!q) continue; try{var name=typeof q.name==='function'?q.name():q.name; add(name); var split=String(name||'').lastIndexOf(' - '); if(split>=0) add(String(name).slice(split+3));}catch(e){reportRpgmError('read-quest-name',e);} try{addArray(typeof q.objectives==='function'?q.objectives():q.objectives);}catch(e){reportRpgmError('read-quest-objectives',e);} try{addArray(typeof q.desc==='function'?q.desc():q.desc);}catch(e){reportRpgmError('read-quest-description',e);} try{addArray(typeof q.resoTxtArray==='function'?q.resoTxtArray():q.resoTxtArray);}catch(e){reportRpgmError('read-quest-resolution',e);}}
     questPrimeKnown=seen; if(!keys.length) return; var signature=keys.join('\n'); if(signature===questPrimeSignature) return; questPrimePending=true;
@@ -242,7 +248,7 @@
   }
   function installQuestPrimeHooks(){try{if(window.DataManager&&DataManager.extractSaveContents&&!DataManager.extractSaveContents._dsQuestPrimeHook){var oldExtract=DataManager.extractSaveContents; var wrap=function(){var r=oldExtract.apply(this,arguments); primeGalvQuestCache(); return r;}; wrap._dsQuestPrimeHook=true; DataManager.extractSaveContents=wrap;} if(window.DataManager&&DataManager.setupNewGame&&!DataManager.setupNewGame._dsQuestPrimeHook){var oldSetup=DataManager.setupNewGame; var setupWrap=function(){var r=oldSetup.apply(this,arguments); primeGalvQuestCache(); return r;}; setupWrap._dsQuestPrimeHook=true; DataManager.setupNewGame=setupWrap;} primeGalvQuestCache();}catch(e){reportRpgmError('install-quest-prime-hooks',e);}}
   installQuestPrimeHooks();
-  function lookupVisible(orig,prefix,body){var key=visibleLookupKey(body); if(!key||key===keyOf(body)) return null; var r=lookup(key); if(r.hit&&r.text!==key&&r.text!==keyOf(key)) return {text:String(prefix||'')+r.text,hit:true}; if(r.hit) return {text:orig,hit:true}; return {text:orig,hit:false};}
+  function lookupVisible(orig,prefix,body){var key=visibleLookupKey(body); if(!key||key===keyOf(body)) return null; var r=lookup(key); if(r.hit&&r.text!==key&&r.text!==keyOf(key)){var out=String(prefix||'')+r.text; if(safeRpgmTranslation(orig,out)!==orig) return {text:out,hit:true}; reportRpgmLayoutFallback('visible-format-cache-rejected','plain cache would remove renderer controls'); return {text:orig,hit:false};} if(r.hit) return {text:orig,hit:true}; return {text:orig,hit:false};}
   function lookupDecorated(s){
     var orig=String(s==null?'':s); var raw=lookup(orig); if(raw.hit&&raw.text!==orig&&raw.text!==keyOf(orig)) return raw;
     // 存档槽等编号标签按已译基础词组合，避免一条污染的完整键遮挡短标签。
@@ -253,14 +259,26 @@
   var suppressDisplayTranslate=0;
   // 本地缓存查询采用异步方式，渲染器钩子不会阻塞 RPG Maker 帧。有限传输超时
   // 只解除短暂本地门控；未命中和故障仍显示原文，并可继续进入现有前台翻译路径。
-  function requestLocalCacheKeys(values,maxKeys,cachePollOnly){var keys=[],seen=Object.create(null),limit=Number(maxKeys)||64; if(limit<1) limit=64; if(limit>512) limit=512; for(var i=0;i<values.length&&keys.length<limit;i++){var key=keyOf(values[i]); if(!key||cache.has(key)||localLookupState.has(key)||localLookupPending[key]||seen[key]||hasCjk(key)||isLayoutOnly(key)||!/[A-Za-z]/.test(key)) continue; seen[key]=true; localLookupState.put(key,true); localLookupPending[key]=true; keys.push(key);} for(var start=0;start<keys.length;start+=64){(function(batch){var done=false,ownerScene=window.SceneManager&&SceneManager._scene; function finish(response,eventName){if(done) return; done=true; var changed=false; for(var i=0;i<batch.length;i++) delete localLookupPending[batch[i]]; if(response&&response.status===200){try{var r=JSON.parse(response.responseText),hits=r.hits||{}; for(var j=0;j<batch.length;j++){var key=batch[j],value=hits[key]; if(value&&value!==key&&cacheSafeRpgmTranslation(key,value,'async-cache-control-guard')) changed=true;} if(!cachePollOnly){var scene=window.SceneManager&&SceneManager._scene; if(isPersistenceScene(scene)) for(var k=0;k<batch.length;k++) if(!cache.has(batch[k])) requestLookup(batch[k]);}}catch(e){reportRpgmError('parse-async-cache-lookup',e); noteVisibleUiCacheFailure(ownerScene,batch);}}else{reportRpgmError('async-cache-lookup-'+String(eventName||'http'),new Error('HTTP status '+(response?response.status:'unavailable'))); noteVisibleUiCacheFailure(ownerScene,batch);} if(changed||!cachePollOnly) requestWindowRefresh();} sendRpgmJson(CACHE_LOOKUP_URL,{texts:batch},1500,'cache-lookup',finish);})(keys.slice(start,start+64));} return keys.length;}
+  function requestLocalCacheKeys(values,maxKeys,cachePollOnly){var keys=[],seen=Object.create(null),limit=Number(maxKeys)||64; if(limit<1) limit=64; if(limit>512) limit=512; for(var i=0;i<values.length&&keys.length<limit;i++){var key=keyOf(values[i]); if(!key||cache.has(key)||localLookupState.has(key)||localLookupPending[key]||seen[key]||isLocalizedText(key)||isLayoutOnly(key)||!/[A-Za-z]/.test(key)) continue; seen[key]=true; localLookupState.put(key,true); localLookupPending[key]=true; keys.push(key);} for(var start=0;start<keys.length;start+=64){(function(batch){var done=false,ownerScene=window.SceneManager&&SceneManager._scene; function finish(response,eventName){if(done) return; done=true; var changed=false; for(var i=0;i<batch.length;i++) delete localLookupPending[batch[i]]; if(response&&response.status===200){try{var r=JSON.parse(response.responseText),hits=r.hits||{}; for(var j=0;j<batch.length;j++){var key=batch[j],value=hits[key]; if(value&&value!==key&&cacheSafeRpgmTranslation(key,value,'async-cache-control-guard')) changed=true;} if(!cachePollOnly){var scene=window.SceneManager&&SceneManager._scene; if(isPersistenceScene(scene)) for(var k=0;k<batch.length;k++) if(!cache.has(batch[k])) requestLookup(batch[k]);}}catch(e){reportRpgmError('parse-async-cache-lookup',e); noteVisibleUiCacheFailure(ownerScene,batch);}}else{reportRpgmError('async-cache-lookup-'+String(eventName||'http'),new Error('HTTP status '+(response?response.status:'unavailable'))); noteVisibleUiCacheFailure(ownerScene,batch);} if(changed||!cachePollOnly) requestWindowRefresh();} sendRpgmJson(CACHE_LOOKUP_URL,{texts:batch},1500,'cache-lookup',finish);})(keys.slice(start,start+64));} return keys.length;}
   function isConvertedRpgmControlToken(part){return part.charCodeAt(0)===27||part.charCodeAt(0)===92||/^<(?:WordWrap|br\s*\/?)>$/i.test(part);}
   // 选择动画可在转义转换前逐帧改变颜色/字号；原始反斜杠与转换后的 ESC
   // 都只拆分显示片段，命中后拼回本帧控制符，避免丢失样式或为样式变动排队。
-  function translateConvertedRpgmText(s,lookupFirst){var orig=String(s==null?'':s); var exact=cache.get(keyOf(orig)); if(exact) return safeRpgmTranslation(orig,exact); if(orig.indexOf(String.fromCharCode(27))<0&&!/\\(?:[A-Za-z]+(?:\[[^\]]{0,64}\]|<[^>\n]{0,64}>)?|[{}$.|!><^])/.test(orig)){if(lookupFirst){requestLocalCacheKeys([orig],1); primeVisibleQuestText(orig);} return tr(orig);} var parts=orig.split(/((?:\x1b|\\)[A-Za-z]+(?:\[[^\]]{0,64}\]|<[^>\n]{0,64}>)?|(?:\x1b|\\)[{}$.|!><^]|<WordWrap>|<br\s*\/?>)/gi),cores=[],allHit=true,changed=false; for(var i=0;i<parts.length;i++){var part=parts[i]; if(!part||isConvertedRpgmControlToken(part)||hasCjk(part)||!/[A-Za-z]/.test(part)) continue; var lead=(part.match(/^\s*/)||[''])[0],tail=(part.match(/\s*$/)||[''])[0],core=part.slice(lead.length,part.length-tail.length); if(core&&/[A-Za-z]/.test(core)) cores.push(core);} if(lookupFirst){requestLocalCacheKeys(cores); for(var ci=0;ci<cores.length;ci++) primeVisibleQuestText(cores[ci]);} for(var j=0;j<parts.length;j++){var value=parts[j]; if(!value||isConvertedRpgmControlToken(value)||hasCjk(value)||!/[A-Za-z]/.test(value)) continue; var prefix=(value.match(/^\s*/)||[''])[0],suffix=(value.match(/\s*$/)||[''])[0],body=value.slice(prefix.length,value.length-suffix.length); if(!body||!/[A-Za-z]/.test(body)) continue; var result=lookupDecorated(body); if(!result.hit) allHit=false; if(result.text!==body){parts[j]=prefix+result.text+suffix; changed=true;}} if(allHit&&changed) return parts.join(''); if(lookupFirst&&orig.indexOf(String.fromCharCode(27))<0) requestLocalCacheKeys([orig],1); return orig;}
+  function translateConvertedRpgmText(s,lookupFirst,allowPartial){
+    var orig=String(s==null?'':s),exact=cache.get(keyOf(orig));
+    if(exact){var safe=safeRpgmTranslation(orig,exact); if(safe!==orig) return safe;}
+    if(!allowPartial&&orig.indexOf(String.fromCharCode(27))<0&&!/\\(?:[A-Za-z]+(?:\[[^\]]{0,64}\]|<[^>\n]{0,64}>)?|[{}$.|!><^])/.test(orig)){if(lookupFirst){requestLocalCacheKeys([orig],1); primeVisibleQuestText(orig);} return tr(orig);}
+    // 带参指令优先，不能把 FIRE[3] 等插件指令拆成 FI 与可见文字。
+    // 无参字体开关保留 YEP 的紧贴文字语义，其余指令按完整名字处理。
+    // 独立插件页面可逐段命中；普通消息与选择项仍保留原有整块语言一致性。
+    var parts=orig.split(/((?:\x1b|\\)(?:[A-Za-z]+[0-9]*(?:\[[^\]]{0,64}\]|<[^>\n]{0,64}>)|fr|fb|fi|[A-Za-z]+[0-9]*)|(?:\x1b|\\)[{}$.|!><^]|<WordWrap>|<br\s*\/?>|\r\n|[\r\n])/gi),cores=[],allHit=true,changed=false;
+    for(var i=0;i<parts.length;i++){var part=parts[i]; if(!part||isConvertedRpgmControlToken(part)||isLocalizedText(part)||!/[A-Za-z]/.test(part)) continue; var lead=(part.match(/^\s*/)||[''])[0],tail=(part.match(/\s*$/)||[''])[0],core=part.slice(lead.length,part.length-tail.length); if(core&&/[A-Za-z]/.test(core)) cores.push(core);}
+    if(lookupFirst){requestLocalCacheKeys(cores); for(var ci=0;ci<cores.length;ci++) primeVisibleQuestText(cores[ci]);}
+    for(var j=0;j<parts.length;j++){var value=parts[j]; if(!value||isConvertedRpgmControlToken(value)||isLocalizedText(value)||!/[A-Za-z]/.test(value)) continue; var prefix=(value.match(/^\s*/)||[''])[0],suffix=(value.match(/\s*$/)||[''])[0],body=value.slice(prefix.length,value.length-suffix.length); if(!body||!/[A-Za-z]/.test(body)) continue; var result=lookupDecorated(body); if(!result.hit) allHit=false; if(result.text!==body){parts[j]=prefix+result.text+suffix; changed=true;}}
+    if((allHit||allowPartial)&&changed) return parts.join(''); if(lookupFirst&&orig.indexOf(String.fromCharCode(27))<0) requestLocalCacheKeys([orig],1); return orig;
+  }
   function trDisplay(s){return suppressDisplayTranslate>0?String(s==null?'':s):translateConvertedRpgmText(s,true);}
   function withDisplayTranslationSuppressed(fn){suppressDisplayTranslate++; try{return fn();}finally{suppressDisplayTranslate--;}}
-  function shouldBitmapTranslate(s){var key=keyOf(s); if(!key||key.length<3||hasCjk(key)) return false; if(!/[A-Za-z]/.test(key)) return false; return true;}
+  function shouldBitmapTranslate(s){var key=keyOf(s); if(!key||key.length<3||isLocalizedText(key)) return false; if(!/[A-Za-z]/.test(key)) return false; return true;}
   function trBitmap(s){var orig=String(s==null?'':s); if(suppressDisplayTranslate>0||!shouldBitmapTranslate(orig)) return orig; requestLocalCacheKeys([orig],1); return tr(orig);}
   function finiteDrawWidth(w){w=Number(w); return isFinite(w)&&w>0&&w<1000000;}
   function withCjkBitmapFont(bitmap,text,draw){if(!bitmap||!hasCjk(text)||typeof bitmap.fontFace!=='string') return draw(); var original=bitmap.fontFace; if(original===CJK_FONT||original.indexOf(CJK_FONT+',')===0) return draw(); bitmap.fontFace=CJK_FONT+(original?', '+original:''); try{return draw();}finally{bitmap.fontFace=original;}}
@@ -274,18 +292,80 @@
   function withRpgmTextExWrap(win,text,x,w,translated,draw){var width=rpgmTextExWidth(win,x,w); if(!translated||!hasCjk(text)||!finiteDrawWidth(width)) return draw(); var left=Number(x); if(!isFinite(left)) left=0; var state={win:win,left:left,right:left+width}; rpgmTextExWrapStack.push(state); reportRpgmLayoutFallback('draw-text-ex-auto-wrap','width='+width+', chars='+String(text==null?'':text).length); try{return draw();}finally{rpgmTextExWrapStack.pop();}}
   function currentRpgmTextExWrap(win){for(var i=rpgmTextExWrapStack.length-1;i>=0;i--){if(rpgmTextExWrapStack[i].win===win) return rpgmTextExWrapStack[i];} return null;}
   function rpgmNextWrapUnit(text,index){text=String(text==null?'':text); var unit=text.charAt(index); if(!unit) return ''; var i=index+1; if(/[A-Za-z0-9_'-]/.test(unit)){while(i<text.length&&/[A-Za-z0-9_'-]/.test(text.charAt(i))) unit+=text.charAt(i++);} while(i<text.length&&/[\u3001\u3002\uff0c\uff0e\uff01\uff1f\uff1a\uff1b\uff09\u3011\u300b\u300d\u300f\u2019\u201d\u2026]/.test(text.charAt(i))) unit+=text.charAt(i++); return unit;}
-  function installTextExAutoWrapHook(){try{var proto=window.Window_Base&&Window_Base.prototype; if(!proto||typeof proto.processNormalCharacter!=='function'||typeof proto.processNewLine!=='function'||proto.processNormalCharacter._dsRpgmTextExWrapHook) return; var old=proto.processNormalCharacter; var wrap=function(textState){var layout=currentRpgmTextExWrap(this); if(layout&&textState&&typeof textState.index==='number'){var x=Number(textState.x),unit=rpgmNextWrapUnit(textState.text,textState.index); if(unit&&!/\s/.test(unit.charAt(0))&&isFinite(x)&&x>layout.left&&x+dsTextWidth(this,unit)>layout.right){var index=textState.index; this.processNewLine(textState); textState.index=index;}} return old.apply(this,arguments);}; wrap._dsRpgmTextExWrapHook=true; wrap._dsRpgmOriginal=old; proto.processNormalCharacter=wrap;}catch(e){reportRpgmError('install-draw-text-ex-auto-wrap-hook',e);}}
-  function drawCjkAutoWrap(win,text,x,y,maxWidth){text=String(text==null?'':text); try{if(win.convertEscapeCharacters) text=win.convertEscapeCharacters(text);}catch(e){reportRpgmError('convert-renderer-escapes',e);} if(!text) return 0; var esc=String.fromCharCode(27); var max=finiteDrawWidth(maxWidth)?Number(maxWidth):1000000; var lh=dsLineHeight(win); var lines=1,x2=0,y2=y; function nl(){lines++; y2+=lh; x2=0;} function drawTok(tok,w){if(x2>0&&x2+w>max) nl(); if(tok===' '&&x2===0) return; win.drawText(tok,x+x2,y2,w,'left'); x2+=w;} for(var i=0;i<text.length;){var rest=text.slice(i); if(text.charAt(i)===esc){var mi=/^\x1bI\[(\d+)\]/.exec(rest); if(mi){var iw=(window.Window_Base&&Window_Base._iconWidth)||32; if(x2>0&&x2+iw>max) nl(); if(win.drawIcon) win.drawIcon(Number(mi[1]),x+x2,y2); x2+=iw; i+=mi[0].length; continue;} var mc=/^\x1bC\[(\d+)\]/.exec(rest); if(mc){if(win.changeTextColor&&win.textColor) win.changeTextColor(win.textColor(Number(mc[1]))); i+=mc[0].length; continue;} if(rest.indexOf(esc+'n')===0){nl(); i+=2; continue;}} var ch=text.charAt(i); if(ch==='\r'||ch==='\n'){if(ch==='\r'&&text.charAt(i+1)==='\n') i++; nl(); i++; continue;} if(/\s/.test(ch)){drawTok(' ',dsTextWidth(win,' ')); i++; continue;} var tok=ch; if(!hasCjk(ch)){var j=i+1; while(j<text.length&&text.charAt(j)!==esc&&!/\s/.test(text.charAt(j))&&!hasCjk(text.charAt(j))) j++; tok=text.slice(i,j); i=j;}else{i++;} drawTok(tok,dsTextWidth(win,tok));} return lines;}
+  function installTextExAutoWrapHook(){try{
+    var proto=window.Window_Base&&Window_Base.prototype; if(!proto||typeof proto.processNewLine!=='function') return;
+    if(!proto.processNewLine._dsRpgmLineCountHook){
+      var oldNewLine=proto.processNewLine;
+      var newLine=function(state){var layout=state&&state._dsRpgmAutoWrap;
+        // 自动换行接口返回实际行数；插件自有行距不能用引擎的字体包围高度换算。
+        // 标记仅属于本次自动换行状态，普通窗口和消息仍由原引擎计算行高。
+        if(layout&&layout.customLineHeight) state.height=dsLineHeight(this);
+        var result=oldNewLine.apply(this,arguments);
+        if(layout){layout.lines++; if(layout.customLineHeight) state.height=dsLineHeight(this);}
+        return result;
+      };
+      newLine._dsRpgmLineCountHook=true; newLine._dsRpgmOriginal=oldNewLine; proto.processNewLine=newLine;
+    }
+    if(typeof proto.processNormalCharacter!=='function'||proto.processNormalCharacter._dsRpgmTextExWrapHook) return;
+    var old=proto.processNormalCharacter; var wrap=function(textState){var layout=currentRpgmTextExWrap(this); if(layout&&textState&&typeof textState.index==='number'){var x=Number(textState.x),unit=rpgmNextWrapUnit(textState.text,textState.index); if(unit&&!/\s/.test(unit.charAt(0))&&isFinite(x)&&x>layout.left&&x+dsTextWidth(this,unit)>layout.right){var index=textState.index; this.processNewLine(textState); textState.index=index;}} return old.apply(this,arguments);}; wrap._dsRpgmTextExWrapHook=true; wrap._dsRpgmOriginal=old; proto.processNormalCharacter=wrap;
+  }catch(e){reportRpgmError('install-draw-text-ex-auto-wrap-hook',e);}}
+  function drawCjkAutoWrap(win,text,x,y,maxWidth){
+    text=String(text==null?'':text); if(!text) return 0;
+    if(typeof win.processCharacter!=='function'||typeof win.calcTextHeight!=='function') throw new Error('RPG Maker character renderer unavailable');
+    var state;
+    if(typeof win.createTextState==='function') state=win.createTextState(text,x,y,maxWidth);
+    else {state={index:0,x:x,y:y,left:x,text:win.convertEscapeCharacters(text)}; state.height=win.calcTextHeight(state,false);}
+    // 科技树插件用小写转义 n 表示显式换行；其余颜色、字体、图标和自定义指令交回引擎。
+    state.text=state.text.replace(/\x1bn(?![A-Za-z0-9_\[])/g,'\n');
+    state._dsRpgmAutoWrap={lines:1,customLineHeight:typeof win.techTreeLineHeight==='function'};
+    if(state._dsRpgmAutoWrap.customLineHeight) state.height=dsLineHeight(win);
+    return withRpgmTextExWrap(win,text,x,maxWidth,true,function(){
+      if(typeof win.processAllText==='function') win.processAllText(state);
+      else while(state.index<state.text.length) win.processCharacter(state);
+      return state._dsRpgmAutoWrap.lines;
+    });
+  }
+  function installCharacterRendererHook(){try{
+    var proto=window.Window_Base&&Window_Base.prototype;
+    if(!proto||typeof proto.processCharacter!=='function'||proto.processCharacter._dsRpgmCharacterHook) return;
+    var old=proto.processCharacter;
+    var wrap=function(state){
+      if(window.Window_Message&&this instanceof Window_Message) return old.apply(this,arguments);
+      if(!suppressDisplayTranslate&&state&&state.index===0&&typeof state.text==='string'){
+        try{delete state._dsRpgmLayout; var source=state.text; if(state.drawing!==false) markRpgmDisplayTarget(this,source); var out=translateConvertedRpgmText(source,true,true);
+          if(out!==source){state.text=out;
+            // MV 使用 left，MZ 使用 startX/width；测量状态需要完整文本宽度，不能按窗口折行。
+            var left=Number(state.left); if(!isFinite(left)) left=Number(state.startX); if(!isFinite(left)) left=Number(state.x)||0;
+            var width=rpgmTextExWidth(this,left,state.width);
+            if(state.drawing!==false&&hasCjk(out)&&finiteDrawWidth(width)&&!currentRpgmTextExWrap(this)) state._dsRpgmLayout={win:this,left:left,right:left+width};}
+        }catch(e){reportRpgmError('translate-character-page',e);}
+      }
+      // 插件自己的逐字循环也会经过此边界。整段已规划后，测量子串和实际字形不能二次翻译。
+      var self=this,args=arguments,layout=state&&state._dsRpgmLayout;
+      if(layout) rpgmTextExWrapStack.push(layout);
+      try{return withDisplayTranslationSuppressed(function(){
+        // MZ 先缓冲整段再提交字形，没有 MV 的 processNormalCharacter 边界。
+        var active=state&&state.drawing===false?null:currentRpgmTextExWrap(self);
+        if(active&&state&&typeof state.buffer==='string'&&typeof self.processNormalCharacter!=='function'&&typeof self.flushTextState==='function'){
+          var unit=rpgmNextWrapUnit(state.text,state.index),sx=Number(state.x);
+          if(unit&&!/[\s\x1b\f]/.test(unit.charAt(0))&&isFinite(sx)&&sx+dsTextWidth(self,state.buffer)>active.left&&sx+dsTextWidth(self,state.buffer+unit)>active.right){self.flushTextState(state); self.processNewLine(state);}
+        }
+        return old.apply(self,args);
+      });}
+      finally{if(layout) rpgmTextExWrapStack.pop();}
+    };
+    wrap._dsRpgmCharacterHook=true; wrap._dsRpgmOriginal=old; proto.processCharacter=wrap;
+  }catch(e){reportRpgmError('install-character-renderer-hook',e);}}
   // 可见消息页批处理负责处理本地 XHR、状态、JSON 和控制令牌故障，因为只有实时
   // RPG Maker 页面规划器知道安全的逐行键。故障继续显示原文，绝不缓存为成功，
   // 同时进入 retryAfter 并输出限频诊断。
   function finishMessagePageBatch(x,batch,eventName){var response=null,results=null,sources=null,translations=null,parsed=false,changed=false,now=Date.now(); if(x&&x.status===200){try{response=JSON.parse(x.responseText); results=response&&response.results; sources=response&&response.sources; translations=response&&response.translations; if(!Array.isArray(results)&&(!translations||typeof translations!=='object')) throw new Error('missing batch result fields'); if(!Array.isArray(results)) results=[]; if(!Array.isArray(sources)) sources=[]; parsed=true;}catch(e){reportRpgmError('parse-message-page-batch-response',e);}}else{reportRpgmError('message-page-batch-'+String(eventName||'http'),new Error('HTTP status '+(x?x.status:'unavailable')));} for(var i=0;i<batch.length;i++){var key=batch[i],value=results&&results[i],source=sources&&sources[i]; delete messagePagePending[key]; if((value==null||value==='')&&translations) value=translations[key]; if(parsed&&value&&value!==key&&source!=='miss'&&source!=='queued'&&source!=='pass'&&cacheSafeRpgmTranslation(key,value,'message-page-control-guard')){changed=true; continue;} retryAfter.put(key,now+MISS_RETRY_MS);} if(changed) requestWindowRefresh();}
   function requestMessagePageBatch(batch){var done=false; function finish(response,eventName){if(done) return; done=true; finishMessagePageBatch(response,batch,eventName);} sendRpgmJson(BATCH_URL,{texts:batch},15000,'message-page-batch',finish);}
-  function primeMessagePage(values){var keys=[],seen=Object.create(null),now=Date.now(); for(var i=0;i<values.length&&keys.length<MAX_MESSAGE_PAGE_PRIME;i++){var key=keyOf(values[i]); if(!key||seen[key]||cache.has(key)||pending[key]||messagePagePending[key]||hasCjk(key)||isLayoutOnly(key)||!/[A-Za-z]/.test(key)) continue; var retryAt=retryAfter.get(key); if(retryAt&&retryAt>now) continue; if(retryAt) retryAfter.remove(key); seen[key]=true; messagePagePending[key]=true; keys.push(key);} for(var start=0;start<keys.length;){var batch=[],chars=0; while(start<keys.length&&batch.length<MESSAGE_PAGE_BATCH_MAX){var next=keys[start]; if(batch.length&&chars+next.length>MESSAGE_PAGE_CHAR_BUDGET) break; batch.push(next); chars+=next.length; start++;} requestMessagePageBatch(batch);}}
+  function primeMessagePage(values){var keys=[],seen=Object.create(null),now=Date.now(); for(var i=0;i<values.length&&keys.length<MAX_MESSAGE_PAGE_PRIME;i++){var key=keyOf(values[i]); if(!key||seen[key]||cache.has(key)||pending[key]||messagePagePending[key]||isLocalizedText(key)||isLayoutOnly(key)||!/[A-Za-z]/.test(key)) continue; var retryAt=retryAfter.get(key); if(retryAt&&retryAt>now) continue; if(retryAt) retryAfter.remove(key); seen[key]=true; messagePagePending[key]=true; keys.push(key);} for(var start=0;start<keys.length;){var batch=[],chars=0; while(start<keys.length&&batch.length<MESSAGE_PAGE_BATCH_MAX){var next=keys[start]; if(batch.length&&chars+next.length>MESSAGE_PAGE_CHAR_BUDGET) break; batch.push(next); chars+=next.length; start++;} requestMessagePageBatch(batch);}}
   function withLookupRequestsSuppressed(fn){suppressLookupRequests++; try{return fn();}finally{suppressLookupRequests--;}}
   function translateTextArray(values,allowPartial,skipLocalLookup){
     if(!values||!values.length) return values; if(!skipLocalLookup) requestLocalCacheKeys(values,512); var out=new Array(values.length); var allHit=true; var changed=false;
-    for(var i=0;i<values.length;i++){var orig=String(values[i]==null?'':values[i]); var r=lookupDecorated(orig); out[i]=r.text; if(!r.hit) allHit=false; if(r.text!==orig) changed=true;}
+    for(var i=0;i<values.length;i++){var orig=String(values[i]==null?'':values[i]); var r=lookupDecorated(orig); if(r.text===orig&&rpgmControlTokens(orig).length){var rich=translateConvertedRpgmText(orig,false); if(rich!==orig) r={text:rich,hit:true};} out[i]=r.text; if(!r.hit) allHit=false; if(r.text!==orig) changed=true;}
     if(!allHit&&changed&&!allowPartial) return values; return out;
   }
   function planMessagePage(original){var candidates=[],liveCandidates=[]; for(var ci=0;ci<original.length;ci++){var line=original[ci]; candidates.push(line); var unwrapped=line.replace(/^(?:<WordWrap>)+/i,''); if(unwrapped!==line) candidates.push(unwrapped); var decor=splitRpgmDecor(line),body=decor?decor.body:unwrapped; if(body){liveCandidates.push(body); if(body!==line&&body!==unwrapped) candidates.push(body);} var visible=visibleLookupKey(body); if(visible){candidates.push(visible); if(visible!==body) liveCandidates.push(visible);}} var joined=original.join('\n'); return {candidates:candidates,liveCandidates:liveCandidates,joined:joined,large:original.length>24||joined.length>4000};}
@@ -294,7 +374,7 @@
     var plan=planMessagePage(original); if(!cacheOnly) requestLocalCacheKeys(original.length>1?[plan.joined].concat(plan.candidates):plan.candidates,512);
     function resolve(){if(plan.large){if(!cacheOnly) primeMessagePage(plan.liveCandidates); return withLookupRequestsSuppressed(function(){return translateTextArray(original,false,true);});}
       if(!plan.large&&original.length>1){var whole=lookup(plan.joined); if(whole.hit&&whole.text!==plan.joined&&whole.text!==keyOf(plan.joined)) return [whole.text];}
-      if(!plan.large&&original.length>1){var first=splitRpgmDecor(original[0]); if(first){var visibleLines=new Array(original.length); visibleLines[0]=visibleLookupKey(first.body)||first.body; for(var vi=1;vi<original.length;vi++){var p=splitRpgmDecor(original[vi]); var b=p?p.body:original[vi]; visibleLines[vi]=visibleLookupKey(b)||b;} var vjoined=visibleLines.join('\n'); var vwhole=lookup(vjoined); if(vwhole.hit&&vwhole.text!==vjoined&&vwhole.text!==keyOf(vjoined)) return [first.prefix+vwhole.text];}}
+      if(!plan.large&&original.length>1){var first=splitRpgmDecor(original[0]); if(first){var visibleLines=new Array(original.length); visibleLines[0]=visibleLookupKey(first.body)||first.body; for(var vi=1;vi<original.length;vi++){var p=splitRpgmDecor(original[vi]); var b=p?p.body:original[vi]; visibleLines[vi]=visibleLookupKey(b)||b;} var vjoined=visibleLines.join('\n'); var vwhole=lookup(vjoined); if(vwhole.hit&&vwhole.text!==vjoined&&vwhole.text!==keyOf(vjoined)){var visibleOut=first.prefix+vwhole.text; if(safeRpgmTranslation(plan.joined,visibleOut)!==plan.joined) return [visibleOut]; reportRpgmLayoutFallback('message-format-cache-rejected','plain page cache would remove renderer controls');}}}
       return translateTextArray(original,false,true);}
     return cacheOnly?withLookupRequestsSuppressed(resolve):resolve();
   }
@@ -322,18 +402,81 @@
     try{if(window.Window_ChoiceList&&Window_ChoiceList.prototype.makeCommandList&&!Window_ChoiceList.prototype.makeCommandList._dsRpgmDisplayHook){var oldChoiceMake=Window_ChoiceList.prototype.makeCommandList; var makeCommandListWrap=function(){var r=oldChoiceMake.apply(this,arguments); applyTranslatedChoiceCommands(this); return r;}; makeCommandListWrap._dsRpgmDisplayHook=true; makeCommandListWrap._dsRpgmOriginal=oldChoiceMake; Window_ChoiceList.prototype.makeCommandList=makeCommandListWrap;}}catch(e){reportRpgmError('install-choice-command-list-hook',e);}
     try{if(window.Window_ChoiceList&&Window_ChoiceList.prototype.maxChoiceWidth&&!Window_ChoiceList.prototype.maxChoiceWidth._dsRpgmDisplayHook){var oldChoiceWidth=Window_ChoiceList.prototype.maxChoiceWidth; var maxChoiceWidthWrap=function(){var w=oldChoiceWidth.apply(this,arguments); try{var gm=window.$gameMessage; var choices=gm&&gm.choices?gm.choices():null; if(choices&&choices.length){var translated=translateTextArray(choices); for(var i=0;i<translated.length;i++){var t=translated[i]; var extra=0; if(this.textWidthEx) extra=this.textWidthEx(t); else if(this.textWidth) extra=this.textWidth(t); else extra=String(t==null?'':t).length; if(this.textPadding) extra+=this.textPadding()*2; if(w<extra) w=extra;}}}catch(e){reportRpgmError('measure-choice-width',e);} return w;}; maxChoiceWidthWrap._dsRpgmDisplayHook=true; maxChoiceWidthWrap._dsRpgmOriginal=oldChoiceWidth; Window_ChoiceList.prototype.maxChoiceWidth=maxChoiceWidthWrap;}}catch(e){reportRpgmError('install-choice-width-hook',e);}
   }
-  function installCopiedDrawTextExHooks(){try{if(!window.Window_Base||!Window_Base.prototype._dsDrawTextEx) return; var original=Window_Base.prototype._dsDrawTextEx,count=0; function patch(proto){if(count>=64||!proto||proto===Window_Base.prototype||proto.drawTextEx!==original) return; var wrap=(function(old){var fn=function(text,x,y,w){var self=this; markRpgmDisplayTarget(self,text); var out=text; try{out=translateConvertedRpgmText(text,true);}catch(e){reportRpgmError('translate-copied-draw-text-ex',e);} var changed=String(out==null?'':out)!==String(text==null?'':text); return withRpgmTextExWrap(self,out,x,w,changed,function(){return old.call(self,out,x,y,w);});}; fn._dsRpgmDisplayHook=true; return fn;})(proto.drawTextEx); proto._dsDrawTextEx=proto.drawTextEx; proto.drawTextEx=wrap; count++;} for(var name in window){if(count>=64) break; if(!/^(?:Sprite|Window)_/.test(name)) continue; var ctor=window[name]; patch(ctor&&ctor.prototype);} var types=window.HUDManager&&HUDManager.types; if(types){for(var typeName in types){if(count>=64) break; var entry=types[typeName],registered=entry&&entry.class; patch(registered&&registered.prototype);}}}catch(e){reportRpgmError('install-copied-draw-text-ex-hooks',e);}}
+  function installCopiedDrawTextExHooks(){try{if(!window.Window_Base||!Window_Base.prototype._dsDrawTextEx) return; var original=Window_Base.prototype._dsDrawTextEx,count=0; function patch(proto){if(count>=64||!proto||proto===Window_Base.prototype||proto.drawTextEx!==original) return; var wrap=(function(old){var fn=function(text,x,y,w){var self=this; markRpgmDisplayTarget(self,text); var out=text; try{out=trDisplay(text);}catch(e){reportRpgmError('translate-copied-draw-text-ex',e);} var changed=String(out==null?'':out)!==String(text==null?'':text); return withRpgmTextExWrap(self,out,x,w,changed,function(){return withDisplayTranslationSuppressed(function(){return old.call(self,out,x,y,w);});});}; fn._dsRpgmDisplayHook=true; return fn;})(proto.drawTextEx); proto._dsDrawTextEx=proto.drawTextEx; proto.drawTextEx=wrap; count++;} for(var name in window){if(count>=64) break; if(!/^(?:Sprite|Window)_/.test(name)) continue; var ctor=window[name]; patch(ctor&&ctor.prototype);} var types=window.HUDManager&&HUDManager.types; if(types){for(var typeName in types){if(count>=64) break; var entry=types[typeName],registered=entry&&entry.class; patch(registered&&registered.prototype);}}}catch(e){reportRpgmError('install-copied-draw-text-ex-hooks',e);}}
   function installDisplayTextHooks(){
     try{if(window.Bitmap&&Bitmap.prototype.drawText&&!Bitmap.prototype.drawText._dsRpgmDisplayHook){var oldBitmapDraw=Bitmap.prototype.drawText; var bitmapWrap=function(text,x,y,maxWidth,lineHeight,align){markRpgmDisplayTarget(this,text); return drawBitmapFit(oldBitmapDraw,this,text,x,y,maxWidth,lineHeight,align);}; bitmapWrap._dsRpgmDisplayHook=true; Bitmap.prototype._dsBitmapDrawText=oldBitmapDraw; Bitmap.prototype.drawText=bitmapWrap;}}catch(e){reportRpgmError('install-bitmap-draw-hook',e);}
     try{if(window.Bitmap&&Bitmap.prototype.measureTextWidth&&!Bitmap.prototype.measureTextWidth._dsRpgmCjkMeasureHook){var oldBitmapMeasure=Bitmap.prototype.measureTextWidth; var measureWrap=function(text){var self=this,args=arguments; return withCjkBitmapFont(self,text,function(){return oldBitmapMeasure.apply(self,args);});}; measureWrap._dsRpgmCjkMeasureHook=true; measureWrap._dsRpgmOriginal=oldBitmapMeasure; Bitmap.prototype.measureTextWidth=measureWrap;}}catch(e){reportRpgmError('install-bitmap-measure-hook',e);}
     try{if(window.Window_Base&&Window_Base.prototype.drawTextAutoWrap&&!Window_Base.prototype.drawTextAutoWrap._dsRpgmDisplayHook){var oldAutoWrap=Window_Base.prototype.drawTextAutoWrap; var autoWrap=function(baseText,x,y,maxWidth){var self=this,args=arguments; markRpgmDisplayTarget(self,baseText); var orig,translated; try{orig=String(baseText==null?'':baseText); translated=trDisplay(orig);}catch(e){reportRpgmError('translate-auto-wrap-text',e); return oldAutoWrap.apply(self,args);} if(hasCjk(translated)){try{return withDisplayTranslationSuppressed(function(){return drawCjkAutoWrap(self,translated,x,y,maxWidth);});}catch(e){reportRpgmError('draw-cjk-auto-wrap',e); return withDisplayTranslationSuppressed(function(){return oldAutoWrap.apply(self,args);});}} if(translated!==orig) return withDisplayTranslationSuppressed(function(){return oldAutoWrap.call(self,translated,x,y,maxWidth);}); return withDisplayTranslationSuppressed(function(){return oldAutoWrap.apply(self,args);});}; autoWrap._dsRpgmDisplayHook=true; Window_Base.prototype._dsDrawTextAutoWrap=oldAutoWrap; Window_Base.prototype.drawTextAutoWrap=autoWrap;}}catch(e){reportRpgmError('install-auto-wrap-hook',e);}
-    try{if(window.Window_Base&&Window_Base.prototype.drawTextEx&&!Window_Base.prototype.drawTextEx._dsRpgmDisplayHook){var old=Window_Base.prototype.drawTextEx; var drawTextExWrap=function(text,x,y,w){var self=this; markRpgmDisplayTarget(self,text); var out=text; try{out=trDisplay(text);}catch(e){reportRpgmError('translate-draw-text-ex',e);} var rendered=String(out==null?'':out),changed=rendered!==String(text==null?'':text)||self._dsRpgmTranslatedCjkText===rendered; return withRpgmTextExWrap(self,out,x,w,changed,function(){return old.call(self,out,x,y,w);});}; drawTextExWrap._dsRpgmDisplayHook=true; Window_Base.prototype._dsDrawTextEx=old; Window_Base.prototype.drawTextEx=drawTextExWrap;}}catch(e){reportRpgmError('install-draw-text-ex-hook',e);}
+    try{if(window.Window_Base&&Window_Base.prototype.drawTextEx&&!Window_Base.prototype.drawTextEx._dsRpgmDisplayHook){var old=Window_Base.prototype.drawTextEx; var drawTextExWrap=function(text,x,y,w){var self=this; markRpgmDisplayTarget(self,text); var out=text; try{out=trDisplay(text);}catch(e){reportRpgmError('translate-draw-text-ex',e);} var rendered=String(out==null?'':out),changed=rendered!==String(text==null?'':text)||self._dsRpgmTranslatedCjkText===rendered; return withRpgmTextExWrap(self,out,x,w,changed,function(){return withDisplayTranslationSuppressed(function(){return old.call(self,out,x,y,w);});});}; drawTextExWrap._dsRpgmDisplayHook=true; Window_Base.prototype._dsDrawTextEx=old; Window_Base.prototype.drawTextEx=drawTextExWrap;}}catch(e){reportRpgmError('install-draw-text-ex-hook',e);}
     try{if(window.Window_Base&&Window_Base.prototype.drawText&&!Window_Base.prototype.drawText._dsRpgmDisplayHook){var old2=Window_Base.prototype.drawText; var drawTextWrap=function(text,x,y,w,a){markRpgmDisplayTarget(this,text); var out=text; try{out=trDisplay(text);}catch(e){reportRpgmError('translate-draw-text',e);} return old2.call(this,out,x,y,w,a);}; drawTextWrap._dsRpgmDisplayHook=true; Window_Base.prototype._dsDrawText=old2; Window_Base.prototype.drawText=drawTextWrap;}}catch(e){reportRpgmError('install-draw-text-hook',e);}
     installTextExAutoWrapHook();
+    installCharacterRendererHook();
     installCopiedDrawTextExHooks();
   }
   function installPersistenceDisplayHooks(){try{if(window.Window_SaveInfo&&Window_SaveInfo.prototype.drawColumnData&&!Window_SaveInfo.prototype.drawColumnData._dsRpgmColumnHook){var oldDraw=Window_SaveInfo.prototype.drawColumnData; var wrap=function(y){this._dsRpgmColumnY=y; return oldDraw.apply(this,arguments);}; wrap._dsRpgmColumnHook=true; wrap._dsRpgmOriginal=oldDraw; Window_SaveInfo.prototype.drawColumnData=wrap;}}catch(e){reportRpgmError('install-persistence-column-hook',e);}}
-  function installAllRpgmHooks(){installCjkFont(); installQuestPrimeHooks(); installMessageRuntimeHooks(); installTopLevelWindowHooks(); installDisplayTextHooks(); installPersistenceDisplayHooks(); installWindowOpenRefreshHook();}
+  var rpgmAutoImageText=null,rpgmAutoImageAttempted=false;
+  function installRpgmAutoImageText(){
+    if(!window.ImageManager||typeof ImageManager.loadBitmap!=='function'||typeof require!=='function'||typeof process!=='object'||process.platform!=='win32'||!process.versions||!process.versions.nw) return;
+    if(!rpgmAutoImageAttempted){rpgmAutoImageAttempted=true;
+      try{var p=require('path');if(!process.mainModule||!process.mainModule.filename)throw new Error('NW.js start page path unavailable');var root=p.dirname(process.mainModule.filename),module=require(p.join(root,'js','rpgm_image_text.js'));
+        rpgmAutoImageText=module.create({root:root,Bitmap:window.Bitmap,ImageManager:ImageManager,document:document,font:CJK_FONT,diagnose:reportRpgmError,system:function(){return window.$dataSystem;},translate:function(text){requestLocalCacheKeys([text],1);return lookupDecorated(text).text;}});
+        if(window.addEventListener)window.addEventListener('unload',function(){rpgmAutoImageText.close();},false);
+      }catch(e){reportRpgmError('image-text-module',e);}
+    }
+    if(!rpgmAutoImageText)return;rpgmAutoImageText.install();
+    if(window.SceneManager&&typeof SceneManager.updateScene==='function'&&!SceneManager.updateScene._dsRpgmAutoImageText){var old=SceneManager.updateScene;var update=function(){var result=old.apply(this,arguments);rpgmAutoImageText.update(this._scene,cacheEpoch);return result;};update._dsRpgmAutoImageText=true;SceneManager.updateScene=update;}
+  }
+  var imageOverridesLoaded=false,imageOverrides=Object.create(null);
+  // 部分菜单把文字烘焙进图片，并关闭普通 drawText 以避免重复绘制。恢复这些方法会破坏
+  // 插件布局，因此只读取独立的图片适配清单，把已核实资源交回引擎自己的加载/缓存流程。
+  // 原图、译图的 SHA-256 和 PNG 尺寸必须同时匹配；游戏升级、缺失或坏清单只能保留原图，
+  // 不冒充翻译成功，原始错误由 image-overrides-* 限频记录。没有清单表示该可选功能未启用。
+  // 校验只在启动生命周期做一次，绘制、窗口刷新与消息排版不做磁盘读取或重新生成图片。
+  function readRpgmImageOverrides(){
+    var fs,nodePath,crypto,base,manifest;
+    try{fs=require('fs'); nodePath=require('path'); crypto=require('crypto');
+      if(!process.mainModule||!process.mainModule.filename) throw new Error('NW.js start page path unavailable');
+      base=fs.realpathSync(nodePath.dirname(process.mainModule.filename));
+    }catch(e){reportRpgmError('image-overrides-runtime',e); return;}
+    function readBounded(file,limit){var size=fs.statSync(file).size; if(size<1||size>limit) throw new Error('image override file size out of bounds: '+file); var bytes=fs.readFileSync(file); if(bytes.length<1||bytes.length>limit) throw new Error('image override file changed size: '+file); return bytes;}
+    try{var json=readBounded(nodePath.join(base,'js','dst_rpgm_image_overrides.json'),262144); manifest=JSON.parse(json.toString('utf8').replace(/^\uFEFF/,''));}
+    catch(e){if(e&&e.code==='ENOENT'){if(window.console&&typeof console.info==='function') console.info('[DeepSeek RPGM] image-overrides: optional manifest not configured'); return;} reportRpgmError('image-overrides-manifest',e); return;}
+    if(!manifest||manifest.schema!==1||!Array.isArray(manifest.images)||manifest.images.length>64){reportRpgmError('image-overrides-schema',new Error('expected schema 1 and at most 64 image entries')); return;}
+    function asset(relative,hash,replacement){
+      if(typeof relative!=='string'||relative.length>512||!/^img\/[^\x00-\x1f:*?<>|]+\.png$/i.test(relative)||/(?:^|\/)\.{1,2}(?:\/|$)|\\|\/\//.test(relative)||!(/^[a-f0-9]{64}$/i.test(String(hash)))) throw new Error('invalid image override path or fingerprint');
+      if(replacement!==/^img\/dst_translated\//i.test(relative)) throw new Error('replacement must be inside img/dst_translated; source must be outside it');
+      var file=fs.realpathSync(nodePath.join(base,relative));
+      if(file.indexOf(base+nodePath.sep)!==0) throw new Error('image override resolves outside game content root');
+      var bytes=readBounded(file,4194304);
+      if(crypto.createHash('sha256').update(bytes).digest('hex').toLowerCase()!==String(hash).toLowerCase()) throw new Error('image override fingerprint mismatch: '+relative);
+      if(bytes.length<24||bytes.slice(0,8).toString('hex')!=='89504e470d0a1a0a'||bytes.toString('ascii',12,16)!=='IHDR') throw new Error('image override is not a PNG: '+relative);
+      var w=bytes.readUInt32BE(16),h=bytes.readUInt32BE(20);
+      if(!w||!h||w>8192||h>8192||w*h>16777216) throw new Error('image override PNG dimensions out of bounds: '+relative);
+      return {width:w,height:h};
+    }
+    var prepared=Object.create(null);
+    for(var i=0;i<manifest.images.length;i++){
+      var entry=manifest.images[i];
+      try{
+        if(!entry||typeof entry!=='object') throw new Error('invalid image entry');
+        var original=asset(entry.source,entry.sourceSha256,false),translated=asset(entry.replacement,entry.replacementSha256,true);
+        if(original.width!==translated.width||original.height!==translated.height) throw new Error('image override changes original geometry: '+entry.source);
+        if(Object.prototype.hasOwnProperty.call(prepared,entry.source)) throw new Error('duplicate image override: '+entry.source);
+        var slash=entry.replacement.lastIndexOf('/');
+        prepared[entry.source]={folder:entry.replacement.slice(0,slash+1),name:entry.replacement.slice(slash+1,-4)};
+      }catch(e){reportRpgmError('image-overrides-entry-'+i,e);}
+    }
+    imageOverrides=prepared;
+  }
+  function installRpgmImageOverrideHook(){
+    if(!window.ImageManager||typeof ImageManager.loadBitmap!=='function'||typeof require!=='function'||typeof process!=='object'||!process.versions||!process.versions.nw) return;
+    if(!imageOverridesLoaded){imageOverridesLoaded=true; readRpgmImageOverrides();}
+    if(!Object.keys(imageOverrides).length||ImageManager.loadBitmap._dsRpgmImageOverrides) return;
+    var old=ImageManager.loadBitmap;
+    var wrap=function(folder,filename,hue,smooth){var mapped=imageOverrides[String(folder||'')+String(filename||'')+'.png']; if(!mapped) return old.apply(this,arguments); if(window.Decrypter&&Decrypter.hasEncryptedImages){reportRpgmError('image-overrides-encrypted-runtime',new Error('plain PNG overrides cannot enter the encrypted image loader')); return old.apply(this,arguments);} var args=Array.prototype.slice.call(arguments); args[0]=mapped.folder; args[1]=mapped.name; return old.apply(this,args);};
+    wrap._dsRpgmImageOverrides=true; wrap._dsRpgmOriginal=old; ImageManager.loadBitmap=wrap;
+  }
+  function installAllRpgmHooks(){installCjkFont(); installQuestPrimeHooks(); installMessageRuntimeHooks(); installTopLevelWindowHooks(); installDisplayTextHooks(); installPersistenceDisplayHooks(); installWindowOpenRefreshHook(); installRpgmImageOverrideHook(); installRpgmAutoImageText();}
   function installBootLifecycleHooks(){
     // 动态插件可能在初次安装后覆盖消息方法。插件执行完毕的 DOM/load 边界可再次安装，
     // 无法从上游控制游戏插件的覆盖顺序；失败仅保留原文，不写成功缓存，控制台限频记录。

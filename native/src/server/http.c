@@ -20,6 +20,7 @@
 #include "cache.h"
 #include "json.h"
 #include "util.h"
+#include "../core/mixed_text.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -37,13 +38,11 @@ void http_set_ctx(HttpCtx *ctx) { g_ctx = ctx; }
    排空期间的最坏占用仍保持在约 10 MB。 */
 #define ASYNC_QUEUE_LIMIT 65536              /* 异步队列上限，防失控占满内存 */
 #define ASYNC_QUEUE_BYTE_LIMIT (32u * 1024u * 1024u)
-#define ASYNC_BATCH_MAX 48                   /* 单批最多合并的文本数 */
-#define ASYNC_BATCH_CHAR_BUDGET 9600         /* 单批字符预算，控制单次 API 请求体量 */
+#define ASYNC_BATCH_MAX 48                   /* 固定数组容量；实际合批上限读取 API 配置 */
 #define ASYNC_BATCH_COALESCE_MS 25           /* 合批等待窗口：攒够一批或超时即发 */
 #define ASYNC_FOREGROUND_YIELD_MS 25         /* 后台等待前台清空的轮询间隔 */
 #define ASYNC_KNOWN_BUCKETS 8192             /* 去重哈希桶数（须为 2 的幂） */
 #define LIVE_BATCH_MAX 48
-#define LIVE_BATCH_CHAR_BUDGET 9600
 #define LIVE_BATCH_COALESCE_MS 35
 #define LIVE_QUEUE_BYTE_LIMIT (32u * 1024u * 1024u)
 #define HTTP_REQUEST_BUFFER_POOL_LIMIT 32    /* 仅缓存固定 64 KiB 初始块，常驻上限约 2 MiB */
@@ -66,6 +65,7 @@ typedef struct LiveJob {
     char *text;
     char *result;
     size_t memory_bytes;
+    int renpy;
     int done;
     CONDITION_VARIABLE cv;
     struct LiveJob *next;
@@ -508,9 +508,20 @@ static int has_translation_signal(const char *s) {
     return 0;
 }
 
-/* 综合判定：非空 + 有翻译信号 + 不含 CJK（已是中文则不翻）。 */
-static int should_translate_text(const char *text) {
-    return text && *text && has_translation_signal(text) && !utf8_has_cjk(text);
+/* 纯中文透传；含可见英文的半汉化文本在 API 边界保护中文后补译。 */
+static int should_translate_text_format(const char *text, int renpy) {
+    return text && *text && has_translation_signal(text)
+        && (!utf8_has_cjk(text) || (renpy ? dst_mixed_latin_renpy(text) : dst_mixed_latin(text)));
+}
+
+static int should_translate_text(const char *text) { return should_translate_text_format(text, 0); }
+
+/* 格式提示只改变正文可见性判定，不改变原文缓存键或请求的异步语义。 */
+static int request_is_renpy(const char *body) {
+    char *engine = json_top_get_str(body, "engine");
+    int renpy = engine && strcmp(engine, "renpy") == 0;
+    free(engine);
+    return renpy;
 }
 
 /* 判定是否为"有效翻译结果"：译文非空且与原文不同。
@@ -598,8 +609,8 @@ static int async_known_locked(const char *text, uint64_t hash) {
    source 标记为 queued 还是 miss。
    带上下文版本：prev 为该文本的上一行（可 NULL），仅预热路径传入；
    prev 只随 job 存储用于构建提示词，绝不写入缓存或参与去重。 */
-static int async_enqueue_miss_ctx(const char *text, const char *prev) {
-    if (!g_ctx || !g_ctx->api || !g_ctx->api->enabled || !should_translate_text(text)) return 0;
+static int async_enqueue_miss_ctx(const char *text, const char *prev, int renpy) {
+    if (!g_ctx || !g_ctx->api || !g_ctx->api->enabled || !should_translate_text_format(text, renpy)) return 0;
 
     if (cache_contains(g_ctx->cache, text)) return 0;
     if (!ensure_async_worker()) return 0;
@@ -649,8 +660,8 @@ static int async_enqueue_miss_ctx(const char *text, const char *prev) {
 }
 
 /* 无上下文入队：实时路径（/translate、/batch、live worker 自愈）共用。 */
-static int async_enqueue_miss(const char *text) {
-    return async_enqueue_miss_ctx(text, NULL);
+static int async_enqueue_miss(const char *text, int renpy) {
+    return async_enqueue_miss_ctx(text, NULL, renpy);
 }
 
 /* 持锁：从去重桶中摘除 job（翻译完成后调用，使相同文本可再次排队重译）。 */
@@ -677,12 +688,15 @@ static AsyncJob *async_pop_locked(void) {
     return job;
 }
 
-/* worker 取一批 job（最多 cap 个，受字符预算约束）。队空时阻塞等待条件变量。
-   合批逻辑：弹出首个后，若短暂等待窗口内还有新任务且不超字符预算，则继续攒，
+/* worker 取一批 job（最多 cap 个，受配置的 UTF-8 字节预算约束）。队空时阻塞等待条件变量。
+   合批逻辑：弹出首个后，若短暂等待窗口内还有新任务且不超字节预算，则继续攒，
    从而把多个小文本合并成一次 API 请求，提升吞吐。 */
 static size_t async_pop_batch(AsyncJob **jobs, size_t cap) {
     size_t n = 0;
-    size_t chars = 0;
+    size_t text_bytes = 0;
+    size_t max_items = (size_t)g_ctx->api->batch_max_items;
+    size_t byte_budget = (size_t)g_ctx->api->batch_char_budget;
+    if (cap > max_items) cap = max_items;
     AcquireSRWLockExclusive(&g_async_lock);
     while (!g_async_head && g_ctx && !InterlockedCompareExchange(g_ctx->stop, 0, 0)) {
         SleepConditionVariableSRW(&g_async_cv, &g_async_lock, 1000, 0);
@@ -694,7 +708,7 @@ static size_t async_pop_batch(AsyncJob **jobs, size_t cap) {
 
     AsyncJob *job = async_pop_locked();
     jobs[n++] = job;
-    chars += strlen(job->text);
+    text_bytes += strlen(job->text);
 
     while (n < cap) {
         if (!g_async_head) {
@@ -702,10 +716,10 @@ static size_t async_pop_batch(AsyncJob **jobs, size_t cap) {
         }
         if (!g_async_head) break;
         size_t next_len = strlen(g_async_head->text);
-        if (chars + next_len > ASYNC_BATCH_CHAR_BUDGET && n > 0) break;
+        if (text_bytes + next_len > byte_budget) break;
         job = async_pop_locked();
         jobs[n++] = job;
-        chars += next_len;
+        text_bytes += next_len;
     }
     ReleaseSRWLockExclusive(&g_async_lock);
     return n;
@@ -728,6 +742,13 @@ static void async_finish_jobs(AsyncJob **jobs, size_t count) {
         free(jobs[i]->prev);
         free(jobs[i]);
     }
+}
+
+/* 拆分重试的让路回调：等前台清空后复查关停/禁用。返回 1 = 调用方应停止
+   拆分，剩余条目按 miss 遗忘（下次 miss 重新排队）。 */
+static int async_split_yield(void) {
+    async_wait_for_foreground();
+    return server_stopping() || !g_ctx || !g_ctx->api || !g_ctx->api->enabled;
 }
 
 /* 翻译一批异步 job：先过滤掉已缓存/不可译的，剩下的调 API。
@@ -755,8 +776,12 @@ static void async_translate_pending(AsyncJob **jobs, size_t count) {
     if (server_stopping() || !g_ctx->api || !g_ctx->api->enabled) return;
     /* 二分重试：范围失败时对半拆分定位最小失败单元（≤4 条逐条兜底），
        取代旧的"整批失败→48 次逐条重发"降级；有语境的批次在每次尝试时
-       都携带各自的 prevs。返回数组中 NULL 槽位计 miss，绝不伪装成功。 */
-    char **translated = api_translate_split_retry(g_ctx->api, texts, prevs, pn);
+       都携带各自的 prevs。返回数组中 NULL 槽位计 miss，绝不伪装成功。
+       让路回调保证拆分树的每个子请求前仍执行前台让位与关停检查——
+       单通道（concurrency=1，本地模型推荐配置）下实时请求才不会被
+       拆分树连续抢占。 */
+    char **translated = api_translate_split_retry(g_ctx->api, texts, prevs, pn,
+                                                  async_split_yield);
     if (!translated) return;
 
     const char *persist_keys[ASYNC_BATCH_MAX];
@@ -813,10 +838,13 @@ static LiveJob *live_pop_locked(void) {
     return job;
 }
 
-/* 实时 worker 取一批 job，合批逻辑与 async_pop_batch 对称（参数独立可单独调优）。 */
+/* 实时 worker 取一批 job，与预热及同步 /batch 共用配置的条数和 UTF-8 字节预算。 */
 static size_t live_pop_batch(LiveJob **jobs, size_t cap) {
     size_t n = 0;
-    size_t chars = 0;
+    size_t text_bytes = 0;
+    size_t max_items = (size_t)g_ctx->api->batch_max_items;
+    size_t byte_budget = (size_t)g_ctx->api->batch_char_budget;
+    if (cap > max_items) cap = max_items;
     AcquireSRWLockExclusive(&g_live_lock);
     while (!g_live_head && g_ctx && !InterlockedCompareExchange(g_ctx->stop, 0, 0)) {
         SleepConditionVariableSRW(&g_live_cv, &g_live_lock, 1000, 0);
@@ -828,7 +856,7 @@ static size_t live_pop_batch(LiveJob **jobs, size_t cap) {
 
     LiveJob *job = live_pop_locked();
     jobs[n++] = job;
-    chars += strlen(job->text);
+    text_bytes += strlen(job->text);
 
     while (n < cap) {
         if (!g_live_head) {
@@ -836,10 +864,10 @@ static size_t live_pop_batch(LiveJob **jobs, size_t cap) {
         }
         if (!g_live_head) break;
         size_t next_len = strlen(g_live_head->text);
-        if (chars + next_len > LIVE_BATCH_CHAR_BUDGET && n > 0) break;
+        if (text_bytes + next_len > byte_budget) break;
         job = live_pop_locked();
         jobs[n++] = job;
-        chars += next_len;
+        text_bytes += next_len;
     }
     ReleaseSRWLockExclusive(&g_live_lock);
     return n;
@@ -869,7 +897,7 @@ static void live_translate_jobs(LiveJob **jobs, size_t count, char **results) {
     for (size_t i = 0; i < count; i++) {
         results[i] = cache_get(g_ctx->cache, jobs[i]->text);
         if (results[i]) continue;
-        if (!g_ctx->api || !g_ctx->api->enabled || !should_translate_text(jobs[i]->text)) {
+        if (!g_ctx->api || !g_ctx->api->enabled || !should_translate_text_format(jobs[i]->text, jobs[i]->renpy)) {
             results[i] = xstrdup(jobs[i]->text);
             continue;
         }
@@ -926,7 +954,7 @@ static void live_translate_jobs(LiveJob **jobs, size_t count, char **results) {
        而不是让英文永久从实时路径漏出。对刚进入缓存的文本，async_enqueue_miss
        不执行任何操作。 */
     for (size_t i = 0; i < pn; i++) {
-        async_enqueue_miss(pending[i]->text);
+        async_enqueue_miss(pending[i]->text, pending[i]->renpy);
     }
 }
 
@@ -951,8 +979,8 @@ static DWORD WINAPI live_worker(LPVOID arg) {
    期间持有 live 锁（SleepConditionVariableSRW 会临时释放锁）。
    foreground_enter/leave 包住整个过程，使后台 worker 主动让路。
    返回新分配的结果（调用方负责 free），不可译/worker 不可用时返回 NULL。 */
-static char *live_translate_batched(const char *text) {
-    if (!g_ctx || !g_ctx->api || !g_ctx->api->enabled || !should_translate_text(text)) return NULL;
+static char *live_translate_batched(const char *text, int renpy) {
+    if (!g_ctx || !g_ctx->api || !g_ctx->api->enabled || !should_translate_text_format(text, renpy)) return NULL;
     if (!ensure_live_worker()) return NULL;
 
     LiveJob job;
@@ -961,6 +989,7 @@ static char *live_translate_batched(const char *text) {
     if (text_bytes > LIVE_QUEUE_BYTE_LIMIT - sizeof job) return NULL;
     job.memory_bytes = sizeof job + text_bytes;
     job.text = xstrdup(text);
+    job.renpy = renpy;
     InitializeConditionVariable(&job.cv);
 
     foreground_enter();
@@ -989,7 +1018,7 @@ static char *live_translate_batched(const char *text) {
 /* 一次性把一个 HTTP 批次中的全部唯一未命中提交到实时工作池。工作线程按条目数和
    字符预算拆分，并可并发使用独立 API 通道。结果保持输入顺序；未解析条目仍为原文
    回显，并由调用方拒绝。 */
-static void live_translate_group(char **texts, size_t count, char **results) {
+static void live_translate_group(char **texts, size_t count, char **results, int renpy) {
     if (!texts || !count || !results || !g_ctx || !g_ctx->api ||
         !g_ctx->api->enabled || !ensure_live_worker()) return;
     if (count > LIVE_QUEUE_BYTE_LIMIT / sizeof(LiveJob)) {
@@ -1010,6 +1039,7 @@ static void live_translate_group(char **texts, size_t count, char **results) {
         memory_bytes += text_bytes;
         jobs[i].memory_bytes = sizeof *jobs + text_bytes;
         jobs[i].text = xstrdup(texts[i]);
+        jobs[i].renpy = renpy;
         InitializeConditionVariable(&jobs[i].cv);
     }
 
@@ -1048,23 +1078,23 @@ static void live_translate_group(char **texts, size_t count, char **results) {
    source 写入本次结果的来源标记（cache/pass/queued/miss/api_batch）。
    优先级：缓存命中 -> 不可译透传 -> cache_only 模式(可入队异步) -> 实时翻译。
    返回新分配字符串，调用方负责 free。 */
-static char *translate_value(const char *text, int cache_only, int queue_miss, const char **source) {
+static char *translate_value(const char *text, int cache_only, int queue_miss, const char **source, int renpy) {
     char *v = cache_get(g_ctx->cache, text);
     if (v) {
         if (source) *source = "cache";
         return v;
     }
-    if (!should_translate_text(text)) {
+    if (!should_translate_text_format(text, renpy)) {
         if (source) *source = "pass";
         return xstrdup(text);
     }
     if (cache_only) {
-        int queued = queue_miss && async_enqueue_miss(text);
+        int queued = queue_miss && async_enqueue_miss(text, renpy);
         if (source) *source = queued ? "queued" : "miss";
         return xstrdup(text);
     }
     if (!cache_only && g_ctx->api && g_ctx->api->enabled) {
-        char *live = live_translate_batched(text);
+        char *live = live_translate_batched(text, renpy);
         if (is_resolved_translation(text, live)) {
             CachePersistResult persisted =
                 cache_set_persist_result(g_ctx->cache, text, live);
@@ -1177,14 +1207,13 @@ static void op_cache_export(Buf *b) {
    translation/translated_text 双字段。否则走批量路径：
      1) 先去重（同文本复用前面结果）、查缓存、判定可译性，把需要实时翻译的
         下标收集进 miss[]；
-     2) foreground 包住 API 调用段（标记前台，让后台让路），按 ASYNC_BATCH_MAX
-        分批调 api_translate_batch，失败则逐条 api_translate 兜底；
+     2) 前台任务进入实时 worker 池，按配置的条数和字节预算分批调用提供商；
      3) 仍未得到的回退为原文（source=miss）；
      4) 拼装 translations 映射 + results 数组 + sources 数组三个视图。 */
-static void op_batch(Buf *b, List *l, int single, int cache_only) {
+static void op_batch(Buf *b, List *l, int single, int cache_only, int renpy) {
     if (single && l->n == 1) {
         const char *source = "miss";
-        char *v = translate_value(l->v[0], cache_only, cache_only, &source);
+        char *v = translate_value(l->v[0], cache_only, cache_only, &source, renpy);
         buf_add(b, "{\"translation\":");
         buf_json(b, v);
         buf_add(b, ",\"translated_text\":");
@@ -1236,11 +1265,11 @@ static void op_batch(Buf *b, List *l, int single, int cache_only) {
             continue;
         }
 
-        if (!should_translate_text(l->v[i])) {
+        if (!should_translate_text_format(l->v[i], renpy)) {
             vals[i] = xstrdup(l->v[i]);
             sources[i] = "pass";
         } else if (cache_only) {
-            sources[i] = async_enqueue_miss(l->v[i]) ? "queued" : "miss";
+            sources[i] = async_enqueue_miss(l->v[i], renpy) ? "queued" : "miss";
             vals[i] = xstrdup(l->v[i]);
         } else if (g_ctx->api && g_ctx->api->enabled) {
             miss[miss_n++] = i;
@@ -1254,7 +1283,7 @@ static void op_batch(Buf *b, List *l, int single, int cache_only) {
         char **texts = xmalloc(miss_n * sizeof *texts);
         char **translated = xcalloc(miss_n, sizeof *translated);
         for (size_t i = 0; i < miss_n; i++) texts[i] = l->v[miss[i]];
-        live_translate_group(texts, miss_n, translated);
+        live_translate_group(texts, miss_n, translated, renpy);
         for (size_t i = 0; i < miss_n; i++) {
             size_t idx = miss[i];
             if (is_resolved_translation(l->v[idx], translated[i])) {
@@ -1417,11 +1446,11 @@ static void op_import(Buf *b, const char *json) {
 /* /prefetch、/warmup：把文本批量排入异步队列后台翻译，立即返回已排队数。
    不等待翻译完成——这正是预热的设计：游戏启动时先排进队列，worker 慢慢消化。
    prevs 为可选平行数组（与 l 等长时生效），携带每条文本的上一行作为语境。 */
-static void op_prefetch(Buf *b, List *l, List *prevs) {
+static void op_prefetch(Buf *b, List *l, List *prevs, int renpy) {
     int use_prevs = prevs && prevs->n == l->n;
     int queued = 0;
     for (size_t i = 0; i < l->n; i++) {
-        queued += async_enqueue_miss_ctx(l->v[i], use_prevs ? prevs->v[i] : NULL);
+        queued += async_enqueue_miss_ctx(l->v[i], use_prevs ? prevs->v[i] : NULL, renpy);
     }
     buf_add(b, "{\"status\":\"queued\",\"queued\":");
     buf_int(b, queued);
@@ -1472,6 +1501,26 @@ static int parse_request_line(const char *request, const char *headers_end,
     return 1;
 }
 
+/* 只检查上次未完成的后缀和新字节。保留 C 字符串在内嵌 NUL 处停止的
+   既有语义；游标停在该字节，不能因下一次分片而越过它找到后面的分隔符。 */
+static char *find_header_end(char *req, size_t length, size_t *cursor) {
+    size_t i = *cursor;
+    while (i + 3 < length) {
+        if (req[i] == '\0') {
+            *cursor = i;
+            return NULL;
+        }
+        if (req[i] == '\r' && req[i + 1] == '\n' &&
+            req[i + 2] == '\r' && req[i + 3] == '\n') {
+            *cursor = i;
+            return req + i;
+        }
+        i++;
+    }
+    *cursor = i;
+    return NULL;
+}
+
 static void serve_one(SOCKET s) {
     DWORD timeout = HTTP_RECV_TIMEOUT_MS;
     if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout) == SOCKET_ERROR ||
@@ -1489,6 +1538,8 @@ static void serve_one(SOCKET s) {
     req[0] = 0;
     size_t n = 0;
     size_t expected_total = 0;
+    size_t header_scan_cursor = 0;
+    size_t header_length = 0;
     int headers_complete = 0;
     int request_error = 0;
     int r;
@@ -1516,7 +1567,7 @@ static void serve_one(SOCKET s) {
         }
         n += (size_t)r;
         req[n] = 0;
-        char *he = strstr(req, "\r\n\r\n");
+        char *he = headers_complete ? NULL : find_header_end(req, n, &header_scan_cursor);
         if (he) {
             size_t hl = (size_t)(he + 4 - req);
             size_t body_length = 0;
@@ -1531,12 +1582,13 @@ static void serve_one(SOCKET s) {
                 break;
             }
             expected_total = hl + body_length;
+            header_length = hl;
             headers_complete = 1;
-            if (n >= expected_total) {
-                n = expected_total;
-                req[n] = 0;
-                break;
-            }
+        }
+        if (headers_complete && n >= expected_total) {
+            n = expected_total;
+            req[n] = 0;
+            break;
         }
     }
 
@@ -1552,7 +1604,8 @@ static void serve_one(SOCKET s) {
         return;
     }
 
-    char *headers_end = strstr(req, "\r\n\r\n");
+    /* 保存偏移而非指针，正文分片导致 realloc 后仍指向当前缓冲。 */
+    char *headers_end = req + header_length - 4;
     int origin_present = 0;
     if (!headers_end || !apply_origin_policy(req, headers_end, &origin_present)) {
         report_origin_rejection("untrusted-or-malformed");
@@ -1587,8 +1640,7 @@ static void serve_one(SOCKET s) {
         return;
     }
 
-    char *body = strstr(req, "\r\n\r\n");
-    body = body ? body + 4 : "";
+    char *body = req + header_length;
 
     Buf out;
     buf_init(&out);
@@ -1623,7 +1675,7 @@ static void serve_one(SOCKET s) {
             resp_plain(s, 400, "Bad Request", "missing_text");
         } else {
             const char *source = "miss";
-            char *v = translate_value(text, cache_only, cache_only, &source);
+            char *v = translate_value(text, cache_only, cache_only, &source, 0);
             if (!cache_only && !strcmp(source, "miss") && should_translate_text(text)) {
                 /* 非缓存模式却仍然 miss：说明 API 不可用/翻译失败。返回 503
                    而非原文，让 XUnity 这类客户端能区分"真未翻译"与"译为原文"。 */
@@ -1669,7 +1721,7 @@ static void serve_one(SOCKET s) {
         if (!l.n) {
             resp(s, 400, "Bad Request", "{\"error\":\"missing_text\"}");
         } else {
-            op_batch(&out, &l, ieq(path, "/translate"), json_bool_true(body, "cache_only"));
+            op_batch(&out, &l, ieq(path, "/translate"), json_bool_true(body, "cache_only"), request_is_renpy(body));
             resp(s, 200, "OK", out.data);
         }
         free(one);
@@ -1705,7 +1757,7 @@ static void serve_one(SOCKET s) {
                 p.cap = 0;
             }
         }
-        op_prefetch(&out, &l, p.n ? &p : NULL);
+        op_prefetch(&out, &l, p.n ? &p : NULL, request_is_renpy(body));
         free(one);
         list_free(&l);
         list_free(&p);

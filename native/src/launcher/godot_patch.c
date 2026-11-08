@@ -1,3 +1,4 @@
+#include "../core/mixed_text.h"
 #include "godot_patch.h"
 #include "godot_encrypted_pack.h"
 
@@ -213,7 +214,8 @@ static int godot_source_fingerprint(const PckSource *src, char out[48]) {
     hash ^= 0xfdu; hash *= 1099511628211ULL;
     const unsigned char *version = (const unsigned char *)DS_TRANSLATOR_VERSION;
     for (size_t i = 0; version[i]; i++) { hash ^= version[i]; hash *= 1099511628211ULL; }
-    snprintf(out, 48, "DST_GODOT_SOURCE_V4:%016llx\n", (unsigned long long)hash);
+    /* V5 声明生成器的 stdin 握手协议；只改生成器时也不能复用旧运行时包。 */
+    snprintf(out, 48, "DST_GODOT_SOURCE_V5:%016llx\n", (unsigned long long)hash);
     return ok;
 }
 
@@ -809,7 +811,7 @@ static int wanted_source_text(const char *s) {
     if (!s) return 0;
     size_t n = strlen(s);
     if (n < 2 || n > GODOT_PATCH_MAX_SOURCE_TEXT_BYTES) return 0;
-    if (has_cjk_utf8(s)) return 0;
+    if (has_cjk_utf8(s) && !dst_mixed_latin(s)) return 0;
     if (!strcmp(s, "RSRC") || !strcmp(s, "OptimizedTranslation") ||
         !strcmp(s, "Translation") || !strcmp(s, "messages") ||
         !strcmp(s, "locale") || !strcmp(s, "strings") ||
@@ -1257,6 +1259,7 @@ static char *build_text_resource_override(const unsigned char *buf, DWORD size,
     *patched_strings = 0;
     ByteBuf out = {0};
     uint32_t last = 0;
+    size_t rejected_format = 0;
     for (size_t i = 0; i < patches->n; i++) {
         TextPatch *p = &patches->v[i];
         if (p->start < last || p->end > size) {
@@ -1266,8 +1269,10 @@ static char *build_text_resource_override(const unsigned char *buf, DWORD size,
         bb_add(&out, (const char *)buf + last, p->start - last);
         const char *source = p->source_index >= 0 ? texts->v[p->source_index] : NULL;
         const char *translated = p->source_index >= 0 ? translations[p->source_index] : NULL;
+        int format_ok = !translated || godot_text_translation_preserves_format(source, translated);
+        if (translated && !format_ok) rejected_format++;
         if (translated && wanted_translation_text(translated) &&
-            godot_text_translation_preserves_format(source, translated) &&
+            format_ok &&
             (!p->raw_text || (!strchr(translated, '\r') && !strchr(translated, '\n')))) {
             char *wrapped = godot_wrap_cjk_translation(translated);
             const char *final_text = wrapped ? wrapped : translated;
@@ -1281,6 +1286,9 @@ static char *build_text_resource_override(const unsigned char *buf, DWORD size,
         last = p->end;
     }
     bb_add(&out, (const char *)buf + last, size - last);
+    /* 模型或旧缓存可损坏标签；只能由 Godot 资源边界拒绝，不能改写共享译文。
+       保留原文且不计为补丁成功，每个资源汇总诊断一次，避免逐字符串刷屏。 */
+    if (rejected_format) append_log(L"Godot: preserved %Iu resource strings with incompatible tags or format tokens.", rejected_format);
     if (!*patched_strings || out.len > UINT32_MAX) {
         free(out.data);
         return NULL;
@@ -1358,6 +1366,40 @@ static int gdscript_translation_preserves_format_tokens(const char *source, cons
 /* 静态文本资源与 GDScript 常量进入相同的 BBCode 和格式化渲染器，因此采用
    相同的翻译门禁：括号必须保持配对，printf 风格令牌必须与原文一致；不匹配
    时保留原字符串。 */
+static const char *godot_next_bbcode(const char **cursor, size_t *length) {
+    static const char *known[] = { "b", "i", "u", "s", "code", "url", "img", "font", "font_size",
+        "color", "bgcolor", "fgcolor", "outline_size", "outline_color", "center", "left", "right",
+        "fill", "indent", "table", "cell", "ul", "ol", "li", "lb", "rb", "br", "p", "lang",
+        "opentype_features", "dropcap", "paragraph", "tab", "hr", "fade", "shake", "wave",
+        "tornado", "rainbow", "pulse" };
+    const char *start;
+    while ((start = strchr(*cursor, '[')) != NULL) {
+        const char *end = strchr(start + 1, ']');
+        if (!end) { *cursor = start + strlen(start); return NULL; }
+        *cursor = end + 1;
+        const char *name = start + 1;
+        int closing = *name == '/';
+        if (closing) name++;
+        const char *p = name;
+        while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+               (*p >= '0' && *p <= '9') || *p == '_') p++;
+        size_t n = (size_t)(p - name);
+        if (!n || n > 63 || !((*name >= 'a' && *name <= 'z') || (*name >= 'A' && *name <= 'Z'))) continue;
+        int tag = closing || (p < end && memchr(p, '=', (size_t)(end - p)) != NULL);
+        if (p == end) {
+            for (size_t i = 0; i < sizeof known / sizeof known[0]; i++) {
+                if (strlen(known[i]) == n && !memcmp(name, known[i], n)) tag = 1;
+            }
+            /* 无参数的自定义效果由配对闭合标签识别；普通字面括号仍可翻译。 */
+            char close[68];
+            memcpy(close, "[/", 2); memcpy(close + 2, name, n); close[n + 2] = ']'; close[n + 3] = 0;
+            if (strstr(end + 1, close)) tag = 1;
+        }
+        if (tag) { *length = (size_t)(end - start + 1); return start; }
+    }
+    return NULL;
+}
+
 static int godot_text_translation_preserves_format(const char *source, const char *translated) {
     if (!source || !translated) return 0;
     int brackets = 0;
@@ -1367,6 +1409,14 @@ static int godot_text_translation_preserves_format(const char *source, const cha
         if (brackets < 0) return 0;
     }
     if (brackets != 0) return 0;
+    const char *src_cursor = source, *out_cursor = translated;
+    for (;;) {
+        size_t src_len = 0, out_len = 0;
+        const char *src_tag = godot_next_bbcode(&src_cursor, &src_len);
+        const char *out_tag = godot_next_bbcode(&out_cursor, &out_len);
+        if (!src_tag || !out_tag) { if (src_tag != out_tag) return 0; break; }
+        if (src_len != out_len || memcmp(src_tag, out_tag, src_len)) return 0;
+    }
     if (count_substr(source, "%s") != count_substr(translated, "%s")) return 0;
     if (count_substr(source, "%d") != count_substr(translated, "%d")) return 0;
     return 1;
@@ -2596,17 +2646,32 @@ static char *build_godot_runtime_autoload(uint32_t engine_major) {
           "\tif scene != \"\":\n"
           "\t\tchange_scene_to_file(scene)\n";
     char *step = replace_all_text(source, "extends SceneTree\n", "extends Node\n");
+    /* 专用预检只消费启动器预先写入的 stdin；正常游戏启动不会进入此分支。 */
+    const char *handshake =
+        "\t\tprint(\"DST_GODOT_AUTOLOAD_READY_V1\")\n"
+        "\t\tif not OS.has_method(\"read_string_from_stdin\"):\n"
+        "\t\t\tpush_error(\"DeepSeek autoload preflight: stdin API unavailable.\")\n"
+        "\t\t\treturn\n"
+        "\t\tif str(OS.call(\"read_string_from_stdin\")).strip_edges() != \"DST_GODOT_AUTOLOAD_CONTINUE_V2\":\n"
+        "\t\t\tpush_error(\"DeepSeek autoload preflight: invalid stdin handshake.\")\n"
+        "\t\t\treturn\n"
+        "\t\tprint(\"DST_GODOT_AUTOLOAD_ACK_V2\")\n"
+        "\t\treturn\n";
     const char *ready = engine_major == 3
-        ? "func _ready():\n\tif OS.get_cmdline_args().has(\"--dst-autoload-preflight\"):\n\t\tprint(\"DST_GODOT_AUTOLOAD_READY_V1\")\n\t\treturn\n"
-        : "func _ready():\n\tif OS.get_cmdline_args().has(\"--dst-autoload-preflight\") or OS.get_cmdline_user_args().has(\"--dst-autoload-preflight\"):\n\t\tprint(\"DST_GODOT_AUTOLOAD_READY_V1\")\n\t\treturn\n";
+        ? "func _ready():\n\tif OS.get_cmdline_args().has(\"--dst-autoload-preflight\"):\n__DST_PREFLIGHT_HANDSHAKE__"
+        : "func _ready():\n\tif OS.get_cmdline_args().has(\"--dst-autoload-preflight\") or OS.get_cmdline_user_args().has(\"--dst-autoload-preflight\"):\n__DST_PREFLIGHT_HANDSHAKE__";
     char *next = step ? replace_all_text(step, "func _initialize():\n", ready) : NULL;
     free(step);
-    step = next ? replace_all_text(next, "\t\tquit(73)\n", "\t\tget_tree().quit(73)\n") : NULL;
+    /* 把握手插在私有参数判断后，正文初始化仍按原引擎生命周期执行。 */
+    step = next ? replace_all_text(next, "__DST_PREFLIGHT_HANDSHAKE__", handshake) : NULL;
     free(next);
-    next = step ? replace_all_text(step, "get_root()", "get_tree().root") : NULL;
+    next = step ? replace_all_text(step, "\t\tquit(73)\n", "\t\tget_tree().quit(73)\n") : NULL;
     free(step);
-    step = next ? replace_all_text(next, scene_start, "") : NULL;
+    step = next ? replace_all_text(next, "get_root()", "get_tree().root") : NULL;
     free(next);
+    next = step ? replace_all_text(step, scene_start, "") : NULL;
+    free(step);
+    step = next;
     if (!step || strstr(step, "extends SceneTree") || strstr(step, "change_scene")) {
         free(step);
         return NULL;

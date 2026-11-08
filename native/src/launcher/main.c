@@ -14,6 +14,7 @@
 #include "server_proc.h"
 #include "self_update.h"
 #include "ui.h"
+#include "ui_operation.h"
 #include "warmup.h"
 
 #include <commctrl.h>
@@ -231,6 +232,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, 1);
             refresh_engine();
         } else if (wp == 2) {
+            if (ui_operation_poll()) { DestroyWindow(hwnd); return 0; }
             tick_ui_animation(hwnd);
         }
         return 0;
@@ -328,7 +330,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     /* ---- WM_CLOSE / WM_DESTROY：关闭窗口并释放 GDI 资源 ---- */
     case WM_CLOSE:
-        DestroyWindow(hwnd);
+        if (ui_operation_request_close()) DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
         free_background_buffer();

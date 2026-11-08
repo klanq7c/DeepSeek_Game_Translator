@@ -18,6 +18,31 @@
 #define CACHE_MAX_ENCODED_LINE_BYTES (8 * 1024 * 1024)
 #define CACHE_INITIAL_CAPACITY (1u << 10)
 
+/* 缓存必须可无损往返 UTF-8，拒绝截断、多余续字节、过长编码及代理码点。
+   不用替换字符“修复”坏字节，否则损坏键可能碰撞已有键，译文也可能被截断。 */
+static int cache_text_valid(const char *text) {
+    unsigned cp = 0, minimum = 0;
+    int remaining = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        unsigned c = *p;
+        if (remaining) {
+            if ((c & 0xc0) != 0x80) return 0;
+            cp = (cp << 6) | (c & 0x3f);
+            if (--remaining == 0 && (cp < minimum || cp > 0x10ffff ||
+                                    (cp >= 0xd800 && cp <= 0xdfff))) return 0;
+        } else if (c < 0x80) {
+            continue;
+        } else if (c >= 0xc2 && c <= 0xdf) {
+            cp = c & 0x1f; remaining = 1; minimum = 0x80;
+        } else if (c >= 0xe0 && c <= 0xef) {
+            cp = c & 0x0f; remaining = 2; minimum = 0x800;
+        } else if (c >= 0xf0 && c <= 0xf4) {
+            cp = c & 7; remaining = 3; minimum = 0x10000;
+        } else return 0;
+    }
+    return remaining == 0;
+}
+
 /* 插入/覆盖一个条目，调用者必须已持有 lock。
    接管 k、v 的所有权。persisted 表示传入值已存在于 TSV。
    返回 0=当前值已持久化，1=新增，2=覆盖，3=同值但仍待持久化。 */
@@ -97,8 +122,9 @@ void cache_init(Cache *c, const char *path) {
 /* 仅写内存。空键/空值直接忽略（绝不能把空值当作翻译结果写入）。 */
 void cache_set(Cache *c, const char *k, const char *v) {
     if (!k || !v || !*k || !*v) return;
+    if (!cache_text_valid(k) || !cache_text_valid(v)) return;
     char *clean = xstrdup(v);
-    normalize_translation_result(clean);
+    normalize_translation_result_for_source(clean, k);
     if (!*clean || strcmp(k, clean) == 0) {
         free(clean);
         return;
@@ -202,12 +228,13 @@ CachePersistResult cache_set_many_persist_result(Cache *c, const char **keys,
     size_t normalized_bytes = 0;
 
     for (size_t i = 0; i < count; i++) {
-        if (!keys[i] || !values[i] || !*keys[i] || !*values[i]) {
+        if (!keys[i] || !values[i] || !*keys[i] || !*values[i] ||
+            !cache_text_valid(keys[i]) || !cache_text_valid(values[i])) {
             result.rejected++;
             continue;
         }
         items[i].clean = xstrdup(values[i]);
-        normalize_translation_result(items[i].clean);
+        normalize_translation_result_for_source(items[i].clean, keys[i]);
         if (!*items[i].clean || strcmp(keys[i], items[i].clean) == 0) {
             free(items[i].clean);
             items[i].clean = NULL;
@@ -357,77 +384,133 @@ int cache_emit_json(Cache *c, const char *k, Buf *out) {
     return hit;
 }
 
-/* 导出整个表为 JSON 对象 {"k":"v",...}，返回条目数。供缓存导出接口使用。 */
-size_t cache_emit_json_map(Cache *c, Buf *out) {
-    int first = 1;
-    size_t n = 0;
+typedef struct {
+    char *data; /* 连续存放 NUL 结尾的键、值；不借用哈希表指针。 */
+    size_t count;
+} CacheExportSnapshot;
+
+/* 在同一次读锁内测量并复制，保证整份导出对应一个一致视图。
+   精确分配一块快照，避免逐条分配或倍增缓冲；释放锁后才做 JSON 编码。
+   分配/大小溢出沿用 x* 的 fatal 契约，不降级为缺项或借用失效指针。 */
+static CacheExportSnapshot cache_export_snapshot(Cache *c) {
+    CacheExportSnapshot snapshot = {0};
+    size_t bytes = 0;
     AcquireSRWLockShared(&c->lock);
     for (size_t i = 0; i < c->cap; i++) {
         if (!c->e[i].used) continue;
-        if (!first) buf_ch(out, ',');
-        first = 0;
-        buf_json(out, c->e[i].k);
-        buf_ch(out, ':');
-        buf_json(out, c->e[i].v);
-        n++;
+        size_t key_bytes = strlen(c->e[i].k) + 1;
+        size_t value_bytes = strlen(c->e[i].v) + 1;
+        if (key_bytes > SIZE_MAX - bytes || value_bytes > SIZE_MAX - bytes - key_bytes)
+            die("cache snapshot too large");
+        bytes += key_bytes + value_bytes;
+        snapshot.count++;
+    }
+    snapshot.data = xmalloc(bytes);
+    char *next = snapshot.data;
+    for (size_t i = 0; i < c->cap; i++) {
+        if (!c->e[i].used) continue;
+        size_t key_bytes = strlen(c->e[i].k) + 1;
+        size_t value_bytes = strlen(c->e[i].v) + 1;
+        memcpy(next, c->e[i].k, key_bytes);
+        next += key_bytes;
+        memcpy(next, c->e[i].v, value_bytes);
+        next += value_bytes;
     }
     ReleaseSRWLockShared(&c->lock);
-    return n;
+    return snapshot;
+}
+
+/* 导出整个表为 JSON 对象 {"k":"v",...}，返回条目数。供缓存导出接口使用。 */
+size_t cache_emit_json_map(Cache *c, Buf *out) {
+    CacheExportSnapshot snapshot = cache_export_snapshot(c);
+    const char *next = snapshot.data;
+    for (size_t i = 0; i < snapshot.count; i++) {
+        if (i) buf_ch(out, ',');
+        buf_json(out, next);
+        next += strlen(next) + 1;
+        buf_ch(out, ':');
+        buf_json(out, next);
+        next += strlen(next) + 1;
+    }
+    free(snapshot.data);
+    return snapshot.count;
 }
 
 /* 导出整个表为 JSON 数组 [{"key":"k","value":"v"},...]，返回条目数。 */
 size_t cache_emit_json_entries(Cache *c, Buf *out) {
-    int first = 1;
-    size_t n = 0;
-    AcquireSRWLockShared(&c->lock);
-    for (size_t i = 0; i < c->cap; i++) {
-        if (!c->e[i].used) continue;
-        if (!first) buf_ch(out, ',');
-        first = 0;
+    CacheExportSnapshot snapshot = cache_export_snapshot(c);
+    const char *next = snapshot.data;
+    for (size_t i = 0; i < snapshot.count; i++) {
+        if (i) buf_ch(out, ',');
         buf_add(out, "{\"key\":");
-        buf_json(out, c->e[i].k);
+        buf_json(out, next);
+        next += strlen(next) + 1;
         buf_add(out, ",\"value\":");
-        buf_json(out, c->e[i].v);
+        buf_json(out, next);
+        next += strlen(next) + 1;
         buf_ch(out, '}');
-        n++;
     }
-    ReleaseSRWLockShared(&c->lock);
-    return n;
+    free(snapshot.data);
+    return snapshot.count;
 }
 
-/* 从 f 读取一行（可能跨多次 fgets），返回新分配的 NUL 结尾缓冲；
-   文件结束且无数据时返回 NULL。Base64 编码保证值内部无换行，
-   因此一行即一条记录。读取出错（非 EOF，如介质/权限故障）时诊断并
-   返回 NULL：否则调用方会拿着空行反复重读同一份错误，形成死循环。 */
-static char *cache_read_line(FILE *f, const char *path) {
+static void cache_record_invalid(size_t *count, const char *path) {
+    (*count)++;
+    if (*count <= 3 || (*count & (*count - 1)) == 0) {
+        fprintf(stderr, "[cache] load-record-invalid skipped (count=%zu, path=%s)\n",
+                *count, path);
+        fflush(stderr);
+    }
+}
+
+/* 缓冲属于本次加载，不共享文件位置；跨行留下的字节供下一次读取使用。 */
+typedef struct {
+    FILE *file;
+    char data[1 << 16];
+    size_t offset, length;
+} CacheLineReader;
+
+/* 按实际字节数寻找换行，避免损坏文件里的原始 NUL 截断 strlen 后吞掉下一行。
+   非法/超长行只消费到自身边界并诊断，不修补文本或改写文件；读取错误立即结束。 */
+static char *cache_read_line(CacheLineReader *reader, const char *path, size_t *invalid_records) {
     Buf b;
-    char chunk[1 << 16];
-    int oversized = 0;
+    int discarded = 0, consumed = 0;
     buf_init(&b);
-    while (fgets(chunk, sizeof chunk, f)) {
-        size_t len = strlen(chunk);
-        if (!oversized) {
+    for (;;) {
+        if (reader->offset == reader->length) {
+            reader->length = fread(reader->data, 1, sizeof reader->data, reader->file);
+            reader->offset = 0;
+            if (ferror(reader->file)) {
+                cache_diag(CACHE_DIAG_LOAD_READ, errno, path);
+                buf_free(&b);
+                return NULL;
+            }
+            if (!reader->length) break;
+        }
+        const char *chunk = reader->data + reader->offset;
+        size_t available = reader->length - reader->offset;
+        const char *newline = memchr(chunk, '\n', available);
+        size_t len = newline ? (size_t)(newline - chunk) + 1 : available;
+        consumed = 1;
+        if (!discarded) {
             if (len > CACHE_MAX_ENCODED_LINE_BYTES - b.len) {
-                oversized = 1;
+                discarded = 1;
                 cache_diag(CACHE_DIAG_LOAD_LINE_TOO_LARGE, 0, path);
+            } else if (memchr(chunk, '\0', len)) {
+                discarded = 1;
+                cache_record_invalid(invalid_records, path);
             } else {
                 buf_addn(&b, chunk, len);
             }
         }
-        if (len > 0 && chunk[len - 1] == '\n') break;
+        reader->offset += len;
+        if (newline) break;
     }
-    if (ferror(f)) {
-        cache_diag(CACHE_DIAG_LOAD_READ, errno, path);
-        buf_free(&b);
-        return NULL;
-    }
-    if (oversized) {
-        /* 上方已经消费到该记录的换行结尾。返回一条空记录，使 cache_load 跳过它并
-           继续处理后续记录。 */
+    if (discarded) {
         buf_free(&b);
         return xstrdup("");
     }
-    if (b.len == 0 && feof(f)) {
+    if (!consumed) {
         buf_free(&b);
         return NULL;
     }
@@ -440,11 +523,14 @@ void cache_load(Cache *c) {
     FILE *f = fopen(c->path, "rb");
     if (!f) return;
     size_t n = 0;
+    size_t invalid_records = 0;
+    CacheLineReader reader = {0};
+    reader.file = f;
     /* 整个加载过程独占：服务尚未开始接受连接，因此没有并发读取者。相比逐条插入加锁，
        可省去 N 次 Acquire/Release。 */
     AcquireSRWLockExclusive(&c->lock);
     char *line;
-    while ((line = cache_read_line(f, c->path)) != NULL) {
+    while ((line = cache_read_line(&reader, c->path, &invalid_records)) != NULL) {
         char *tab = strchr(line, '\t');
         if (!tab) {
             free(line);
@@ -455,7 +541,14 @@ void cache_load(Cache *c) {
         while (end > tab && (end[-1] == '\n' || end[-1] == '\r')) *--end = 0;
         char *k = b64dec(line, strlen(line));
         char *v = b64dec(tab, strlen(tab));
-        normalize_translation_result(v);
+        if (!k || !v || !cache_text_valid(k) || !cache_text_valid(v)) {
+            cache_record_invalid(&invalid_records, c->path);
+            free(k);
+            free(v);
+            free(line);
+            continue;
+        }
+        normalize_translation_result_for_source(v, k);
         if (*k && *v && strcmp(k, v) != 0) {
             if ((c->len + 1) * 10 > c->cap * 7) cache_rehash_locked(c);
             (void)cache_insert_locked(c, k, v, 1);

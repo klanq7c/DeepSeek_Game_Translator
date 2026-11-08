@@ -1,0 +1,48 @@
+// 仅替换 IL2CPP/Unity 属性和对象边界，覆盖层更新、源隐藏和恢复直接使用生产方法。
+public static class TmpOverlaySeam {
+    public struct Color { public float r, g, b, a; public Color(float r, float g, float b, float a) { this.r=r; this.g=g; this.b=b; this.a=a; } }
+    public class GameObject { public bool activeInHierarchy = true; public bool destroyed; }
+    public class Component { public int id; public GameObject gameObject = new GameObject(); public Color color = new Color(1,1,1,1); public bool enabled = true; }
+    public class RectTransform { }
+    private static class UnityEngine { public static class Object { public static void Destroy(GameObject obj) { obj.destroyed = true; } } }
+    private static class TmpFontFallbackPlugin { public static TestLogger Logger = new TestLogger(); }
+    public static Component Source, Overlay;
+    public static bool RejectSourceDisable;
+    private static readonly HashSet<int> TmpUguiHiddenSourceIds = new HashSet<int>();
+    private static readonly Dictionary<int,object> TmpUguiOverlayTextBySourceId = new Dictionary<int,object>();
+    private static readonly HashSet<int> TmpUguiOverlayTextIds = new HashSet<int>();
+    private static object _uguiFont = new object();
+    private static Type _tmpTextType = typeof(Component);
+    private static RectTransform ResolveRectTransform(Component node) { return new RectTransform(); }
+    private static bool TryGetColor(object node, out Color value) { value = ((Component)node).color; return true; }
+    private static object GetOrCreateTmpUguiOverlay(Component node, RectTransform rect, int id) {
+        if (Overlay == null || Overlay.gameObject.destroyed) Overlay = new Component { id = 999 };
+        TmpUguiOverlayTextBySourceId[id] = Overlay;
+        TmpUguiOverlayTextIds.Add(Overlay.id);
+        return Overlay;
+    }
+    private static void CopyRectTransform(RectTransform a, RectTransform b) { }
+    private static bool TryPositionWorldSpaceTmpOverlay(Component c, object o, out int size) { size=24; return true; }
+    private static bool TrySetPropertyIfExists(object node, string property, object value) {
+        var component = (Component)node;
+        if (property == "color") component.color = (Color)value;
+        if (property == "enabled") {
+            if (node == Source && RejectSourceDisable && !(bool)value) return false;
+            component.enabled = (bool)value;
+        }
+        return true;
+    }
+    private static object GetPropertyValue(object node, string property) { return ((Component)node).enabled; }
+    private static IEnumerable<object> FindUnityObjects(Type type) { return new object[] { Source }; }
+    private static int InstanceId(object node) { return ((Component)node).id; }
+    private static bool TryGetFloatProperty(object node, string property, out float value) { value=24; return true; }
+    private static void SetEnumPropertyIfExists(object node, string property, string value) { }
+    private static string GetUguiTextAnchorName(object node) { return "MiddleLeft"; }
+    private static bool GetTmpWordWrap(object node) { return true; }
+    private static string NormalizeTmpTextForFallback(string value) { return value; }
+    private static void InvokeNoThrow(object node, string method) { }
+    public static void Reset() {
+        Source = new Component { id = 1 }; Overlay = null; RejectSourceDisable = false;
+        TmpUguiHiddenSourceIds.Clear();
+        TmpUguiOverlayTextBySourceId.Clear(); TmpUguiOverlayTextIds.Clear();
+    }
