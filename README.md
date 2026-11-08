@@ -1,49 +1,54 @@
 # ds游戏翻译器
 
-**新用户下载（Windows）：[点击下载 EXE，下载后双击运行](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/download/v0.4.1.0/ds-translator_0.4.1.0.exe)。**
+**新用户推荐下载（Windows）：[下载 0.4.1.1 EXE，下载后双击运行](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/download/v0.4.1.1/ds-translator_0.4.1.1.exe)。**
 
 ## 更新日志
 
-后续更新请继续把最新更新日志放在本节最上方。
+### 2026-11-08（0.4.1.1）
 
-### 20261013（0.4.1.0）
+- **API 连通检测**：配置窗口新增“检测连通”，可在保存前验证当前地址、模型和 Key，并查看认证、权限、限流、超时等错误提示。
+- **本地模型适配**：延长 Ollama、LM Studio 等本机服务的首次响应等待，显示模型加载提示；标准本机 Ollama 接口请求关闭思考模式，本地翻译默认采用较小批次，也可调整批次预算。
+- **API 配置体验**：模型列表显示提供商返回的名称与 API ID，刷新保留当前选择；切换提供商时分别保留各家的 Key 草稿。配置和提示窗口统一为星夜主题。
+- **半汉化补译**：继续翻译中英混合文本中的剩余英文，保护原有中文、变量和格式标记。
+- **Ren'Py**：改进中文字体补字，保留游戏原有字体、图标和字体组规则；修复嵌套插值、长目录预热漏句，并减少无关文本的重复刷新。
+- **RPG Maker**：MV/MZ 新增部分菜单及 UI 图片文字的自动识别与翻译；改进插件文本、中文换行及颜色控制符处理，修复命令字段次序不同造成的预热漏句。
+- **Unity**：改进 Mono 与 IL2CPP 的富文本、中文字体及动态界面适配，修复字体覆盖层的颜色跟随和缓存读取失败后的覆盖问题，并优化可选深预取的扫描预算。
+- **Godot**：完善富文本标签保护、导出资源采集和启动预检，减少格式损坏及错误回退。
+- **启动与缓存稳定性**：启动、还原、清缓存和服务启停在后台执行，避免同时操作互相干扰；改进长路径文件操作，严格检查提供商响应与缓存记录，避免异常内容进入译文缓存。
 
-1. **启动页重新设计**：加入星夜主题、暖白操作卡片和更平滑的悬停动画；后台、最小化或系统关闭动画时停止装饰刷新，保留目录选择、拖放、API 配置、缓存管理和还原游戏等功能。
-2. **Godot 翻译修复**：处理菜单动画反复写回英文、设置选项被链接标签拆成半词、部分未命中导致整块文字不显示译文等问题；改进动态控件、场景切换、暂停菜单、导出包识别与启动预检。
-3. **其他引擎兼容性**：修复 Ren'Py 旧版本刷新线程及迟到响应覆盖译文、RPG Maker 菜单补译和断线恢复、Unity 动态菜单扫描与富文本标签保护，完善 IL2CPP 响应校验和中文字体回退。
-4. **API 与缓存稳定性**：支持从提供商实时刷新模型目录并保留手动选择；修复部分 Unicode 模型名保存、响应体超时、缓存写入失败恢复和不完整末行追加问题。
-5. **性能与维护**：复用启动器绘图缓冲，限制日志历史长度，减少 Godot 重复文本解析和 Unity 同轮重复控件枚举；补充跨引擎回归测试并统一核心模块的中文说明注释。
+[更新详情与升级方法](docs/UPDATE_2026-11-08.md)
 
-更多内容见 [本次更新详情](docs/UPDATE_2026-10-13.md)。
+### 2026-10-13（0.4.1.0）
 
-版本：`0.4.1.0`。下载文件统一使用 `ds-translator` 前缀，压缩包内仍为 `ds游戏翻译器.exe`。
+- **启动页重新设计**：加入星夜主题、暖白操作卡片和悬停动画；后台、最小化或系统关闭动画时停止装饰刷新。
+- **Godot**：修复菜单动画写回英文、设置文字被标签拆分和部分缓存未命中影响显示的问题；改进动态控件、场景切换、导出包识别与启动预检。
+- **其他引擎**：修复 Ren'Py 旧版刷新和迟到响应问题、RPG Maker 菜单补译与断线恢复；改进 Unity 动态菜单、富文本保护及 IL2CPP 中文字体回退。
+- **API 与缓存**：支持实时刷新模型目录并保留手动选择；修复 Unicode 模型名保存、响应超时、缓存写入失败恢复和不完整末行追加问题。
+- **运行开销**：减少启动器绘图、Godot 文本解析和 Unity 控件扫描中的重复工作。
 
-### 20260909（0.4.0.0）
+[更新详情与升级方法](docs/UPDATE_2026-10-13.md)
 
-1、启动器配置 API 改成了提供商下拉，DeepSeek、硅基流动、Kimi、智谱、阿里百炼都能直接选，也可以接本机的 Ollama / LM Studio。
-2、增加了术语表，人名、武器、技能这些专有名词可以固定成指定译名。
-3、对 Godot 的通用翻译模块做了比较大的更新，导出游戏会生成外部补丁包来汉化，不会改原包。
-4、修复了部分 Unity IL2CPP 游戏被识别成 Mono 的问题，也修了 RPG Maker 扫描长文件时可能漏句的问题。
+### 2026-09-09（0.4.0.0）
 
-版本：`0.4.0.0`
+- **API 配置**：提供商改为下拉选择，支持常见云端服务及本机 Ollama、LM Studio。
+- **术语表**：可为人名、武器、技能等专有名词指定固定译名。
+- **Godot**：导出游戏使用外部翻译补丁包，保留原始游戏包。
+- **兼容性修复**：修复部分 Unity IL2CPP 游戏被识别为 Mono，以及 RPG Maker 长文件扫描漏句的问题。
 
-### 20260801（0.3.3.8）
+### 2026-08-01（0.3.3.8）
 
-1、对于部分unity游戏过度裁剪导致的文本翻译问题进行了优化。
-2、对于部分unity版本的字体编码问题进行了修复，并且对翻译文本阵列优化了一下。
-3、对于godot的通用翻译模块进行了优化，之前的翻译模块存在问题。
-4、对于rpgm游戏进行了更新支持，修复了出现的翻译偏移问题。
+- **Unity**：改进部分过度裁剪游戏的文本翻译，修复部分版本的字体编码问题，并优化批量文本处理。
+- **Godot**：修复通用翻译模块中的兼容问题。
+- **RPG Maker**：更新游戏支持并修复翻译偏移问题。
 
-版本：`0.3.3.8`
+### 2026-07-15（0.3.2.7）
 
-### 20260715（0.3.2.7）
+- **Godot**：新增引擎翻译支持，后续持续完善兼容性。
+- **Ren'Py**：改善多选项语句的翻译延迟。
+- **RPG Maker**：修复长译文溢出文本框及文本刷新问题。
+- **Unity**：改进游戏兼容性。
 
-1. 添加了对 Godot 引擎的翻译支持（现在还在优化阶段）。
-2. 解决了 Ren'Py 翻译模块对于多选择项语句的翻译延迟问题。
-3. 解决了 RPG Maker 模块对于长文本翻译的文本框溢出以及文本刷新问题。
-4. 对 Unity 游戏的支持项目进行了优化。
-
-版本：`0.3.2.7`
+## 项目简介
 
 ds游戏翻译器是一个本地游戏翻译工具，目标是支持：
 
@@ -58,27 +63,27 @@ ds游戏翻译器是一个本地游戏翻译工具，目标是支持：
 
 ## 下载
 
-### 新用户下载这个
+### 推荐下载
 
-**[下载 ds游戏翻译器 0.4.1.0.exe（Windows，下载后双击运行）](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/download/v0.4.1.0/ds-translator_0.4.1.0.exe)**
+**[下载 ds游戏翻译器 0.4.1.1.exe（Windows，下载后双击运行）](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/download/v0.4.1.1/ds-translator_0.4.1.1.exe)**
 
 只需下载这个 EXE，放到一个固定文件夹后双击打开，再配置 API 并选择游戏目录。
-浏览器保存的文件名为 `ds-translator_0.4.1.0.exe`。首次运行会自动释放所需的自有组件；
+浏览器保存的文件名为 `ds-translator_0.4.1.1.exe`。首次运行会自动释放所需的自有组件；
 Unity 游戏另需按下方说明安装对应运行组件。
 
-备用：[下载 ZIP 程序包，解压后运行](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/download/v0.4.1.0/ds-translator_0.4.1.0.zip)。
+备用：[下载 ZIP 程序包，解压后运行](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/download/v0.4.1.1/ds-translator_0.4.1.1.zip)。
 它与 EXE 的程序功能相同，附带说明文档，**二选一即可**。
 
 源码和校验文件供开发或检查文件使用。普通使用无需下载它们，也无需下载
 GitHub 附件区自动显示的 `Source code (zip)` 或 `Source code (tar.gz)`。
 
-[全部附件与更新说明](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.4.1.0)
+[全部附件与更新说明](https://github.com/klanq7c/DeepSeek_Game_Translator/releases/tag/v0.4.1.1)
 
 为了降低侵权和授权风险，下载包不直接内置 BepInEx、XUnity、Unity 官方 DLL、游戏文件、TMP 字体包、翻译记忆或 API key。Unity 第三方运行时和 XUnity TMP 字体 AssetBundle 由用户通过命令行脚本从上游项目下载。
 
 ## 使用方式
 
-1. 下载 `ds-translator_0.4.1.0.exe`，或解压 `ds-translator_0.4.1.0.zip` 后运行里面的 `ds游戏翻译器.exe`。更新已有安装时，将单文件启动器改名为 `ds游戏翻译器.exe`，替换原目录中的同名程序，再重新启动翻译器及游戏。
+1. 下载 `ds-translator_0.4.1.1.exe`，或解压 `ds-translator_0.4.1.1.zip` 后运行里面的 `ds游戏翻译器.exe`。更新已有安装时，将单文件启动器改名为 `ds游戏翻译器.exe`，替换原目录中的同名程序，再重新启动翻译器及游戏。
 2. 首次运行时，启动器会自动生成/更新这些自有组件：
    - `native\dst_server.exe`
    - `native\dst_server_cs.exe`
@@ -90,6 +95,8 @@ GitHub 附件区自动显示的 `Source code (zip)` 或 `Source code (tar.gz)`�
 3. 在启动器里点击“配置 API”，选择提供商并填写自己的 API key。点击“刷新模型”从当前厂商获取最新目录，在可编辑下拉框中自主选择模型，也可以直接填写模型 ID。已有 Key 的配置打开时自动刷新；更换厂商、地址或 Key 后请重新刷新。支持任意 OpenAI 兼容服务（DeepSeek、硅基流动、Moonshot、智谱、阿里百炼、OpenAI、Claude、Gemini 及本地 Ollama/LM Studio 等），本地回环服务的 key 可留空。
 
    提供商预设只填写地址，不再内置容易过期的模型名。切换到不同厂商地址后需重新选模型；刷新目录保留当前选择，显示获取时间，并提示当前模型是否仍在目录中。未列出的别名仍可手动保存。请选用支持聊天补全的模型，保存后重启翻译服务生效。
+
+   填写完成后，可点击“检测连通”发送一次短请求验证是否可用；检测不会自动保存配置，云端检测可能产生少量费用。本机模型首次加载时请等待窗口提示。
 
    Claude、百炼的目录会读取后续分页，硅基流动会筛选聊天模型。百炼使用所填地址对应的目录；如果账号要求业务空间地址，请填写控制台提供的兼容接口完整地址。厂商未开放目录、Key 无权限、分页不完整或网络失败时，窗口会显示原因并保留手动输入，不会用旧列表伪装刷新成功。目录来自当前 API 地址和账号权限，不代表所有厂商公开发布的模型。
 4. 如需翻译 Unity 游戏，在程序所在目录运行：
@@ -148,19 +155,21 @@ powershell -ExecutionPolicy Bypass -File scripts\install_runtime_payloads.ps1 -U
 ```ini
 [api]
 endpoint=https://api.deepseek.com/v1/chat/completions
-model=deepseek-flash
+model=YOUR_MODEL_ID
 key=YOUR_API_KEY_HERE
 timeout_ms=15000
 concurrency=4
 ```
 
-以上以 DeepSeek 为例；`deepseek-flash` 是 DeepSeek V4.1 Flash 当前的官方 API ID，模型显示版本不一定包含在 API ID 中。可通过“刷新模型”读取厂商当前提供的 ID。任意 OpenAI 兼容端点均可使用，更多提供商地址见 `config\api.ini.example` 的注释。
+以上以 DeepSeek 地址为例，`YOUR_MODEL_ID` 需要替换为账号可用的聊天模型 ID。点击“刷新模型”获取实时目录；提供商返回显示名称时，列表同时显示名称与 API ID，保存的仍是 API ID。更多提供商地址见 `config\api.ini.example` 的注释。
 
 真实的 `config/api.ini` 不要提交到仓库，也不要发给别人。
 
+不同提供商需要各自的 API Key。切换提供商预设时，窗口会隔离各家的 Key；切回时恢复本次窗口内填写过的对应 Key。只有点击“保存配置”才写入当前配置，取消不会修改配置文件。401 提示认证问题，403 提示访问限制；请按窗口提示检查当前厂商的 Key、权限与连接。
+
 ## 当前状态
 
-这是 `0.4.1.0` 预览版。主要源码路径：
+当前发布版本为 `0.4.1.1`。主要源码路径：
 
 - `native/src/server/`、`native/src/launcher/`：本地 C 服务端和 Windows 启动器（当前发布主线）。
 - `native/src/core/`：`DstCore` 共享核心（文本规则、JSON、缓存编解码、HTTP 契约常量），
@@ -227,7 +236,7 @@ build_native.bat
   一键流程与窗口渲染（布局报告 + 客户区位图哈希）比对；加 `-ServerSmoke` 可额外
   验证服务端启动/健康检查/关闭（需 19999 端口空闲）。
 - `tests/server_contract/run_contract_tests.ps1`：以假 provider 对两套服务端
-  （默认 `dst_server.exe` 与 `dst_server_cs.exe`）各跑 50 项 HTTP 契约检查。
+  （默认 `dst_server.exe` 与 `dst_server_cs.exe`）执行相同的 HTTP 契约检查。
 - `tests/payload_scripts/check_payload_scripts.ps1`：钩子脚本的字节卫生、
   语法、锚点与端点契约检查。
 
@@ -236,7 +245,7 @@ build_native.bat
 发布源码包前运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version 0.4.1.0
+powershell -ExecutionPolicy Bypass -File scripts\prepare_open_source_release.ps1 -Version 0.4.1.1
 ```
 
 该脚本会生成 source-only 包，并自动检查是否误带：

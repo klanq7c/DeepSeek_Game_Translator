@@ -16,6 +16,8 @@ try {
     if (!$CsLauncher) { $CsLauncher = Join-Path $repo 'build\launcher_cs\dst_launcher_cs.exe' }
     Copy-Item -LiteralPath $CsLauncher -Destination (Join-Path $fixture 'dst_launcher_cs.exe')
     $csProbe = Join-Path $fixture 'api_models_cs.exe'
+    # 与正式启动器保持相同的运行时及 TLS 默认值。
+    Copy-Item -LiteralPath ($CsLauncher + '.config') -Destination ($csProbe + '.config')
     $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
     & $csc /nologo /target:exe "/out:$csProbe" "/reference:$fixture\dst_launcher_cs.exe" "$PSScriptRoot\ApiModelsProbe.cs"
     if ($LASTEXITCODE -ne 0) { throw 'C# model discovery probe build failed' }

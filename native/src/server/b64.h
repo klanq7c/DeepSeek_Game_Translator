@@ -13,4 +13,4 @@
 
 void b64enc_append(Buf *out, const char *s); /* 直接追加到复用缓冲，避免逐项分配编码结果 */
 
-char *b64dec(const char *s, size_t n);   /* 解码长度为 n 的输入，返回新分配的 NUL 结尾缓冲 */
+char *b64dec(const char *s, size_t n);   /* 完整 Base64 文本解码；非法输入或内嵌 NUL 返回 NULL */

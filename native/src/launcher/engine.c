@@ -64,10 +64,26 @@ int find_subdir_suffix(const WCHAR *dir, const WCHAR *suffix) {
  *   - 本工具自身 (ds游戏翻译器.exe / DeepSeekTranslator.exe / dst_server.exe)
  * 找到后将完整路径写入 out。
  * ---------------------------------------------------------------- */
+static int translator_release_exe_name(const WCHAR *name) {
+    static const WCHAR prefix[] = L"ds-translator_";
+    size_t n = wcslen(name), start = (sizeof(prefix) / sizeof(prefix[0])) - 1;
+    if (n <= start + 4 || _wcsnicmp(name, prefix, start) || _wcsicmp(name + n - 4, L".exe")) return 0;
+    int digits = 0;
+    for (size_t i = start; i < n - 4; ++i) {
+        if (name[i] >= L'0' && name[i] <= L'9') digits++;
+        else if (name[i] != L'.') return 0;
+    }
+    return digits > 0;
+}
+
 static int ignored_exe_name(const WCHAR *name) {
     return wcsstr(name, L"CrashHandler") ||
            wcsstr(name, L"UnityCrashHandler") ||
            !_wcsicmp(name, L"DeepSeekTranslator.exe") ||
+           !_wcsicmp(name, L"ds游戏翻译器.exe") ||
+           !_wcsicmp(name, L"dst_server_cs.exe") ||
+           !_wcsicmp(name, L"dst_launcher_cs.exe") ||
+           translator_release_exe_name(name) ||
            !_wcsicmp(name, L"dst_godot_patch.exe") ||
            !_wcsicmp(name, L"dst_server.exe");
 }
@@ -130,14 +146,18 @@ int find_exe(const WCHAR *dir, WCHAR *out, size_t cap) {
     int ok = 0;
     int best_score = INT_MIN;
     WCHAR best_name[MAX_PATH * 4] = {0};
+    WCHAR own_path[MAX_PATH * 4] = {0};
+    DWORD own_len = GetModuleFileNameW(NULL, own_path, MAX_PATH * 4);
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         if (ignored_exe_name(fd.cFileName)) continue;
-        if (!_wcsicmp(fd.cFileName, L"ds游戏翻译器.exe") ||
-            !_wcsicmp(fd.cFileName, L"DeepSeekTranslator.exe") ||
-            !_wcsicmp(fd.cFileName, L"dst_server.exe")) continue;
         WCHAR candidate[MAX_PATH * 4];
         path_join(candidate, MAX_PATH * 4, dir, fd.cFileName);
+        WCHAR full_path[MAX_PATH * 4];
+        DWORD full_len = GetFullPathNameW(candidate, MAX_PATH * 4, full_path, NULL);
+        /* 用户可任意重命名下载程序；仍按实际进程路径排除自身。 */
+        if (own_len > 0 && own_len < MAX_PATH * 4 && full_len > 0 && full_len < MAX_PATH * 4 &&
+            !_wcsicmp(own_path, full_path)) continue;
         int score = exe_candidate_score(dir, fd.cFileName, candidate);
         if (!ok || score > best_score ||
             (score == best_score && _wcsicmp(fd.cFileName, best_name) < 0)) {

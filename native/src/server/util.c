@@ -11,6 +11,75 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 汉字按完整 UTF-8 码点识别；不将无效字节作为可保护的中文。 */
+static size_t mixed_han_len(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    if ((p[0] & 0xf0) != 0xe0 || !p[1] || !p[2]
+        || (p[1] & 0xc0) != 0x80 || (p[2] & 0xc0) != 0x80) return 0;
+    unsigned cp = ((p[0] & 15) << 12) | ((p[1] & 63) << 6) | (p[2] & 63);
+    return cp >= 0x4e00 && cp <= 0x9fff ? 3 : 0;
+}
+
+static char *mixed_prefix(const char *source) {
+    char *prefix = xmalloc(48);
+    size_t salt = 0;
+    do { snprintf(prefix, 48, "__DST_HAN%zu_", salt++); } while (strstr(source, prefix));
+    return prefix;
+}
+
+char *mixed_text_protect(const char *source) {
+    const char *han = source;
+    while (*han && !mixed_han_len(han)) han++;
+    if (!*han) return xstrdup(source);
+    char *prefix = mixed_prefix(source);
+    size_t source_len = strlen(source), prefix_len = strlen(prefix);
+    size_t runs = 0;
+    for (const char *p = han; *p;) {
+        if (!mixed_han_len(p)) { p++; continue; }
+        runs++;
+        while (mixed_han_len(p)) p += 3;
+    }
+    if (runs > (SIZE_MAX - source_len - 1) / (prefix_len + 24)) die("mixed text too large");
+    char *out = xmalloc(source_len + runs * (prefix_len + 24) + 1), *write = out;
+    size_t token = 0;
+    for (const char *p = source; *p;) {
+        if (!mixed_han_len(p)) { *write++ = *p++; continue; }
+        while (mixed_han_len(p)) p += 3;
+        write += sprintf(write, "%s%zu__", prefix, token++);
+    }
+    *write = 0;
+    free(prefix);
+    return out;
+}
+
+/* 模型必须按顺序保留每个中文标记且恰好一次。NULL 由 API 边界记录，
+   不能把受损中文作为成功结果，也不对共享缓存中已有译文做替换。 */
+char *mixed_text_restore(const char *source, const char *reply) {
+    if (!reply) return NULL;
+    char *prefix = mixed_prefix(source);
+    size_t source_len = strlen(source), reply_len = strlen(reply);
+    if (source_len > SIZE_MAX - reply_len - 1) die("mixed text too large");
+    char *out = xmalloc(source_len + reply_len + 1), *write = out;
+    char *key = xmalloc(strlen(prefix) + 24);
+    const char *copied = reply;
+    size_t token = 0;
+    for (const char *p = source; *p;) {
+        if (!mixed_han_len(p)) { p++; continue; }
+        const char *start = p;
+        while (mixed_han_len(p)) p += 3;
+        sprintf(key, "%s%zu__", prefix, token++);
+        const char *pos = strstr(copied, key);
+        if (!pos || strstr(pos + strlen(key), key)) { free(key); free(prefix); free(out); return NULL; }
+        memcpy(write, copied, (size_t)(pos - copied)); write += pos - copied;
+        memcpy(write, start, (size_t)(p - start)); write += p - start;
+        copied = pos + strlen(key);
+    }
+    strcpy(write, copied);
+    if (token && strstr(out, prefix)) { free(out); out = NULL; }
+    free(key); free(prefix);
+    return out;
+}
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -122,7 +191,7 @@ static const char *translation_after_prompt_prefix(const char *text, const char 
     return *p ? p : NULL;
 }
 
-static int strip_translation_prompt_echo(char *s) {
+static const char *translation_after_any_prompt_prefix(const char *s) {
     static const char *const prefixes[] = {
         u8"\u7ffb\u8bd1\u6210\u7b80\u4f53\u4e2d\u6587",
         u8"\u7ffb\u8bd1\u4e3a\u7b80\u4f53\u4e2d\u6587",
@@ -135,24 +204,48 @@ static int strip_translation_prompt_echo(char *s) {
         "Translated into Simplified Chinese",
         "Translate this exact game text to Simplified Chinese. Return only the translation."
     };
-    char *candidate = s;
+    const char *candidate = s;
     while (*candidate && isspace((unsigned char)*candidate)) candidate++;
     for (size_t i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++) {
         const char *rest = translation_after_prompt_prefix(candidate, prefixes[i]);
         if (!rest) continue;
-        memmove(s, rest, strlen(rest) + 1);
-        trim_translation_result(s);
-        return 1;
+        return rest;
     }
-    return 0;
+    return NULL;
+}
+
+static size_t translation_prompt_depth(const char *s) {
+    size_t depth = 0;
+    if (!s) return 0;
+    const char *rest;
+    while ((rest = translation_after_any_prompt_prefix(s)) != NULL) {
+        depth++;
+        s = rest;
+    }
+    return depth;
 }
 
 /* 实时 API 响应和所有缓存入口共用。正常值逐字节保持不变；从磁盘加载的提示词回显
    只在内存中修复。 */
 void normalize_translation_result(char *s) {
+    normalize_translation_result_for_source(s, NULL);
+}
+
+/* 原文已有的提示词形状前缀属于游戏文字，模型额外添加的前缀才可剥离。
+   API 传中文保护后的请求原文，所有缓存入口传原文键；最多仍清理三层。 */
+void normalize_translation_result_for_source(char *s, const char *source) {
     if (!s || !*s) return;
-    for (int pass = 0; pass < 3 && *s; pass++) {
-        if (!strip_translation_prompt_echo(s)) break;
+    size_t passes = 3, original_depth = translation_prompt_depth(source);
+    if (original_depth) {
+        size_t depth = translation_prompt_depth(s);
+        passes = depth > original_depth ? depth - original_depth : 0;
+        if (passes > 3) passes = 3;
+    }
+    for (size_t pass = 0; pass < passes && *s; pass++) {
+        const char *rest = translation_after_any_prompt_prefix(s);
+        if (!rest) break;
+        memmove(s, rest, strlen(rest) + 1);
+        trim_translation_result(s);
     }
 }
 

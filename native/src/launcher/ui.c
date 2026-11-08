@@ -19,6 +19,8 @@
  * ================================================================ */
 
 #include "ui.h"
+#include "ui_operation.h"
+#include "dialog_theme.h"
 #include "deploy.h"
 #include "engine.h"
 #include "fsutil.h"
@@ -55,15 +57,10 @@
 /* 日志水平滚动的最大像素宽度（随最长行动态增长） */
 static int g_log_extent_px = 0;
 
-/* 一键翻译流程进行中标志：start_server 健康检查、deploy、预热与启动都在
-   后台线程执行期间为 1，期间拒绝重复的开始/还原/清缓存/服务器切换，
-   避免重复部署、并发 patch worker 写同一 pck 或争抢服务器进程状态。
-   UI 线程置 1，工作线程结束时清 0。 */
-static volatile int g_start_flow_running = 0;
 static int g_godot_runtime_verified = 0;
 
 int translation_flow_running(void) {
-    return g_start_flow_running;
+    return ui_operation_busy();
 }
 
 /* ----------------------------------------------------------------
@@ -375,18 +372,11 @@ int clear_cache_file(void) {
     return 0;
 }
 
-void clear_translation_cache(void) {
-    if (g_start_flow_running) {
-        MessageBoxW(g_main, L"翻译流程正在进行中，请完成后再清除缓存。", L"ds游戏翻译器", MB_ICONWARNING);
-        return;
-    }
-    const WCHAR *message =
-        L"这会永久删除本机共享翻译缓存 translation_memory_c.tsv。\n\n"
-        L"清除后，已有译文需要重新请求 API。正在运行的游戏可能仍保留进程内存缓存，重启游戏后才会完全生效。\n\n"
-        L"API 配置、日志和游戏目录不会被删除。确定继续吗？";
-    if (MessageBoxW(g_main, message, L"清除缓存",
-                    MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
+typedef struct { int cleared, restarted; } ClearCacheResult;
+static ClearCacheResult clear_cache_result;
 
+static void clear_translation_cache_work(void *context) {
+    ClearCacheResult *result = (ClearCacheResult *)context;
     refresh_server_status();
     int was_running = g_server_started && server_alive();
     int server_stopped = 1;
@@ -405,29 +395,47 @@ void clear_translation_cache(void) {
 
     WCHAR cache_path[MAX_PATH * 4];
     path_join(cache_path, MAX_PATH * 4, g_root, L"translation_memory_c.tsv");
-    int cleared = server_stopped ? clear_cache_file() : 0;
+    result->cleared = server_stopped ? clear_cache_file() : 0;
 
-    int restarted = 1;
+    result->restarted = 1;
     if (was_running && server_stopped) {
         set_status(L"正在重新启动本地服务...");
-        restarted = start_server();
+        result->restarted = start_server();
     }
+    if (result->cleared) append_log(L"共享翻译缓存已清除：%s", cache_path);
+}
+
+static void clear_translation_cache_complete(void *context) {
+    ClearCacheResult *result = (ClearCacheResult *)context;
     update_cache_card();
 
-    if (cleared) append_log(L"共享翻译缓存已清除：%s", cache_path);
-    if (cleared && restarted) {
+    if (result->cleared && result->restarted) {
         set_status(L"缓存已清除。");
-        MessageBoxW(g_main, L"共享翻译缓存已清除。正在运行的游戏请重启后再使用。",
+        themed_message(g_main, L"共享翻译缓存已清除。正在运行的游戏请重启后再使用。",
                     L"清除缓存", MB_ICONINFORMATION);
-    } else if (cleared) {
+    } else if (result->cleared) {
         set_status(L"缓存已清除，但本地服务重启失败。");
-        MessageBoxW(g_main, L"缓存已清除，但本地服务重启失败，请查看日志。",
+        themed_message(g_main, L"缓存已清除，但本地服务重启失败，请查看日志。",
                     L"清除缓存", MB_ICONWARNING);
     } else {
         set_status(L"缓存清除失败，请查看日志。");
-        MessageBoxW(g_main, L"缓存清除失败，原缓存文件已保留，请查看日志。",
+        themed_message(g_main, L"缓存清除失败，原缓存文件已保留，请查看日志。",
                     L"清除缓存", MB_ICONWARNING);
     }
+}
+
+void clear_translation_cache(void) {
+    if (!ui_operation_reserve()) return;
+    const WCHAR *message =
+        L"这会永久删除本机共享翻译缓存 translation_memory_c.tsv。\n\n"
+        L"清除后，已有译文需要重新请求 API。正在运行的游戏可能仍保留进程内存缓存，重启游戏后才会完全生效。\n\n"
+        L"API 配置、日志和游戏目录不会被删除。确定继续吗？";
+    if (themed_message(g_main, message, L"清除缓存",
+                    MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
+        ui_operation_cancel();
+        return;
+    }
+    ui_operation_start(clear_translation_cache_work, &clear_cache_result, clear_translation_cache_complete);
 }
 
 /* 刷新引擎卡片：从路径框读取目录，重新检测引擎类型并更新显示 */
@@ -1301,38 +1309,55 @@ int launch_game(const WCHAR *dir) {
     return launch_game_with_params(dir, NULL);
 }
 
+typedef struct { WCHAR dir[MAX_PATH * 4]; Engine engine; int ok; } RestoreGameResult;
+static RestoreGameResult restore_game_result;
+
+static void restore_selected_game_work(void *context) {
+    RestoreGameResult *result = (RestoreGameResult *)context;
+    result->ok = restore_game(result->dir, result->engine);
+}
+
+static void restore_selected_game_complete(void *context) {
+    int ok = ((RestoreGameResult *)context)->ok;
+    set_status(ok ? L"游戏还原完成。" : L"游戏还原未完成，请查看日志。");
+    themed_message(g_main,
+        ok ? L"还原完成。翻译缓存、用户模组和已有运行时均已保留。" : L"还原未完全完成，请查看启动器日志。未确认归属的文件已保留。",
+        L"还原游戏", ok ? MB_ICONINFORMATION : MB_ICONWARNING);
+}
+
 void restore_selected_game(void) {
-    if (g_start_flow_running) {
-        MessageBoxW(g_main, L"翻译流程正在进行中，请完成后再还原游戏。", L"ds游戏翻译器", MB_ICONWARNING);
-        return;
-    }
+    if (!ui_operation_reserve()) return;
     GetWindowTextW(g_path, g_game, MAX_PATH * 4);
     if (!is_dir(g_game)) {
-        MessageBoxW(g_main, L"请先选择游戏目录。", L"ds游戏翻译器", MB_ICONWARNING);
+        themed_message(g_main, L"请先选择游戏目录。", L"ds游戏翻译器", MB_ICONWARNING);
+        ui_operation_cancel();
         return;
     }
 
     Engine engine = detect_engine(g_game);
     refresh_engine();
     if (engine == ENGINE_UNKNOWN) {
-        MessageBoxW(g_main, L"无法识别游戏引擎，未执行还原。", L"ds游戏翻译器", MB_ICONWARNING);
+        themed_message(g_main, L"无法识别游戏引擎，未执行还原。", L"ds游戏翻译器", MB_ICONWARNING);
+        ui_operation_cancel();
         return;
     }
 
+    wcsncpy(restore_game_result.dir, g_game, MAX_PATH * 4);
+    restore_game_result.dir[MAX_PATH * 4 - 1] = 0;
+    restore_game_result.engine = engine;
     const WCHAR *message =
         L"请先完全退出游戏，然后再执行还原。\n\n"
         L"此操作只移除启动器部署的翻译文件，不会删除翻译缓存、用户模组或已有的 BepInEx。\n\n"
         L"确定要还原当前游戏吗？";
-    if (MessageBoxW(g_main, message, L"还原游戏", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) return;
+    if (themed_message(g_main, message, L"还原游戏", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
+        ui_operation_cancel();
+        return;
+    }
 
-    save_last_game_dir(g_game);
-    append_log(L"开始还原：%s（%s）", g_game, engine_name(engine));
+    save_last_game_dir(restore_game_result.dir);
+    append_log(L"开始还原：%s（%s）", restore_game_result.dir, engine_name(engine));
     set_status(L"正在还原游戏...");
-    int ok = restore_game(g_game, engine);
-    set_status(ok ? L"游戏还原完成。" : L"游戏还原未完成，请查看日志。");
-    MessageBoxW(g_main,
-        ok ? L"还原完成。翻译缓存、用户模组和已有运行时均已保留。" : L"还原未完全完成，请查看启动器日志。未确认归属的文件已保留。",
-        L"还原游戏", ok ? MB_ICONINFORMATION : MB_ICONWARNING);
+    ui_operation_start(restore_selected_game_work, &restore_game_result, restore_selected_game_complete);
 }
 
 /* 发行版模板可能缺少命令行脚本支持，或忽略编辑器专用的语法检查。
@@ -1423,6 +1448,37 @@ static int godot_runtime_sidecar_preflight(const WCHAR *dir, const WCHAR *runtim
     return ok;
 }
 
+/* 专用握手按行增量识别，只保留短行和 ready 状态；长日志不占用无界内存。 */
+typedef struct GodotAutoloadProof {
+    char line[64];
+    size_t used;
+    int dropped, ready_seen;
+} GodotAutoloadProof;
+
+static int godot_autoload_proof_consume(GodotAutoloadProof *state, const char *output, size_t count) {
+    const char *ready = "DST_GODOT_AUTOLOAD_READY_V1";
+    const char *ack = "DST_GODOT_AUTOLOAD_ACK_V2";
+    for (size_t i = 0; i < count; i++) {
+        char ch = output[i];
+        if (ch == '\n') {
+            size_t size = state->used;
+            if (size && state->line[size - 1] == '\r') size--;
+            int acknowledged = 0;
+            if (!state->dropped) {
+                if (size == strlen(ready) && !memcmp(state->line, ready, size)) state->ready_seen = 1;
+                else if (state->ready_seen && size == strlen(ack) && !memcmp(state->line, ack, size)) acknowledged = 1;
+            }
+            state->used = 0;
+            state->dropped = 0;
+            if (acknowledged) return 1;
+        } else if (!state->dropped) {
+            if (!ch || state->used == sizeof state->line) { state->dropped = 1; state->used = 0; }
+            else state->line[state->used++] = ch;
+        }
+    }
+    return 0;
+}
+
 /* 某些导出的 Godot 模板会同时拒绝 --main-pack 与 --script。Format 3 补丁包
    把翻译器注册为 autoload，因此匹配的启动器自有可执行文件只需一个私有
    用户参数即可验证该路径可用。 */
@@ -1436,7 +1492,7 @@ static int godot_runtime_autoload_preflight(const WCHAR *dir, const WCHAR *runti
     godot_preflight_sig_add_file(sig, MAX_PATH * 8, runtime_exe);
     if (pack) godot_preflight_sig_add_file(sig, MAX_PATH * 8, pack);
     godot_preflight_sig_add_text(sig, MAX_PATH * 8, dir);
-    godot_preflight_sig_add_text(sig, MAX_PATH * 8, L"autoload-ready-v1");
+    godot_preflight_sig_add_text(sig, MAX_PATH * 8, L"autoload-ready-v3-stdio-ack");
     int cached = godot_preflight_cache_get(L"autoload", sig);
     if (cached >= 0) {
         append_log(cached
@@ -1479,67 +1535,99 @@ static int godot_runtime_autoload_preflight(const WCHAR *dir, const WCHAR *runti
         if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
         return 0;
     }
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    /* 在创建子进程前放入完整输入并关闭写端；探针不会等待用户输入，
+       也不在 ready 与进程退出之间争抢写入。只继承读取端，不接触游戏目录。 */
+    HANDLE input_read = NULL, input_write = NULL;
+    if (!CreatePipe(&input_read, &input_write, &inherit, 0)) {
+        append_log(L"Godot: runtime autoload preflight input pipe failed (Windows error %lu).", GetLastError());
+        CloseHandle(reader); CloseHandle(capture);
+        return 0;
+    }
+    const char input[] = "DST_GODOT_AUTOLOAD_CONTINUE_V2\n";
+    DWORD written = 0;
+    if (!WriteFile(input_write, input, sizeof(input) - 1, &written, NULL) || written != sizeof(input) - 1) {
+        append_log(L"Godot: runtime autoload preflight input write failed (Windows error %lu).", GetLastError());
+        CloseHandle(input_write); CloseHandle(input_read);
+        CloseHandle(reader); CloseHandle(capture);
+        return 0;
+    }
+    CloseHandle(input_write);
+    si.hStdInput = input_read;
     si.hStdOutput = capture; si.hStdError = capture;
     if (!CreateProcessW(runtime_exe, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
                         NULL, dir, &si, &pi)) {
         append_log(L"Godot: runtime autoload preflight could not start. Windows error: %lu",
                    GetLastError());
+        CloseHandle(input_read);
         CloseHandle(reader); CloseHandle(capture);
         return 0;
     }
+    CloseHandle(input_read);
     CloseHandle(pi.hThread);
-    /* _ready 的证明由探测脚本输出；不让 SceneTree.quit 与游戏的后台资源加载竞争。
-       独立读取句柄避免与子进程 stdout 共用文件位置。只接受完整证明行且进程仍存活。 */
+    /* _ready 输出后还须读取专用输入并确认，才进入由父进程停止的探测协议。
+       不让 SceneTree.quit 与游戏的后台资源加载竞争，也不推断之后游戏不会崩溃。
+       独立读取句柄避免与子进程 stdout 共用文件位置。 */
     ULONGLONG started = GetTickCount64();
     DWORD waited;
     int ok = 0;
+    GodotAutoloadProof proof = {0};
+    char output[16384];
+    int read_failed = 0;
     do {
         waited = WaitForSingleObject(pi.hProcess, 50);
-        char output[16385]; DWORD got = 0;
-        LARGE_INTEGER zero; zero.QuadPart = 0;
-        if (!SetFilePointerEx(reader, zero, NULL, FILE_BEGIN) ||
-            !ReadFile(reader, output, sizeof(output) - 1, &got, NULL)) {
-            append_log(L"Godot: runtime autoload preflight output read failed (Windows error %lu).", GetLastError());
-            break;
+        /* 独立读取句柄保留位置，凭据可跨读取边界；每轮最多读 512 KiB，
+           日志持续增长时仍保留进程退出与预检期限检查。 */
+        for (int batch = 0; batch < 32; batch++) {
+            DWORD got = 0;
+            if (!ReadFile(reader, output, sizeof output, &got, NULL)) {
+                append_log(L"Godot: runtime autoload preflight output read failed (Windows error %lu).", GetLastError());
+                read_failed = 1;
+                break;
+            }
+            if (waited == WAIT_TIMEOUT && godot_autoload_proof_consume(&proof, output, got)) { ok = 1; break; }
+            if (got < sizeof output) break;
         }
-        output[got] = 0;
-        const char *proof = strstr(output, "DST_GODOT_AUTOLOAD_READY_V1");
-        if (proof && (proof == output || proof[-1] == '\n')) {
-            const char *end = proof + strlen("DST_GODOT_AUTOLOAD_READY_V1");
-            if (*end == '\r') end++;
-            if (*end == '\n' && waited == WAIT_TIMEOUT) { ok = 1; break; }
-        }
+        if (ok || read_failed) break;
     } while (waited == WAIT_TIMEOUT && GetTickCount64() - started < 5000);
     DWORD exit_code = 1;
+    const DWORD probe_stop_code = 0x44535450u;
+    int stop_requested = 0;
     /* 游戏进程可能在等待返回后、读取证明时自行退出；这是外部进程生命周期，
        无法由脚本保证。收尾前重新核对，停止失败时再区分自行退出与真正的拒绝。
-       已退出的证明作废且不入缓存，日志记录真实退出码或查询错误。 */
+       Windows 也可能接受对正在退出进程的结束请求；只有最终退出码匹配本次
+       探针的专用结束码才确认父进程收尾。自行退出的证明作废且不入缓存。 */
     if (waited == WAIT_TIMEOUT) waited = WaitForSingleObject(pi.hProcess, 0);
     if (waited == WAIT_TIMEOUT) {
-        if (!TerminateProcess(pi.hProcess, 1)) {
+        if (!TerminateProcess(pi.hProcess, probe_stop_code)) {
             DWORD stop_error = GetLastError();
             ok = 0;
-            if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) waited = WAIT_OBJECT_0;
+            /* 已进入退出清理的进程可能拒绝结束请求，但句柄尚未变为有信号。
+               等待其实际退出事件；期限内未完成仍按原始停止错误报告。 */
+            if (WaitForSingleObject(pi.hProcess, 1000) == WAIT_OBJECT_0) waited = WAIT_OBJECT_0;
             else append_log(L"Godot: runtime autoload preflight probe termination failed (Windows error %lu).", stop_error);
         } else {
-            DWORD stopped = WaitForSingleObject(pi.hProcess, 1000);
-            if (stopped != WAIT_OBJECT_0) {
-                DWORD stop_error = stopped == WAIT_FAILED ? GetLastError() : stopped;
+            stop_requested = 1;
+            waited = WaitForSingleObject(pi.hProcess, 1000);
+            if (waited != WAIT_OBJECT_0) {
+                DWORD stop_error = waited == WAIT_FAILED ? GetLastError() : waited;
                 append_log(L"Godot: runtime autoload preflight probe termination failed (Windows error %lu).", stop_error);
                 ok = 0;
             }
         }
-        if (waited == WAIT_TIMEOUT) {
+    }
+    if (waited == WAIT_OBJECT_0) {
+        if (!GetExitCodeProcess(pi.hProcess, &exit_code)) {
+            ok = 0;
+            append_log(L"Godot: runtime autoload preflight exit code read failed (Windows error %lu).", GetLastError());
+        } else if (!stop_requested || exit_code != probe_stop_code) {
+            ok = 0;
+            append_log(L"Godot: runtime autoload preflight exited with code %lu.", exit_code);
+        } else {
             if (ok) append_log(L"Godot: runtime autoload load proof confirmed; independent probe stopped.");
             else append_log(L"Godot: runtime autoload preflight timed out without a load proof.");
         }
-    }
-    if (waited == WAIT_OBJECT_0) {
+    } else if (waited == WAIT_TIMEOUT) {
         ok = 0;
-        if (GetExitCodeProcess(pi.hProcess, &exit_code))
-            append_log(L"Godot: runtime autoload preflight exited with code %lu.", exit_code);
-        else append_log(L"Godot: runtime autoload preflight exit code read failed (Windows error %lu).", GetLastError());
     } else if (waited != WAIT_TIMEOUT) {
         ok = 0;
         append_log(L"Godot: runtime autoload preflight wait failed (Windows error %lu).", GetLastError());
@@ -2011,7 +2099,7 @@ static void report_server_start_failure(void) {
     set_status(L"状态：服务器启动失败，未启动游戏");
 }
 
-/* 按引擎部署翻译钩子；start_translation 的工作线程、同步回退与
+/* 按引擎部署翻译钩子；start_translation 的工作线程与
    --deploy-and-exit 诊断子命令共用。 */
 int deploy_for_engine(const WCHAR *dir, Engine e) {
     int deployed = 0;
@@ -2041,7 +2129,7 @@ int run_deploy_launch_flow(const WCHAR *dir, Engine engine) {
    数十 MB 资源并做同步 HTTP，全部在工作线程执行以保持 UI 响应。launch_game
    使用 ShellExecuteW (COM)，因此 CoInitializeEx。调用的 UI 辅助函数
    （append_log / set_status）经 SendMessage 封送到 UI 线程。 */
-static DWORD WINAPI warmup_launch_thread(LPVOID p) {
+static void warmup_launch_thread(void *p) {
     WarmupLaunchArgs *a = (WarmupLaunchArgs *)p;
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (!start_server()) {
@@ -2050,24 +2138,17 @@ static DWORD WINAPI warmup_launch_thread(LPVOID p) {
         run_deploy_launch_flow(a->dir, a->engine);
     }
     if (SUCCEEDED(hr)) CoUninitialize();
-    free(a);
-    g_start_flow_running = 0;
-    return 0;
 }
 
 /* 开始翻译主流程入口：验证路径 → 检测引擎 → 创建后台线程执行启动服务、部署钩子、预热和启动游戏
  * start_server 的就绪轮询、deploy 与预热都是同步阻塞操作，全部放到工作线程，
- * 避免 UI 冻结；CreateThread 失败时才回退到 UI 线程同步执行。
- * g_start_flow_running 在流程期间拒绝重复点击以及并发的还原/清缓存/服务器切换。 */
+ * 工作参数和线程由 UI 操作执行器持有到完成，创建失败只报告失败。 */
 void start_translation(void) {
-    if (g_start_flow_running) {
-        append_log(L"翻译流程仍在进行中，已忽略重复的开始请求。");
-        set_status(L"翻译流程仍在进行中，请稍候。");
-        return;
-    }
+    if (!ui_operation_reserve()) return;
     GetWindowTextW(g_path, g_game, MAX_PATH * 4);
     if (!is_dir(g_game)) {
-        MessageBoxW(g_main, L"请先选择游戏目录。", L"ds游戏翻译器", MB_ICONWARNING);
+        themed_message(g_main, L"请先选择游戏目录。", L"ds游戏翻译器", MB_ICONWARNING);
+        ui_operation_cancel();
         return;
     }
     save_last_game_dir(g_game);
@@ -2076,29 +2157,13 @@ void start_translation(void) {
     append_log(L"选择目录：%s", g_game);
     append_log(L"识别引擎：%s", engine_name(e));
     set_status(L"正在启动服务并部署...");
-    g_start_flow_running = 1;
 
     /* 把服务器启动、部署、预热（重 I/O + 同步 HTTP）和游戏启动全部放到
        工作线程，避免 UI 冻结。传入路径的私有副本，防止并发的路径框编辑
        （会经 refresh_engine 重写 g_game）在中途改变它。 */
-    WarmupLaunchArgs *args = (WarmupLaunchArgs *)malloc(sizeof *args);
-    HANDLE th = NULL;
-    if (args) {
-        wcsncpy(args->dir, g_game, MAX_PATH * 4);
-        args->dir[MAX_PATH * 4 - 1] = 0;
-        args->engine = e;
-        th = CreateThread(NULL, 0, warmup_launch_thread, args, 0, NULL);
-        if (th) {
-            CloseHandle(th);
-            return;
-        }
-        free(args); /* CreateThread 失败：回退到同步路径 */
-    }
-    if (!start_server()) {
-        report_server_start_failure();
-        g_start_flow_running = 0;
-        return;
-    }
-    run_deploy_launch_flow(g_game, e);
-    g_start_flow_running = 0;
+    static WarmupLaunchArgs args;
+    wcsncpy(args.dir, g_game, MAX_PATH * 4);
+    args.dir[MAX_PATH * 4 - 1] = 0;
+    args.engine = e;
+    ui_operation_start(warmup_launch_thread, &args, NULL);
 }

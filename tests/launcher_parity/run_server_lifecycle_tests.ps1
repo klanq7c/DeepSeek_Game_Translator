@@ -18,7 +18,7 @@ try {
     $cProbe = Join-Path $fixture 'lifecycle_c.exe'
     & $gcc -std=c17 -O2 -Wall -Wextra -Werror -municode -D_CRT_SECURE_NO_WARNINGS "-I$launcher" `
         "$PSScriptRoot\server_lifecycle_probe.c" "$launcher\server_proc.c" `
-        "$launcher\fsutil.c" "$launcher\globals.c" -lwinhttp -lgdi32 -o $cProbe
+        "$launcher\fsutil.c" "$launcher\globals.c" "$launcher\ui_operation.c" -lwinhttp -lgdi32 -o $cProbe
     if ($LASTEXITCODE -ne 0) { throw 'C lifecycle probe build failed' }
     if (!$CsLauncher) { $CsLauncher = Join-Path $repo 'build\launcher_cs\dst_launcher_cs.exe' }
     Copy-Item -LiteralPath $CsLauncher -Destination (Join-Path $fixture 'dst_launcher_cs.exe')

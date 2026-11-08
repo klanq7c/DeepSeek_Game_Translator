@@ -1,0 +1,109 @@
+#include "ui.h"
+#include <objbase.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "ui_operation.h"
+HWND g_main, g_path;
+WCHAR g_game[MAX_PATH*4], g_root[MAX_PATH*4];
+int g_server_started=1;
+static DWORD owner;
+static HANDLE entered, release_work;
+static int calls, wrong_thread, dialogs, diagnostics, cleared, cards, stuck, restart_fail;
+static int modal_close, modal_reentry, fail_create, cancel, destroyed;
+static char order[32];
+void toggle_server(void);
+void append_log(const WCHAR *s, ...) { (void)s; InterlockedIncrement((LONG*)&diagnostics); }
+void set_status(const WCHAR *s) { (void)s; }
+void update_cache_card(void) { cards++; if(GetCurrentThreadId()!=owner) wrong_thread=1; }
+void refresh_server_status(void) {}
+int server_alive(void) { return g_server_started; }
+static void boundary(char operation) {
+    int slot=(int)InterlockedIncrement((LONG*)&calls)-1;
+    if(slot>=31) exit(8);
+    order[slot]=operation;
+    if(GetCurrentThreadId()==owner) { wrong_thread=1; return; }
+    SetEvent(entered);
+    if(WaitForSingleObject(release_work,5000)!=WAIT_OBJECT_0) exit(9);
+}
+void stop_server(void) { boundary('s'); if(!stuck) g_server_started=0; }
+int start_server(void) { boundary('r'); g_server_started=!restart_fail; return !restart_fail; }
+int clear_cache_file(void) { boundary('c'); cleared++; return 1; }
+static int fake_path(HWND h,WCHAR *out,int cap) { (void)h; wcsncpy(out,L"original",cap); return 8; }
+#define GetWindowTextW fake_path
+int is_dir(const WCHAR *s) { (void)s; return 1; }
+void save_last_game_dir(const WCHAR *s) { (void)s; }
+Engine detect_engine(const WCHAR *s) { (void)s; return ENGINE_RENPY; }
+const WCHAR *engine_name(Engine e) { (void)e; return L"RenPy"; }
+void refresh_engine(void) {}
+int restore_game(const WCHAR *s,Engine e) { (void)e; boundary('u'); if(wcscmp(s,L"original")) exit(7); return 1; }
+int run_deploy_launch_flow(const WCHAR *s,Engine e) { (void)e; boundary('l'); if(wcscmp(s,L"original")) exit(7); return 1; }
+void path_join(WCHAR *out,size_t n,const WCHAR *a,const WCHAR *b) { (void)a; wcsncpy(out,b,n); }
+int themed_message(HWND h,const WCHAR *m,const WCHAR *t,UINT flags) {
+    (void)h;(void)m;(void)t; dialogs++;
+    if(GetCurrentThreadId()!=owner) wrong_thread=1;
+    if(flags&MB_YESNO) {
+        if(modal_close) ui_operation_request_close();
+        if(modal_reentry) toggle_server();
+    }
+    return cancel && (flags&MB_YESNO) ? IDNO : IDYES;
+}
+BOOL IsWindow_fake(HWND h) { (void)h; return FALSE; }
+#define IsWindow IsWindow_fake
+int translation_flow_running(void) { return ui_operation_busy(); }
+/* 创建失败注入仅替换执行器的外部线程边界。 */
+HANDLE ui_operation_create_thread(LPTHREAD_START_ROUTINE work, void *arg) {
+    if(fail_create) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    return CreateThread(NULL,0,work,arg,0,NULL);
+}
+/* REAL_ENTRIES */
+static BOOL fake_destroy(HWND h) { (void)h; destroyed++; return TRUE; }
+#define DestroyWindow fake_destroy
+void tick_ui_animation(HWND h) { (void)h; }
+static LRESULT dispatch(HWND hwnd,UINT msg,WPARAM wp) { switch(msg) {
+/* REAL_DISPATCH */
+} return 0; }
+static void check(int ok,const char *s) { if(!ok) { printf("FAIL %s calls=%d wrong_thread=%d dialogs=%d cleared=%d\n",s,calls,wrong_thread,dialogs,cleared); exit(1); } }
+int main(int argc,char **argv) {
+    if(argc!=2) return 2;
+    const char *s=argv[1]; owner=GetCurrentThreadId();
+    entered=CreateEventW(NULL,TRUE,FALSE,NULL); release_work=CreateEventW(NULL,TRUE,FALSE,NULL);
+    stuck=!strcmp(s,"stop-failure"); restart_fail=!strcmp(s,"restart-failure");
+    fail_create=strstr(s,"create-failure")!=NULL; modal_close=!strcmp(s,"modal-close"); modal_reentry=!strcmp(s,"modal-reentry"); cancel=!strcmp(s,"cancel");
+    int is_start=!strncmp(s,"start",5), is_restore=!strncmp(s,"restore",7), is_toggle=!strcmp(s,"toggle");
+    if(is_toggle) toggle_server(); else if(is_start) start_translation(); else if(is_restore) restore_selected_game(); else clear_translation_cache();
+    wcscpy(g_game,L"changed");
+    check(!wrong_thread,"button performed blocking work on UI");
+    if(fail_create || modal_close || cancel) {
+        check(calls==0 && !ui_operation_busy(),"failed creation/close started work or retained busy");
+        check(!fail_create || diagnostics>0,"thread creation failure lacked diagnostics");
+        check(!modal_close || ui_operation_poll(),"modal close was lost");
+        if(!modal_close) { check(ui_operation_reserve(),"failure/cancel did not release ownership"); ui_operation_cancel(); }
+    } else {
+        check(WaitForSingleObject(entered,1000)==WAIT_OBJECT_0,"worker not entered");
+        int before=calls, beforeDialogs=dialogs;
+        toggle_server(); clear_translation_cache(); start_translation(); restore_selected_game();
+        check(calls==before && dialogs==beforeDialogs,"duplicate operations entered boundary/modal");
+        for(int i=0;i<1000;i++) check(!ui_operation_poll(),"unfinished operation completed");
+        int closing=strstr(s,"close")!=NULL;
+        if(!strcmp(s,"window-close")) { dispatch(NULL,WM_CLOSE,0); check(!destroyed,"WM_CLOSE destroyed running operation"); }
+        else if(closing) check(!ui_operation_request_close(),"close destroyed running operation");
+        SetEvent(release_work);
+        DWORD deadline=GetTickCount()+3000;
+        int close_ready=0;
+        while(ui_operation_busy()) {
+            if(!strcmp(s,"window-close")) { dispatch(NULL,WM_TIMER,2); close_ready=destroyed==1; }
+            else close_ready=ui_operation_poll();
+            check(GetTickCount()<deadline,"completion not observed"); Sleep(1);
+        }
+        check(!wrong_thread,"completion dialog/card ran off UI");
+        check(!strcmp(order,is_toggle?"s":is_start?"rl":is_restore?"u":stuck?"s":"scr"),"service/deploy/file operation order changed");
+        if(is_toggle) check(calls==1 && dialogs==0,"toggle rejected itself");
+        else if(is_start) check(calls==2 && dialogs==0,"start/deploy sequence changed");
+        else if(is_restore) check(calls==1 && dialogs==(closing?1:2),"restore sequence changed");
+        else if(stuck) check(cleared==0 && calls==1,"live server cache was deleted");
+        else check(cleared==1 && calls==3,"stop/delete/restart sequence changed");
+        check(closing ? close_ready && dialogs==(is_start?0:1) && cards==0 : cards==((is_toggle||is_start||is_restore)?0:1),"close/completion ownership failed");
+    }
+    CloseHandle(entered); CloseHandle(release_work); puts("PASS"); return 0;
+}

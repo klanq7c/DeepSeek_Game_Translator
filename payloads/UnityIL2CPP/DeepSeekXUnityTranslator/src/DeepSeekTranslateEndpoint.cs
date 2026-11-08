@@ -229,7 +229,7 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
                 context.Fail("DeepSeek mixed-language translation lost protected text: " + oneRestoreError);
                 return;
             }
-            one = PrepareDisplayTranslation(one);
+            one = PrepareDisplayTranslation(one, original[0]);
             if (string.IsNullOrWhiteSpace(one))
             {
                 context.Fail("DeepSeek local server returned no translation.");
@@ -238,6 +238,12 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
             if (string.Equals(one, original[0], StringComparison.Ordinal))
             {
                 context.Fail("DeepSeek local server returned the untranslated source text.");
+                return;
+            }
+            /* 与批量路径同一守卫：单条译文行数与源不一致时失败关闭，保留原文。 */
+            if (CountLineBreaks(one) != CountLineBreaks(original[0]))
+            {
+                context.Fail("DeepSeek local server returned a translation whose line count differs from the source (TMP pagination).");
                 return;
             }
 
@@ -302,13 +308,22 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
                 return;
             }
         }
-        results = PrepareDisplayTranslations(results);
+        results = PrepareDisplayTranslations(results, original);
         // 标点兼容和回显剥离之后再次检查；显示层处理不能把空白或原文报告为批量成功。
         for (int i = 0; i < results.Length; i++)
         {
             if (!identityResults[i] && (string.IsNullOrWhiteSpace(results[i]) || string.Equals(results[i], original[i], StringComparison.Ordinal)))
             {
                 context.Fail("DeepSeek display normalization left an unresolved batch item at index " + i + ".");
+                return;
+            }
+            /* TMP 分页依赖源文本换行结构（\n 数量必须逐行保留，否则 TMP 分页/
+               空页分隔错乱）。在显示层处理之后的最终文本上检查；行数不一致按
+               批次失败处理（与未解析条目同一语义）：XUnity 保留原文，坏译文
+               不会进入 XUnity 文本缓存。pass 条目即原文，天然满足。 */
+            if (!identityResults[i] && CountLineBreaks(results[i]) != CountLineBreaks(original[i]))
+            {
+                context.Fail("DeepSeek local server returned a batch item whose line count differs from the source (TMP pagination) at index " + i + ".");
                 return;
             }
         }
@@ -323,12 +338,12 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         context.Complete(results);
     }
 
-    private string[] PrepareDisplayTranslations(string[] values)
+    private string[] PrepareDisplayTranslations(string[] values, string[] originals)
     {
         if (values == null) return values;
         for (int i = 0; i < values.Length; i++)
         {
-            values[i] = StripTranslationPromptEchoPrefix(values[i]);
+            values[i] = StripTranslationPromptEchoPrefix(values[i], originals[i]);
             if (_displaySafePunctuation)
             {
                 values[i] = NormalizeForTmpDisplay(values[i]);
@@ -337,18 +352,38 @@ public sealed class DeepSeekTranslateEndpoint : HttpEndpoint
         return values;
     }
 
-    private string PrepareDisplayTranslation(string value)
+    private string PrepareDisplayTranslation(string value, string original)
     {
-        value = StripTranslationPromptEchoPrefix(value);
+        value = StripTranslationPromptEchoPrefix(value, original);
         return _displaySafePunctuation ? NormalizeForTmpDisplay(value) : value;
     }
 
     /* 提示词回显剥离：与服务器（util.c / DstCore.TextRules）同一份规则。
        服务器返回前已经剥过一次，这里是端点侧的防御性复查，规则必须一致，
-       否则端点会对同一条缓存值得出与服务器不同的结论。 */
-    private static string StripTranslationPromptEchoPrefix(string text)
+       否则端点会对同一条缓存值得出与服务器不同的结论。中文已经恢复，必须传
+       真实原文保留其自有前缀，不能把“简体中文译文：”等游戏说明再次剥掉。 */
+    /* 按 '\n' 计数的换行结构不变量（\r 后缀变体不影响 TMP 分页，行数才会）。
+       供单条/批量译文的结构守卫使用。 */
+    private static int CountLineBreaks(string text)
     {
-        return TextRules.NormalizeTranslationResult(text);
+        if (string.IsNullOrEmpty(text))
+        {
+            return 0;
+        }
+        int count = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '\n')
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static string StripTranslationPromptEchoPrefix(string text, string original)
+    {
+        return TextRules.NormalizeTranslationResult(text, original);
     }
 
     private static string BuildPayload(string[] texts, bool single)

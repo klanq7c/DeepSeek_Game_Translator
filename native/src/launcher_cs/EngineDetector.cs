@@ -43,11 +43,28 @@ namespace DstLauncher
 
         /* ---------------- 查找游戏程序：find_exe ---------------- */
 
+        private static bool TranslatorReleaseExeName(string name)
+        {
+            const string prefix = "ds-translator_";
+            if (name.Length <= prefix.Length + 4 || !name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                || !name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return false;
+            int digits = 0;
+            for (int i = prefix.Length; i < name.Length - 4; i++) {
+                if (name[i] >= '0' && name[i] <= '9') digits++;
+                else if (name[i] != '.') return false;
+            }
+            return digits > 0;
+        }
+
         private static bool IgnoredExeName(string name)
         {
             return name.IndexOf("CrashHandler", StringComparison.Ordinal) >= 0
                 || name.IndexOf("UnityCrashHandler", StringComparison.Ordinal) >= 0
                 || PathUtil.EqualsNoCase(name, "DeepSeekTranslator.exe")
+                || PathUtil.EqualsNoCase(name, "ds游戏翻译器.exe")
+                || PathUtil.EqualsNoCase(name, "dst_server_cs.exe")
+                || PathUtil.EqualsNoCase(name, "dst_launcher_cs.exe")
+                || TranslatorReleaseExeName(name)
                 || PathUtil.EqualsNoCase(name, "dst_godot_patch.exe")
                 || PathUtil.EqualsNoCase(name, "dst_server.exe");
         }
@@ -95,13 +112,12 @@ namespace DstLauncher
             bool ok = false;
             int bestScore = int.MinValue;
             string bestName = "";
+            string ownPath = System.Reflection.Assembly.GetEntryAssembly().Location;
             foreach (string name in PathUtil.ListEntries(dir, "*.exe")) {
                 string candidate = PathUtil.Join(dir, name);
                 if (PathUtil.IsDir(candidate)) continue;
                 if (IgnoredExeName(name)) continue;
-                if (PathUtil.EqualsNoCase(name, "ds游戏翻译器.exe")
-                    || PathUtil.EqualsNoCase(name, "DeepSeekTranslator.exe")
-                    || PathUtil.EqualsNoCase(name, "dst_server.exe")) continue;
+                if (PathUtil.EqualsNoCase(Path.GetFullPath(candidate), ownPath)) continue;
                 int score = ExeCandidateScore(dir, name, candidate);
                 if (!ok || score > bestScore
                     || (score == bestScore && string.Compare(name, bestName, StringComparison.OrdinalIgnoreCase) < 0)) {

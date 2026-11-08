@@ -60,8 +60,9 @@ namespace DstLauncher
         /* 把像素值按当前 DPI 缩放（96 基准）。所有 UI 尺寸必须过 Sc()。 */
         internal static int Sc(int v)
         {
-            return Win32.MulDiv(v, ScaleDpi, 96);
+            return Sc(v, ScaleDpi);
         }
+        internal static int Sc(int v, int dpi) { return Win32.MulDiv(v, dpi, 96); }
 
         /* 按 DPI 缩放创建字体。高度取负值表示 pt -> 像素（CreateFontW 约定）。 */
         internal static IntPtr MakeFont(int pt, int weight, string face)

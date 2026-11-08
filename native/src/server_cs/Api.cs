@@ -16,8 +16,8 @@ namespace DstServerCs
      * ApiConfig / ApiClient —— 与 api.h/api.c 对齐的远程翻译客户端。
      *
      * api.ini 解析直接走 Win32 GetPrivateProfileStringA（net472 可 P/Invoke），
-     * 与 C 版本逐字段一致：endpoint/model/key/timeout_ms/concurrency，
-     * timeout 钳制 3s..60s，concurrency 钳制 1..8。
+     * 与 C 版本逐字段一致，包含超时、并发及批次条数/输入 UTF-8 字节预算；
+     * 回环端点使用较长超时和较小批次，所有数值按相同范围钳制。
      * 明文 HTTP 只允许回环端点；空 key 只允许回环端点。
      */
 
@@ -26,6 +26,8 @@ namespace DstServerCs
         public bool Enabled;
         public int TimeoutMs = 15000;
         public int Concurrency = ApiClient.ConcurrencyMax;
+        public int BatchMaxItems = 48;
+        public int BatchCharBudget = 9600;
         public string Endpoint = "https://api.deepseek.com/v1/chat/completions";
         public string Model = "deepseek-flash";
         public string Key = "";
@@ -54,6 +56,8 @@ namespace DstServerCs
         {
             TimeoutMs = 15000;
             Concurrency = ApiClient.ConcurrencyMax;
+            BatchMaxItems = 48;
+            BatchCharBudget = 9600;
             Endpoint = "https://api.deepseek.com/v1/chat/completions";
             Model = "deepseek-flash";
             Key = "";
@@ -89,6 +93,13 @@ namespace DstServerCs
             Concurrency = GetPrivateProfileIntA("api", "concurrency", Concurrency, path);
             if (Concurrency < 1) Concurrency = 1;
             if (Concurrency > ApiClient.ConcurrencyMax) Concurrency = ApiClient.ConcurrencyMax;
+            // 回环模型默认缩小单批；预算按原始输入的 UTF-8 字节累计，与 C 版一致。
+            BatchMaxItems = GetPrivateProfileIntA("api", "batch_max_items", loopback ? 8 : 48, path);
+            if (BatchMaxItems < 1) BatchMaxItems = 1;
+            if (BatchMaxItems > 48) BatchMaxItems = 48;
+            BatchCharBudget = GetPrivateProfileIntA("api", "batch_char_budget", loopback ? 2048 : 9600, path);
+            if (BatchCharBudget < 256) BatchCharBudget = 256;
+            if (BatchCharBudget > 9600) BatchCharBudget = 9600;
             MigrateDeprecatedDeepseekModel();
             Enabled = !string.IsNullOrEmpty(Endpoint) && !string.IsNullOrEmpty(Model)
                 && (Key.Length > 0 || ApiClient.IsLoopbackEndpoint(Endpoint))
@@ -111,10 +122,12 @@ namespace DstServerCs
     public static class ApiClient
     {
         public const int ConcurrencyMax = 8;
+        private static readonly UTF8Encoding StrictResponseUtf8 = new UTF8Encoding(false, true);
+        // 截止时间统一由每次请求的配置令牌控制，避免 HttpClient 默认 100 秒提前截断慢速本地模型。
         private static readonly HttpClient Http = new HttpClient(new HttpClientHandler
         {
             AutomaticDecompression = DecompressionMethods.None,
-        });
+        }) { Timeout = Timeout.InfiniteTimeSpan };
 
         /* 前台计数：实时翻译在调用远程期间持有，后台预热批次在计数非零时让路。 */
         private static int foreground;
@@ -163,12 +176,31 @@ namespace DstServerCs
             return rest.Length == host.Length || ":/?".IndexOf(rest[host.Length]) >= 0;
         }
 
+        /* 只认标准本机 Ollama 路由；不按模型名改变其他提供方的请求参数。 */
+        public static bool IsLocalOllamaEndpoint(string endpoint)
+        {
+            const string path = "/v1/chat/completions";
+            if (!IsLoopbackEndpoint(endpoint)) return false;
+            if (!endpoint.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                && !endpoint.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return false;
+            int scheme = endpoint.IndexOf("://", StringComparison.Ordinal);
+            string host = endpoint.Substring(scheme + 3);
+            string port = host.Substring(host[0] == '[' ? 5 : 9);
+            if (!port.StartsWith(":11434", StringComparison.Ordinal)) return false;
+            string route = port.Substring(6);
+            if (!route.StartsWith(path, StringComparison.Ordinal)) return false;
+            string tail = route.Substring(path.Length);
+            if (tail.StartsWith("/", StringComparison.Ordinal)) tail = tail.Substring(1);
+            return tail.Length == 0 || tail[0] == '?' || tail[0] == '#';
+        }
+
         public static void Configure(ApiConfig cfg)
         {
             ModelName = cfg.Model;
             /* V4.1 Flash 的稳定 ID 与旧 V4 系列都保持翻译专用非思考模式。 */
             DisableThinking = IsOfficialDeepseekEndpoint(cfg.Endpoint)
                 && (cfg.Model == "deepseek-flash" || cfg.Model.StartsWith("deepseek-v4-", StringComparison.Ordinal));
+            DisableOllamaThinking = IsLocalOllamaEndpoint(cfg.Endpoint);
             ChatUrl = cfg.Endpoint;
             AuthHeader = string.IsNullOrEmpty(cfg.Key)
                 ? null
@@ -193,15 +225,17 @@ namespace DstServerCs
 
         /* 语境段只列"批外断点"：prev 与批内前一条相同的条目跳过——那条文本
            本身就在待翻译数组里，重复发送只会让输入 token 翻倍。 */
-        private static string BuildCtxUser(IList<string> texts, IList<string> prevs)
+        private static string BuildCtxUser(IList<string> texts, IList<string> originalTexts,
+                                           IList<string> prevs)
         {
             var sb = new StringBuilder(128);
             sb.Append("Previous lines (context only, never translate or output them):\n");
             for (int i = 0; i < texts.Count; i++) {
                 var p = prevs != null && i < prevs.Count ? prevs[i] : null;
                 if (string.IsNullOrEmpty(p)) continue;
-                if (i > 0 && texts[i - 1] != null && p == texts[i - 1]) continue;
-                sb.Append(i).Append(": ").Append(p).Append('\n');
+                // 不同汉字会映射为相同占位符；去重必须比较原文，再保护保留的前文。
+                if (i > 0 && p == originalTexts[i - 1]) continue;
+                sb.Append(i).Append(": ").Append(MixedText.Protect(p)).Append('\n');
             }
             sb.Append("\nTexts to translate:\n");
             sb.Append(BuildBatchUser(texts));
@@ -254,6 +288,7 @@ namespace DstServerCs
         private static string AuthHeader;
         private static string ModelName;
         private static bool DisableThinking;
+        private static bool DisableOllamaThinking;
 
         private static string BuildMessages(string system, string user, int maxTokens)
         {
@@ -264,6 +299,7 @@ namespace DstServerCs
             sb.Append("},{\"role\":\"user\",\"content\":").Append(Json.Escape(user));
             sb.Append("}],\"temperature\":0,\"max_tokens\":").Append(maxTokens);
             if (DisableThinking) sb.Append(",\"thinking\":{\"type\":\"disabled\"}");
+            if (DisableOllamaThinking) sb.Append(",\"reasoning_effort\":\"none\"");
             sb.Append('}');
             return sb.ToString();
         }
@@ -299,12 +335,21 @@ namespace DstServerCs
 
         /* send_chat_request：发请求 + 校验 2xx + 提取 content + 双重 normalize。 */
         private static async Task<string> SendChatAsync(
-            ApiConfig cfg, string body, SemaphoreSlim gate, FailureInfo fail)
+            ApiConfig cfg, string body, SemaphoreSlim gate, FailureInfo fail, string source = null)
         {
+            // 外部配置可含非法端口；在请求构造边界拒绝并限频记录，不能让后台线程退出。
+            // 配置文件可由用户直接编辑，因此发送方仍需校验；失败不拆分、不产生译文。
+            Uri target;
+            if (!Uri.TryCreate(ChatUrl, UriKind.Absolute, out target)
+                || (target.Scheme != Uri.UriSchemeHttp && target.Scheme != Uri.UriSchemeHttps)) {
+                Diag("request-uri", "invalid absolute HTTP endpoint");
+                if (fail != null) fail.Splittable = false;
+                return null;
+            }
             await gate.WaitAsync().ConfigureAwait(false);
             try {
                 using (var cts = new CancellationTokenSource(cfg.TimeoutMs)) {
-                    using (var req = new HttpRequestMessage(HttpMethod.Post, ChatUrl)) {
+                    using (var req = new HttpRequestMessage(HttpMethod.Post, target)) {
                         req.Content = new StringContent(body, Encoding.UTF8, "application/json");
                         if (AuthHeader != null) {
                             req.Headers.TryAddWithoutValidation("Authorization", AuthHeader);
@@ -372,7 +417,16 @@ namespace DstServerCs
                                 if (fail != null) fail.Splittable = true;
                                 return null;
                             }
-                            string raw = Encoding.UTF8.GetString(rawBytes);
+                            string raw;
+                            try {
+                                raw = StrictResponseUtf8.GetString(rawBytes);
+                            } catch (DecoderFallbackException) {
+                                // 提供商坏字节无法在上游修复；拒绝并记录类别，不用替换字符
+                                // 拼出可入库的译文，也不记录响应正文或认证信息。
+                                Diag("invalid-response", "invalid UTF-8");
+                                if (fail != null) fail.Splittable = true;
+                                return null;
+                            }
                             string content = ExtractContent(raw);
                             if (content == null) {
                                 Diag("missing-content", null);
@@ -380,7 +434,7 @@ namespace DstServerCs
                                 return null;
                             }
                             content = TextRules.NormalizeTranslation(content);
-                            content = TextRules.NormalizeTranslationResult(content);
+                            content = TextRules.NormalizeTranslationResult(content, source);
                             if (content.Length == 0) {
                                 Diag("empty-content", null);
                                 if (fail != null) fail.Splittable = true;
@@ -398,22 +452,29 @@ namespace DstServerCs
         private static string ExtractContent(string raw)
         {
             try {
-                var dom = Json.Parse(raw) as Dictionary<string, object>;
+                var dom = Json.ParseStrict(raw) as Dictionary<string, object>;
                 var choices = Json.TopArray(dom, "choices");
                 if (choices == null || choices.Count == 0) return null;
                 var first = choices[0] as Dictionary<string, object>;
                 var message = Json.TopObject(first);
                 var msg = message != null && message.TryGetValue("message", out var m)
                     ? m as Dictionary<string, object> : null;
-                return msg != null ? (msg.TryGetValue("content", out var c) ? c as string : null) : null;
+                string content = msg != null ? (msg.TryGetValue("content", out var c) ? c as string : null) : null;
+                if (content == null || content.IndexOf('\0') >= 0) return null;
+                // JSON 转义也可能产生孤立代理；不允许编码器把坏译文替换成 U+FFFD。
+                StrictResponseUtf8.GetByteCount(content);
+                return content;
             } catch (Json.ParseException) {
+                return null;
+            } catch (EncoderFallbackException) {
                 return null;
             }
         }
 
         /* parse_json_string_array：批量响应必须是等长同序的字符串数组。 */
-        private static string[] ParseStringArray(string json, int expected)
+        private static string[] ParseStringArray(string json, IList<string> sources)
         {
+            int expected = sources.Count;
             List<object> arr;
             try {
                 var dom = Json.Parse(json);
@@ -429,7 +490,7 @@ namespace DstServerCs
                 var item = arr[i] as string;
                 if (item == null) return null;
                 outArr[i] = TextRules.NormalizeTranslationResult(
-                    TextRules.NormalizeTranslation(item));
+                    TextRules.NormalizeTranslation(item), sources[i]);
                 if (outArr[i] == null) return null;
             }
             return outArr;
@@ -438,40 +499,45 @@ namespace DstServerCs
         public static bool IsTranslatable(ApiConfig cfg, string text)
         {
             return cfg != null && cfg.Enabled
-                && !string.IsNullOrEmpty(text)
-                && TextRules.ShouldTranslate(text);
+                && !string.IsNullOrEmpty(text);
         }
 
         public static async Task<string> TranslateSingle(
             ApiConfig cfg, string text, SemaphoreSlim gate, FailureInfo fail = null)
         {
             if (!IsTranslatable(cfg, text)) return null;
-            var texts = new[] { text };
+            var texts = new[] { MixedText.Protect(text) };
             string body = BuildMessages(
                 BuildSystemContent(SystemPrefix, cfg, texts),
-                SingleUserLine + text,
+                SingleUserLine + texts[0],
                 EstimateMaxTokens(texts));
-            return await SendChatAsync(cfg, body, gate, fail).ConfigureAwait(false);
+            string reply = await SendChatAsync(cfg, body, gate, fail, texts[0]).ConfigureAwait(false);
+            if (reply == null) return null;
+            if (MixedText.TryRestore(text, reply, out string restored)) return restored;
+            Diag("mixed-cjk", "protected Chinese token mismatch");
+            if (fail != null) fail.Splittable = true;
+            return null;
         }
 
         public static async Task<string[]> TranslateBatch(
             ApiConfig cfg, IList<string> texts, SemaphoreSlim gate, FailureInfo fail = null)
         {
             if (cfg == null || !cfg.Enabled || texts == null || texts.Count == 0) return null;
+            var requests = ProtectMixedTexts(texts);
             string body = BuildMessages(
                 BuildSystemContent(
                     SystemPrefix + " Translate each element of the user's JSON array in order. Return only a valid JSON array with the same length and order.",
-                    cfg, texts),
-                BuildBatchUser(texts),
-                EstimateMaxTokens(texts));
+                    cfg, requests),
+                BuildBatchUser(requests),
+                EstimateMaxTokens(requests));
             var content = await SendChatAsync(cfg, body, gate, fail).ConfigureAwait(false);
             if (content == null) return null;
-            var arr = ParseStringArray(content, texts.Count);
+            var arr = ParseStringArray(content, requests);
             if (arr == null) {
                 Diag("batch-shape", "expected=" + texts.Count);
                 if (fail != null) fail.Splittable = true; // 形状错误：缩小批次有机会修复
             }
-            return arr;
+            return RestoreMixedTexts(texts, arr, fail);
         }
 
         public static async Task<string[]> TranslateBatchCtx(
@@ -479,20 +545,42 @@ namespace DstServerCs
             FailureInfo fail = null)
         {
             if (cfg == null || !cfg.Enabled || texts == null || texts.Count == 0) return null;
+            var requests = ProtectMixedTexts(texts);
             string body = BuildMessages(
                 BuildSystemContent(
                     SystemPrefix + " The texts are consecutive in-game lines in story order; some entries list a previous line for context. Use that context to resolve pronouns, tone, and terminology, and keep character naming consistent, but never translate or output the context itself. Translate each element of the JSON array. Return only a valid JSON array with the same length and order.",
-                    cfg, texts),
-                BuildCtxUser(texts, prevs),
-                EstimateMaxTokens(texts));
+                    cfg, requests),
+                BuildCtxUser(requests, texts, prevs),
+                EstimateMaxTokens(requests));
             var content = await SendChatAsync(cfg, body, gate, fail).ConfigureAwait(false);
             if (content == null) return null;
-            var arr = ParseStringArray(content, texts.Count);
+            var arr = ParseStringArray(content, requests);
             if (arr == null) {
                 Diag("batch-shape", "expected=" + texts.Count);
                 if (fail != null) fail.Splittable = true;
             }
-            return arr;
+            return RestoreMixedTexts(texts, arr, fail);
+        }
+
+        private static string[] ProtectMixedTexts(IList<string> texts)
+        {
+            var requests = new string[texts.Count];
+            for (int i = 0; i < texts.Count; i++) requests[i] = MixedText.Protect(texts[i]);
+            return requests;
+        }
+
+        private static string[] RestoreMixedTexts(IList<string> texts, string[] replies, FailureInfo fail)
+        {
+            if (replies == null) return null;
+            for (int i = 0; i < texts.Count; i++) {
+                if (!MixedText.TryRestore(texts[i], replies[i], out string restored)) {
+                    Diag("mixed-cjk", "protected Chinese token mismatch; slot=" + i);
+                    if (fail != null) fail.Splittable = true;
+                    return null;
+                }
+                replies[i] = restored;
+            }
+            return replies;
         }
 
         private static long splitAbortCount;
@@ -505,10 +593,19 @@ namespace DstServerCs
            比它取代的逐条方案还多）。终止类失败直接返回全 null，条目在后台队列
            收尾时被遗忘，下次 miss 可再次排队。 */
         public static async Task<string[]> TranslateSplitRetry(
-            ApiConfig cfg, IList<string> texts, IList<string> prevs, SemaphoreSlim gate)
+            ApiConfig cfg, IList<string> texts, IList<string> prevs, SemaphoreSlim gate,
+            Func<bool> yieldCheck = null)
         {
             var arr = new string[texts.Count];
             if (cfg == null || !cfg.Enabled || texts.Count == 0) return arr;
+
+            // 每个子请求前让路：函数入口覆盖首次调用与每层递归，逐条兜底循环
+            // 在每个条目前单独检查。让路命中时剩余槽位保持 null 返回，
+            // 条目由后台队列收尾遗忘、下次 miss 重新排队，不产生重复翻译。
+            if (yieldCheck != null && yieldCheck()) {
+                SplitAbortDiag(texts.Count);
+                return arr;
+            }
 
             bool hasPrev = false;
             for (int i = 0; i < texts.Count; i++) {
@@ -534,6 +631,11 @@ namespace DstServerCs
             const int SplitMinItems = 4;
             if (texts.Count <= SplitMinItems) {
                 for (int i = 0; i < texts.Count; i++) {
+                    if (yieldCheck != null && yieldCheck()) {
+                        // 让路命中：剩余条目按 miss 遗忘（与终止类失败同一收尾语义）。
+                        SplitAbortDiag(texts.Count - i);
+                        break;
+                    }
                     string[] one;
                     var oneFail = new FailureInfo();
                     bool itemHasPrev = prevs != null && i < prevs.Count
@@ -566,8 +668,8 @@ namespace DstServerCs
             var prevsLeft = prevs != null ? SliceList(prevs, 0, half) : null;
             var prevsRight = prevs != null ? SliceList(prevs, half, texts.Count - half) : null;
 
-            var a = await TranslateSplitRetry(cfg, left, prevsLeft, gate).ConfigureAwait(false);
-            var b = await TranslateSplitRetry(cfg, right, prevsRight, gate).ConfigureAwait(false);
+            var a = await TranslateSplitRetry(cfg, left, prevsLeft, gate, yieldCheck).ConfigureAwait(false);
+            var b = await TranslateSplitRetry(cfg, right, prevsRight, gate, yieldCheck).ConfigureAwait(false);
             for (int i = 0; i < half; i++) arr[i] = a[i];
             for (int i = half; i < texts.Count; i++) arr[i] = b[i - half];
             return arr;

@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <Compile Include="..\..\..\UnityTranslator\src\TmpRichText.cs" Link="renderer\TmpRichText.cs" />
+    <Compile Include="..\..\..\UnityTranslator\src\TmpFontPopulation.cs" Link="renderer\TmpFontPopulation.cs" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="BepInEx.Core">

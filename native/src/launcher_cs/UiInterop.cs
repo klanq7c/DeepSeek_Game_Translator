@@ -289,6 +289,10 @@ namespace DstLauncher
 
         [DllImport("user32.dll")]
         internal static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        internal static extern int GetClassNameW(IntPtr hwnd, StringBuilder text, int count);
+        [DllImport("user32.dll")]
+        internal static extern bool DrawFocusRect(IntPtr dc, ref RECT rect);
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool SystemParametersInfoW(uint action, uint parameter, out int value, uint flags);

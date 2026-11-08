@@ -2,7 +2,7 @@
 last_game_dir=
 
 [server]
-; Which local translation server binary the launcher starts.
-;   native = native\dst_server.exe (default)
-;   cs     = native\dst_server_cs.exe (C# parallel build, same HTTP contract)
+; 启动器要启动的本地翻译服务器二进制。
+;   native = native\dst_server.exe（默认）
+;   cs     = native\dst_server_cs.exe（C# 平行实现，使用相同的 HTTP 契约）
 binary=native

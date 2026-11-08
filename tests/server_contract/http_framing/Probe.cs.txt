@@ -1,0 +1,49 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using System.Net.Sockets;
+using Encoding = MeasuredEncoding;
+internal static class MeasuredEncoding {
+    internal sealed class Decoder {
+        public string GetString(byte[] bytes,int offset,int count) { Probe.DecodedBytes += count; return System.Text.Encoding.ASCII.GetString(bytes,offset,count); }
+    }
+    public static readonly Decoder ASCII = new Decoder();
+}
+internal static class Probe {
+    private const int MaxReq = 2 * 1024 * 1024, RecvTimeoutMs = 5000;
+    private static byte[] input;
+    private static int pos, chunk, reads, status;
+    internal static long DecodedBytes, SearchBytes, SearchCalls, ParseCalls;
+    private sealed class Socket { public void Shutdown(SocketShutdown how) {} public void Close() {} }
+    private sealed class NetworkStream : IDisposable { public NetworkStream(Socket socket,bool ownsSocket) {} public void Dispose() {} }
+    private sealed class Result { public int Length; public ulong Hash; }
+    private static byte[] PoolAcquire() { return new byte[65536]; }
+    private static void PoolRelease(byte[] buffer) {}
+    private static void HttpDiag(string operation,Exception ex) { Console.Error.WriteLine(operation+":"+ex.GetType().Name); }
+    private static Task SendAsync(Socket socket,object request,int code,string reason,string body) { status=code; return Task.CompletedTask; }
+    private static Task<int> ReadWithTimeoutAsync(NetworkStream stream,byte[] buffer,int offset,int capacity,int timeout) {
+        reads++; int count=Math.Min(Math.Min(input.Length-pos,chunk),capacity);
+        Buffer.BlockCopy(input,pos,buffer,offset,count);pos+=count;return Task.FromResult(count);
+    }
+@METHODS@
+@RECEIVER@
+    private static int Main(string[] args) {
+        input=File.ReadAllBytes(args[0]);chunk=int.Parse(args[1]);int rounds=int.Parse(args[2]);
+        if(chunk<=0 || rounds<=0)return 2;
+        // 首次 JIT 与稳态计时分开，统计仍保留最后一轮。
+        ReadRequestAsync(new Socket()).GetAwaiter().GetResult();
+        Result result=null;
+        var watch=Stopwatch.StartNew();
+        for(int i=0;i<rounds;i++) {
+            pos=reads=0;status=200;DecodedBytes=SearchBytes=SearchCalls=ParseCalls=0;
+            result=ReadRequestAsync(new Socket()).GetAwaiter().GetResult();
+        }
+        watch.Stop();
+        Console.WriteLine("{{\"status\":{0},\"bodyBytes\":{1},\"bodyHash\":{2},\"reads\":{3},\"searchCalls\":{4},\"searchBytes\":{5},\"parseCalls\":{6},\"decodedBytes\":{7},\"ms\":{8}}}",
+            status,result==null?0:result.Length,result==null?0:result.Hash,reads,SearchCalls,SearchBytes,ParseCalls,DecodedBytes,
+            (watch.Elapsed.TotalMilliseconds/rounds).ToString("F6",System.Globalization.CultureInfo.InvariantCulture));
+        return 0;
+    }
+}

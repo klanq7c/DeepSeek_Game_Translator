@@ -17,16 +17,38 @@ and runtime. The important design shape is:
 - Both servers confirm new batch persistence only after all writes and the
   final flush succeed. A write/flush failure keeps the batch dirty for a later
   same-value retry, including repeated keys with A/B/A values. Cache export
-  keeps its existing consistent view: native JSON copies ordinary UTF-8 runs
-  in bulk, while the C# HTTP layer encodes the body directly into its final
-  send buffer instead of creating another full response string.
+  keeps its existing consistent view: native full-map/entry exports copy all
+  key/value bytes into one owned snapshot under the map lock, then encode JSON
+  after releasing it. This reduces writer contention at the cost of a temporary
+  full-cache copy and longer total export time; single-key lookups keep their
+  existing path. C# already snapshots immutable string references under its
+  lock. Native JSON copies ordinary UTF-8 runs in bulk, while the C# HTTP layer
+  encodes the body directly into its final send buffer.
+- HTTP request framing scans only newly available delimiter positions, retaining
+  the incomplete suffix across reads. Once headers complete, both servers parse
+  Content-Length once and retain byte offsets across buffer growth. C# decodes
+  only the completed header block. The 2 MiB total limit, incomplete-request
+  timeouts, origin policy and per-language malformed-input rules are unchanged.
 - When reopening a cache for append, both servers check its final byte and
   append a separator if needed, preserving every existing byte. This prevents
   an interrupted tail from absorbing a later successfully persisted record;
   recovery is diagnosed as `persist-tail`.
+- Cache records must contain complete Base64 and valid UTF-8 without NUL.
+  Invalid records are diagnosed and skipped without replacing prior valid
+  entries or rewriting the file. Native loading uses byte-counted line
+  boundaries so a corrupt line cannot consume the next record. C# admission
+  also rejects unpaired surrogates that cannot be persisted losslessly.
 - Engine adapters own renderer compatibility. Font coverage, rich text, glyph
   punctuation, typewriter behavior, overlays, and resource parsing belong in
   the closest Ren'Py, RPG Maker, Unity, or Godot layer.
+- RPG Maker command warmup pairs code and parameters within each JSON object,
+  independent of property order. Adjacent commands and nested metadata cannot
+  lend their code to another object's dialogue parameters.
+- Launcher file operations convert normalized long paths only at the native
+  file API boundary. Ownership and reparse-point checks use the same paths;
+  the existing buffer limit and refusal of external device namespaces remain.
+  Payload comparison uses that boundary too, so identical long-path files are
+  reused without rewriting their timestamps.
 - Godot control and menu-item discovery parses each source once per operation.
   Filtering and queueing read that text plan before rendering consumes its parts;
   plans are never retained across frames. Cache-only redraw still performs no HTTP.
@@ -36,6 +58,23 @@ and runtime. The important design shape is:
 - Both launchers reuse a UI-thread-owned GDI back buffer, repainting every dirty
   region. Size, DPI, display-device changes and window destruction release it;
   the render probe compares buffered full/partial redraws with direct painting.
+- Both launchers serialize start, restore, cache clear and manual server toggle
+  through a UI-owned operation executor (`ui_operation.c` / `UiOperation.cs`).
+  Reservation includes confirmation and completion dialogs. Blocking work runs
+  on one retained thread; the existing window heartbeat observes actual thread
+  completion and runs completion dialogs on the UI thread. Close waits for the
+  operation, suppresses its final dialog and then destroys the window. Failed
+  thread creation reports failure and releases reservation without doing the
+  blocking work on the UI thread. Diagnostic command-line flows remain synchronous.
+- C# explicit live batches share the same 32 MiB admission budget and dedicated
+  workers as single live translations. A group enters atomically, keeps input
+  order and retains split-retry behavior. Accounting is a logical text/job budget,
+  not an exact managed-heap limit; worker release still precedes persistence.
+- RPG Maker automatic image text discovery skips scene traversal only when no
+  bitmap has usable OCR regions. A count, not a bitmap collection, controls this
+  gate; late valid OCR opens it immediately and destroying the final candidate
+  closes it. With candidates, per-frame discovery still handles new/visible
+  sprites and bitmap changes. Destroyed bitmaps and closed modules reject late OCR.
 - Unity Mono shares TMP/UGUI discovery only within one synchronous group of
   scene, activation and periodic cache consumers. Snapshot references are released
   in `finally`; scene reset and even throttled activation invalidate them. Scan
@@ -46,6 +85,13 @@ and runtime. The important design shape is:
 - Translation memory, cache files, API keys, user config, logs, third-party
   runtimes, Unity/game assemblies, and generated build products are user or
   build artifacts. Do not commit or rewrite them unless explicitly requested.
+- The read-only audit separates translation presence from marker consistency.
+  Optional `-DetailsPath` exports one UTF-8 JSONL record for every scanned unique
+  source, independently of the example cap. Discovery provenance is the launcher
+  prefetch or resource-import channel, not a recovered file/field location.
+  Missing, rejected and malformed candidates remain traceable; no candidates are
+  repaired or written to the shared cache. The export creates a new file outside
+  the game tree and publishes it only after all records have been written.
 
 ## Domain Terms
 
@@ -110,7 +156,7 @@ and runtime. The important design shape is:
   `/capabilities`, `/translate`, `/batch`, `/prefetch`, `/cache/import`,
   `/cache/lookup`, `/cache/export`, `/cache/dump`, `/shutdown`. The contract is
   pinned by `tests/server_contract/run_contract_tests.ps1`, which runs the same
-  74 checks against each binary with a fake OpenAI-compatible provider,
+  79 checks against each binary with a fake OpenAI-compatible provider,
   including cache write-failure recovery, duplicate imports, batch confirmation,
   and restart durability.
 - **Shared core (`DstCore`)**: `native/src/core/*.cs` — `TextRules` (prompt echo
@@ -144,6 +190,14 @@ and runtime. The important design shape is:
   retirement migration targets this stable ID in memory only. Translation
   requests disable thinking for this exact official ID as well as the supported
   legacy V4 family, with custom endpoints left untouched.
+- **Local provider budget**: both servers read `batch_max_items` and
+  `batch_char_budget` from `[api]`. Loopback defaults are 8 items and 2048 UTF-8
+  bytes; remote defaults remain 48 and 9600. The bounded settings apply to
+  asynchronous prefetch, live queues and synchronous batches. A single
+  over-budget input remains a separate request rather than being truncated.
+  Standard loopback Ollama endpoints on port 11434 at `/v1/chat/completions`
+  explicitly request `reasoning_effort: "none"`; other endpoint request
+  options remain owned by their existing provider handling.
 - **Embedded engine scripts**: the Ren'Py hook (`payloads/RenPy/iron_deepseek.rpy`),
   the RPG Maker hook (`payloads/RPGMaker/hook_rpgm_mv.js`) and the Godot 3/4
   runtime sidecars (`payloads/Godot/dst_godot_runtime_g{3,4}.gd`) are real
@@ -168,9 +222,23 @@ and runtime. The important design shape is:
 - **Runtime payload**: engine-specific code used inside a game, such as the
   Ren'Py hook, RPG Maker hook, UnityTranslator plugin, XUnity endpoint, or TMP
   font fallback.
+- **Unity build reference cache**: `scripts/stage_unity_references.ps1` owns
+  content-addressed snapshots under `build/unity-managed-refs/<SHA256>`.
+  Explicit `UNITY_MANAGED_DIR` and saved `UnityManagedRefs` retain priority;
+  otherwise both Mono builds share one verified snapshot outside their cleaned
+  output directories. Names, lengths and bytes of UnityEngine/TMP references
+  determine the key. An exclusive publisher lock, verified staging directory
+  and atomic `current.txt` publication protect the last complete version.
+  Missing build output can reuse verified current references; corruption and
+  filesystem failures stop the build. Old versions and failed staging evidence
+  are retained. The helper is part of all five managed recipe fingerprints.
 - **Source-only release**: public repository/archive without third-party
   runtime binaries, user data, caches, logs, Unity/game assemblies, or real
-  config files.
+  config files. Preparation and independent audit share a read-only scan view
+  for the reviewed UI password-style boolean probe and its exact assertion.
+  Only their field names are masked in memory; values and adjacent text remain
+  subject to all credential rules, including single-character values. Source
+  bytes and the launcher diagnostic protocol remain unchanged.
 - **Program release**: standalone `ds游戏翻译器.exe` package containing the
   launcher, local server, scripts, example config, and first-party plugin DLLs.
 - **Load-test fixture**: an owned temporary cache containing one fixed hot key,
@@ -257,6 +325,13 @@ and runtime. The important design shape is:
   Live client work uses bounded 32-text batches, while script and optional deep
   prefetch use larger chunks with short yielding gaps; visible work remains
   ahead of background discovery.
+  Optional deep prefetch stays disabled by default. Its three object categories
+  share a 260-entry inspection budget, including already-seen, inactive and null
+  entries, and retain separate rotating cursors without holding scene objects.
+  Scene reset restarts the cursors; visited-set capacity pruning does not.
+  Each discovery call still enumerates the full category, and the 80-text cap
+  remains separate from the inspection budget. This bounds inspection count,
+  not discovery time or the cost of extracting one object's strings.
 - **Failure transparency boundary**: a narrow adapter edge where an external
   transport, process, engine version, or optional renderer API may fail while
   the game preserves source text. The boundary must log operation context,
@@ -375,9 +450,33 @@ when repainted. Cache misses/faults never become successful translated text.
 
 Ren'Py legacy engines without `invoke_in_main_thread` drain translation refresh
 from their periodic/interaction callbacks; HTTP workers cannot touch Text layout.
+Successful worker results carry exact source keys to the coalesced main-thread
+drain. A weak-key dependency map records only lookups made during each real Text
+update, replacing old keys after a successful update and separating nested Text
+calls. Captured Text objects lose layout only for matching keys. Clean plugin
+Text objects that bypass the base update retain a diagnosed conservative refresh
+in a separate weak set; dirty uncaptured objects use their next normal update.
+Without matching or conservative targets, completion does not restart interaction.
+Affected results retain the existing one-restart behavior. Engine copies inherit
+dependencies; clean restored/untracked objects
+rebuild theirs on first interaction, with a diagnostic. Dependency metadata is
+not added to Text state or saves. The drain still scans registered dependencies,
+and matching hidden/history objects may also refresh; this is not a visibility
+index or a measured FPS improvement.
 Memo publication cannot replace an already translated value with a late queued
 identity reply. Unity punctuation compatibility shares one renderer tag-boundary
 helper (`TmpRichText.cs`, source-linked into Mono and both IL2CPP payloads), so
 link/sprite attributes remain intact. Atlas readability is an optional diagnosed
 reflection boundary for stripped APIs. The XUnity endpoint source-links the
 shared JSON parser and rejects incomplete, blank or normalized identity results.
+
+Ren'Py CJK font coverage belongs to Text segmentation. The hook chains the
+engine's TextSegment/FontGroup methods, leaving styles, font aliases, replacement
+maps and the original group/remap data intact. Plain CJK runs and group characters
+without an explicit font use the deployed CJK font; explicit group ranges and
+non-CJK runs keep the game's selection. Remap targets determine routing, with
+variation selectors/combining marks following a supplemented base. Windows
+Python 2 surrogate pairs stay together. Language changes naturally use the next
+layout's current styles; no font inventory or language-time style rewrite remains.
+This is scoped Chinese coverage, not an arbitrary glyph-availability detector:
+explicit but incomplete fonts and missing deployed glyphs can still show gaps.

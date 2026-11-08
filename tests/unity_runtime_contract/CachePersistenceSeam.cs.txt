@@ -1,0 +1,27 @@
+// 缓存读取、启动状态、调度和原子替换都来自生产源码；仅模拟 Unity 和内存导入边界。
+public sealed class CachePersistenceSeam : Object {
+    public string Root;
+    public bool _shuttingDown, _firstFrameLocalCachePrimed, _bootCacheLoadComplete, _bootCacheLoadFinished;
+    public bool _cachePersistDirty, _cachePersistScheduled;
+    private readonly object _cacheFileWriteLock = new object(), _cachePersistLock = new object();
+    private const int OversizedLocalCacheFileBytes = 10000, OversizedLocalCacheEntryLimit = 100;
+    private const int FirstFrameLocalCacheFileBytes = 1000, FirstFrameLocalCacheEntryLimit = 10;
+    private const int CachePersistDebounceMs = 5;
+    public readonly Dictionary<string,string> Cache = new Dictionary<string,string>();
+    public readonly List<string> Errors = new List<string>();
+    public Action OnImport;
+    private string ResolveGameRoot() { return Root; }
+    public string GetLocalCacheFilePath() { return Path.Combine(Root, "TranslationCache", "unity_translation_cache.json"); }
+    private static Task<T> RunBackground<T>(Func<T> action) { return Task.Run(action); }
+    private void StartServerCacheSync() { }
+    private void ReportCaughtException(Exception error, string context = null) { Errors.Add(context + ": " + error.Message); }
+    private int GetCacheCount() { return Cache.Count; }
+    private int ImportServerCacheEntries(IEnumerable<KeyValuePair<string,string>> entries, bool logPromotions,
+        string sourceLabel, bool persistAfterImport, bool markImportedAsLocal = false, bool preserveExisting = false) {
+        foreach (var entry in entries) {
+            if (!preserveExisting || !Cache.ContainsKey(entry.Key)) Cache[entry.Key] = entry.Value;
+        }
+        OnImport?.Invoke();
+        return Cache.Count;
+    }
+    private Dictionary<string,string> SnapshotLocalCacheForPersist() { return new Dictionary<string,string>(Cache); }

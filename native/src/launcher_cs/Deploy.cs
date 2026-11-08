@@ -298,6 +298,16 @@ namespace DstLauncher
                 Log.Append("RPGM MV/MZ：无法写入 hook 文件 " + hook + "（Windows 错误 " + SafeFs.LastError + "）。");
                 return false;
             }
+            string[] imageIds = { EmbeddedScripts.RpgmImageOcr, EmbeddedScripts.RpgmImageText };
+            string[] imageNames = { "dst_rpgm_ocr.ps1", "rpgm_image_text.js" };
+            for (int i = 0; i < imageIds.Length; i++) {
+                string imagePath = PathUtil.Join(jsdir, imageNames[i]);
+                byte[] imageScript = EmbeddedScripts.Bytes(imageIds[i]);
+                if (imageScript == null || !SafeFs.WriteBytes(imagePath, imageScript, imageScript.Length)) {
+                    Log.Append("RPGM MV/MZ：无法部署通用图片文字组件 " + imagePath + "（Windows 错误 " + SafeFs.LastError + "）。");
+                    return false;
+                }
+            }
             DeployRpgmFont(contentRoot);
 
             string index = PathUtil.Join(contentRoot, "index.html");
@@ -526,7 +536,9 @@ namespace DstLauncher
             if (indexOk && SafeFs.Exists(index)) RestoreDeleteFile(backup, stats);
 
             string[] files = {
-                "js\\hook_rpgm_mv.js"
+                "js\\hook_rpgm_mv.js",
+                "js\\dst_rpgm_ocr.ps1",
+                "js\\rpgm_image_text.js"
             };
             foreach (string f in files) RestoreDeleteFile(PathUtil.Join(contentRoot, f), stats);
             RestoreOwnedCjkFont(PathUtil.Join(contentRoot, "fonts\\ds_font.ttf"), "simhei.ttf", FontTtfOwner, stats);

@@ -67,7 +67,7 @@ internal static class Program
         var whitespace = Extract(new[] { "Existing text." }, " \r\n{\"translation\":\"译文\",\"extra\":{\"value\":1},\"source\":\"cache\"}\t ");
         Check("valid JSON whitespace and unrelated fields remain supported", whitespace.Error == null && whitespace.Result?[0] == "译文");
         string unicodeValue = "你好\n第二行\t\"引号\"\\😀";
-        var unicode = Extract(new[] { "Existing text." }, JsonSerializer.Serialize(new { source = "cache", translation = unicodeValue }));
+        var unicode = Extract(new[] { "Existing text.\nSecond line." }, JsonSerializer.Serialize(new { source = "cache", translation = unicodeValue }));
         Check("escaped Unicode newline tab quotes and slash preserved", unicode.Error == null && unicode.Result?[0] == unicodeValue);
         var oldBatch = Extract(new[] { "First.", "Second." }, "{\"sources\":[\"cache\",\"api\"],\"translations\":{\"Second.\":\"第二\",\"First.\":\"第一\"}}");
         Check("legacy batch map follows request order", oldBatch.Error == null && oldBatch.Result?[0] == "第一" && oldBatch.Result[1] == "第二");
@@ -82,6 +82,25 @@ internal static class Program
         object[] shortLabelArguments = { "欢迎 Welcome back.", null, null };
         string shortLabel = (string)protect.Invoke(null, shortLabelArguments);
         Check("short CJK labels keep the existing mixed-language threshold", shortLabel == "欢迎 Welcome back." && ((string[])shortLabelArguments[1]).Length == 0);
+        string realPrefix = "简体中文译文: ";
+        foreach (string sourceWithPrefix in new[] { realPrefix + "Open", realPrefix + "Open the door in this room." })
+        {
+            object[] prefixArguments = { sourceWithPrefix, null, null };
+            protect.Invoke(null, prefixArguments);
+            string[] prefixTokens = (string[])prefixArguments[1];
+            string reply = prefixTokens.Length == 0 ? realPrefix + "打开" : prefixTokens[0] + ": 打开";
+            var preservedPrefix = Extract(new[] { sourceWithPrefix }, JsonSerializer.Serialize(new { source = "cache", translation = reply }));
+            Check("IL2CPP preserves a genuine source prompt-like prefix after Chinese restoration " + sourceWithPrefix,
+                preservedPrefix.Error == null && preservedPrefix.Result?[0] == realPrefix + "打开");
+        }
+        var addedPrefix = Extract(new[] { realPrefix + "Open" }, JsonSerializer.Serialize(new { source = "cache", translation = realPrefix + realPrefix + "打开" }));
+        Check("IL2CPP removes only an added model prefix above the source prefix", addedPrefix.Error == null && addedPrefix.Result?[0] == realPrefix + "打开");
+        var ordinaryEcho = Extract(new[] { "Open" }, JsonSerializer.Serialize(new { source = "cache", translation = realPrefix + "打开" }));
+        Check("IL2CPP still strips a model-only prefix for an ordinary source", ordinaryEcho.Error == null && ordinaryEcho.Result?[0] == "打开");
+        var prefixedBatch = Extract(new[] { realPrefix + "Open", "Close" }, JsonSerializer.Serialize(new {
+            sources = new[] { "cache", "cache" }, results = new[] { realPrefix + "打开", realPrefix + "关闭" } }));
+        Check("IL2CPP batch prompt cleanup uses each original source independently",
+            prefixedBatch.Error == null && prefixedBatch.Result?[0] == realPrefix + "打开" && prefixedBatch.Result[1] == "关闭");
         object[] protectArguments = { mixed, null, null };
         protect.Invoke(null, protectArguments);
         string[] tokens = (string[])protectArguments[1];
@@ -167,6 +186,11 @@ internal static class Program
         Check("mixed batch preserves raw text when fallback is disabled", batch.Error == null && batch.Result?[0] == "你好。" && batch.Result[1] == "已经是中文。" && SavesGlobally(batch.jobsArray[0]) && !SavesGlobally(batch.jobsArray[1]));
         var safeBatch = ExtractSession(new[] { "Hello.", "已经是中文。" }, batchJson);
         Check("mixed batch retains existing display fallback and session-only pass", safeBatch.Error == null && safeBatch.Result?[0] == "你好." && safeBatch.Result[1] == "已经是中文." && SavesGlobally(safeBatch.jobsArray[0]) && !SavesGlobally(safeBatch.jobsArray[1]));
+        string promptLikeOriginal = "简体中文译文: 已经是中文";
+        var promptPass = ExtractSession(new[] { "Hello", promptLikeOriginal }, JsonSerializer.Serialize(new {
+            sources = new[] { "cache", "pass" }, results = new[] { "你好", promptLikeOriginal } }));
+        Check("IL2CPP batch pass keeps genuine Chinese prefix and session-only ownership", promptPass.Error == null
+            && promptPass.Result?[1] == promptLikeOriginal && !SavesGlobally(promptPass.jobsArray[1]));
     }
 
     private static bool CollectPending(string json, string[] texts, out string[] pending)
@@ -378,9 +402,13 @@ internal static class Program
         CheckPassSessionBehavior();
         CheckQueueClassification();
         CheckCacheScanReuse();
+        CachePersistenceTests.Run(Check);
+        TmpOverlayTests.Run(Check);
+        TmpFontPopulationTests.Run(Check);
+        DeepPrefetchTests.Run(Check);
         var animated = MonoAnimatedSetterSeam._instance;
         var animatedText = new Text();
-        var tmpText = new Object();
+        var tmpText = new TmpText();
         bool immediate = true;
         for (int frame = 0; frame < 60; frame++)
         {
@@ -398,6 +426,120 @@ internal static class Program
         MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref unknownTmp);
         MonoAnimatedSetterSeam.UGUITextPrefix(animatedText, ref unknownUgui);
         Check("Mono uncached fragments preserve original and existing debounce", unknownTmp == unknownUgui && unknownTmp == "continue a new unknown adventure" && animated.Debounced == 2);
+        foreach (string original in new[] {
+            "<b>这是一段已经翻译好的长对话，需要保留人物强调的内容，即使长度超过短标签限制也不能去掉游戏原有的文字格式。</b>",
+            "<i>第一行对话。\n第二行对话。</i>" })
+        {
+            string value = original;
+            MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref value);
+            Check("Mono existing CJK dialogue retains original long/multiline styles", value == original);
+        }
+        bool richAnimation = true;
+        for (int frame = 0; frame < 60; frame++)
+        {
+            string source = "<size=" + (24 + frame % 3) + "><b>Continue your adventure through this long hallway.</b>\n<i>Watch your step.</i></size>";
+            string expected = source.Replace("Continue your adventure through this long hallway.", "继续穿过这条长廊。").Replace("Watch your step.", "小心脚下。");
+            animated.Cache[source] = expected;
+            string tmpValue = source, uguiValue = source;
+            MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref tmpValue);
+            MonoAnimatedSetterSeam.UGUITextPrefix(animatedText, ref uguiValue);
+            richAnimation &= tmpValue == expected && uguiValue == expected;
+        }
+        Check("Mono TMP and UGUI preserve all current long dialogue style tags for 60 writes", richAnimation);
+        string longPlain = "Continue your adventure through this long hallway and watch your step.";
+        Check("Mono unrelated added dialogue formatting retains existing compatibility policy",
+            !MonoAnimatedSetterSeam.ShouldPreserveRichTextForDisplay(longPlain, "<b>继续冒险。</b>") &&
+            !MonoAnimatedSetterSeam.ShouldPreserveRichTextForDisplay("<size=24>" + longPlain + "</size>", "<size=99>继续冒险。</size>"));
+        string literalAngles = "< The lobby is ahead. >";
+        Check("Mono literal angle text is not interpreted as formatting",
+            MonoAnimatedSetterSeam.StripRichTextForPlainText(literalAngles) == literalAngles);
+        foreach (string quote in new[] { "\"", "'" })
+        {
+            string originalLink = "<link=" + quote + "quest>original" + quote + ">" + longPlain + "</link>";
+            string translatedLink = "<link=" + quote + "quest>changed" + quote + ">继续冒险。</link>";
+            Check("Mono full quoted link attribute must match before preserving long dialogue " + quote,
+                !MonoAnimatedSetterSeam.ShouldPreserveRichTextForDisplay(originalLink, translatedLink));
+            Check("Mono identical quoted link attribute is preserved " + quote,
+                MonoAnimatedSetterSeam.ShouldPreserveRichTextForDisplay(originalLink, originalLink.Replace(longPlain, "继续冒险。")));
+            animated.Cache[originalLink] = translatedLink;
+            string tmpFallback = originalLink;
+            MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref tmpFallback);
+            Check("Mono plain fallback removes complete changed link attribute " + quote, tmpFallback == "继续冒险。");
+            string styledLink = "<link=" + quote + "quest>original" + quote + "><b>" + longPlain + "</b></link>";
+            animated.Cache[styledLink] = styledLink.Replace(longPlain, "继续冒险。");
+            string uguiFallback = styledLink;
+            MonoAnimatedSetterSeam.UGUITextPrefix(animatedText, ref uguiFallback);
+            Check("Mono UGUI filters complete TMP link while preserving supported nested bold " + quote,
+                uguiFallback == "<b>继续冒险。</b>");
+            string unchangedLink = originalLink.Replace(longPlain, "继续冒险。");
+            Check("Mono renderer without rich text removes complete quoted link " + quote,
+                MonoAnimatedSetterSeam.PrepareTranslatedTextForComponent(new Object(), unchangedLink, originalLink) == "继续冒险。");
+            Check("Mono visible text excludes complete quoted link attributes " + quote,
+                MonoAnimatedSetterSeam.GetVisibleText(unchangedLink) == "继续冒险。");
+            var protectedLink = MonoAnimatedSetterSeam.ProtectTextForTranslation(originalLink);
+            Check("Mono request protects complete quoted link attribute " + quote,
+                !protectedLink.RequestText.Contains("original") && protectedLink.Tokens.Values.Contains(originalLink.Substring(0, originalLink.IndexOf(longPlain))));
+            Check("Mono protected quoted link roundtrip retains exact attributes " + quote,
+                MonoAnimatedSetterSeam.RestoreProtectedText(protectedLink.RequestText.Replace(longPlain, "继续冒险。"), protectedLink) == unchangedLink);
+            var adjacentLink = Extract(new[] { originalLink }, JsonSerializer.Serialize(new { source = "cache", translated_text = unchangedLink }));
+            Check("IL2CPP endpoint preserves complete quoted link attributes " + quote,
+                adjacentLink.Error == null && adjacentLink.Result?[0] == unchangedLink.Replace("。", "."));
+        }
+        foreach (string tag in new[] { "<link=\"quest>original\">", "<link=\"size=20>section\">", "<size=120%><b>" })
+        {
+            string end = tag.StartsWith("<link=") ? "</link>" : "</b></size>";
+            string source = tag + longPlain + end;
+            string translated = tag + "继续冒险。" + end;
+            animated.Cache[source] = translated;
+            string value = source;
+            MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref value);
+            Check("Mono preparation preserves complete matching tag attributes " + tag, value == translated && tmpText.richText);
+        }
+        foreach (var row in new[] {
+            new[] { "<color-=red>警告</<color>", "<color=red>警告</color>" },
+            new[] { "<b>继续</ <b>", "<b>继续</b>" },
+            new[] { "size=24>继续/size>", "<size=24>继续</size>" },
+            new[] { "<b>继续</b>/ ", "<b>继续</b> " },
+            new[] { "<b>__DS_INTACT_TAG_0</b> <__DS_INTACT_TAG_0>", "<b>__DS_INTACT_TAG_0</b> <__DS_INTACT_TAG_0>" },
+            new[] { "<link=\"color>size=24>id\">继续</link>", "<link=\"color>size=24>id\">继续</link>" },
+            new[] { "<link=\"</<color>size=24>id\">继续</link>", "<link=\"</<color>size=24>id\">继续</link>" } })
+        {
+            Check("Mono intact tag protection retains repair and literal text " + row[0],
+                MonoAnimatedSetterSeam.SanitizeTranslationArtifacts(row[0]) == row[1]);
+        }
+        foreach (string id in new[] { "quest><br>original", "quest><color=red>original", "id>，section/size>" })
+        {
+            string source = "<link=\"" + id + "\"><b>" + longPlain + "</b></link>";
+            string translated = source.Replace(longPlain, "继续冒险。");
+            animated.Cache[source] = translated;
+            string uguiValue = source;
+            MonoAnimatedSetterSeam.UGUITextPrefix(animatedText, ref uguiValue);
+            Check("Mono complete attribute filtering never renders embedded tag-like text " + id,
+                uguiValue == "<b>继续冒险。</b>" && MonoAnimatedSetterSeam.StripRichTextForPlainText(translated) == "继续冒险。");
+            var payload = MonoAnimatedSetterSeam.ProtectTextForTranslation(source);
+            Check("Mono complete attribute is opaque to request protection " + id,
+                !payload.RequestText.Contains(id) && MonoAnimatedSetterSeam.RestoreProtectedText(payload.RequestText.Replace(longPlain, "继续冒险。"), payload) == translated);
+        }
+        Check("Mono plain fallback preserves actual line breaks and literal comparisons",
+            MonoAnimatedSetterSeam.StripRichTextForPlainText("<b>继续</b><br>生命 < 5") == "继续\n生命 < 5");
+        Check("Mono UGUI still filters TMP-only tags while retaining supported styles",
+            MonoAnimatedSetterSeam.PrepareTranslatedTextForComponent(animatedText, "<link=\"id\"><b>继续</b></link>", "<link=\"id\"><b>Continue</b></link>") == "<b>继续</b>");
+        foreach (var row in new[] {
+            new[] { "- Continue", "继续", "- 继续" },
+            new[] { "> Continue", "* 继续", "> 继续" },
+            new[] { "- Continue", "- 继续", "- 继续" },
+            new[] { "Continue", "继续", "继续" },
+            new[] { "- ", "继续", "继续" },
+            new[] { "- Continue", "-", "-" } })
+        {
+            Check("Mono leading decoration restoration remains source-compatible " + row[0] + " / " + row[1],
+                UnityTextFormatting.RestoreLeadingTextDecoration(row[1], row[0]) == row[2]);
+        }
+        Check("Mono leading decoration production entry uses extracted module",
+            MonoAnimatedSetterSeam.RestoreLeadingTextDecoration("继续", "- Continue") == "- 继续");
+        Check("Mono leading decoration restoration preserves empty input",
+            UnityTextFormatting.RestoreLeadingTextDecoration(null, "- Continue") == null &&
+            UnityTextFormatting.RestoreLeadingTextDecoration("继续", null) == "继续");
         bool il2cppAnimation = true;
         for (int frame = 0; frame < 60; frame++)
         {
@@ -407,6 +549,106 @@ internal static class Program
             il2cppAnimation &= response.Error == null && response.Result?[0] == translated.Replace("继续，", "继续,").Replace("！", "!");
         }
         Check("IL2CPP endpoint and TMP display preserve all 60 current animation tags and link ids", il2cppAnimation);
+        bool mixedAnimation = true;
+        for (int frame = 0; frame < 60; frame++) {
+            string source = "请 <color=#" + (frame % 2 == 0 ? "ff0000" : "0000ff") + ">Open the door</color>。";
+            string expected = source.Replace("Open the door", "打开门");
+            animated.Cache[source] = expected;
+            string tmpValue = source, uguiValue = source;
+            MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref tmpValue);
+            MonoAnimatedSetterSeam.UGUITextPrefix(animatedText, ref uguiValue);
+            mixedAnimation &= tmpValue == expected && uguiValue == expected;
+        }
+        Check("Mono half-localized TMP/UGUI preserve Chinese and animated colors for 60 writes", mixedAnimation);
+        Check("Mono existing Chinese variables and acronyms are terminal", MonoAnimatedSetterSeam.IsLocalizedText("已完成 HP 100 <color=red>确认</color> [player]"));
+        string namedSource = "请 Hello John.", namedOutput = "请 你好 John。";
+        animated.Cache[namedSource] = namedOutput;
+        MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref namedSource);
+        Check("Mono completed translation with Latin name is terminal", namedSource == namedOutput && MonoAnimatedSetterSeam.IsLocalizedText(namedOutput));
+        string completedStyled = "<color=red>请 Hello Archer.</color>";
+        string completedOutput = "<color=red>请 你好 Archer。</color>";
+        animated.Cache[completedStyled] = completedOutput;
+        MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref completedStyled);
+        foreach (string rewrite in new[] { "<color=blue>请 你好 Archer。</color>", "  请  你好 Archer。 \n", "<size=30><b>请 你好 Archer。</b></size>",
+            "请 你<color=blue>好</color> Archer。", "请 你好 Ar<color=blue>cher</color>。", "请<br>你好 Archer。" })
+        {
+            string tmpRewrite = rewrite, uguiRewrite = rewrite;
+            int queuedBefore = animated.Debounced;
+            MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref tmpRewrite);
+            MonoAnimatedSetterSeam.UGUITextPrefix(animatedText, ref uguiRewrite);
+            Check("Mono completed visible text survives presentation-only rewrites " + rewrite,
+                MonoAnimatedSetterSeam.IsLocalizedText(rewrite) && animated.Debounced == queuedBefore);
+        }
+        string formatOnlySource = "<color=red>请 Continue</color>";
+        MonoAnimatedSetterSeam.RememberCompletedOutput(formatOnlySource, "<b>请 Continue</b>");
+        Check("Mono formatting an untranslated source cannot mark it completed", !MonoAnimatedSetterSeam.IsLocalizedText("请 Continue"));
+        Check("Mono appended English content cannot inherit a completed prefix", !MonoAnimatedSetterSeam.IsLocalizedText(completedOutput + " Press Enter"));
+        Check("Mono completed keys retain real word spaces and br separation",
+            !MonoAnimatedSetterSeam.IsLocalizedText("请你好 Archer。") && !MonoAnimatedSetterSeam.IsLocalizedText("请 你好 Ar<br>cher。"));
+        foreach (string shortSource in new[] { "请 <color=red>Save</color>", "请 <b>Exit</b>", "请 <b>SAVE</b>" })
+        {
+            var shortPayload = MonoAnimatedSetterSeam.ProtectTextForTranslation(shortSource);
+            Check("Mono short mixed UI words survive protected-token filtering " + shortSource,
+                !MonoAnimatedSetterSeam.IsTokenDominatedFragment(shortPayload.RequestText)
+                && animated.CollectWarmupRequestItems(new[] { shortSource }, null).Count == 1);
+        }
+        foreach (string fragment in new[] { "请 <b>S</b>", "请 <b>Sa</b>", "<b>HP</b>", "请 <b>42</b>" })
+            Check("Mono token-dominated fragments retain existing filtering " + fragment,
+                MonoAnimatedSetterSeam.IsTokenDominatedFragment(MonoAnimatedSetterSeam.ProtectTextForTranslation(fragment).RequestText));
+        foreach (bool nativeCoverage in new[] { true, false })
+        {
+            string pendingTmp = "请 Wait for the next train.", pendingUgui = pendingTmp;
+            var pendingText = new Text();
+            animated.TmpFontCoversText = nativeCoverage;
+            int appliedBefore = animated.Applied, checkedBefore = animated.FontCoverageChecks, queuedBefore = animated.Debounced;
+            MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref pendingTmp);
+            MonoAnimatedSetterSeam.UGUITextPrefix(pendingText, ref pendingUgui);
+            Check("Mono unresolved mixed text retains CJK font handling; native coverage=" + nativeCoverage,
+                pendingTmp == "请 Wait for the next train." && pendingUgui == pendingTmp && pendingText.font != null
+                && animated.Applied >= appliedBefore + 2 && animated.FontCoverageChecks > checkedBefore
+                && animated.PendingOverlay == !nativeCoverage && !animated.OverlayRecordsCompletion && animated.Debounced == queuedBefore + 2
+                && !MonoAnimatedSetterSeam.IsLocalizedText(pendingTmp));
+        }
+        animated.TmpFontCoversText = true;
+        string pendingMalformed = "请 Activate</<b>";
+        string pendingPrepared = MonoAnimatedSetterSeam.PrepareTranslatedTextForComponent(tmpText, pendingMalformed, pendingMalformed, rememberCompletedOutput: false);
+        Check("Mono pending overlay format repair never records completed English",
+            pendingPrepared != pendingMalformed && !MonoAnimatedSetterSeam.IsLocalizedText(pendingPrepared));
+        foreach (int route in new[] { 0, 1, 2 })
+        {
+            string pendingImGui = "请 Keep the existing words.";
+            var style = new GUIStyle();
+            var rect = new Rect();
+            var content = new GUIContent { text = pendingImGui };
+            int queuedBefore = animated.Debounced;
+            if (route == 0) MonoAnimatedSetterSeam.GUILabelPrefix(ref rect, ref pendingImGui, style);
+            else if (route == 1) MonoAnimatedSetterSeam.TranslateImGuiString(ref pendingImGui, style, false, ref rect);
+            else MonoAnimatedSetterSeam.TranslateGUILayoutLabelContent(content, style);
+            Check("Mono IMGUI unresolved mixed text keeps Chinese font and queues English; route=" + route,
+                style.font != null && animated.Debounced == queuedBefore + 1
+                && pendingImGui == "请 Keep the existing words." && content.text == pendingImGui);
+        }
+        animated.UseProductionCacheLookup = true;
+        foreach (bool addedEcho in new[] { false, true })
+        {
+            string prefix = "简体中文译文: ";
+            string source = prefix + (addedEcho ? "Unlock" : "Open");
+            string expected = prefix + (addedEcho ? "解锁" : "打开");
+            animated.StoreCachedTranslation(source, (addedEcho ? prefix : "") + expected);
+            string tmpValue = source, uguiValue = source;
+            MonoAnimatedSetterSeam.TMPSetTextPrefix(tmpText, ref tmpValue);
+            MonoAnimatedSetterSeam.UGUITextPrefix(animatedText, ref uguiValue);
+            Check("Mono cache writer and real TMP/UGUI setter preserve genuine source prefix; added echo=" + addedEcho,
+                animated.Cache.TryGetValue(source, out string stored) && stored == expected && tmpValue == expected && uguiValue == expected);
+            var payload = MonoAnimatedSetterSeam.ProtectTextForTranslation(source);
+            Check("Mono response token restoration preserves genuine Chinese prefix; added echo=" + addedEcho,
+                MonoAnimatedSetterSeam.RestoreProtectedText((addedEcho ? prefix : "") + expected, payload) == expected);
+        }
+        animated.Cache["简体中文译文: Close"] = "简体中文译文: 关闭";
+        Check("Mono existing cache lookup retains genuine source prefix", animated.TryGetLocalTranslation("简体中文译文: Close", out string fromCache) && fromCache == "简体中文译文: 关闭");
+        animated.StoreCachedTranslation("Ordinary source", "简体中文译文: 正常结果");
+        Check("Mono ordinary source still removes a genuine model echo", animated.Cache["Ordinary source"] == "正常结果");
+        animated.UseProductionCacheLookup = false;
         Console.WriteLine("Unity endpoint contract: PASS=" + passed + " FAIL=" + failed);
         return failed == 0 ? 0 : 1;
     }

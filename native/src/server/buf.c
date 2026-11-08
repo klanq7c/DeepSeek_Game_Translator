@@ -87,8 +87,8 @@ void buf_int(Buf *b, long long v) {
 void buf_json(Buf *b, const char *s) {
     buf_ch(b, '"');
     while (s && *s) {
-        /* 普通 UTF-8 字节连续复制；每段只预留/提交一次，减少缓存导出持锁期间
-           的逐字节函数调用。特殊字符仍走原转义规则，不改变任何引擎的标签文本。 */
+        /* 普通 UTF-8 字节连续复制；每段只预留/提交一次，减少批量 JSON 编码中的
+           逐字节函数调用。特殊字符仍走原转义规则，不改变任何引擎的标签文本。 */
         const char *start = s;
         while ((unsigned char)*s >= 32 && *s != '"' && *s != '\\') s++;
         if (s != start) buf_addn(b, start, (size_t)(s - start));

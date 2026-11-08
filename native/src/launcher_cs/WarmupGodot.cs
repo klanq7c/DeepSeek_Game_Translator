@@ -691,6 +691,16 @@ namespace DstLauncher
         /* scan_godot_binary_buffer：以非文本字节为界切片，3..1200 字节且通过 UTF-8 校验的片段进入采集。 */
         private static void ScanGodotBinaryBuffer(byte[] bytes, int size, TextList prefetch)
         {
+            // tokenizer v100 的非零解压大小表示 Zstd 容器，不能把其字节当常量。
+            // 缺少解压能力时保留实时发现，每次扫描只记录一次限制，不伪造提取成功。
+            if (size >= 12 && bytes[0] == 'G' && bytes[1] == 'D' && bytes[2] == 'S' && bytes[3] == 'C' &&
+                ReadU32Le(bytes, 4) == 100 && ReadU32Le(bytes, 8) != 0) {
+                if (!prefetch.GodotCompressedReported) {
+                    prefetch.GodotCompressedReported = true;
+                    Log.Append("Godot warmup: compressed GDSC skipped; decompression is unavailable, visible text remains discoverable at runtime.");
+                }
+                return;
+            }
             int start = 0;
             for (int i = 0; i <= size && !prefetch.Full; i++) {
                 bool textual = false;

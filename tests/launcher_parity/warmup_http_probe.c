@@ -19,7 +19,11 @@ void *dst_test_realloc(void *ptr, size_t size) {
 void write_stdout_utf8(const WCHAR *s) {
     char bytes[16384];
     int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, bytes, sizeof bytes, NULL, NULL);
-    if (n > 0) fwrite(bytes, 1, (size_t)n - 1, stdout);
+    if (n > 0) {
+        /* 与正式启动器使用同一输出边界，避免 stdio 缓冲使正文先于 post= 前缀。 */
+        DWORD written = 0;
+        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), bytes, (DWORD)n - 1, &written, NULL);
+    }
 }
 
 void append_log(const WCHAR *fmt, ...) {

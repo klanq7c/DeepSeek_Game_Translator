@@ -16,6 +16,7 @@ namespace DstCore
      */
     public static class CacheCodec
     {
+        private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
         /* 单条记录允许的最大原始行长；超过视为损坏记录跳过（防止畸形文件拖垮启动）。 */
         public const int MaxLineChars = 8 * 1024 * 1024;
 
@@ -23,7 +24,15 @@ namespace DstCore
         public static string NormalizeForStore(string key, string value)
         {
             if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(value)) return null;
-            string clean = TextRules.NormalizeTranslationResult(value);
+            if (key.IndexOf('\0') >= 0 || value.IndexOf('\0') >= 0) return null;
+            try {
+                StrictUtf8.GetByteCount(key);
+                StrictUtf8.GetByteCount(value);
+            } catch (EncoderFallbackException) {
+                // 孤立代理无法无损写成 UTF-8；由入库调用方计入 rejected。
+                return null;
+            }
+            string clean = TextRules.NormalizeTranslationResult(value, key);
             if (string.IsNullOrEmpty(clean) || string.CompareOrdinal(clean, key) == 0) return null;
             return clean;
         }
@@ -49,13 +58,24 @@ namespace DstCore
            解码得到的 value 已经过 NormalizeForStore。 */
         public static bool TryDecodeLine(string line, out string key, out string value)
         {
+            bool invalidEncoding;
+            return TryDecodeLine(line, out key, out value, out invalidEncoding);
+        }
+
+        public static bool TryDecodeLine(string line, out string key, out string value, out bool invalidEncoding)
+        {
             key = null;
             value = null;
+            invalidEncoding = false;
             if (line == null || line.Length > MaxLineChars) return false;
             int tab = line.IndexOf('\t');
             if (tab < 0) return false;
             string k = DecodeB64(line.Substring(0, tab));
             string v = DecodeB64(line.Substring(tab + 1));
+            if (k == null || v == null) {
+                invalidEncoding = true;
+                return false;
+            }
             string clean = NormalizeForStore(k, v);
             if (clean == null) return false;
             key = k;
@@ -66,10 +86,14 @@ namespace DstCore
         private static string DecodeB64(string s)
         {
             try {
-                return Encoding.UTF8.GetString(Convert.FromBase64String(s));
+                string text = StrictUtf8.GetString(Convert.FromBase64String(s));
+                return text.IndexOf('\0') >= 0 ? null : text;
             } catch (FormatException) {
-                /* 非法 Base64 视为空串，随后被准入规则拒绝；与 C 版 b64_decode 失败即跳过一致。 */
-                return "";
+                // 原始文件保留，由加载调用方限频记录 invalidEncoding。
+                return null;
+            } catch (DecoderFallbackException) {
+                // 不以 U+FFFD 替换坏字节，避免损坏键碰撞或译文被悄悄改写。
+                return null;
             }
         }
     }

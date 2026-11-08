@@ -1,0 +1,119 @@
+using System;
+using System.Threading;
+using System.Text;
+namespace DstLauncher {
+static class Probe {
+    internal static int Owner, Calls, WrongThread, Dialogs, Diagnostics, Cleared, Cards, Destroyed;
+    internal static bool Stuck, RestartFail, FailCreate, ModalClose, ModalReentry, Cancel;
+    internal static ManualResetEvent Entered=new ManualResetEvent(false), Release=new ManualResetEvent(false);
+    internal static StringBuilder Order=new StringBuilder();
+    internal static void Boundary(char operation) {
+        Interlocked.Increment(ref Calls);
+        Order.Append(operation);
+        if(Thread.CurrentThread.ManagedThreadId==Owner) { WrongThread=1; return; }
+        Entered.Set(); if(!Release.WaitOne(5000)) Environment.Exit(9);
+    }
+    internal static void Check(bool ok,string s) { if(!ok) { Console.WriteLine("FAIL "+s+" calls="+Calls+" wrong_thread="+WrongThread+" dialogs="+Dialogs+" cleared="+Cleared); Environment.Exit(1); } }
+    public static void Main(string[] args) {
+        string s=args[0]; Owner=Thread.CurrentThread.ManagedThreadId;
+        Stuck=s=="stop-failure"; RestartFail=s=="restart-failure"; FailCreate=s.Contains("create-failure");
+        ModalClose=s=="modal-close"; ModalReentry=s=="modal-reentry"; Cancel=s=="cancel";
+        bool isStart=s.StartsWith("start"), isRestore=s.StartsWith("restore"), isToggle=s=="toggle";
+        UiOperation.CreateThread=delegate(ThreadStart work) {
+            if(FailCreate) throw new OutOfMemoryException("injected thread creation failure");
+            return new Thread(work);
+        };
+        if(isToggle) ServerProcess.Toggle(); else if(isStart) MainWindow.StartTranslation(); else if(isRestore) MainWindow.RestoreSelectedGame(); else MainWindow.ClearTranslationCache();
+        Check(WrongThread==0,"button performed blocking work on UI");
+        if(FailCreate || ModalClose || Cancel) {
+            Check(Calls==0 && !UiOperation.Busy,"failed creation/close started work or retained busy");
+            Check(!FailCreate || Diagnostics>0,"thread creation failure lacked diagnostics");
+            Check(!ModalClose || UiOperation.Poll(),"modal close was lost");
+            if(!ModalClose) { Check(UiOperation.Reserve(),"failure/cancel did not release ownership"); UiOperation.Cancel(); }
+        } else {
+            Check(Entered.WaitOne(1000),"worker not entered");
+            int before=Calls, beforeDialogs=Dialogs;
+            ServerProcess.Toggle(); MainWindow.ClearTranslationCache(); MainWindow.StartTranslation(); MainWindow.RestoreSelectedGame();
+            Check(Calls==before && Dialogs==beforeDialogs,"duplicate operation entered boundary/modal");
+            for(int i=0;i<1000;i++) Check(!UiOperation.Poll(),"unfinished operation completed");
+            bool closing=s.Contains("close");
+            if(s=="window-close") { MainWindow.Dispatch(Win32.WM_CLOSE,0); Check(Destroyed==0,"WM_CLOSE destroyed running operation"); }
+            else if(closing) Check(!UiOperation.RequestClose(),"close destroyed running operation");
+            Release.Set(); var deadline=DateTime.UtcNow.AddSeconds(3); bool closeReady=false;
+            while(UiOperation.Busy) {
+                if(s=="window-close") { MainWindow.Dispatch(Win32.WM_TIMER,2); closeReady=Destroyed==1; }
+                else closeReady=UiOperation.Poll();
+                Check(DateTime.UtcNow<deadline,"completion not observed"); Thread.Sleep(1);
+            }
+            Check(WrongThread==0,"completion dialog/card ran off UI");
+            Check(Order.ToString()==(isToggle?"s":isStart?"rl":isRestore?"u":Stuck?"s":"scr"),"service/deploy/file operation order changed");
+            if(isToggle) Check(Calls==1 && Dialogs==0,"toggle rejected itself");
+            else if(isStart) Check(Calls==2 && Dialogs==0,"start/deploy sequence changed");
+            else if(isRestore) Check(Calls==1 && Dialogs==(closing?1:2),"restore sequence changed");
+            else if(Stuck) Check(Cleared==0 && Calls==1,"live server cache was deleted");
+            else Check(Cleared==1 && Calls==3,"stop/delete/restart sequence changed");
+            Check(closing ? closeReady && Dialogs==(isStart?0:1) && Cards==0 : Cards==((isToggle||isStart||isRestore)?0:1),"close/completion ownership failed");
+        }
+        Console.WriteLine("PASS");
+    }
+}
+static class MainWindow {
+    internal static IntPtr Hwnd;
+    internal static bool TranslationFlowRunning { get {
+        return UiOperation.Busy;
+    } }
+    const uint MbIconWarning=0x30, MbIconInformation=0x40, MbYesNo=4, MbDefButton2=0x100;
+    const int IdYes=6;
+    static void UpdateCacheCard() { Probe.Cards++; if(Thread.CurrentThread.ManagedThreadId!=Probe.Owner) Probe.WrongThread=1; }
+    static string GetPathText() { return "original"; }
+    static void RefreshEngine() {}
+    internal static IntPtr Dispatch(uint msg,int timer) {
+        IntPtr hwnd=IntPtr.Zero, wp=(IntPtr)timer;
+        switch(msg) {
+/* REAL_DISPATCH */
+        }
+        return IntPtr.Zero;
+    }
+    /* REAL_ENTRIES */
+}
+static class ServerProcess {
+    internal static bool Started=true;
+    public static bool Alive() { return Started; }
+    public static void RefreshStatus() {}
+    public static void Stop() { Probe.Boundary('s'); if(!Probe.Stuck) Started=false; }
+    public static bool Start() { Probe.Boundary('r'); Started=!Probe.RestartFail; return Started; }
+    private static bool _started { get { return Started; } }
+    /* REAL_TOGGLE */
+}
+static class Launcher { internal static string Root="fixture"; }
+static class Win32 {
+    internal const uint WM_TIMER=0x113,WM_CLOSE=0x10;
+    internal static void KillTimer(IntPtr h,UIntPtr id) {}
+    internal static void DestroyWindow(IntPtr h) { Probe.Destroyed++; }
+}
+static class UiLayout { internal static void TickAnimation(IntPtr h) {} }
+static class PathUtil { internal static string Join(string a,string b) { return b; } }
+enum Engine { Unknown, RenPy }
+static class SafeFs { internal static bool IsDir(string s) { return true; } }
+static class EngineDetector { internal static Engine Detect(string s) { return Engine.RenPy; } internal static string Name(Engine e) { return "RenPy"; } }
+static class LauncherConfig { internal static void SaveLastGameDir(string s) {} }
+static class Deploy { internal static int Restore(string s,Engine e) { Probe.Boundary('u'); Probe.Check(s=="original","restore path changed"); return 1; } }
+static class LaunchFlow {
+    internal static bool ClearCacheFile() { Probe.Boundary('c'); Probe.Cleared++; return true; }
+    internal static void RunAfterDeploy(string s,Engine e) { Probe.Boundary('l'); Probe.Check(s=="original","launch path changed"); }
+}
+static class Log {
+    internal static void Append(string s) { Interlocked.Increment(ref Probe.Diagnostics); }
+    internal static void Status(string s) {}
+}
+static class ThemedMessage {
+    internal static int Show(IntPtr h,string s,string t,uint flags) {
+        Probe.Dialogs++; if(Thread.CurrentThread.ManagedThreadId!=Probe.Owner) Probe.WrongThread=1;
+        if((flags&4)!=0) {
+            if(Probe.ModalClose) UiOperation.RequestClose();
+            if(Probe.ModalReentry) ServerProcess.Toggle();
+        }
+        return Probe.Cancel && (flags&4)!=0 ? 7 : 6;
+    }
+}
+}

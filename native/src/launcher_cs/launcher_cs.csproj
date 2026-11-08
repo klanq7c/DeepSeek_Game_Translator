@@ -71,6 +71,8 @@
   <ItemGroup>
     <EmbeddedResource Include="..\..\..\payloads\RenPy\iron_deepseek.rpy" LogicalName="IDR_SCRIPT_RENPY_HOOK" />
     <EmbeddedResource Include="..\..\..\payloads\RPGMaker\hook_rpgm_mv.js" LogicalName="IDR_SCRIPT_RPGM_HOOK" />
+    <EmbeddedResource Include="..\..\..\payloads\RPGMaker\dst_rpgm_ocr.ps1" LogicalName="IDR_SCRIPT_RPGM_IMAGE_OCR" />
+    <EmbeddedResource Include="..\..\..\payloads\RPGMaker\rpgm_image_text.js" LogicalName="IDR_SCRIPT_RPGM_IMAGE_TEXT" />
     <EmbeddedResource Include="..\..\..\payloads\Godot\dst_godot_runtime_g3.gd" LogicalName="IDR_SCRIPT_GODOT_RUNTIME_G3" />
     <EmbeddedResource Include="..\..\..\payloads\Godot\dst_godot_runtime_g4.gd" LogicalName="IDR_SCRIPT_GODOT_RUNTIME_G4" />
   </ItemGroup>

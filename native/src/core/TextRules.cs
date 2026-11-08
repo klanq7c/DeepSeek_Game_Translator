@@ -42,10 +42,11 @@ namespace DstCore
             return false;
         }
 
-        /* should_translate_text：非空 + 有翻译信号 + 不含 CJK。 */
+        /* 纯中文跳过；半汉化文本还含可见英文单词时交给中文保护路径。 */
         public static bool ShouldTranslate(string text)
         {
-            return !string.IsNullOrEmpty(text) && HasTranslationSignal(text) && !HasCjk(text);
+            return !string.IsNullOrEmpty(text) && HasTranslationSignal(text)
+                && (!HasCjk(text) || MixedText.HasUntranslatedLatin(text));
         }
 
         /* is_resolved_translation：译文非空且与原文不同——绝不把原文回显当成功。 */
@@ -76,7 +77,18 @@ namespace DstCore
             return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
         }
 
-        private static readonly char[] AsciiSpaces = { ' ', '\t', '\n', '\r', '\v', '\f' };
+        /* 尾部/首部 ASCII 修剪：与 C 的 isspace 语义一致。刻意不用 char[] 常量
+           初始化器 + string.Trim：本机 SDK 生成的常量数组数据块曾把 0x20 写坏
+           （复现与证据见 .scratch/core_echo_repro），而直接字符比较经测试与
+           探针双重验证可靠。 */
+        private static string TrimAscii(string s)
+        {
+            int start = 0;
+            int end = s.Length;
+            while (start < end && IsAsciiSpace(s[start])) start++;
+            while (end > start && IsAsciiSpace(s[end - 1])) end--;
+            return start == 0 && end == s.Length ? s : s.Substring(start, end - start);
+        }
 
         /* translation_prefix_equal：ASCII 字节不区分大小写，非 ASCII 逐字精确比较。
            不用文化相关的 string.Compare——它对某些码位做语言学等价处理，与 C 的
@@ -100,9 +112,8 @@ namespace DstCore
            真实分隔符（可选空格/制表符 + 半角或全角冒号，或直接换行），且余文非空；
            否则不是回显，原样保留——避免误改仅以相似短语开头的普通译文，
            也避免把恰好等于前缀的译文剥成空串后被缓存拒收。 */
-        private static bool StripPromptEcho(ref string s)
+        private static int PromptEchoRemainder(string s, int start)
         {
-            int start = 0;
             while (start < s.Length && IsAsciiSpace(s[start])) start++;
             for (int i = 0; i < EchoPrefixes.Length; i++) {
                 if (!PrefixEqualAt(s, start, EchoPrefixes[i])) continue;
@@ -115,19 +126,42 @@ namespace DstCore
                 }
                 while (rest < s.Length && IsAsciiSpace(s[rest])) rest++;
                 if (rest >= s.Length) continue; // 余文为空：不剥离
-                s = s.Substring(rest).Trim(AsciiSpaces);
-                return true;
+                return rest;
             }
-            return false;
+            return -1;
+        }
+
+        private static int PromptEchoDepth(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return 0;
+            int depth = 0, start = 0, rest;
+            while ((rest = PromptEchoRemainder(s, start)) >= 0) {
+                depth++;
+                start = rest;
+            }
+            return depth;
         }
 
         /* normalize_translation_result：最多 3 轮前缀剥离。所有缓存入口与
            API 响应共用，与 util.c 的 normalize_translation_result 逐条对齐。 */
         public static string NormalizeTranslationResult(string s)
         {
+            return NormalizeTranslationResult(s, null);
+        }
+
+        /* 原文也可能含真正的“简体中文译文：”说明文字。保留原文已有的前缀层数，
+           只清理模型额外添加的层；原文回显仍由入库处与原文逐字比较后拒绝。
+           API 在中文恢复前传保护后的原文，缓存入口则传真实原文键。 */
+        public static string NormalizeTranslationResult(string s, string original)
+        {
             if (string.IsNullOrEmpty(s)) return s;
-            for (int pass = 0; pass < 3 && s.Length > 0; pass++) {
-                if (!StripPromptEcho(ref s)) break;
+            int passes = 3;
+            int originalDepth = PromptEchoDepth(original);
+            if (originalDepth > 0) passes = Math.Min(passes, Math.Max(0, PromptEchoDepth(s) - originalDepth));
+            for (int pass = 0; pass < passes && s.Length > 0; pass++) {
+                int rest = PromptEchoRemainder(s, 0);
+                if (rest < 0) break;
+                s = TrimAscii(s.Substring(rest));
             }
             return s;
         }

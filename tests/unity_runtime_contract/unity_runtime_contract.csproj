@@ -9,8 +9,14 @@
     <CheckEolTargetFramework>false</CheckEolTargetFramework>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>../../payloads/UnityTranslator/Newtonsoft.Json.dll</HintPath>
+    </Reference>
     <Compile Include="../../build/unity_runtime_contract/GeneratedSeams.cs" Link="GeneratedSeams.cs" />
     <Compile Include="../../payloads/UnityTranslator/src/VisibleScanWindow.cs" Link="VisibleScanWindow.cs" />
+    <Compile Include="../../payloads/UnityTranslator/src/DeepPrefetchScanWindow.cs" Link="DeepPrefetchScanWindow.cs" />
+    <Compile Include="../../payloads/UnityTranslator/src/TmpFontPopulation.cs" Link="TmpFontPopulation.cs" />
+    <Compile Include="../../payloads/UnityTranslator/src/UnityTextFormatting.cs" Link="UnityTextFormatting.cs" />
     <Reference Include="DeepSeekTranslate">
       <HintPath>../../payloads/UnityIL2CPP/DeepSeekXUnityTranslator/DeepSeekTranslate.dll</HintPath>
     </Reference>

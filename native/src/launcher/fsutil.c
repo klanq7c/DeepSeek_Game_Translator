@@ -10,6 +10,127 @@
 #include <string.h>
 #include <wchar.h>
 
+static int full_path_for_safety_check(const WCHAR *path, WCHAR *full, size_t cap,
+                                      size_t *root_len_out);
+
+/* 只在文件 API 边界转换已规范化的长路径。短路径保留原来的 Win32 语义。
+   外部设备命名空间、尾部点/空格和保留设备名不能借扩展前缀变成另一个目标；
+   失败仍由原调用方报告操作，逐级重解析点检查使用同一转换，不放宽所有权。 */
+int path_for_file_api(WCHAR *out, size_t cap, const WCHAR *path) {
+    if (!out || !cap || !path || !*path) { SetLastError(ERROR_INVALID_NAME); return 0; }
+    WCHAR full[MAX_PATH * 4];
+    DWORD n = GetFullPathNameW(path, MAX_PATH * 4, full, NULL);
+    if (!n) return 0;
+    if (n >= MAX_PATH * 4) { SetLastError(ERROR_FILENAME_EXCED_RANGE); return 0; }
+    size_t input_len = wcslen(path);
+    if (n < MAX_PATH - 12 && input_len < MAX_PATH - 12) {
+        if (input_len >= cap) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+        memcpy(out, path, (input_len + 1) * sizeof(*out));
+        return 1;
+    }
+    /* GetFullPathName 会消去部分尾点；转换前先拒绝这些歧义组件。
+       独立的 . / .. 仍按普通 Win32 规则规范化，不改变相对路径语义。 */
+    const WCHAR *component = path;
+    for (const WCHAR *end = path;; end++) {
+        if (*end && *end != L'\\' && *end != L'/') continue;
+        size_t length = (size_t)(end - component);
+        int relative_dot = (length == 1 && component[0] == L'.') ||
+                           (length == 2 && component[0] == L'.' && component[1] == L'.');
+        if (length && !relative_dot && (end[-1] == L'.' || end[-1] == L' ')) {
+            SetLastError(ERROR_INVALID_NAME); return 0;
+        }
+        if (!*end) break;
+        component = end + 1;
+    }
+    size_t root_len = 0;
+    if (!full_path_for_safety_check(path, full, MAX_PATH * 4, &root_len)) {
+        SetLastError(ERROR_INVALID_NAME); return 0;
+    }
+    for (const WCHAR *part = full + root_len; *part;) {
+        const WCHAR *end = wcschr(part, L'\\');
+        if (!end) end = part + wcslen(part);
+        size_t length = (size_t)(end - part);
+        if (!length || end[-1] == L'.' || end[-1] == L' ') {
+            SetLastError(ERROR_INVALID_NAME); return 0;
+        }
+        const WCHAR *dot = wmemchr(part, L'.', length);
+        size_t stem = dot ? (size_t)(dot - part) : length;
+        int device = (stem == 3 && (!_wcsnicmp(part, L"CON", 3) ||
+            !_wcsnicmp(part, L"PRN", 3) || !_wcsnicmp(part, L"AUX", 3) || !_wcsnicmp(part, L"NUL", 3))) ||
+            (stem == 6 && !_wcsnicmp(part, L"CONIN$", 6)) ||
+            (stem == 7 && !_wcsnicmp(part, L"CONOUT$", 7)) ||
+            (stem == 4 && (!_wcsnicmp(part, L"COM", 3) || !_wcsnicmp(part, L"LPT", 3)) &&
+             ((part[3] >= L'1' && part[3] <= L'9') || part[3] == 0x00b9 || part[3] == 0x00b2 || part[3] == 0x00b3));
+        if (device || wmemchr(part, L':', length)) { SetLastError(ERROR_INVALID_NAME); return 0; }
+        part = *end ? end + 1 : end;
+    }
+    const WCHAR *tail = full;
+    const WCHAR *prefix = L"\\\\?\\";
+    if (full[0] == L'\\' && full[1] == L'\\') { prefix = L"\\\\?\\UNC\\"; tail += 2; }
+    size_t prefix_len = wcslen(prefix), tail_len = wcslen(tail);
+    if (prefix_len + tail_len >= cap) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+    memcpy(out, prefix, prefix_len * sizeof(*out));
+    memcpy(out + prefix_len, tail, (tail_len + 1) * sizeof(*out));
+    return 1;
+}
+
+DWORD file_attributes(const WCHAR *path) {
+    WCHAR native[FS_FILE_API_PATH_CAP];
+    if (!path_for_file_api(native, FS_FILE_API_PATH_CAP, path)) return INVALID_FILE_ATTRIBUTES;
+    return GetFileAttributesW(native);
+}
+
+BOOL file_set_attributes(const WCHAR *path, DWORD attrs) {
+    WCHAR native[FS_FILE_API_PATH_CAP];
+    if (!path_for_file_api(native, FS_FILE_API_PATH_CAP, path)) return FALSE;
+    return SetFileAttributesW(native, attrs);
+}
+
+BOOL file_remove_directory(const WCHAR *path) {
+    WCHAR native[FS_FILE_API_PATH_CAP];
+    if (!path_for_file_api(native, FS_FILE_API_PATH_CAP, path)) return FALSE;
+    return RemoveDirectoryW(native);
+}
+
+static HANDLE file_open(const WCHAR *path, DWORD access, DWORD share,
+                        LPSECURITY_ATTRIBUTES security, DWORD disposition, DWORD flags, HANDLE template) {
+    WCHAR native[FS_FILE_API_PATH_CAP];
+    if (!path_for_file_api(native, FS_FILE_API_PATH_CAP, path)) return INVALID_HANDLE_VALUE;
+    return CreateFileW(native, access, share, security, disposition, flags, template);
+}
+
+static BOOL file_mkdir(const WCHAR *path, LPSECURITY_ATTRIBUTES security) {
+    WCHAR native[FS_FILE_API_PATH_CAP];
+    if (!path_for_file_api(native, FS_FILE_API_PATH_CAP, path)) return FALSE;
+    return CreateDirectoryW(native, security);
+}
+
+static BOOL file_copy(const WCHAR *from, const WCHAR *to, BOOL fail_if_exists) {
+    WCHAR source[FS_FILE_API_PATH_CAP], target[FS_FILE_API_PATH_CAP];
+    if (!path_for_file_api(source, FS_FILE_API_PATH_CAP, from) ||
+        !path_for_file_api(target, FS_FILE_API_PATH_CAP, to)) return FALSE;
+    return CopyFileW(source, target, fail_if_exists);
+}
+
+static BOOL file_move(const WCHAR *from, const WCHAR *to, DWORD flags) {
+    WCHAR source[FS_FILE_API_PATH_CAP], target[FS_FILE_API_PATH_CAP];
+    if (!path_for_file_api(source, FS_FILE_API_PATH_CAP, from) ||
+        !path_for_file_api(target, FS_FILE_API_PATH_CAP, to)) return FALSE;
+    return MoveFileExW(source, target, flags);
+}
+
+static BOOL file_delete(const WCHAR *path) {
+    WCHAR native[FS_FILE_API_PATH_CAP];
+    if (!path_for_file_api(native, FS_FILE_API_PATH_CAP, path)) return FALSE;
+    return DeleteFileW(native);
+}
+
+HANDLE file_find_first(const WCHAR *path, WIN32_FIND_DATAW *data) {
+    WCHAR native[FS_FILE_API_PATH_CAP];
+    if (!path_for_file_api(native, FS_FILE_API_PATH_CAP, path)) return INVALID_HANDLE_VALUE;
+    return FindFirstFileW(native, data);
+}
+
 /*
  * Win32 的同步 ReadFile/WriteFile 允许成功但只传输部分字节。下面两个助手把
  * “完整传输”收进文件 IO 模块的实现，调用方只需要处理成功/失败，不再重复
@@ -118,13 +239,13 @@ int wide_format_checked(WCHAR *out, size_t cap, const WCHAR *fmt, ...) {
 
 /* 路径是否存在（文件或目录均可）。 */
 int exists_path(const WCHAR *p) {
-    DWORD a = GetFileAttributesW(p);
+    DWORD a = file_attributes(p);
     return a != INVALID_FILE_ATTRIBUTES;
 }
 
 /* 是否为目录。 */
 int is_dir(const WCHAR *p) {
-    DWORD a = GetFileAttributesW(p);
+    DWORD a = file_attributes(p);
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
@@ -163,7 +284,7 @@ static int full_path_for_safety_check(const WCHAR *path, WCHAR *full, size_t cap
 }
 
 static int component_is_unsafe(const WCHAR *path, int require_directory) {
-    DWORD attrs = GetFileAttributesW(path);
+    DWORD attrs = file_attributes(path);
     if (attrs == INVALID_FILE_ATTRIBUTES) {
         DWORD error = GetLastError();
         return error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND;
@@ -191,15 +312,15 @@ int path_has_reparse_point(const WCHAR *path, int include_leaf) {
 }
 
 static int ensure_checked_directory(const WCHAR *path) {
-    DWORD attrs = GetFileAttributesW(path);
+    DWORD attrs = file_attributes(path);
     if (attrs != INVALID_FILE_ATTRIBUTES) {
         return (attrs & FILE_ATTRIBUTE_DIRECTORY) &&
                !(attrs & FILE_ATTRIBUTE_REPARSE_POINT);
     }
     DWORD error = GetLastError();
     if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return 0;
-    if (!CreateDirectoryW(path, NULL)) return 0;
-    attrs = GetFileAttributesW(path);
+    if (!file_mkdir(path, NULL)) return 0;
+    attrs = file_attributes(path);
     return attrs != INVALID_FILE_ATTRIBUTES &&
            (attrs & FILE_ATTRIBUTE_DIRECTORY) &&
            !(attrs & FILE_ATTRIBUTE_REPARSE_POINT);
@@ -239,7 +360,7 @@ static int write_target_is_safe(const WCHAR *path) {
         SetLastError(ERROR_ACCESS_DENIED);
         return 0;
     }
-    DWORD attrs = GetFileAttributesW(path);
+    DWORD attrs = file_attributes(path);
     if (attrs == INVALID_FILE_ATTRIBUTES) {
         DWORD error = GetLastError();
         return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
@@ -254,7 +375,7 @@ static int write_target_is_safe(const WCHAR *path) {
 /* 以 CREATE_ALWAYS 写 UTF-8 文本，返回是否写入完整。 */
 int write_text_file_utf8(const WCHAR *path, const char *bytes) {
     if (!path || !bytes || !write_target_is_safe(path)) return 0;
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE h = file_open(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     size_t len = strlen(bytes);
     if (len > UINT32_MAX) {
@@ -272,7 +393,7 @@ int read_file_bytes(const WCHAR *path, char **out, DWORD *size) {
     if (!path || !out || !size) return 0;
     *out = NULL;
     *size = 0;
-    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE h = file_open(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     LARGE_INTEGER li;
     if (!GetFileSizeEx(h, &li) || li.QuadPart < 0 || li.QuadPart > UINT32_MAX - 1) {
@@ -294,7 +415,7 @@ int read_file_bytes(const WCHAR *path, char **out, DWORD *size) {
 /* 写入原始字节到文件，CREATE_ALWAYS 覆盖。 */
 int write_file_bytes(const WCHAR *path, const char *buf, DWORD size) {
     if (!path || (!buf && size != 0) || !write_target_is_safe(path)) return 0;
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE h = file_open(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     int ok = write_handle_all(h, buf, size);
     CloseHandle(h);
@@ -313,7 +434,7 @@ int write_file_bytes_if_absent_safe(const WCHAR *path, const char *buf, DWORD si
         *slash = 0;
         if (!ensure_dir(parent)) return 0;
     }
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE h = file_open(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     int ok = write_handle_all(h, buf, size);
     DWORD error = ok ? ERROR_SUCCESS : GetLastError();
@@ -327,11 +448,11 @@ int write_file_bytes_if_absent_safe(const WCHAR *path, const char *buf, DWORD si
 
 /* 用固定缓冲区比较两个普通文件，避免为了跳过重复部署而整文件载入内存。 */
 static int files_equal_streaming(const WCHAR *left, const WCHAR *right) {
-    HANDLE left_file = CreateFileW(left, GENERIC_READ,
+    HANDLE left_file = file_open(left, GENERIC_READ,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (left_file == INVALID_HANDLE_VALUE) return 0;
-    HANDLE right_file = CreateFileW(right, GENERIC_READ,
+    HANDLE right_file = file_open(right, GENERIC_READ,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (right_file == INVALID_HANDLE_VALUE) {
@@ -370,7 +491,7 @@ static int copy_file_checked(const WCHAR *from, const WCHAR *to,
         SetLastError(ERROR_ACCESS_DENIED);
         return 0;
     }
-    DWORD source_attrs = GetFileAttributesW(from);
+    DWORD source_attrs = file_attributes(from);
     if (source_attrs == INVALID_FILE_ATTRIBUTES ||
         (source_attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
         return 0;
@@ -386,7 +507,7 @@ static int copy_file_checked(const WCHAR *from, const WCHAR *to,
     }
     if (!write_target_is_safe(to)) return 0;
     if (!fail_if_exists && files_equal_streaming(from, to)) return 1;
-    return CopyFileW(from, to, fail_if_exists ? TRUE : FALSE);
+    return file_copy(from, to, fail_if_exists ? TRUE : FALSE);
 }
 
 int copy_file_safe(const WCHAR *from, const WCHAR *to) {
@@ -409,13 +530,13 @@ int move_file_safe(const WCHAR *from, const WCHAR *to, DWORD flags) {
         SetLastError(ERROR_ACCESS_DENIED);
         return 0;
     }
-    DWORD attrs = GetFileAttributesW(from);
+    DWORD attrs = file_attributes(from);
     if (attrs == INVALID_FILE_ATTRIBUTES ||
         (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
         SetLastError(ERROR_ACCESS_DENIED);
         return 0;
     }
-    return MoveFileExW(from, to, flags);
+    return file_move(from, to, flags);
 }
 
 int delete_file_safe(const WCHAR *path) {
@@ -423,13 +544,13 @@ int delete_file_safe(const WCHAR *path) {
         SetLastError(ERROR_ACCESS_DENIED);
         return 0;
     }
-    DWORD attrs = GetFileAttributesW(path);
+    DWORD attrs = file_attributes(path);
     if (attrs == INVALID_FILE_ATTRIBUTES ||
         (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
         SetLastError(ERROR_ACCESS_DENIED);
         return 0;
     }
-    return DeleteFileW(path);
+    return file_delete(path);
 }
 
 /* 递归复制目录树。跳过 . 和 ..，目录递归，文件走 copy_file_safe。 */
@@ -440,7 +561,7 @@ int copy_tree_safe(const WCHAR *from, const WCHAR *to) {
     WCHAR pat[MAX_PATH * 4];
     path_join(pat, MAX_PATH * 4, from, L"*");
     WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(pat, &fd);
+    HANDLE h = file_find_first(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
 
     int ok = 1;

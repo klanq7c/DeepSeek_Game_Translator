@@ -235,14 +235,17 @@ namespace DstLauncher
             patchedStrings = 0;
             var outBuf = new StringBuilder(size + 64);
             uint last = 0;
+            int rejectedFormat = 0;
             for (int i = 0; i < patches.Count; i++) {
                 TextPatch p = patches.V[i];
                 if (p.Start < last || p.End > (uint)size) return null;
                 outBuf.Append(buf, (int)last, (int)(p.Start - last));
                 string source = p.SourceIndex >= 0 ? texts.V[p.SourceIndex] : null;
                 string translated = p.SourceIndex >= 0 ? translations[p.SourceIndex] : null;
+                bool formatOk = translated == null || TextTranslationPreservesFormat(source, translated);
+                if (translated != null && !formatOk) rejectedFormat++;
                 if (translated != null && WantedTranslationText(translated) &&
-                    TextTranslationPreservesFormat(source, translated) &&
+                    formatOk &&
                     (!p.RawText || (translated.IndexOf('\r') < 0 && translated.IndexOf('\n') < 0))) {
                     string wrapped = WrapCjkTranslation(translated);
                     string finalText = wrapped ?? translated;
@@ -255,6 +258,8 @@ namespace DstLauncher
                 last = p.End;
             }
             outBuf.Append(buf, (int)last, size - (int)last);
+            // 外部模型或旧缓存的标签损坏只能由资源边界拒绝；保留原文并按资源汇总诊断。
+            if (rejectedFormat > 0) Log.Append("Godot: preserved " + rejectedFormat + " resource strings with incompatible tags or format tokens.");
             if (patchedStrings == 0) return null;
             return ByteStr.ToBytes(outBuf.ToString());
         }

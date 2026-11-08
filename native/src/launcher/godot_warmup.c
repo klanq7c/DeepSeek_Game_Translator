@@ -38,6 +38,8 @@ typedef struct {
     int offsets_are_absolute;
 } GodotPckInfo;
 
+static uint32_t read_u32le(const unsigned char *p);
+
 /* Godot 资源会混合玩家文本、路径、节点元数据、资源 ID 以及编辑器或工程设置。
    此过滤器保留常见的玩家可见文本，并拒绝只会污染共享翻译缓存的字符串。 */
 static int should_warm_godot_text(const char *s) {
@@ -744,6 +746,16 @@ static void collect_godot_binary_payload(char *s, TextList *prefetch) {
 }
 
 static void scan_godot_binary_buffer(const unsigned char *bytes, DWORD size, TextList *prefetch) {
+    /* Godot 4 的 tokenizer v100 在偏移 8 声明解压大小；非零时后面是 Zstd，
+       可打印字节并非可靠常量。当前启动器没有该解压边界，只保留运行时发现；
+       同批明确报告限制，不把压缩片段伪装成成功提取。旧 GDSC 与普通资源不变。 */
+    if (size >= 12 && !memcmp(bytes, "GDSC", 4) && read_u32le(bytes + 4) == 100 && read_u32le(bytes + 8)) {
+        if (!prefetch->godot_compressed_reported) {
+            prefetch->godot_compressed_reported = 1;
+            append_log(L"Godot warmup: compressed GDSC skipped; decompression is unavailable, visible text remains discoverable at runtime.");
+        }
+        return;
+    }
     DWORD start = 0;
     for (DWORD i = 0; i <= size && prefetch->n < textlist_limit(prefetch); i++) {
         int textual = 0;

@@ -333,6 +333,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private volatile bool _firstFrameLocalCachePrimed;
 
 	private volatile bool _bootCacheLoadComplete;
+	private volatile bool _bootCacheLoadFinished;
 
 	private readonly Dictionary<string, string> _mixedRepairOriginals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -361,6 +362,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private readonly List<WeakReference> _activeTmpOverlays = new List<WeakReference>();
 
 	private readonly HashSet<int> _deepScannedObjects = new HashSet<int>();
+
+	private readonly DeepPrefetchScanWindow _deepPrefetchScanWindow = new DeepPrefetchScanWindow();
 
 	private readonly HashSet<int> _cjkRenderDiagnostics = new HashSet<int>();
 
@@ -759,7 +762,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	/* 标签名刻意保守：带值标签必须有 '='，裸标签必须完整匹配标签词，
 	   从而不..."< The lobby... >" ..."<Mark looked at me.>" 当成富文本...*/
-	private static readonly Regex RichTextTagRegex = new Regex("<\\s*/?\\s*(?:b|i|u|s)\\s*>|<\\s*#[0-9A-Fa-f]{3,8}\\s*>|<\\s*(?:color|size|material)\\s*=\\s*[^>]+>|<\\s*/\\s*(?:color|size|material)\\s*>|<\\s*quad\\b[^>]*>|<\\s*br\\s*/?\\s*>|<\\s*(?:mark|sprite|line-height|link|font-weight|font|align|alpha|cspace|indent|line-indent|margin|mspace|pos|rotate|space|style|voffset|width|gradient|page)\\s*(?:=|\\s+[A-Za-z-]+\\s*=)[^>]*>|<\\s*(?:nobr|noparse|allcaps|smallcaps|lowercase|uppercase|strikethrough)\\s*>|<\\s*/\\s*(?:mark|sprite|line-height|link|font-weight|font|align|alpha|cspace|indent|line-indent|margin|mspace|pos|rotate|space|style|voffset|width|gradient|page|nobr|noparse|allcaps|smallcaps|lowercase|uppercase|strikethrough)\\s*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+	private static readonly Regex RichTextTagRegex = new Regex(DstUnity.TmpRichText.KnownTagPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
 	private static readonly Regex EmptyAngleTagRegex = new Regex("<\\s*>", RegexOptions.Compiled);
 
@@ -1748,7 +1751,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					Interlocked.Increment(ref _targetedCacheQueueCount);
 					return true;
 				}
-				else if (!ContainsCjk(currentComponentText) && TryGetLocalTranslation(currentComponentText, out var translated))
+				else if (!IsLocalizedText(currentComponentText) && TryGetLocalTranslation(currentComponentText, out var translated))
 				{
 					bool applied = ApplyCachedComponentTranslationNow(component, componentInstanceId, currentComponentText, translated, isTmp);
 					if (applied)
@@ -1757,11 +1760,15 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					}
 					return applied;
 				}
-				else if (!ContainsCjk(currentComponentText) && allowRemoteFallback && !WasProcessed(componentInstanceId, currentComponentText) && !IsInProgress(componentInstanceId, currentComponentText) && !ShouldSkipText(currentComponentText) && !IsTranslationRetryCoolingDown(currentComponentText))
+				else if (!IsLocalizedText(currentComponentText))
 				{
-					QueueDebouncedTextRequest(component, componentInstanceId, currentComponentText, isTmp);
-					Interlocked.Increment(ref _targetedCacheQueueCount);
-					return true;
+					PreparePendingCjkDisplay(component, currentComponentText, isTmp);
+					if (allowRemoteFallback && !WasProcessed(componentInstanceId, currentComponentText) && !IsInProgress(componentInstanceId, currentComponentText) && !ShouldSkipText(currentComponentText) && !IsTranslationRetryCoolingDown(currentComponentText))
+					{
+						QueueDebouncedTextRequest(component, componentInstanceId, currentComponentText, isTmp);
+						Interlocked.Increment(ref _targetedCacheQueueCount);
+						return true;
+					}
 				}
 			}
 		}
@@ -1957,17 +1964,20 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						ApplyTMProTranslation(val, componentInstanceId, originalText, repaired, _textPropCache, _fontPropCache, _forceMeshMethodCache);
 						continue;
 					}
-					num3++;
-					text = NormalizeTmpPunctuationForMissingGlyphs(text);
-					bool tmpFontCoversText = EnsureTMPFontCoversText(val, text);
-					if (!IsTmpOverlayCurrent(val, text, text))
+					if (IsLocalizedText(text))
 					{
-						ApplyTMPFont(val);
-					ApplyTmpOverlay(val, text, text, !tmpFontCoversText);
-				}
-				MarkProcessed(componentInstanceId, text);
-				LogCjkRenderStateOnce(val, text);
-				continue;
+						num3++;
+						text = NormalizeTmpPunctuationForMissingGlyphs(text);
+						bool tmpFontCoversText = EnsureTMPFontCoversText(val, text);
+						if (!IsTmpOverlayCurrent(val, text, text))
+						{
+							ApplyTMPFont(val);
+							ApplyTmpOverlay(val, text, text, !tmpFontCoversText);
+						}
+						MarkProcessed(componentInstanceId, text);
+						LogCjkRenderStateOnce(val, text);
+						continue;
+					}
 				}
 				if (TryGetLocalTranslation(text, out var translated))
 				{
@@ -1976,6 +1986,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 					ApplyTMProTranslation(val, componentInstanceId, text, translated, _textPropCache, _fontPropCache, _forceMeshMethodCache);
 					continue;
 				}
+				PreparePendingCjkDisplay(val, text, isTmp: true);
 				if (WasProcessed(componentInstanceId, text))
 				{
 					num5++;
@@ -2014,29 +2025,23 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			string text2 = val2.text;
 			int componentInstanceId2 = GetComponentInstanceId(val2);
 			string translated2;
-			if (ContainsCjk(text2))
+			if (ContainsCjk(text2) && TryRepairMixedTranslatedText(text2, out var originalText2, out var repaired2))
 			{
-				if (TryRepairMixedTranslatedText(text2, out var originalText2, out var repaired2))
-				{
-					val2.text = PrepareTranslatedTextForUGUIText(val2, repaired2, originalText2);
-					if ((Object)(object)_chineseFont != (Object)null)
-					{
-						val2.font = _chineseFont;
-					}
-					MarkProcessed(componentInstanceId2, originalText2);
-					TryMarkAppliedCacheKeyForPersist(originalText2, repaired2);
-				}
-				else
-				{
-					if ((Object)(object)_chineseFont != (Object)null && (Object)(object)val2.font != (Object)(object)_chineseFont)
-					{
-						val2.font = _chineseFont;
-					}
-					MarkProcessed(componentInstanceId2, text2);
-				}
+				val2.text = PrepareTranslatedTextForUGUIText(val2, repaired2, originalText2);
+				if ((Object)(object)_chineseFont != (Object)null) val2.font = _chineseFont;
+				MarkProcessed(componentInstanceId2, originalText2);
+				TryMarkAppliedCacheKeyForPersist(originalText2, repaired2);
 				LogCjkRenderStateOnce(val2, text2);
+				continue;
 			}
-			else if (TryGetLocalTranslation(text2, out translated2))
+			if (IsLocalizedText(text2))
+			{
+				if ((Object)(object)_chineseFont != (Object)null && (Object)(object)val2.font != (Object)(object)_chineseFont) val2.font = _chineseFont;
+				MarkProcessed(componentInstanceId2, text2);
+				LogCjkRenderStateOnce(val2, text2);
+				continue;
+			}
+			if (TryGetLocalTranslation(text2, out translated2))
 			{
 				val2.text = PrepareTranslatedTextForUGUIText(val2, translated2, text2);
 				if ((Object)(object)_chineseFont != (Object)null)
@@ -2048,6 +2053,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			else
 			{
+				PreparePendingCjkDisplay(val2, text2, isTmp: false);
 				if (WasProcessed(componentInstanceId2, text2) || IsInProgress(componentInstanceId2, text2) || ShouldSkipText(text2))
 				{
 					continue;
@@ -2196,58 +2202,44 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void CollectDeepPrefetchCandidates(int maxObjects, int maxTexts)
 	{
+		if (maxObjects <= 0 || maxTexts <= 0)
+		{
+			return;
+		}
 		EnsureScannerInitialized("DEEP");
 		List<string> list = new List<string>(maxTexts);
-		int num = 0;
-		if (_textAssetTypeCache != null)
+		int processed = 0;
+		int discovered = 0;
+		PropertyInfo textProperty = null;
+		int inspected = _deepPrefetchScanWindow.Scan<Object>(maxObjects, kind =>
 		{
-			PropertyInfo propertyInfo = AccessTools.Property(_textAssetTypeCache, "text");
-			Object[] array = FindObjectsOfTypeAllSafe(_textAssetTypeCache);
-			foreach (Object val in array)
+			Object[] objects;
+			if (kind == 0)
 			{
-				if (!(val == (Object)null) && TryMarkDeepScanned(val))
-				{
-					num++;
-					ExtractDeepPrefetchText(propertyInfo?.GetValue(val) as string, list, maxTexts);
-					if (num >= maxObjects || list.Count >= maxTexts)
-					{
-						break;
-					}
-				}
+				if (_textAssetTypeCache == null) return Array.Empty<Object>();
+				textProperty = AccessTools.Property(_textAssetTypeCache, "text");
+				objects = FindObjectsOfTypeAllSafe(_textAssetTypeCache);
 			}
-		}
-		if (num < maxObjects && list.Count < maxTexts)
+			else if (kind == 1)
+			{
+				objects = FindObjectsOfTypeAllSafe<ScriptableObject>();
+			}
+			else
+			{
+				objects = FindObjectsOfTypeAllSafe<MonoBehaviour>();
+			}
+			discovered += objects.Length;
+			return objects;
+		}, (kind, obj) =>
 		{
-			ScriptableObject[] array2 = FindObjectsOfTypeAllSafe<ScriptableObject>();
-			foreach (ScriptableObject val2 in array2)
+			if (obj != (Object)null && (kind != 2 || IsComponentActive((MonoBehaviour)obj)) && TryMarkDeepScanned(obj))
 			{
-				if (!((Object)(object)val2 == (Object)null) && TryMarkDeepScanned(val2))
-				{
-					num++;
-					ExtractDeepObjectStrings(val2, list, maxTexts);
-					if (num >= maxObjects || list.Count >= maxTexts)
-					{
-						break;
-					}
-				}
+				processed++;
+				if (kind == 0) ExtractDeepPrefetchText(textProperty?.GetValue(obj) as string, list, maxTexts);
+				else ExtractDeepObjectStrings(obj, list, maxTexts);
 			}
-		}
-		if (num < maxObjects && list.Count < maxTexts)
-		{
-			MonoBehaviour[] array3 = FindObjectsOfTypeAllSafe<MonoBehaviour>();
-			foreach (MonoBehaviour val3 in array3)
-			{
-				if (!((Object)(object)val3 == (Object)null) && IsComponentActive(val3) && TryMarkDeepScanned(val3))
-				{
-					num++;
-					ExtractDeepObjectStrings(val3, list, maxTexts);
-					if (num >= maxObjects || list.Count >= maxTexts)
-					{
-						break;
-					}
-				}
-			}
-		}
+			return list.Count >= maxTexts;
+		});
 		if (list.Count == 0)
 		{
 			return;
@@ -2259,7 +2251,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				_deepPrefetchQueue.Enqueue(item);
 			}
 		}
-		LogVerbose($"[DEEP] queued {list.Count} prefetch texts from {num} objects");
+		LogVerbose($"[DEEP] discovered {discovered}, inspected {inspected}, processed {processed}, queued {list.Count} prefetch texts");
 	}
 
 	private bool TryMarkDeepScanned(object obj)
@@ -2429,7 +2421,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return;
 		}
 		string text2 = GetVisibleText(text).Trim();
-		if (text2.Length < 4 || text2.Length > 220 || ContainsCjk(text2) || LooksLikeTypewriterFragment(text) || ShouldSkipText(text) || IsTranslationRetryCoolingDown(text) || !LooksLikeNaturalLanguage(text2) || TryGetLocalTranslation(text, out var _))
+		if (text2.Length < 4 || text2.Length > 220 || IsLocalizedText(text2) || LooksLikeTypewriterFragment(text) || ShouldSkipText(text) || IsTranslationRetryCoolingDown(text) || !LooksLikeNaturalLanguage(text2) || TryGetLocalTranslation(text, out var _))
 		{
 			return;
 		}
@@ -2576,15 +2568,16 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			Interlocked.Increment(ref _cacheApplyHitCount);
 			return true;
 		}
-		if (!ContainsCjk(text) && TryGetLocalTranslation(text, out var translated))
+		if (!IsLocalizedText(text) && TryGetLocalTranslation(text, out var translated))
 		{
 			ApplyTMProTranslation(val, componentInstanceId, text, translated, _textPropCache, _fontPropCache, _forceMeshMethodCache);
 			Interlocked.Increment(ref _cacheApplyHitCount);
 			return true;
 		}
-		if (!ContainsCjk(text) && !WasProcessed(componentInstanceId, text))
+		if (!IsLocalizedText(text))
 		{
-			ShouldSkipText(text);
+			PreparePendingCjkDisplay(val, text, isTmp: true);
+			if (!WasProcessed(componentInstanceId, text)) ShouldSkipText(text);
 		}
 		return false;
 	}
@@ -2613,7 +2606,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			Interlocked.Increment(ref _cacheApplyHitCount);
 			return true;
 		}
-		if (ContainsCjk(text2))
+		if (IsLocalizedText(text2))
 		{
 			return false;
 		}
@@ -2629,6 +2622,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			Interlocked.Increment(ref _cacheApplyHitCount);
 			return true;
 		}
+		PreparePendingCjkDisplay(val2, text2, isTmp: false);
 		if (!WasProcessed(componentInstanceId2, text2))
 		{
 			ShouldSkipText(text2);
@@ -3749,7 +3743,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void QueueImGuiTranslation(string text)
 	{
-		if (string.IsNullOrWhiteSpace(text) || ContainsCjk(text) || ShouldSkipText(text) || IsTranslationRetryCoolingDown(text))
+		if (string.IsNullOrWhiteSpace(text) || IsLocalizedText(text) || ShouldSkipText(text) || IsTranslationRetryCoolingDown(text))
 		{
 			return;
 		}
@@ -3936,6 +3930,54 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		_instance.ResetTmpExternalWriteDepthAfterSetterException(__instance, __exception, "tmp-SetText-overload-depth-reset");
 	}
 
+	/* TMP 换行结构守卫：按 '\n' 计数为结构不变量（\r 后缀变体不影响 TMP 分页，
+	   行数才会）。译文行数与源一致才允许应用到 TMP 组件。 */
+	private static int CountTextLineBreaks(string text)
+	{
+		if (string.IsNullOrEmpty(text))
+		{
+			return 0;
+		}
+		int count = 0;
+		for (int i = 0; i < text.Length; i++)
+		{
+			if (text[i] == '\n')
+			{
+				count++;
+			}
+		}
+		return count;
+	}
+
+	/* TMP 换行结构守卫：源与译文先过同一 NormalizeDisplayWhitespace（<br>→\n、
+	   \r 归一、连续换行折叠、Trim——正是应用管线会做的变换），再按 '\n' 计数
+	   对称比较。这样 <br> 换行的译文不会被误拒，模型合并/拆行仍会被拦截。
+	   只在渲染层最终应用前调用，不校验共享缓存。 */
+	private static bool TmpLineStructurePreserved(string original, string translated)
+	{
+		return CountTextLineBreaks(NormalizeDisplayWhitespace(original ?? string.Empty))
+			== CountTextLineBreaks(NormalizeDisplayWhitespace(translated ?? string.Empty));
+	}
+
+	private static int _tmpLineStructureRejections;
+
+	/* 拒绝属于设计内回退（保留原文，不应用不缓存），诊断限频：前 3 次全报，
+	   此后 2 的幂次，避免同一坏译文反复触发刷屏。stderr 之外同时走实例
+	   LogVerbose（BepInEx 默认不捕获 System.Console，开 verbose 才可见）。 */
+	private static void ReportTmpLineStructureRejection(string original, string translated, bool sync)
+	{
+		int occurrence = Interlocked.Increment(ref _tmpLineStructureRejections);
+		if (occurrence <= 3 || (occurrence & (occurrence - 1)) == 0)
+		{
+			string detail = "[DeepSeek][TMP] rejected a translation whose line count differs from the source; keeping source text. occurrence="
+				+ occurrence + " path=" + (sync ? "sync" : "async")
+				+ " sourceLines=" + (CountTextLineBreaks(NormalizeDisplayWhitespace(original ?? string.Empty)) + 1)
+				+ " translatedLines=" + (CountTextLineBreaks(NormalizeDisplayWhitespace(translated ?? string.Empty)) + 1);
+			Console.Error.WriteLine(detail);
+			_instance?.LogVerbose(detail);
+		}
+	}
+
 	private static bool TMPSetTextPrefix(object __instance, ref string value)
 	{
 		if ((Object)(object)_instance == (Object)null)
@@ -3961,8 +4003,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			if (_instance.TryRepairMixedTranslatedText(value, out var originalText, out var repaired))
 			{
 				_instance.ApplyTMPFont(__instance);
-				string repairedText = (ShouldPreserveRichTextForDisplayWithColor(originalText, repaired) ? PrepareTranslatedTextForComponent(__instance, repaired, originalText) : StripRichTextForPlainText(repaired));
-				repairedText = _instance.NormalizeTmpPunctuationForMissingGlyphs(repairedText);
+				string repairedText = (ShouldPreserveRichTextForDisplayWithColor(originalText, repaired) ? PrepareTranslatedTextForComponent(__instance, repaired, originalText) : StripRichTextForPlainText(repaired, originalText));
+				repairedText = RememberCompletedOutput(originalText, _instance.NormalizeTmpPunctuationForMissingGlyphs(repairedText));
 				bool repairedFontCoversText = _instance.EnsureTMPFontCoversText(__instance, repairedText);
 				_instance.ApplyTmpOverlay(__instance, repairedText, originalText, !repairedFontCoversText);
 				RevealTmpText(__instance, repairedText);
@@ -3972,20 +4014,27 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				_instance.LogVerbose("[MIXED] repaired TMP text '" + originalText?.Substring(0, Math.Min(originalText?.Length ?? 0, 30)) + "'");
 				return true;
 			}
-			_instance.ApplyTMPFont(__instance);
-			string text = (ShouldPreserveRichTextForDisplayWithColor(value, value) ? PrepareTranslatedTextForComponent(__instance, value, value) : StripRichTextForPlainText(value));
-			text = _instance.NormalizeTmpPunctuationForMissingGlyphs(text);
-			bool tmpFontCoversText = _instance.EnsureTMPFontCoversText(__instance, text);
-			_instance.ApplyTmpOverlay(__instance, text, value, !tmpFontCoversText);
-			RevealTmpText(__instance, text);
-			value = text;
-			return true;
+			if (IsLocalizedText(value))
+			{
+				_instance.ApplyTMPFont(__instance);
+				string text = (ShouldPreserveRichTextForDisplayWithColor(value, value) ? PrepareTranslatedTextForComponent(__instance, value, value) : StripRichTextForPlainText(value, value));
+				text = _instance.NormalizeTmpPunctuationForMissingGlyphs(text);
+				bool tmpFontCoversText = _instance.EnsureTMPFontCoversText(__instance, text);
+				_instance.ApplyTmpOverlay(__instance, text, value, !tmpFontCoversText);
+				RevealTmpText(__instance, text);
+				value = text;
+				return true;
+			}
 		}
 		_instance.RestoreTmpOverlay(__instance);
 		string rawText = value;
 		_instance.ClearProcessedIfChanged(componentInstanceId, value);
 		// 动画每帧重写已知短语时应立即命中；去抖只约束未翻译的新片段。
 		string text2 = _instance.Translate(value);
+		if (text2 == value)
+		{
+			_instance.PreparePendingCjkDisplay(__instance, value, isTmp: true);
+		}
 		if (text2 == value && LooksLikeTypewriterFragment(value))
 		{
 			_instance.QueueDebouncedTextRequest(__instance, componentInstanceId, value, isTmp: true);
@@ -3999,8 +4048,18 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				_instance.ClearInProgress(componentInstanceId, value);
 				return true;
 			}
-			text2 = (ShouldPreserveRichTextForDisplayWithColor(value, text2) ? PrepareTranslatedTextForComponent(__instance, text2, value) : StripRichTextForPlainText(text2));
-			text2 = _instance.NormalizeTmpPunctuationForMissingGlyphs(text2);
+			text2 = (ShouldPreserveRichTextForDisplayWithColor(value, text2) ? PrepareTranslatedTextForComponent(__instance, text2, value) : StripRichTextForPlainText(text2, value));
+			text2 = RememberCompletedOutput(rawText, _instance.NormalizeTmpPunctuationForMissingGlyphs(text2));
+			/* TMP 分页/空页分隔依赖换行结构（\n、\n\r、\n\n\r 变体必须逐行保留，
+			   实测换行数变化会导致 TMP 分页错乱）。守卫必须在变换链之后、真正
+			   应用之前检查最终文本：<br>→\n 转换、\r 归一化和 Trim 都会改变计数，
+			   提前检查会误拒可修复的译文。源与译文按同一规范化形式对称比较；
+			   拒绝时保留原文，不改动共享缓存，更正后的译文仍可正常应用。 */
+			if (!TmpLineStructurePreserved(value, text2))
+			{
+				ReportTmpLineStructureRejection(value, text2, sync: true);
+				return true;
+			}
 			if (!_instance.CanTranslateTmp() && _instance.ShouldUseTmpOverlay())
 			{
 				if (!_instance.ApplyTmpOverlay(__instance, text2, value))
@@ -4093,17 +4152,24 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				_instance.LogVerbose("[MIXED] repaired UGUI text '" + originalText?.Substring(0, Math.Min(originalText?.Length ?? 0, 30)) + "'");
 				return true;
 			}
-			if ((Object)(object)_instance._chineseFont != (Object)null && (Object)(object)__instance.font != (Object)(object)_instance._chineseFont)
+			if (IsLocalizedText(value))
 			{
-				__instance.font = _instance._chineseFont;
+				if ((Object)(object)_instance._chineseFont != (Object)null && (Object)(object)__instance.font != (Object)(object)_instance._chineseFont)
+				{
+					__instance.font = _instance._chineseFont;
+				}
+				value = PrepareTranslatedTextForUGUIText(__instance, value, value);
+				return true;
 			}
-			value = PrepareTranslatedTextForUGUIText(__instance, value, value);
-			return true;
 		}
 		string rawText = value;
 		_instance.ClearProcessedIfChanged(componentInstanceId, value);
 		// 已有译文不等待去抖，避免逐帧改写把恢复推迟到动画结束。
 		string text = _instance.Translate(value);
+		if (text == value)
+		{
+			_instance.PreparePendingCjkDisplay(__instance, value, isTmp: false);
+		}
 		if (text == value && LooksLikeTypewriterFragment(value))
 		{
 			_instance.QueueDebouncedTextRequest(__instance, componentInstanceId, value, isTmp: false);
@@ -4148,6 +4214,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		if (ContainsCjk(text))
 		{
 			_instance.ApplyImGuiFont(style);
+		}
+		if (IsLocalizedText(text))
+		{
 			return;
 		}
 		string originalText = text;
@@ -4287,6 +4356,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		if (ContainsCjk(text))
 		{
 			_instance.ApplyImGuiFont(effectiveStyle);
+		}
+		if (IsLocalizedText(text))
+		{
 			return;
 		}
 		string originalText = text;
@@ -4323,6 +4395,9 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		if (ContainsCjk(text))
 		{
 			_instance.ApplyImGuiFont(effectiveStyle);
+		}
+		if (IsLocalizedText(text))
+		{
 			return;
 		}
 		string originalText = text;
@@ -4710,7 +4785,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		HashSet<string> requestSeen = new HashSet<string>(StringComparer.Ordinal);
 		foreach (string candidate in candidates ?? Enumerable.Empty<string>())
 		{
-			if (requestTexts.Count >= FungusPrefetchMaxRequestTexts || string.IsNullOrWhiteSpace(candidate) || ContainsCjk(candidate) || ShouldSkipText(candidate) || LooksLikeTypewriterFragment(candidate) || TryGetLocalTranslation(candidate, out _))
+			if (requestTexts.Count >= FungusPrefetchMaxRequestTexts || string.IsNullOrWhiteSpace(candidate) || IsLocalizedText(candidate) || ShouldSkipText(candidate) || LooksLikeTypewriterFragment(candidate) || TryGetLocalTranslation(candidate, out _))
 			{
 				continue;
 			}
@@ -4917,8 +4992,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			PropertyInfo propertyInfo = AccessTools.Property(type, "text");
 			string sourceForFormatting = originalText ?? translated;
-			translated = ((preserveRichText && ShouldPreserveRichTextForDisplayWithColor(sourceForFormatting, translated)) ? PrepareTranslatedTextForComponent(component, translated, sourceForFormatting) : StripRichTextForPlainText(translated));
-			translated = NormalizeTmpPunctuationForMissingGlyphs(translated);
+			translated = ((preserveRichText && ShouldPreserveRichTextForDisplayWithColor(sourceForFormatting, translated)) ? PrepareTranslatedTextForComponent(component, translated, sourceForFormatting) : StripRichTextForPlainText(translated, sourceForFormatting));
+			translated = RememberCompletedOutput(originalText, NormalizeTmpPunctuationForMissingGlyphs(translated));
 			if (!CanTranslateTmp())
 			{
 				if (!ApplyTmpOverlay(component, translated, sourceForFormatting))
@@ -5126,7 +5201,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			if (_glossary.TryGetValue(text, out var value))
 			{
-				value = SanitizeTranslationArtifacts(value);
+				value = SanitizeTranslationArtifacts(value, text);
 				if (IsAcceptableTranslation(text, value))
 				{
 					translated = value;
@@ -5135,20 +5210,20 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			if (!string.Equals(text2, text, StringComparison.Ordinal) && _glossary.TryGetValue(text2, out var value2))
 			{
-				value2 = SanitizeTranslationArtifacts(value2);
+				value2 = SanitizeTranslationArtifacts(value2, text);
 				if (IsAcceptableTranslation(text, value2))
 				{
 					translated = value2;
 					return true;
 				}
 			}
-			if (ContainsCjk(text) || ShouldSkipText(text))
+			if (IsLocalizedText(text) || ShouldSkipText(text))
 			{
 				return false;
 			}
 			if (_cache.TryGetValue(text, out var value3))
 			{
-				value3 = SanitizeTranslationArtifacts(value3);
+				value3 = SanitizeTranslationArtifacts(value3, text);
 				if (IsAcceptableTranslation(text, value3))
 				{
 					translated = value3;
@@ -5157,7 +5232,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			}
 			if (!string.Equals(text2, text, StringComparison.Ordinal) && _cache.TryGetValue(text2, out var value4))
 			{
-				value4 = SanitizeTranslationArtifacts(value4);
+				value4 = SanitizeTranslationArtifacts(value4, text);
 				if (IsAcceptableTranslation(text, value4))
 				{
 					translated = value4;
@@ -5263,7 +5338,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		string normalized = NormalizeRequestText(term);
 		if (_glossary.TryGetValue(term, out var glossaryValue) || _glossary.TryGetValue(normalized, out glossaryValue) || _cache.TryGetValue(term, out glossaryValue) || _cache.TryGetValue(normalized, out glossaryValue))
 		{
-			glossaryValue = SanitizeTranslationArtifacts(glossaryValue);
+			glossaryValue = SanitizeTranslationArtifacts(glossaryValue, term);
 			string visible = GetVisibleText(glossaryValue);
 			if (ContainsCjk(visible) && !LooksLikeMixedTranslationResidue(glossaryValue))
 			{
@@ -5502,7 +5577,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				continue;
 			}
-			string value = SanitizeTranslationArtifacts(pair.Value);
+			string value = SanitizeTranslationArtifacts(pair.Value, pair.Key);
 			if (!ContainsCjk(value) || !GetLeadingCjkSignature(value).StartsWith(cjkPrefix, StringComparison.Ordinal) || LooksLikeMixedTranslationResidue(value))
 			{
 				continue;
@@ -5525,7 +5600,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private async Task TranslateAsync(string text, string domain, Action<string> callback)
 	{
-		if (string.IsNullOrWhiteSpace(text) || ContainsCjk(text) || ShouldSkipText(text))
+		if (string.IsNullOrWhiteSpace(text) || IsLocalizedText(text) || ShouldSkipText(text))
 		{
 			callback?.Invoke(text);
 			return;
@@ -5590,7 +5665,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void StoreCachedTranslation(string original, string translated)
 	{
-		translated = SanitizeTranslationArtifacts(translated);
+		translated = SanitizeTranslationArtifacts(translated, original);
 		/* 能走到这里的文本已经通过去抖稳定窗，可视为最终文本并安全缓存...		   即使结尾形态仍像打字机截断，也不能再次永久丢弃...*/
 		if (!IsAcceptableTranslation(original, translated))
 		{
@@ -5632,7 +5707,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return false;
 		}
-		translated = SanitizeTranslationArtifacts(translated);
+		translated = SanitizeTranslationArtifacts(translated, original);
 		if (LooksLikeTypewriterFragment(original) || !IsAcceptableTranslation(original, translated))
 		{
 			return false;
@@ -5642,11 +5717,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			string text = NormalizeRequestText(original);
 			bool flag2 = false;
-			if (_cache.TryGetValue(original, out var value) && string.Equals(SanitizeTranslationArtifacts(value), translated, StringComparison.Ordinal))
+			if (_cache.TryGetValue(original, out var value) && string.Equals(SanitizeTranslationArtifacts(value, original), translated, StringComparison.Ordinal))
 			{
 				flag2 = true;
 			}
-			else if (!string.Equals(text, original, StringComparison.Ordinal) && _cache.TryGetValue(text, out var value2) && string.Equals(SanitizeTranslationArtifacts(value2), translated, StringComparison.Ordinal))
+			else if (!string.Equals(text, original, StringComparison.Ordinal) && _cache.TryGetValue(text, out var value2) && string.Equals(SanitizeTranslationArtifacts(value2, original), translated, StringComparison.Ordinal))
 			{
 				flag2 = true;
 			}
@@ -5812,7 +5887,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
 		foreach (string rawText in texts ?? Enumerable.Empty<string>())
 		{
-			if (string.IsNullOrWhiteSpace(rawText) || ContainsCjk(rawText) || LooksLikeTypewriterFragment(rawText) ||
+			if (string.IsNullOrWhiteSpace(rawText) || IsLocalizedText(rawText) || LooksLikeTypewriterFragment(rawText) ||
 				ShouldSkipText(rawText) || IsTranslationRetryCoolingDown(rawText))
 			{
 				continue;
@@ -6682,7 +6757,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private bool TryReserveWarmupText(string text, ISet<string> seenTexts)
 	{
-		if (string.IsNullOrWhiteSpace(text) || ContainsCjk(text) || ShouldSkipText(text))
+		if (string.IsNullOrWhiteSpace(text) || IsLocalizedText(text) || ShouldSkipText(text))
 		{
 			return false;
 		}
@@ -6925,14 +7000,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return payload;
 		}
 		int tokenIndex = 0;
-		MatchEvaluator evaluator = delegate(Match match)
+		Func<string, string> protect = delegate(string value)
 		{
 			string text2 = $"__DS_TOKEN_{tokenIndex++}__";
-			payload.Tokens[text2] = match.Value;
+			payload.Tokens[text2] = value;
 			return text2;
 		};
-		payload.RequestText = RichTextTagRegex.Replace(payload.RequestText, evaluator);
-		payload.RequestText = NumericTokenRegex.Replace(payload.RequestText, evaluator);
+		payload.RequestText = ReplaceRichTextTags(payload.RequestText, protect);
+		payload.RequestText = NumericTokenRegex.Replace(payload.RequestText, match => protect(match.Value));
 		return payload;
 	}
 
@@ -6944,13 +7019,13 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		if (payload == null || payload.Tokens.Count == 0)
 		{
-			return SanitizeTranslationArtifacts(text);
+			return SanitizeTranslationArtifacts(text, payload?.OriginalText);
 		}
 		foreach (KeyValuePair<string, string> token in payload.Tokens)
 		{
 			text = text.Replace(token.Key, token.Value);
 		}
-		text = SanitizeTranslationArtifacts(text);
+		text = SanitizeTranslationArtifacts(text, payload.OriginalText);
 		return RestoreOuterRichTextWrapper(text, payload);
 	}
 
@@ -6961,90 +7036,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private static string RestoreLeadingTextDecoration(string translated, string originalText)
 	{
-		if (string.IsNullOrWhiteSpace(translated) || string.IsNullOrWhiteSpace(originalText))
-		{
-			return translated;
-		}
-		if (!TryGetLeadingTextDecoration(originalText, out var decoration, out _))
-		{
-			return translated;
-		}
-		int contentStart;
-		if (!TryGetLeadingTextDecoration(translated, out _, out contentStart))
-		{
-			contentStart = 0;
-			while (contentStart < translated.Length && IsHorizontalWhitespace(translated[contentStart]))
-			{
-				contentStart++;
-			}
-			int markerStart = contentStart;
-			while (contentStart < translated.Length && IsLeadingTextDecorationMarker(translated[contentStart]))
-			{
-				contentStart++;
-			}
-			if (contentStart == markerStart)
-			{
-				contentStart = 0;
-			}
-			else
-			{
-				while (contentStart < translated.Length && IsHorizontalWhitespace(translated[contentStart]))
-				{
-					contentStart++;
-				}
-			}
-		}
-		if (contentStart >= translated.Length || string.IsNullOrWhiteSpace(translated.Substring(contentStart)))
-		{
-			return translated;
-		}
-		return decoration + translated.Substring(contentStart);
-	}
-
-	private static bool TryGetLeadingTextDecoration(string text, out string decoration, out int contentStart)
-	{
-		decoration = null;
-		contentStart = 0;
-		if (string.IsNullOrEmpty(text))
-		{
-			return false;
-		}
-		int index = 0;
-		while (index < text.Length && IsHorizontalWhitespace(text[index]))
-		{
-			index++;
-		}
-		int markerStart = index;
-		while (index < text.Length && IsLeadingTextDecorationMarker(text[index]))
-		{
-			index++;
-		}
-		if (index == markerStart)
-		{
-			return false;
-		}
-		int separatorStart = index;
-		while (index < text.Length && IsHorizontalWhitespace(text[index]))
-		{
-			index++;
-		}
-		if (index == separatorStart || index >= text.Length)
-		{
-			return false;
-		}
-		decoration = text.Substring(0, index);
-		contentStart = index;
-		return true;
-	}
-
-	private static bool IsHorizontalWhitespace(char c)
-	{
-		return c == ' ' || c == '\t';
-	}
-
-	private static bool IsLeadingTextDecorationMarker(char c)
-	{
-		return c == '-' || c == '\u2013' || c == '\u2014' || c == '\u2022' || c == '\u2023' || c == '\u25aa' || c == '\u25cf' || c == '\u25a0' || c == '\u25a1' || c == '*' || c == '>' || c == '+' || c == '\u00b7';
+		return UnityTextFormatting.RestoreLeadingTextDecoration(translated, originalText);
 	}
 
 	private static string RestoreOuterRichTextWrapper(string text, string originalText)
@@ -7211,8 +7203,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		"Translate this exact game text to Simplified Chinese. Return only the translation."
 	};
 
-	private static string StripTranslationPromptEchoPrefix(string text)
+	private static string StripTranslationPromptEchoPrefix(string text, string originalText = null)
 	{
+		// 中文恢复后的游戏原文可能自带提示样式说明；有来源时共用服务的前缀层数
+		// 规则，只清掉额外回显。缺少来源的旧调用继续沿用原有清洗语义。
+		if (originalText != null)
+		{
+			return DstCore.TextRules.NormalizeTranslationResult(text, originalText);
+		}
 		if (string.IsNullOrWhiteSpace(text))
 		{
 			return text;
@@ -7262,14 +7260,61 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return changed ? candidate : text;
 	}
 
-	private static string SanitizeTranslationArtifacts(string text)
+	private static string SanitizeTranslationArtifacts(string text, string originalText = null)
 	{
 		if (string.IsNullOrWhiteSpace(text))
 		{
 			return text;
 		}
 		text = RepairUtf8DecodedAsGbk(text);
-		text = StripTranslationPromptEchoPrefix(text);
+		text = StripTranslationPromptEchoPrefix(text, originalText);
+		// 修复裸标签前暂存完整标签，避免把链接或资源属性里的 size=、color>
+		// 当成损坏格式。占位串避开原文，且在返回前完整还原，不进入显示或缓存。
+		string tagPrefix = "__DS_INTACT_TAG_";
+		while (text.IndexOf(tagPrefix, StringComparison.Ordinal) >= 0)
+		{
+			tagPrefix += "_";
+		}
+		List<string> intactTags = new List<string>();
+		StringBuilder protectedText = null;
+		int copied = 0;
+		int searchAt = 0;
+		while (searchAt < text.Length)
+		{
+			Match tag = RichTextTagRegex.Match(text, searchAt);
+			if (!tag.Success)
+			{
+				break;
+			}
+			searchAt = tag.Index + tag.Length;
+			// </ <b> 属于待修复的嵌套闭合残片，不能把内部 <b> 当成独立标签。
+			int previous = tag.Index - 1;
+			while (previous >= 0 && char.IsWhiteSpace(text[previous]))
+			{
+				previous--;
+			}
+			if (previous >= 1 && text[previous] == '/' && text[previous - 1] == '<')
+			{
+				continue;
+			}
+			if (!DstUnity.TmpRichText.TryGetTagEnd(text, tag.Index, out int tagEnd))
+			{
+				continue;
+			}
+			if (protectedText == null)
+			{
+				protectedText = new StringBuilder(text.Length);
+			}
+			protectedText.Append(text, copied, tag.Index - copied);
+			protectedText.Append('<').Append(tagPrefix).Append(intactTags.Count).Append('>');
+			intactTags.Add(text.Substring(tag.Index, tagEnd - tag.Index + 1));
+			copied = searchAt = tagEnd + 1;
+		}
+		if (protectedText != null)
+		{
+			protectedText.Append(text, copied, text.Length - copied);
+			text = protectedText.ToString();
+		}
 		text = NestedBrokenRichTextRegex.Replace(text, "</$1>");
 		text = BrokenOpeningRichTextDashRegex.Replace(text, "<$1=");
 		text = BareClosingRichTextRegex.Replace(text, "<$1");
@@ -7280,6 +7325,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		text = text.Replace("< >", string.Empty).Replace("＜＞", string.Empty).Replace("〈〉", string.Empty);
 		text = text.Replace("</>", string.Empty).Replace("<\\>", string.Empty).Replace("<>\\", string.Empty)
 			.Replace("＜＞", string.Empty);
+		for (int i = 0; i < intactTags.Count; i++)
+		{
+			text = text.Replace("<" + tagPrefix + i + ">", intactTags[i]);
+		}
 		return text;
 	}
 
@@ -7306,7 +7355,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return false;
 		}
-		return Regex.Replace(PlaceholderTokenRegex.Replace(text, string.Empty), "[\\s\\W_]+", string.Empty).Length <= 6;
+		string visible = PlaceholderTokenRegex.Replace(text, string.Empty);
+		// 混合短标签含有完整英文实词时仍需补译；一两个字母、数字或控制符碎片
+		// 继续沿用原来的过滤，避免把逐字刷新的未完成片段送给服务。
+		if (ContainsCjk(visible) && DstCore.MixedText.HasUntranslatedLatin(visible))
+		{
+			return false;
+		}
+		return Regex.Replace(visible, "[\\s\\W_]+", string.Empty).Length <= 6;
 	}
 
 	private static string NormalizeDisplayWhitespace(string text)
@@ -7337,7 +7393,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return string.Empty;
 		}
-		return NormalizeRequestText(RichTextTagRegex.Replace(text, " ").Replace("\u200b", "").Replace("\ufeff", ""));
+		return NormalizeRequestText(ReplaceRichTextTags(text, tag => " ").Replace("\u200b", "").Replace("\ufeff", ""));
 	}
 
 	private static bool LooksLikeUiText(string text)
@@ -7520,20 +7576,19 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return TextSettleDebounceSeconds;
 	}
 
-	private static string SanitizeRichTextForUnityText(string text)
+	private static string SanitizeRichTextForUnityText(string text, string originalText = null)
 	{
 		if (string.IsNullOrWhiteSpace(text))
 		{
 			return text;
 		}
-		text = SanitizeTranslationArtifacts(text);
+		text = SanitizeTranslationArtifacts(text, originalText);
 		if (!RichTextTagRegex.IsMatch(text))
 		{
 			return text;
 		}
-		return RichTextTagRegex.Replace(text, delegate(Match match)
+		return ReplaceRichTextTags(text, delegate(string value)
 		{
-			string value = match.Value;
 			if (value.Length <= 2)
 			{
 				return string.Empty;
@@ -7592,9 +7647,54 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return false;
 	}
 
+	private static string ReplaceRichTextTags(string text, Func<string, string> replacement)
+	{
+		if (string.IsNullOrEmpty(text))
+		{
+			return text;
+		}
+		StringBuilder result = null;
+		int copied = 0;
+		int searchAt = 0;
+		while (searchAt < text.Length)
+		{
+			Match tag = RichTextTagRegex.Match(text, searchAt);
+			if (!tag.Success)
+			{
+				break;
+			}
+			// 正则只筛选既有标签；完整属性边界由解析器确定，不能把引号中的 >
+			// 留作可见文字或发给模型。既有宽松/残片语法仍沿用原正则范围。
+			int end = tag.Index + tag.Length;
+			if (DstUnity.TmpRichText.TryGetTagEnd(text, tag.Index, out int tagEnd))
+			{
+				end = tagEnd + 1;
+			}
+			if (result == null)
+			{
+				result = new StringBuilder(text.Length);
+			}
+			result.Append(text, copied, tag.Index - copied);
+			result.Append(replacement(text.Substring(tag.Index, end - tag.Index)));
+			copied = searchAt = end;
+		}
+		if (result == null)
+		{
+			return text;
+		}
+		result.Append(text, copied, text.Length - copied);
+		return result.ToString();
+	}
+
 	private static bool ShouldPreserveRichTextForDisplay(string originalText, string translatedText)
 	{
 		if (!ContainsRichTextTags(translatedText))
+		{
+			return true;
+		}
+		// 游戏自身的格式不能因正文变长或换行而被清掉。只放行原样保留的标签
+		// 序列（包括属性与链接标识），其余译文继续使用既有兼容判断。
+		if (HaveSameRichTextTags(originalText, translatedText))
 		{
 			return true;
 		}
@@ -7616,6 +7716,42 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return false;
 		}
 		return LooksLikeUiText(visibleText);
+	}
+
+	private static bool HaveSameRichTextTags(string originalText, string translatedText)
+	{
+		if (string.IsNullOrEmpty(originalText) || string.IsNullOrEmpty(translatedText))
+		{
+			return false;
+		}
+		int sourceAt = 0;
+		int translatedAt = 0;
+		bool found = false;
+		while (true)
+		{
+			Match sourceTag = RichTextTagRegex.Match(originalText, sourceAt);
+			Match translatedTag = RichTextTagRegex.Match(translatedText, translatedAt);
+			if (!sourceTag.Success || !translatedTag.Success)
+			{
+				return found && !sourceTag.Success && !translatedTag.Success;
+			}
+			// 正则只确定已知标签入口；参数中的引号可包含 >，完整边界沿用
+			// Unity 显示层解析器，避免把不同链接或资源误判为相同格式。
+			if (!DstUnity.TmpRichText.TryGetTagEnd(originalText, sourceTag.Index, out int sourceEnd)
+				|| !DstUnity.TmpRichText.TryGetTagEnd(translatedText, translatedTag.Index, out int translatedEnd))
+			{
+				return false;
+			}
+			int length = sourceEnd - sourceTag.Index + 1;
+			if (length != translatedEnd - translatedTag.Index + 1
+				|| string.CompareOrdinal(originalText, sourceTag.Index, translatedText, translatedTag.Index, length) != 0)
+			{
+				return false;
+			}
+			found = true;
+			sourceAt = sourceEnd + 1;
+			translatedAt = translatedEnd + 1;
+		}
 	}
 
 	private static bool ShouldPreserveRichTextForDisplayWithColor(string originalText, string translatedText)
@@ -7668,22 +7804,18 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		return result;
 	}
 
-	private static string PrepareTranslatedTextForComponent(object component, string text, string originalText = null)
+	private static string PrepareTranslatedTextForComponent(object component, string text, string originalText = null, bool rememberCompletedOutput = true)
 	{
 		text = RestoreLeadingTextDecoration(text, originalText);
 		text = RestoreOuterRichTextWrapper(text, originalText);
 		/* UGUI Text 只支持少量标签，必须过滤不支持的标签；TMP 支持完整标签集，
 		   若复...UGUI 过滤会误...<mark> 等真实格式...*/
-		string text2 = ((component is Text) ? SanitizeRichTextForUnityText(text) : SanitizeTranslationArtifacts(text));
-		if (!ContainsRichTextTags(text2))
+		string text2 = ((component is Text) ? SanitizeRichTextForUnityText(text, originalText) : SanitizeTranslationArtifacts(text, originalText));
+		if (ContainsRichTextTags(text2) && !TryEnableRichText(component))
 		{
-			return text2;
+			text2 = ReplaceRichTextTags(text2, tag => string.Empty);
 		}
-		if (!TryEnableRichText(component))
-		{
-			return RichTextTagRegex.Replace(text2, string.Empty);
-		}
-		return text2;
+		return rememberCompletedOutput ? RememberCompletedOutput(originalText, text2) : text2;
 	}
 
 	private static string PrepareTranslatedTextForUGUIText(Text component, string translated, string originalText = null, bool preserveRichText = true)
@@ -7700,12 +7832,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		else
 		{
-			prepared = StripRichTextForPlainText(translated);
+			prepared = StripRichTextForPlainText(translated, sourceText);
 		}
 		prepared = RestoreOuterLineBreaks(prepared, sourceText);
 		PrepareUGUITranslatedShortLabelLayout(component, prepared, sourceText);
 		prepared = ApplyUGUITextLayoutCompatibility(component, prepared);
-		return PreserveUguiTypewriterSourceLength(component, prepared, sourceText);
+		return RememberCompletedOutput(originalText, PreserveUguiTypewriterSourceLength(component, prepared, sourceText));
 	}
 
 	private static string PreserveUguiTypewriterSourceLength(Text component, string prepared, string sourceText)
@@ -8046,7 +8178,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			return translated;
 		}
 		translated = RestoreLeadingTextDecoration(translated, originalText);
-		return SanitizeRichTextForUnityText(RestoreOuterRichTextWrapper(translated, originalText));
+		return RememberCompletedOutput(originalText, SanitizeRichTextForUnityText(RestoreOuterRichTextWrapper(translated, originalText), originalText));
 	}
 
 	private string NormalizeTmpPunctuationForMissingGlyphs(string text)
@@ -8157,15 +8289,14 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private static string StripRichTextForPlainText(string text)
+	private static string StripRichTextForPlainText(string text, string originalText = null)
 	{
 		if (string.IsNullOrWhiteSpace(text))
 		{
 			return text;
 		}
-		string input = SanitizeTranslationArtifacts(text);
-		input = Regex.Replace(input, "</?br\\s*/?>", "\n", RegexOptions.IgnoreCase);
-		input = RichTextTagRegex.Replace(input, string.Empty);
+		string input = SanitizeTranslationArtifacts(text, originalText);
+		input = ReplaceRichTextTags(input, tag => Regex.IsMatch(tag, "^</?br\\s*/?>$", RegexOptions.IgnoreCase) ? "\n" : string.Empty);
 		input = StripResidualRichTextFragments(input);
 		return NormalizeDisplayWhitespace(input);
 	}
@@ -8220,7 +8351,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return true;
 		}
-		if (ContainsCjk(visibleText))
+		if (IsLocalizedText(text))
 		{
 			return true;
 		}
@@ -8466,6 +8597,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 	private void ResetSceneScopedState(bool clearPendingComponentWork)
 	{
 		InvalidateCacheApplySnapshot();
+		_deepPrefetchScanWindow.Reset();
 		/* 场景对象状态不能跨场景复用。翻...cache/glossary 是进程级资产...		   因此这里仅回收“场景代”的组件 ID、预取队列和渲染器状态，不清共享译文...		   大场景退出时顺便收缩深扫描集合，避免 Clear 后仍永久保留峰值桶数组...*/
 		lock (_pendingLock)
 		{
@@ -8707,7 +8839,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 
 	private void QueueDebouncedTextRequest(object component, int instanceId, string text, bool isTmp, bool preserveRichText = true)
 	{
-		if (component == null || string.IsNullOrWhiteSpace(text) || ContainsCjk(text) || ShouldSkipText(text) || (isTmp && !CanHandleTmp()) || IsTranslationRetryCoolingDown(text))
+		if (component == null || string.IsNullOrWhiteSpace(text) || IsLocalizedText(text) || ShouldSkipText(text) || (isTmp && !CanHandleTmp()) || IsTranslationRetryCoolingDown(text))
 		{
 			return;
 		}
@@ -9074,6 +9206,26 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	private void PreparePendingCjkDisplay(object component, string text, bool isTmp)
+	{
+		// 英文尚在排队或服务未命中时，已有汉字仍需要字体覆盖。这里只准备显示，
+		// 不改原文、不记录完成译文，也不把组件标成已处理，后续补译照常进行。
+		if (!ContainsCjk(text))
+		{
+			return;
+		}
+		if (isTmp)
+		{
+			ApplyTMPFont(component);
+			bool coversText = EnsureTMPFontCoversText(component, text);
+			ApplyTmpOverlay(component, text, text, !coversText, rememberCompletedOutput: false);
+		}
+		else
+		{
+			ApplyFont(component);
+		}
+	}
+
 	private static IList GetTmpFallbackList(object fontAsset)
 	{
 		if (fontAsset == null)
@@ -9116,6 +9268,10 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return false;
 		}
+		DstUnity.TmpFontPopulationAction population = DstUnity.TmpFontPopulation.Plan(fontAsset, visibleText,
+			(error, operation) => ReportCaughtException(error, "renderer=UnityMono method=TryAddCharacters", operation));
+		if (population == DstUnity.TmpFontPopulationAction.Covered) return true;
+		if (population == DstUnity.TmpFontPopulationAction.Unavailable) return false;
 		try
 		{
 			MethodInfo method = fontAsset.GetType().GetMethod("TryAddCharacters", new Type[3]
@@ -9538,6 +9694,37 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
+	/* 启用 TMP 多图集：单张 4096 图集装满后 TMP 会拒绝新增字形（表现为
+	   长文本游戏后半程豆腐块/缺字），多图集模式让 TMP 自动追加纹理。
+	   仅对动态图集字体有意义；旧版 TMP 无此属性时为无害空操作，
+	   反射异常经 ReportCaughtException 记录后跳过（不阻断字体应用）。 */
+	private static void TryEnableTmpMultiAtlas(object fontAsset)
+	{
+		if (fontAsset == null)
+		{
+			return;
+		}
+		try
+		{
+			Type type = fontAsset.GetType();
+			PropertyInfo property = AccessTools.Property(type, "isMultiAtlasTexturesEnabled");
+			if (property != null && property.CanWrite)
+			{
+				property.SetValue(fontAsset, true, null);
+				return;
+			}
+			FieldInfo field = AccessTools.Field(type, "m_IsMultiAtlasTexturesEnabled");
+			if (field != null && !field.IsInitOnly)
+			{
+				field.SetValue(fontAsset, true);
+			}
+		}
+		catch (Exception reportedException)
+		{
+			ReportCaughtException(reportedException, "renderer=TMP;operation=enable-multi-atlas");
+		}
+	}
+
 	private static bool TryWarmHostFontAssetIfDynamic(object hostFontAsset, string text)
 	{
 		if (!IsHostFontDynamic(hostFontAsset) || string.IsNullOrEmpty(text))
@@ -9549,6 +9736,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			return true;
 		}
+		/* 宿主动态字体同样可能装满单张图集；预热前启用多图集。 */
+		TryEnableTmpMultiAtlas(hostFontAsset);
 		TryAddCharactersToTmpFontAsset(hostFontAsset, visibleText);
 		return AreAllGlyphsInAtlas(hostFontAsset, text);
 	}
@@ -11523,7 +11712,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private bool ApplyTmpOverlay(object tmpComponent, string translatedText, string sourceText = null, bool force = false)
+	private bool ApplyTmpOverlay(object tmpComponent, string translatedText, string sourceText = null, bool force = false, bool rememberCompletedOutput = true)
 	{
 		/* 覆盖层是最终显示降级：仅当 TMP 字体不能完整覆盖文本时使用...		   ...TMP 组件仍保留，恢复时按保存的颜...透明度还原，避免破坏游戏逻辑...*/
 		if ((!force && !IsTmpOverlayMode() && HasUsableTmpFont()) || (Object)(object)_chineseFont == (Object)null || string.IsNullOrWhiteSpace(translatedText))
@@ -11629,7 +11818,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			{
 				RefreshTmpOverlayLiveStyle(overlayText, tmpComponent, tmpOverlayState);
 				string sourceForFormatting = sourceText ?? translatedText;
-				string text = (ShouldPreserveRichTextForDisplayWithColor(sourceForFormatting, translatedText) ? PrepareTranslatedTextForComponent(overlayText, translatedText, sourceForFormatting) : StripRichTextForPlainText(translatedText));
+				string text = (ShouldPreserveRichTextForDisplayWithColor(sourceForFormatting, translatedText) ? PrepareTranslatedTextForComponent(overlayText, translatedText, sourceForFormatting, rememberCompletedOutput) : StripRichTextForPlainText(translatedText, sourceForFormatting));
 				if (string.IsNullOrWhiteSpace(GetVisibleText(text)) || (Object)(object)((Component)overlayText).GetComponentInParent<Canvas>() == (Object)null)
 				{
 					RestoreTmpOverlay(tmpComponent);
@@ -12950,6 +13139,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 						if (obj != null)
 						{
 							base.Logger.LogInfo("[FONT-CREATE] Rich CreateFontAsset returned non-null for " + ((Object)sourceFont).name);
+							TryEnableTmpMultiAtlas(obj);
 							TryWarmTmpFontAsset(obj, "知道继续任务");
 							if (LooksLikeCjkFontAsset(obj) || TryAddCharactersToTmpFontAsset(obj, "知道任务返回"))
 							{
@@ -12986,6 +13176,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				object obj2 = method2.Invoke(null, new object[1] { sourceFont });
 				if (obj2 != null)
 				{
+					TryEnableTmpMultiAtlas(obj2);
 					TryWarmTmpFontAsset(obj2, "知道继续任务");
 					if (LooksLikeCjkFontAsset(obj2) || TryAddCharactersToTmpFontAsset(obj2, "知道任务返回"))
 					{
@@ -13065,6 +13256,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			FieldInfo fieldInfo4 = AccessTools.Field(tmpFontAssetType, "m_AtlasHeight");
 			fieldInfo3?.SetValue(obj, 4096);
 			fieldInfo4?.SetValue(obj, 4096);
+			TryEnableTmpMultiAtlas(obj);
 			FieldInfo fieldInfo5 = AccessTools.Field(tmpFontAssetType, "m_SamplingPointSize");
 			if (fieldInfo5 != null)
 			{
@@ -13875,7 +14067,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				if (array2.Length >= 2)
 				{
 					string text2 = array2[0].Trim();
-					string text3 = SanitizeTranslationArtifacts(array2[1].Trim());
+					string text3 = SanitizeTranslationArtifacts(array2[1].Trim(), text2);
 					if (IsAcceptableTranslation(text2, text3))
 					{
 						_glossary[text2] = text3;
@@ -13924,11 +14116,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			if (!_firstFrameLocalCachePrimed)
 			{
-				await RunBackground(delegate
-				{
-					LoadServerCache();
-					return true;
-				});
+				_bootCacheLoadComplete = await RunBackground(LoadServerCache);
+			}
+			else
+			{
+				_bootCacheLoadComplete = !_shuttingDown;
 			}
 		}
 		catch (Exception ex)
@@ -13944,8 +14136,8 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 		finally
 		{
-			/* 后台加载器导入或安全隔离旧缓存前，持久化绝不能替换未经检查的旧缓存。 */
-			_bootCacheLoadComplete = true;
+			/* 完成尝试不等于导入成功；只有成功读取或隔离才能放行覆盖原文件。 */
+			_bootCacheLoadFinished = true;
 		}
 		if (_shuttingDown)
 		{
@@ -13968,72 +14160,59 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		}
 	}
 
-	private void LoadServerCache()
+	private bool LoadServerCache()
 	{
 		/* 后台导入运行时钩子已经活动。必须合并磁盘快照，防止更快的实时响应被启动 IO 擦除。 */
 		if (_shuttingDown)
 		{
-			return;
-		}
-		string text = Path.Combine(ResolveGameRoot(), "TranslationCache");
-		if (!Directory.Exists(text))
-		{
-			return;
+			return false;
 		}
 		try
 		{
-			string path = Path.Combine(text, "unity_translation_cache.json");
+			string path = GetLocalCacheFilePath();
 			List<KeyValuePair<string, string>> diskEntries = null;
 			/* 缓存加载/隔离和持久化会替换同一文件。这里串行化全部文件系统所有权，防止
 			   缓慢的超大缓存隔离与钩子启动后接受的实时翻译快照发生竞争。 */
 			lock (_cacheFileWriteLock)
 			{
-				if (File.Exists(path))
+				// 直接读取元数据，让访问拒绝与文件不存在保持可区分。
+				if (new FileInfo(path).Length > OversizedLocalCacheFileBytes)
 				{
-					if (new FileInfo(path).Length > OversizedLocalCacheFileBytes)
-					{
-						TryIsolateOversizedLocalCacheLocked(path, -1);
-					}
-					else
-					{
-						JObject val = JObject.Parse(File.ReadAllText(path));
-						/* 旧版全服务转储会让每次持久化校验数万条无关记录。应把原始字节保存在
-						   唯一版本的隔离文件中，而不是截断或覆盖。 */
-						if (val.Count > OversizedLocalCacheEntryLimit)
-						{
-							TryIsolateOversizedLocalCacheLocked(path, val.Count);
-						}
-						else
-						{
-							diskEntries = (from prop in val.Properties()
-								select new KeyValuePair<string, string>(prop.Name, ((object)prop.Value)?.ToString())).ToList();
-						}
-					}
+					return TryIsolateOversizedLocalCacheLocked(path, -1) && !_shuttingDown;
 				}
+				JObject val = JObject.Parse(File.ReadAllText(path));
+				if (val.Count > OversizedLocalCacheEntryLimit)
+				{
+					return TryIsolateOversizedLocalCacheLocked(path, val.Count) && !_shuttingDown;
+				}
+				diskEntries = (from prop in val.Properties()
+					select new KeyValuePair<string, string>(prop.Name, ((object)prop.Value)?.ToString())).ToList();
 			}
 			if (diskEntries != null)
 			{
 				ImportServerCacheEntries(diskEntries, logPromotions: false, "local cache file", persistAfterImport: false, markImportedAsLocal: true, preserveExisting: true);
 			}
 		}
+		catch (FileNotFoundException) { return !_shuttingDown; }
+		catch (DirectoryNotFoundException) { return !_shuttingDown; }
 		catch (Exception ex)
 		{
-			base.Logger.LogWarning("Cache load failed: " + ex.Message);
+			/* 文件锁、权限或损坏 JSON 只能在文件边界处理。保留原文件及内存脏状态，
+			   不宣称已保存；持久化去抖后可重新读取。此诊断按已有异常记录器限频。 */
+			ReportCaughtException(ex, "boundary=local-cache-load; persistence blocked until successful inspection");
+			return false;
 		}
 		base.Logger.LogInfo($"Cache preloaded: {GetCacheCount()} entries");
+		return !_shuttingDown;
 	}
 
-	private void TryIsolateOversizedLocalCacheLocked(string path, int entryCount)
+	private bool TryIsolateOversizedLocalCacheLocked(string path, int entryCount)
 	{
 		/* 外部不兼容：旧插件版本可能把完整服务转储保存为单游戏缓存，使启动和每次重写
 		   都无界增长。渲染器无法在不付出该成本的情况下逐行识别所有权。隔离会把用户
 		   原始文件移到唯一同级文件，绝不把它当作缓存命中，不覆盖旧备份，并记录保留路径。 */
 		try
 		{
-			if (!File.Exists(path))
-			{
-				return;
-			}
 			string timestamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff", System.Globalization.CultureInfo.InvariantCulture);
 			string text = path + ".bak-oversized-" + timestamp;
 			int collision = 1;
@@ -14045,10 +14224,12 @@ public class DeepSeekTranslator : BaseUnityPlugin
 			File.Move(path, text);
 			string text2 = (entryCount >= 0) ? $"{entryCount} entries" : "more than " + OversizedLocalCacheFileBytes + " bytes";
 			base.Logger.LogWarning($"Local cache file holds {text2} (legacy server-dump pollution); skipped import and isolated the exact artifact without overwriting prior backups. Backup: {Path.GetFileName(text)}");
+			return true;
 		}
 		catch (Exception ex)
 		{
 			ReportCaughtException(ex, "boundary=oversized-local-cache-isolation file=" + Path.GetFileName(path));
+			return false;
 		}
 	}
 
@@ -14070,7 +14251,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				break;
 			}
 			string key = entry.Key;
-			string text = SanitizeTranslationArtifacts(entry.Value);
+			string text = SanitizeTranslationArtifacts(entry.Value, key);
 			if (!string.Equals(text, entry.Value, StringComparison.Ordinal))
 			{
 				num3++;
@@ -14177,9 +14358,11 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				}
 				if (!_bootCacheLoadComplete)
 				{
-					/* 预先存在的用户文件归加载器所有。保留脏状态，并在下一次有界去抖后重试，
-					   而不是覆盖该文件。 */
-					continue;
+					/* 等启动加载器释放所有权后，在已有去抖周期重试外部文件读取。
+					   导入保留较新的实时译文；失败仍由加载边界限频诊断，绝不覆盖旧文件。 */
+					if (!_bootCacheLoadFinished) continue;
+					_bootCacheLoadComplete = await RunBackground(LoadServerCache);
+					if (!_bootCacheLoadComplete) continue;
 				}
 				lock (_cachePersistLock)
 				{
@@ -14271,7 +14454,7 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		Dictionary<string, string> dictionary = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 		foreach (KeyValuePair<string, string> pair in pairs)
 		{
-			string value = SanitizeTranslationArtifacts(pair.Value);
+			string value = SanitizeTranslationArtifacts(pair.Value, pair.Key);
 			if (!LooksLikeTypewriterFragment(pair.Key) && IsAcceptableTranslation(pair.Key, value))
 			{
 				dictionary[pair.Key] = value;
@@ -14465,8 +14648,15 @@ public class DeepSeekTranslator : BaseUnityPlugin
 				return;
 			}
 			RescueStrandedAlpha(comp);
-			translated = ((preserveRichText && ShouldPreserveRichTextForDisplayWithColor(rawText, translated)) ? PrepareTranslatedTextForComponent(comp, translated, rawText) : StripRichTextForPlainText(translated));
-			translated = NormalizeTmpPunctuationForMissingGlyphs(translated);
+			translated = ((preserveRichText && ShouldPreserveRichTextForDisplayWithColor(rawText, translated)) ? PrepareTranslatedTextForComponent(comp, translated, rawText) : StripRichTextForPlainText(translated, rawText));
+			translated = RememberCompletedOutput(rawText, NormalizeTmpPunctuationForMissingGlyphs(translated));
+			/* 与同步路径同一守卫、同一位置：变换链之后检查最终文本，
+			   行数与规范化后的源不一致时保留原文，不应用、不回写缓存。 */
+			if (!TmpLineStructurePreserved(rawText, translated))
+			{
+				ReportTmpLineStructureRejection(rawText, translated, sync: false);
+				return;
+			}
 			if (!canTranslateTmp)
 			{
 				if (!ApplyTmpOverlay(comp, translated, rawText))
@@ -14550,6 +14740,48 @@ public class DeepSeekTranslator : BaseUnityPlugin
 		{
 			base.Logger.LogWarning("TMPro apply failed (" + comp.GetType().FullName + ", '" + GetVisibleText(rawText) + "'): " + (ex2.InnerException?.Message ?? ex2.Message));
 		}
+	}
+
+	private static readonly HashSet<string> CompletedMixedOutputs = new HashSet<string>(StringComparer.Ordinal);
+	private static readonly Queue<string> CompletedMixedOutputOrder = new Queue<string>();
+
+	private static string GetCompletedOutputKey(string text)
+	{
+		// 只消除真实样式标签，不能为单词中间的颜色标签凭空插入空格。
+		// 换行标签仍形成正文分隔；真实空白沿用请求规范，不能拼接相邻单词。
+		string visible = ReplaceRichTextTags(text, tag => Regex.IsMatch(tag, "^</?br\\s*/?>$", RegexOptions.IgnoreCase) ? "\n" : string.Empty);
+		return NormalizeRequestText((visible ?? string.Empty).Replace("\u200b", string.Empty).Replace("\ufeff", string.Empty));
+	}
+
+	private static string RememberCompletedOutput(string original, string output)
+	{
+		if (original != null && output != original && ContainsCjk(output))
+		{
+			// 颜色、字号和空白由游戏逐帧改写；完成状态归可见正文所有。
+			// 仅修整原文格式没有翻译进展，不能因此把未完成混合句记成终态。
+			string completedKey = GetCompletedOutputKey(output);
+			if (completedKey.Length == 0 || string.Equals(completedKey, GetCompletedOutputKey(original), StringComparison.Ordinal))
+			{
+				return output;
+			}
+			lock (CompletedMixedOutputs)
+			{
+				if (CompletedMixedOutputs.Add(completedKey)) CompletedMixedOutputOrder.Enqueue(completedKey);
+				while (CompletedMixedOutputs.Count > 4096) CompletedMixedOutputs.Remove(CompletedMixedOutputOrder.Dequeue());
+			}
+		}
+		return output;
+	}
+
+	private static bool IsLocalizedText(string text)
+	{
+		if (!ContainsCjk(text)) return false;
+		string completedKey = GetCompletedOutputKey(text);
+		lock (CompletedMixedOutputs)
+		{
+			if (CompletedMixedOutputs.Contains(completedKey)) return true;
+		}
+		return !DstCore.MixedText.HasUntranslatedLatin(text);
 	}
 
 	private static bool ContainsCjk(string s)

@@ -4,6 +4,7 @@
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'release_content_scan.ps1')
 function Get-Sha256Hex([string]$path) {
     $sha = [Security.Cryptography.SHA256]::Create()
     $stream = [IO.File]::OpenRead($path)
@@ -69,9 +70,9 @@ try {
 
     $contentPatterns = @(
         "sk-[A-Za-z0-9]{16,}",
-        "(?i)(?<![A-Za-z0-9_])api[_-]?key\s*=\s*[^<\s][^\r\n]+",
-        "(?i)(?<![A-Za-z0-9_])password\s*=\s*[^<\s][^\r\n]+",
-        "(?i)(?<![A-Za-z0-9_])secret\s*=\s*[^<\s][^\r\n]+",
+        "(?i)(?<![A-Za-z0-9_])api[_-]?key\s*=\s*[^<\s][^\r\n]*",
+        "(?i)(?<![A-Za-z0-9_])password\s*=\s*[^<\s][^\r\n]*",
+        "(?i)(?<![A-Za-z0-9_])secret\s*=\s*[^<\s][^\r\n]*",
         "(?i)Authorization:\s*Bearer\s+[A-Za-z0-9._-]+",
         "C:\\Users\\[A-Za-z0-9._-]+",
         "E:\\Projects\\[^\\\r\n]+",
@@ -118,6 +119,7 @@ try {
             [void]$errors.Add("Unreadable or non-text file: $($file.FullName)")
             continue
         }
+        $text = Get-ReleaseContentScanText -RelativePath $rel -Text $text
         foreach ($pattern in $contentPatterns) {
             if ($text -match $pattern) {
                 [void]$errors.Add("Forbidden content pattern '$pattern' in $($file.FullName)")

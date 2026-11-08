@@ -20,21 +20,25 @@ C_PREFIX = r'''
 #include <stdlib.h>
 #include <stdarg.h>
 static int scenario, term_calls;
+static DWORD requested_stop_code;
 static DWORD fake_wait(HANDLE process, DWORD ms) {
     (void)process;
-    if (scenario == 2 || scenario == 7 || (scenario == 3 && term_calls)) return WAIT_OBJECT_0;
+    if (scenario == 2 || scenario == 7 || scenario == 11 || (scenario == 3 && term_calls)) return WAIT_OBJECT_0;
     if (scenario == 5) { SetLastError(6); return WAIT_FAILED; }
+    if (scenario == 4) return WAIT_TIMEOUT;
+    if (scenario == 12) return term_calls && ms == 1000 ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
     return ms == 1000 && scenario != 6 ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
 }
 static BOOL fake_terminate(HANDLE process, UINT code) {
-    (void)process; (void)code; term_calls++;
-    if (scenario == 2 || scenario == 3 || scenario == 4 || scenario == 7) { SetLastError(5); return FALSE; }
+    (void)process; requested_stop_code = code; term_calls++;
+    if (scenario == 2 || scenario == 3 || scenario == 4 || scenario == 7 || scenario == 12) { SetLastError(5); return FALSE; }
     return TRUE;
 }
 static BOOL fake_exit(HANDLE process, LPDWORD code) {
     (void)process;
-    if (scenario == 7) { SetLastError(31); return FALSE; }
-    *code = 1; return TRUE;
+    if (scenario == 7 || scenario == 10) { SetLastError(31); return FALSE; }
+    *code = scenario <= 1 ? requested_stop_code : scenario == 9 ? 0 : scenario == 11 ? 0x44535450u : 1;
+    return TRUE;
 }
 static void append_log(const WCHAR *format, ...) {
     va_list args; va_start(args, format); vwprintf(format, args); va_end(args); wprintf(L"\n");
@@ -55,20 +59,24 @@ using System;
 class Probe {
     const uint WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 258, WAIT_FAILED = 0xffffffff;
     static int scenario, termCalls, error;
+    static uint requestedStopCode;
     struct ProcessInfo { public IntPtr hProcess; }
     static uint WaitForSingleObject(IntPtr process, uint ms) {
-        if (scenario == 2 || scenario == 7 || (scenario == 3 && termCalls > 0)) return WAIT_OBJECT_0;
+        if (scenario == 2 || scenario == 7 || scenario == 11 || (scenario == 3 && termCalls > 0)) return WAIT_OBJECT_0;
         if (scenario == 5) { error = 6; return WAIT_FAILED; }
+        if (scenario == 4) return WAIT_TIMEOUT;
+        if (scenario == 12) return termCalls > 0 && ms == 1000 ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
         return ms == 1000 && scenario != 6 ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
     }
     static bool TerminateProcess(IntPtr process, uint code) {
         termCalls++;
-        if (scenario == 2 || scenario == 3 || scenario == 4 || scenario == 7) { error = 5; return false; }
+        requestedStopCode = code;
+        if (scenario == 2 || scenario == 3 || scenario == 4 || scenario == 7 || scenario == 12) { error = 5; return false; }
         return true;
     }
     static bool GetExitCodeProcess(IntPtr process, out uint code) {
-        code = 1;
-        if (scenario == 7) { error = 31; return false; }
+        code = scenario <= 1 ? requestedStopCode : scenario == 9 ? 0u : scenario == 11 ? 0x44535450u : 1u;
+        if (scenario == 7 || scenario == 10) { error = 31; return false; }
         return true;
     }
     static class Log { public static void Append(string text) { Console.WriteLine(text); } }
@@ -116,12 +124,17 @@ def main():
             ('invalid process handle', 5, 'wait failed (Windows error 6).', 'result=0 terminated=0'),
             ('termination wait expires', 6, 'termination failed', 'result=0 terminated=1'),
             ('exit code read fails', 7, 'exit code read failed (Windows error 31).', 'result=0 terminated=0'),
+            ('natural exit despite accepted termination', 8, 'exited with code 1.', 'result=0 terminated=1'),
+            ('natural zero despite accepted termination', 9, 'exited with code 0.', 'result=0 terminated=1'),
+            ('exit read fails after accepted termination', 10, 'exit code read failed (Windows error 31).', 'result=0 terminated=1'),
+            ('stop code without launcher termination', 11, 'exited with code 1146311760.', 'result=0 terminated=0'),
+            ('exit cleanup completes after termination denial', 12, 'exited with code 1.', 'result=0 terminated=1'),
         )
         for name, mode, message, status in cases:
             outputs = [execute([root / binary, mode]) for binary in ('c.exe', 'cs.exe')]
             assert outputs[0] == outputs[1], name + ': C/C# differ:\n' + '\n'.join(outputs)
             assert message in outputs[0] and status in outputs[0], name + ':\n' + outputs[0]
-            if mode in (2, 3, 7):
+            if mode in (2, 3, 7, 12):
                 assert 'termination failed' not in outputs[0] and 'timed out' not in outputs[0], outputs[0]
             print('[PASS] Godot preflight C/C#: ' + name)
     finally:

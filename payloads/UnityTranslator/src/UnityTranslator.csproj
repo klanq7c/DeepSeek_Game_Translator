@@ -19,6 +19,8 @@
   <ItemGroup />
   <ItemGroup>
     <Compile Remove="FontPatcher\**\*.cs" />
+    <Compile Include="..\..\..\native\src\core\MixedText.cs" Link="core\MixedText.cs" />
+    <Compile Include="..\..\..\native\src\core\TextRules.cs" Link="core\TextRules.cs" />
   </ItemGroup>
   <ItemGroup Condition="'$(BepInExFlavor)' != '6'">
     <Reference Include="BepInEx">

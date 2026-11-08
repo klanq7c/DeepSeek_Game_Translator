@@ -569,6 +569,14 @@ $scenarios['rpgm_legacy_noop'] = @{
     Build = { param($d) Touch "$d\Data\Scripts.rxdata"; Touch "$d\Game.exe" }
     Steps = @('deploy', 'restore')
 }
+$scenarios['rpgm_blocked_ocr_helper'] = @{
+    Build = { param($d) New-RpgmTree $d $indexPlain $true; Mkdir "$d\www\js\dst_rpgm_ocr.ps1" }
+    Steps = @('deploy')
+}
+$scenarios['rpgm_blocked_image_text_helper'] = @{
+    Build = { param($d) New-RpgmTree $d $indexPlain $true; Mkdir "$d\www\js\rpgm_image_text.js" }
+    Steps = @('deploy')
+}
 $scenarios['godot_deploy_restore_owned_patch'] = @{
     Build = { param($d) Touch "$d\game.pck"; Touch "$d\game.exe"; Touch "$d\dst_godot_patch.exe"; Touch "$d\dst_godot_patch.exe.dst-owned"; Touch "$d\dst_godot_runtime.gd"; Touch "$d\dst_godot_patch.pck"; Touch "$d\dst_godot_patch.pck.dst-source"; Touch "$d\dst_godot_patch.next.pck"; Touch "$d\dst_godot_patch.next.pck.dst-source" }
     Steps = @('deploy', 'restore')
@@ -909,6 +917,18 @@ if (Test-Path -LiteralPath $hookCheckJs) {
 
 # 文件归属快照必须在翻译器升级后保留，用户修改过的文件也必须保持原样。
 foreach ($side in @('c', 'cs')) {
+    foreach ($helper in @('dst_rpgm_ocr.ps1', 'rpgm_image_text.js')) {
+        $installed = Join-Path $root "dr\$side\rpgm_deploy_twice_idempotent\www\js\$helper"
+        $expected = [IO.File]::ReadAllBytes((Join-Path $repo "payloads\RPGMaker\$helper"))
+        $removed = Join-Path $root "dr\$side\rpgm_www_deploy_restore\www\js\$helper"
+        if ((Test-Path -LiteralPath $installed -PathType Leaf) -and
+            [Linq.Enumerable]::SequenceEqual([IO.File]::ReadAllBytes($installed), $expected) -and
+            -not (Test-Path -LiteralPath $removed)) {
+            $pass++; Write-Host "  ok  generic RPGM helper deploy/restore bytes ($side/$helper)"
+        } else { $fail++; $failures.Add("generic RPGM helper deploy/restore mismatch ($side/$helper)") }
+    }
+}
+foreach ($side in @('c', 'cs')) {
     $base = Join-Path $root "dr\$side"
     $userFonts = @(
         @('renpy_font_already_present\game\ds_font.ttf', [byte[]](9,9)),
@@ -1067,6 +1087,19 @@ function New-RpgmWww([string]$d) {
 function New-UnityGame([string]$d) { Mkdir "$d\MyGame_Data\Managed"; Touch "$d\MyGame.exe"; Touch "$d\UnityPlayer.dll" }
 
 $warmupScenarios = New-Object System.Collections.Specialized.OrderedDictionary
+
+$warmupScenarios['warm_half_localized'] = {
+    param($d) New-RenpyGame $d
+    Write-Utf8 "$d\game\script.rpy" "label start:`n    `"请 Open the door.`"`n    `"已经是中文。`"`n    `"生命 HP 100`"`n"
+}
+$warmupScenarios['warm_renpy_mixed_literals'] = {
+    param($d) New-RenpyGame $d
+    $lines = @('请 <Continue>', '请 [[Continue]', '请 {{Continue}',
+               '请 __DS_TOKEN_0__Continue__DS_TOKEN_1__',
+               '中文 [player]', '中文 {b}请{/b}', '中文 %(player)s', '已经是中文。',
+               ('中文 [' + ('中' * 90) + 'Save]'))
+    Write-Utf8 "$d\game\script.rpy" ("label start:`n" + (($lines | ForEach-Object { '    "' + $_ + '"' }) -join "`n"))
+}
 
 # ---- Ren'Py 预热 ----
 $warmupScenarios['warm_renpy_dialogue'] = {
@@ -1653,7 +1686,30 @@ $warmupScenarios['warm_godot_cap'] = {
 }
 $warmupScenarios['warm_godot_nothing_to_do'] = { param($d) Write-Utf8 "$d\project.godot" "config_version=5`n" }
 
+$warmupScenarios['warm_godot_compressed_gdsc'] = {
+    param($d)
+    Write-Utf8 "$d\project.godot" "config_version=5`n"
+    Write-Utf8 "$d\menu.tscn" "text = `"Adjacent visible scene text.`"`n"
+    # 声明为压缩容器的载荷可能损坏或带可打印字节，不能作为明文提交翻译。
+    $header = [byte[]]($asciiEnc.GetBytes('GDSC') + [BitConverter]::GetBytes([uint32]100) + [BitConverter]::GetBytes([uint32]4096))
+    Touch "$d\game.pck" (New-GodotPck 1 @(
+        (GodotEntry 'res://one.gdc' ([byte[]]($header + (NulJoin @('Compressed payload must not become a translation.'))))),
+        (GodotEntry 'res://two.gdc' ([byte[]]($header + (NulJoin @('Second compressed payload must not become a translation.')))))
+    ))
+}
+
 # ---- 不提供预热流程的引擎 ----
+$warmupScenarios['warm_godot_exported_cache'] = {
+    param($d)
+    Touch "$d\Game.exe"
+    # 导出包里的运行时缓存需采集，但不能先于常规文本耗尽配额。
+    Touch "$d\game.pck" (New-GodotPck 4 @(
+        (GodotEntry 'res://.godot/exported/room.scn' (NulJoin @('RSRC', 'PackedScene', 'Compiled task journal text.'))),
+        (GodotEntry 'res://.godot/exported/items.res' (NulJoin @('RSRC', 'Compiled inventory tooltip.'))),
+        (GodotEntry 'res://ui/main.tscn' $utf8.GetBytes('text = "Primary scene text before compiled caches."'))
+    ) 0 0 7)
+    Touch "$d\.godot\exported\obsolete.scn" (NulJoin @('Stale loose editor cache must remain skipped.'))
+}
 $warmupScenarios['warm_rpgm_legacy_noop'] = { param($d) Touch "$d\Data\Scripts.rvdata2"; Touch "$d\Game.exe" }
 $warmupScenarios['warm_unknown_noop'] = { param($d) Touch "$d\readme.txt" }
 
@@ -1666,6 +1722,32 @@ foreach ($name in $warmupScenarios.Keys) {
     $cs = Invoke-Detect $CsLauncher @('--warmup', $d)
     $after = Snapshot-Tree $d
     $label = "warmup/$name"
+    if ($name -eq 'warm_godot_exported_cache' -and
+        (!$c.Out.Contains('Compiled task journal text.') -or !$c.Out.Contains('Compiled inventory tooltip.') -or
+         !$c.Out.Contains('Primary scene text before compiled caches.') -or $c.Out.Contains('Stale loose editor cache must remain skipped.') -or
+         $c.Out.IndexOf('Primary scene text before compiled caches.') -gt $c.Out.IndexOf('Compiled task journal text.'))) {
+        $fail++; $failures.Add("[$label] exported runtime cache missed, loose stale cache queued or source priority lost`n$($c.Out)"); continue
+    }
+    if ($name -eq 'warm_godot_compressed_gdsc' -and
+        (!$c.Out.Contains('Adjacent visible scene text.') -or $c.Out.Contains('payload must not become a translation.') -or
+         [regex]::Matches($c.Out, 'Godot warmup: compressed GDSC skipped').Count -ne 1)) {
+        $fail++; $failures.Add("[$label] compressed bytes queued or format limitation was not diagnosed once`n$($c.Out)"); continue
+    }
+    if ($name -eq 'warm_half_localized' -and (!$c.Out.Contains('Open the door') -or $c.Out.Contains('生命 HP 100') -or $c.Out.Contains('已经是中文'))) {
+        $fail++; $failures.Add("[$label] mixed text was skipped or localized text was queued`n$($c.Out)"); continue
+    }
+    if ($name -eq 'warm_renpy_mixed_literals') {
+        $posts = @([regex]::Matches($c.Out, '(?m)^post=/prefetch (.+)$') | ForEach-Object { $_.Groups[1].Value | ConvertFrom-Json })
+        $texts = @($posts | ForEach-Object { $_.texts })
+        $required = @('请 <Continue>', '请 [[Continue]', '请 {{Continue}', '请 __DS_TOKEN_0__Continue__DS_TOKEN_1__')
+        if ($texts.Count -ne $required.Count -or @($required | Where-Object { $_ -cnotin $texts }).Count -or
+            @($posts | Where-Object { $_.engine -cne 'renpy' }).Count) {
+            $fail++; $failures.Add("[$label] literal text, variable isolation or RenPy format hint incorrect`n$($c.Out)"); continue
+        }
+    }
+    if ($name -notlike 'warm_renpy_*' -and $name -ne 'warm_half_localized' -and $c.Out.Contains('"engine":"renpy"')) {
+        $fail++; $failures.Add("[$label] RenPy format hint leaked into adjacent engine`n$($c.Out)"); continue
+    }
     if ($c.Code -ne $cs.Code) {
         $fail++; $failures.Add("[$label] exit codes C=$($c.Code) C#=$($cs.Code)`n--- C ---`n$($c.Out)$($c.Err)--- C# ---`n$($cs.Out)$($cs.Err)")
         continue
@@ -2304,9 +2386,35 @@ function Check-ConfigPair([string]$label, [object]$r, [string[]]$mustMatch) {
 
 # API 对话框：全部八个控件（含刷新/状态）、选择模型及手动输入。
 $r = Invoke-ConfigPair @('--api-ui-probe-and-exit') @('--api-ui-probe')
-if (Check-ConfigPair 'api-config/ui' $r @('(?m)^control=206,400,184,144,30$', '(?m)^control=207,24,300,520,56$', '(?m)^select=1$', '(?m)^manual=1$', '(?m)^catalog_preserves=1$', '(?m)^catalog_new_id=1$', '(?m)^catalog_unlisted=1$', '(?m)^provider_same_keeps=1$', '(?m)^provider_change_clears=1$', '(?m)^provider_custom_keeps=1$', '(?m)^empty_model_rejected=1$', '(?m)^stale_catalog_ignored=1$', '(?m)^all_providers_clear=1$', '(?m)^catalog_listed=1$', '(?m)^catalog_case_sensitive=1$', '(?m)^catalog_failure_keeps=1$')) {
-    $pass++; Write-Host ('  ok  {0,-52} 8 controls, editable model selection' -f 'api-config/ui')
+if (Check-ConfigPair 'api-config/ui' $r @('(?m)^control=206,442,304,134,36$', '(?m)^control=207,52,446,516,58$', '(?m)^control=212,44,546,134,36$', '(?m)^control=213,196,540,380,58$', '(?m)^connection_current=1$', '(?m)^connection_model_stale=1$', '(?m)^connection_key_stale=1$', '(?m)^connection_endpoint_stale=1$', '(?m)^connection_missing_key=1$', '(?m)^connection_missing_model=1$', '(?m)^select=1$', '(?m)^manual=1$', '(?m)^catalog_preserves=1$', '(?m)^catalog_new_id=1$', '(?m)^catalog_unlisted=1$', '(?m)^provider_same_keeps=1$', '(?m)^provider_change_clears=1$', '(?m)^provider_key_isolated=1$', '(?m)^provider_key_restored=1$', '(?m)^provider_missing_key=1$', '(?m)^provider_custom_keeps=1$', '(?m)^empty_model_rejected=1$', '(?m)^stale_catalog_ignored=1$', '(?m)^all_providers_clear=1$', '(?m)^catalog_listed=1$', '(?m)^catalog_display_name=1$', '(?m)^catalog_selected_name=1$', '(?m)^catalog_selected_id=1$', '(?m)^catalog_refresh_name=1$', '(?m)^catalog_optional_name=1$', '(?m)^catalog_case_sensitive=1$', '(?m)^catalog_failure_keeps=1$')) {
+    $pass++; Write-Host ('  ok  {0,-52} 14 controls, editable model selection and connectivity' -f 'api-config/ui')
 }
+
+# 二级窗口使用真实窗口过程；比较 100/125/150/200% 的布局、卡片与按钮像素。
+# 确认框探针仅发送窗口消息，不调用清缓存或还原函数。
+$previousApiDpi = $env:DST_API_UI_DPI; $previousApiBmp = $env:DST_API_UI_BMP
+try {
+    foreach ($dpi in @(96, 120, 144, 192)) {
+        $env:DST_API_UI_DPI = "$dpi"
+        $bmpC = Join-Path $cfgC "api-$dpi.bmp"; $bmpCs = Join-Path $cfgCs "api-$dpi.bmp"
+        $env:DST_API_UI_BMP = $bmpC
+        $c = Invoke-Detect $cfgExe @('--api-ui-probe-and-exit')
+        $env:DST_API_UI_BMP = $bmpCs
+        $cs = Invoke-Detect $CsLauncher @('--api-ui-probe', '--root', $cfgCs)
+        $r = @{ C=$c; Cs=$cs; OutC=$c.Out; OutCs=$cs.Out }
+        $label = "api-config/theme-$dpi"
+        if (Check-ConfigPair $label $r @('(?m)^bounds=1$', '(?m)^fonts=1$', '(?m)^tabs=1$', '(?m)^password=1$', '(?m)^dpi_preserves=1$', '(?m)^cancel=1$', '(?m)^render=1$', '(?m)^message_render=1$', '(?m)^message_enter=1$', '(?m)^message_escape=1$', '(?m)^message_yes=1$', '(?m)^message_close=1$', '(?m)^message_info=1$')) {
+            $same = (Test-Path -LiteralPath $bmpC) -and (Test-Path -LiteralPath $bmpCs) -and
+                (Test-Path -LiteralPath ($bmpC + '.message.bmp')) -and (Test-Path -LiteralPath ($bmpCs + '.message.bmp'))
+            if ($same) {
+                $same = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($bmpC))) -eq [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($bmpCs))) -and
+                    [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($bmpC + '.message.bmp'))) -eq [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($bmpCs + '.message.bmp')))
+            }
+            if ($same) { $pass++; Write-Host ("  ok  {0,-52} API + confirmation pixels, safe default/cancel" -f $label) }
+            else { $fail++; $failures.Add("[$label] secondary window bitmap mismatch") }
+        }
+    }
+} finally { $env:DST_API_UI_DPI = $previousApiDpi; $env:DST_API_UI_BMP = $previousApiBmp }
 
 # api.ini 尚不存在时的默认值，以及完整的提供商预设表
 $r = Invoke-ConfigPair @('--api-config-and-exit') @('--api-config')
@@ -2438,6 +2546,9 @@ public static class FakeGodot
         if (Array.IndexOf(args, "--dst-autoload-preflight") >= 0 && preflightCode == 73) {
             Console.Out.WriteLine("DST_GODOT_AUTOLOAD_READY_V1");
             Console.Out.Flush();
+            if (Console.ReadLine() != "DST_GODOT_AUTOLOAD_CONTINUE_V2") return 74;
+            Console.Out.WriteLine("DST_GODOT_AUTOLOAD_ACK_V2");
+            Console.Out.Flush();
             Thread.Sleep(15000); // 真实父进程必须识别就绪凭据，并停止其拥有的探测进程。
             return 73;
         }
@@ -2511,6 +2622,12 @@ $launchScenarios['lf_godot_v4_ignored'] = {
     param($d)
     Touch "$d\Game.pck" (New-GodotPck 4 $gpPckEntries 0 0 7)
     New-FakeGodotExe $d 'Game.exe' '' 0
+}
+$launchScenarios['lf_godot_autoload_log_boundary'] = {
+    param($d)
+    Touch "$d\Game.pck" (New-GodotPck 4 $gpPckEntries 0 0 7)
+    # ready 在原 16 KiB 窗口内，但新增 ACK 跨越边界，不能误降级为侧车。
+    New-FakeGodotExe $d 'Game.exe' (('L' * 16349) + '\n') 0 0 73
 }
 $launchScenarios['lf_godot_autoload_error_marker'] = {
     param($d)
@@ -2608,6 +2725,9 @@ $lfExpect = [ordered]@{
         'preparing initial runtime pack without translation requests',
         '(?m)^log=Godot: runtime autoload preflight exited with code 0\.$',
         '(?m)^status=Godot: 游戏已启动，但实时翻译模块未确认加载；请查看日志。$')
+    'lf_godot_autoload_log_boundary' = @(
+        '(?m)^log=Godot: runtime autoload load proof confirmed; independent probe stopped\.$',
+        '(?m)^spawn=proc\|<DIR>\\dst_godot_patch\.exe\|"<DIR>\\dst_godot_patch\.exe" --language en\|<DIR>$')
     'lf_godot_autoload_error_marker' = @(
         '(?m)^log=Godot: runtime autoload preflight exited with code 0\.$',
         '(?m)^status=Godot: 游戏已启动，但实时翻译模块未确认加载；请查看日志。$')
@@ -2692,10 +2812,11 @@ if ($staleC.Code -ne $staleCs.Code -or $staleOutC -ne $staleOutCs -or
 }
 
 # 即使游戏未改动，也必须重建使用旧翻译器组件指纹生成的包；
-# 仅降低归属元数据中的版本来模拟此次升级。
+# 仅降低归属元数据中的版本来模拟此次升级，保留 V3 并覆盖无 stdin 握手的 V4。
+foreach ($oldStampVersion in @('V3', 'V4')) {
 foreach ($side in @('c', 'cs')) {
     $marker = "$($staleDirs[$side])\dst_godot_patch.pck.dst-source"
-    [IO.File]::WriteAllText($marker, ([IO.File]::ReadAllText($marker) -replace 'SOURCE_V4', 'SOURCE_V3'), $asciiEnc)
+    [IO.File]::WriteAllText($marker, ([IO.File]::ReadAllText($marker) -replace 'SOURCE_V5', "SOURCE_$oldStampVersion"), $asciiEnc)
 }
 $upgradeC = Invoke-Detect $lfExe @('--launch-flow-and-exit', $staleDirs['c'])
 $upgradeCs = Invoke-Detect $CsLauncher @('--launch-flow', $staleDirs['cs'], '--root', $lfCs)
@@ -2705,10 +2826,11 @@ if ($upgradeC.Code -ne $upgradeCs.Code -or $upgradeOutC -ne $upgradeOutCs -or
     (Snapshot-Tree $staleDirs['c']) -ne (Snapshot-Tree $staleDirs['cs']) -or
     $upgradeOutC -notmatch 'game pack or translator payload changed, or the source fingerprint is invalid' -or
     $upgradeOutC -notmatch 'preparing initial runtime pack without translation requests' -or
-    -not ([IO.File]::ReadAllText("$($staleDirs['c'])\dst_godot_patch.pck.dst-source")).StartsWith('DST_GODOT_SOURCE_V4:')) {
-    $fail++; $failures.Add("[launch-flow/godot-payload-upgrade] old translator stamp was reused or C/C# diverged`n--- C ---`n$upgradeOutC`n--- C# ---`n$upgradeOutCs")
+    -not ([IO.File]::ReadAllText("$($staleDirs['c'])\dst_godot_patch.pck.dst-source")).StartsWith('DST_GODOT_SOURCE_V5:')) {
+    $fail++; $failures.Add("[launch-flow/godot-payload-upgrade-$oldStampVersion] old translator stamp was reused or C/C# diverged`n--- C ---`n$upgradeOutC`n--- C# ---`n$upgradeOutCs")
 } else {
-    $pass++; Write-Host ("  ok  {0,-52} unchanged game, old translator stamp" -f 'launch-flow/godot-payload-upgrade')
+    $pass++; Write-Host ("  ok  {0,-52} unchanged game, old translator stamp" -f "launch-flow/godot-payload-upgrade-$oldStampVersion")
+}
 }
 
 # --clear-cache-and-exit / --clear-cache：删除共享缓存文件，不存在视为已清理；

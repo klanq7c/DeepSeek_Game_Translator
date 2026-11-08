@@ -17,6 +17,8 @@ typedef struct {
     int enabled;              /* 是否启用远程 API（0=纯缓存模式） */
     int timeout_ms;           /* 单次请求超时 */
     int concurrency;          /* 并发通道数，决定 worker 池大小（<=API_CONCURRENCY_MAX） */
+    int batch_max_items;      /* 单批条数上限（1..48） */
+    int batch_char_budget;    /* 单批输入 UTF-8 字节预算（256..9600） */
     char endpoint[1024];      /* API 端点 URL */
     char model[256];          /* 模型名 */
     char key[1024];           /* API Key（本机回环端点可留空） */
@@ -35,6 +37,11 @@ int api_translate_batch_ctx(ApiConfig *cfg, char **texts, const char *const *pre
                             size_t count, char ***out);
 /* 整批失败后的二分重试：对半递归定位最小失败单元（≤4 条时逐条兜底），
    返回 count 长度数组，成功槽位为新分配译文、失败槽位为 NULL。
-   调用方以 NULL 槽位计 miss，绝不把原文回显当翻译。 */
+   调用方以 NULL 槽位计 miss，绝不把原文回显当翻译。
+   yield_check 非 NULL 时在每个子请求前调用：返回非 0 表示调用方要求
+   停止（前台优先/服务器关停），剩余槽位保持 NULL 直接返回——条目由
+   后台队列收尾遗忘，下次 miss 可再次排队。后台（预热）路径必须传入；
+   前台路径自身即优先级持有者，可传 NULL。 */
 char **api_translate_split_retry(ApiConfig *cfg, char **texts,
-                                 const char *const *prevs, size_t count);
+                                 const char *const *prevs, size_t count,
+                                 int (*yield_check)(void));

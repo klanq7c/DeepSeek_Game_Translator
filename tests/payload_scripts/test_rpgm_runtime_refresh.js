@@ -5,7 +5,7 @@ const path = require('path');
 const vm = require('vm');
 const hookPath = path.resolve(__dirname, '../../payloads/RPGMaker/hook_rpgm_mv.js');
 
-function fixture() {
+function fixture(extra = {}) {
     let now = 0, sequence = 0, online = true, responseDelay = () => 1;
     const timers = [], requests = [], errors = [], hits = Object.create(null);
     function setTimeout(callback, delay) {
@@ -39,6 +39,8 @@ function fixture() {
                 const found = Object.create(null);
                 for (const key of payload.texts) if (hits[key]) found[key] = hits[key];
                 result = { hits: found };
+            } else if (this.url.endsWith('/prefetch')) {
+                result = { status: 'queued' };
             } else if (this.url.endsWith('/batch')) {
                 result = { results: payload.texts.map(key => hits[key] || key),
                     sources: payload.texts.map(key => hits[key] ? 'cache' : 'queued') };
@@ -57,6 +59,8 @@ function fixture() {
     Window_Base.prototype.drawText = function(text) { this.drawn = text; };
     Window_Base.prototype.drawTextEx = function(text) { this.drawn = text; };
     Window_Base.prototype.updateOpen = function() {};
+    function Bitmap() { this.fontFace = 'GameFont'; this.fontSize = 20; this.drawn = ''; }
+    Bitmap.prototype.drawText = function(text) { this.drawn = text; };
     function Menu(source) { Window_Base.call(this); this.source = source; this.refreshes = 0; }
     Menu.prototype = Object.create(Window_Base.prototype);
     Menu.prototype.refresh = function() { this.refreshes++; this.drawText(this.source); };
@@ -81,20 +85,114 @@ function fixture() {
         getElementsByTagName() { return []; }, addEventListener() {},
         fonts: { load() { return Promise.resolve([{}]); } } };
     const consoleStub = { error(message) { errors.push(message); }, info() {} };
-    const window = { Window_Base, Window_Message, Game_Message, SceneManager,
+    const window = { Bitmap, Window_Base, Window_Message, Game_Message, SceneManager,
         $gameMessage: gameMessage, document, console: consoleStub, setTimeout,
         addEventListener() {} };
     const context = { window, document, console: consoleStub, XMLHttpRequest, setTimeout,
-        Window_Base, Window_Message, Game_Message, SceneManager, Date: Clock,
+        Bitmap, Window_Base, Window_Message, Game_Message, SceneManager, Date: Clock,
         $gameMessage: gameMessage };
+    Object.assign(window, extra); Object.assign(context, extra);
     vm.createContext(context);
     vm.runInContext(fs.readFileSync(hookPath, 'utf8'), context, { filename: hookPath });
-    return { advance, requests, errors, hits, Menu, Window_Message, gameMessage, SceneManager,
+    return { advance, requests, errors, hits, Bitmap, Menu, Window_Message, gameMessage, SceneManager,
         offline() { online = false; }, online() { online = true; },
         delayResponses(callback) { responseDelay = callback; } };
 }
 
 const cases = {
+    half_localized_quest_prefetch_does_not_skip_remaining_english() {
+        const source = '请 Open the door.', localized = '任务已经完成 HP 100';
+        const f = fixture({ $gameSystem: { _quests: { quest: [{ name: source, desc: [localized] }] } } });
+        f.advance(10);
+        const prefetch = f.requests.filter(request => request.url.endsWith('/prefetch'));
+        assert.strictEqual(prefetch.length, 1);
+        assert.ok(prefetch[0].payload.texts.includes(source));
+        assert.ok(!prefetch[0].payload.texts.includes(localized), 'localized quest metadata was requeued');
+        assert.deepStrictEqual(f.errors, []);
+    },
+    half_localized_bitmap_uses_cold_and_warm_cache() {
+        const f = fixture(), bitmap = new f.Bitmap(), source = '请 Open the door.';
+        f.hits[source] = '请 打开门。';
+        bitmap.drawText(source, 0, 0, 400, 30, 'left');
+        assert.ok(f.requests.some(request => request.url.endsWith('/cache/lookup') && request.payload.texts.includes(source)),
+            'mixed bitmap never requested the local cache');
+        f.advance(10);
+        bitmap.drawText(source, 0, 0, 400, 30, 'left');
+        assert.strictEqual(bitmap.drawn, f.hits[source]);
+        assert.strictEqual(bitmap.fontFace, 'GameFont');
+        f.hits['请 Hello John.'] = '请 你好 John。';
+        bitmap.drawText('请 Hello John.', 0, 0, 400, 30, 'left');
+        f.advance(10);
+        bitmap.drawText('请 Hello John.', 0, 0, 400, 30, 'left');
+        assert.strictEqual(bitmap.drawn, '请 你好 John。');
+        const before = f.requests.length;
+        bitmap.drawText(bitmap.drawn, 0, 0, 400, 30, 'left');
+        bitmap.drawText('已经翻译完成 HP 100', 0, 0, 400, 30, 'left');
+        assert.strictEqual(f.requests.length, before, 'completed Chinese bitmap was requeued');
+    },
+    adjacent_protected_markers_and_url_punctuation_leave_english_visible() {
+        for (const source of ['请 __DS_TOKEN_0__Continue__DS_TOKEN_1__', '请访问 https://example.com，Continue']) {
+            const f = fixture(), menu = new f.Menu(source);
+            f.hits[source] = source.replace('Continue', '继续');
+            f.SceneManager._scene.children = [menu];
+            menu.refresh(); f.advance(1500);
+            assert.strictEqual(menu.drawn, f.hits[source], 'visible English was swallowed by a protected span');
+        }
+        const f = fixture(), localized = new f.Menu('请访问 https://example.com/Continue，继续。');
+        f.SceneManager._scene.children = [localized];
+        localized.refresh(); f.advance(1500);
+        assert.strictEqual(f.requests.length, 0, 'English inside a URL became visible work');
+    },
+    half_localized_menu_completes_and_preserves_chinese() {
+        const f = fixture(), source = '请 Open the door.', menu = new f.Menu(source);
+        f.SceneManager._scene.children = [menu]; f.hits[source] = '请 打开门。';
+        menu.refresh(); f.advance(1500);
+        assert.strictEqual(menu.drawn, '请 打开门。');
+        menu.source = '请 Hello John.'; f.hits[menu.source] = '请 你好 John。';
+        menu.refresh(); f.advance(1500);
+        assert.strictEqual(menu.drawn, '请 你好 John。');
+        menu.source = menu.drawn;
+        const requests = f.requests.length;
+        menu.refresh(); f.advance(1500);
+        assert.strictEqual(f.requests.length, requests, 'completed result with a Latin name was queued again');
+        menu.source = '已经翻译完成 HP 100'; menu.refresh(); f.advance(1500);
+        assert.strictEqual(f.requests.length, requests, 'Chinese and acronym text was requeued');
+    },
+    completed_colored_page_keeps_controls_after_plain_cache_arrives() {
+        const f = fixture(), message = new f.Window_Message();
+        const lines = ['<WordWrap>\\C[4]A colored greeting.\\C[0]', 'A plain reply.'];
+        f.SceneManager._scene.children = [message]; f.gameMessage._texts = lines.slice();
+        f.hits[lines[0]] = '<WordWrap>\\C[4]彩色问候。\\C[0]';
+        f.hits[lines[1]] = '普通回答。';
+        message.startMessage(); f.advance(20); message.updateMessage();
+        assert.ok(message.drawn.includes('\\C[4]彩色问候。\\C[0]'), 'initial colored translation missing');
+        // 同一页面的无格式整页缓存稍后到达，不能覆盖已显示的颜色和原始等待状态。
+        f.hits['A colored greeting.\nA plain reply.'] = '问候和回答的无格式整页译文。';
+        f.advance(1500); message.startMessage(); message.updateMessage(); f.advance(20);
+        assert.ok(message.drawn.includes('\\C[4]'), 'late plain page cache erased dialogue color');
+        assert.ok(message.drawn.includes('\\C[0]'), 'late plain page cache erased color reset');
+        assert.strictEqual(message.pause, true);
+        assert.deepStrictEqual(Array.from(f.gameMessage._texts), lines);
+        assert.deepStrictEqual(f.errors, []);
+    },
+    builtin_party_and_currency_tokens() {
+        for (const [source, translated, expected] of [
+            ['Hello \\P[1], welcome back!', '你好，欢迎回来！', null],
+            ['Pay 100 \\G to proceed.', '支付100即可继续。', null],
+            ['Hello \\P[1], welcome back!', '你好\\P[2]，欢迎回来！', null],
+            ['Hello \\P[1], welcome back!', '你好\\P[1]，欢迎回来！', '你好\\P[1]，欢迎回来！'],
+            ['Pay 100 \\G to proceed.', '支付100\\G即可继续。', '支付100\\G即可继续。'],
+            ['You have \\V[1] coins.', '你拥有金币。', null],
+            // 裸方括号在 RPG Maker 是正文，不应用 Ren'Py 嵌套插值恢复规则。
+            ['Check [stats[player].name] label.', '检查[属性[角色].名字]标签。', '检查[属性[角色].名字]标签。'],
+            ['\\C[2]Welcome\\C[0]!', '\\C[2]欢迎\\C[0]！', '\\C[2]欢迎\\C[0]！']
+        ]) {
+            const f = fixture(), menu = new f.Menu(source);
+            f.SceneManager._scene.children = [menu]; f.hits[source] = translated;
+            menu.refresh(); f.advance(200);
+            assert.strictEqual(menu.drawn, expected === null ? source : expected, source);
+        }
+    },
     animated_menu_controls() {
         const f = fixture(), source = 'New Game', menu = new f.Menu(source);
         f.SceneManager._scene.children = [menu]; f.hits[source] = '新游戏';

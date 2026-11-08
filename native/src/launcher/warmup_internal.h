@@ -23,6 +23,8 @@ typedef struct {
     const char **seen; /* 指向 items 的借用指针；字符串所有权归 TextList。 */
     size_t seen_cap;
     size_t max_items; /* 0 表示使用 WARMUP_MAX_ITEMS。 */
+    int renpy; /* 仅 Ren'Py 预热声明其括号/变量格式，其余引擎保持原有请求。 */
+    int godot_compressed_reported; /* 同一次发现只报告一次未解压 GDSC 的限制。 */
 } TextList;
 
 size_t textlist_limit(const TextList *l);

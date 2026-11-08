@@ -55,7 +55,8 @@ namespace DstLauncher
                     hash = unchecked((hash ^ 0xfdUL) * 1099511628211UL);
                     foreach (byte b in Encoding.UTF8.GetBytes(BuildInfo.TranslatorVersion))
                         hash = unchecked((hash ^ b) * 1099511628211UL);
-                    return "DST_GODOT_SOURCE_V4:" + hash.ToString("x16", System.Globalization.CultureInfo.InvariantCulture) + "\n";
+                    // V5 声明生成器的 stdin 握手协议，确保旧包在生成器升级后重建。
+                    return "DST_GODOT_SOURCE_V5:" + hash.ToString("x16", System.Globalization.CultureInfo.InvariantCulture) + "\n";
                 }
             } catch (IOException ex) {
                 Log.Append("Godot: source fingerprint read failed (Windows error " + (ex.HResult & 0xffff) + ").");
@@ -716,6 +717,13 @@ namespace DstLauncher
                 "\tif OS.get_cmdline_args().has(\"--dst-autoload-preflight\")" +
                 (engineMajor == 3 ? "" : " or OS.get_cmdline_user_args().has(\"--dst-autoload-preflight\")") + ":\n" +
                 "\t\tprint(\"DST_GODOT_AUTOLOAD_READY_V1\")\n" +
+                "\t\tif not OS.has_method(\"read_string_from_stdin\"):\n" +
+                "\t\t\tpush_error(\"DeepSeek autoload preflight: stdin API unavailable.\")\n" +
+                "\t\t\treturn\n" +
+                "\t\tif str(OS.call(\"read_string_from_stdin\")).strip_edges() != \"DST_GODOT_AUTOLOAD_CONTINUE_V2\":\n" +
+                "\t\t\tpush_error(\"DeepSeek autoload preflight: invalid stdin handshake.\")\n" +
+                "\t\t\treturn\n" +
+                "\t\tprint(\"DST_GODOT_AUTOLOAD_ACK_V2\")\n" +
                 "\t\treturn\n");
             step = step.Replace("\t\tquit(73)\n", "\t\tget_tree().quit(73)\n");
             step = step.Replace("get_root()", "get_tree().root");

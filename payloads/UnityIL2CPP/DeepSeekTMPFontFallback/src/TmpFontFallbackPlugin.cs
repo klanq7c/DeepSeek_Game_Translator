@@ -210,7 +210,8 @@ internal static class TmpFontFallbackInstaller
     private static readonly HashSet<int> DirtiedTexts = new();
     private static readonly HashSet<int> PatchedUguiTexts = new();
     private static readonly HashSet<string> AttemptedFallbackBundlePaths = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<char> WarmedFallbackCharacters = new(CjkWarmupText);
+    // 预热样例不是覆盖证明；只有当前字体实际检查或加字成功后才记住字形。
+    private static readonly HashSet<char> WarmedFallbackCharacters = new();
     private static readonly Dictionary<int, string> LastTmpTextById = new();
     private static readonly Dictionary<int, string> LastUguiTextById = new();
     private static readonly Dictionary<int, object> OriginalTmpFontByTextId = new();
@@ -219,7 +220,7 @@ internal static class TmpFontFallbackInstaller
     private static readonly Dictionary<int, Color> InteractiveOriginalColorBySourceId = new();
     private static readonly HashSet<int> InteractiveOverlayTextIds = new();
     private static readonly Dictionary<int, object> TmpUguiOverlayTextBySourceId = new();
-    private static readonly Dictionary<int, Color> TmpUguiOriginalColorBySourceId = new();
+    private static readonly HashSet<int> TmpUguiHiddenSourceIds = new();
     private static readonly HashSet<int> TmpUguiOverlayTextIds = new();
     /*
      * 上述集合保存跨帧状态，但 Unity 场景对象本身是分代出现/销毁的。下面的 scratch
@@ -332,6 +333,7 @@ internal static class TmpFontFallbackInstaller
             _nextFallbackLoadAttemptUtc = now +
                 (_fallbackBundleRequest != null ? TimeSpan.Zero : FallbackLoadRetryInterval);
             _fallbackAsset = LoadFallbackFontAsset();
+            WarmedFallbackCharacters.Clear();
             if (_fallbackAsset == null)
             {
                 if (_fallbackBundleRequest != null)
@@ -454,7 +456,7 @@ internal static class TmpFontFallbackInstaller
                 CollectStaleInteractiveSources(InteractiveOriginalColorBySourceId.Keys);
                 CollectStaleInteractiveSources(OriginalTmpFontByTextId.Keys);
                 CollectStaleInteractiveSources(TmpUguiOverlayTextBySourceId.Keys);
-                CollectStaleInteractiveSources(TmpUguiOriginalColorBySourceId.Keys);
+                CollectStaleInteractiveSources(TmpUguiHiddenSourceIds);
                 foreach (int sourceId in StaleInteractiveSourceIds)
                 {
                     DestroyInteractiveOverlay(sourceId);
@@ -791,8 +793,8 @@ internal static class TmpFontFallbackInstaller
                 object fontAsset = FindTmpFontAssetInBundle(_fallbackBundle, assetName);
                 if (fontAsset != null)
                 {
+                    // 静态图集无需源字体，保留打包模式；缺字时交给显示层的后续回退。
                     SetPropertyIfExists(fontAsset, "isMultiAtlasTexturesEnabled", true);
-                    SetEnumPropertyIfExists(fontAsset, "atlasPopulationMode", "Dynamic");
                     TmpFontFallbackPlugin.Logger.LogInfo("Loaded TMP fallback font asset from bundle: " + assetName);
                     return fontAsset;
                 }
@@ -909,7 +911,6 @@ internal static class TmpFontFallbackInstaller
             }
 
             SetPropertyIfExists(fontAsset, "isMultiAtlasTexturesEnabled", true);
-            SetEnumPropertyIfExists(fontAsset, "atlasPopulationMode", "Dynamic");
             TmpFontFallbackPlugin.Logger.LogInfo(
                 "Loaded TMP fallback font asset through compatible async boundary: " + assetName);
             return fontAsset;
@@ -1332,6 +1333,11 @@ internal static class TmpFontFallbackInstaller
 
     private static bool TryAddCharactersToTmpFontAsset(object fontAsset, string characters)
     {
+        if (fontAsset == null || string.IsNullOrEmpty(characters)) return false;
+        DstUnity.TmpFontPopulationAction population = DstUnity.TmpFontPopulation.Plan(fontAsset, characters,
+            (error, operation) => TmpFontFallbackPlugin.ReportCaughtException(error, "renderer=UnityIL2CPP method=TryAddCharacters", operation));
+        if (population == DstUnity.TmpFontPopulationAction.Covered) return true;
+        if (population == DstUnity.TmpFontPopulationAction.Unavailable) return false;
         foreach (MethodInfo method in fontAsset.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
             .Where(m => m.Name == "TryAddCharacters"))
         {
@@ -1346,14 +1352,11 @@ internal static class TmpFontFallbackInstaller
                 object result = method.Invoke(fontAsset, args);
                 if (result is bool ok)
                 {
-                    if (ok)
-                    {
-                        return true;
-                    }
-                    continue;
+                    return ok;
                 }
-
-                return true;
+                TmpFontFallbackPlugin.ReportCaughtException(new InvalidOperationException("TMP TryAddCharacters did not return a coverage result."),
+                    "renderer=UnityIL2CPP method=" + method, "tmp-font-population-result");
+                return false;
             }
             catch (Exception ex)
             {
@@ -1535,7 +1538,8 @@ internal static class TmpFontFallbackInstaller
         foreach (object text in texts)
         {
             string value = GetStringProperty(text, "text");
-            if (ContainsCjk(value))
+            // Legacy UGUI 不支持 TMP 的 link/font/noparse；按字面检查，避免漏掉实际显示的属性文字。
+            if (NeedsCjkFont(value, false))
             {
                 cjkTexts ??= new List<object>();
                 cjkTexts.Add(text);
@@ -1795,6 +1799,50 @@ internal static class TmpFontFallbackInstaller
         return false;
     }
 
+    // 字体覆盖与语言判定分开：全角括号等独立行也需要字形，标签属性不参与。
+    private static bool IsCjkFontCharacter(char ch)
+    {
+        return (ch >= '\u3400' && ch <= '\u9fff') || (ch >= '\uf900' && ch <= '\ufaff') ||
+            (ch >= '\u3000' && ch <= '\u303f') || (ch >= '\uff00' && ch <= '\uffef');
+    }
+
+    private static bool FontTagNameIs(string text, int start, int end, string name)
+    {
+        int next = start + name.Length;
+        return next <= end && string.Compare(text, start, name, 0, name.Length, StringComparison.OrdinalIgnoreCase) == 0
+            && (text[next] == '>' || text[next] == '=' || text[next] == '/' || char.IsWhiteSpace(text[next]));
+    }
+
+    // 只遮住 TMP 的资源/标识属性；noparse 和未知/非法样式中的字面字符仍需字体。
+    private static bool TrySkipTmpFontTag(string text, int start, ref bool noParse, out int end)
+    {
+        if (!DstUnity.TmpRichText.TryGetTagEnd(text, start, out end)) return false;
+        int name = start + 1;
+        bool closing = text[name] == '/';
+        if (closing) name++;
+        if (FontTagNameIs(text, name, end, "noparse") && name + 7 == end)
+        {
+            if (closing) { noParse = false; return true; }
+            if (!noParse) { noParse = true; return true; }
+        }
+        if (noParse) return false;
+        return FontTagNameIs(text, name, end, "link") || FontTagNameIs(text, name, end, "font")
+            || FontTagNameIs(text, name, end, "material") || FontTagNameIs(text, name, end, "sprite")
+            || FontTagNameIs(text, name, end, "style") || FontTagNameIs(text, name, end, "gradient");
+    }
+
+    private static bool NeedsCjkFont(string text, bool richText = true)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        bool noParse = false;
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (richText && TrySkipTmpFontTag(text, i, ref noParse, out int tagEnd)) { i = tagEnd; continue; }
+            if (IsCjkFontCharacter(text[i])) return true;
+        }
+        return false;
+    }
+
     private static int PatchLoadedFontAssets(IReadOnlyList<object> fontAssets, out bool fontTablesChanged)
     {
         fontTablesChanged = false;
@@ -1821,23 +1869,40 @@ internal static class TmpFontFallbackInstaller
         return PatchedFontAssets.Count;
     }
 
-    private static bool TryWarmFallbackGlyphs(string value, out bool glyphsAdded)
+    private static bool TryWarmFallbackGlyphs(string value, out bool glyphsAdded, bool richText = true)
     {
         glyphsAdded = false;
-        if (_fallbackAsset == null || !ContainsCjk(value))
+        if (_fallbackAsset == null || !NeedsCjkFont(value, richText))
         {
             return false;
         }
 
-        HashSet<char> missing = null;
-        foreach (char ch in value)
+        HashSet<char> requested = new();
+        bool noParse = false;
+        for (int i = 0; i < value.Length; i++)
         {
-            bool isCjk = (ch >= '\u3400' && ch <= '\u9fff') || (ch >= '\uf900' && ch <= '\ufaff');
-            if (isCjk && !WarmedFallbackCharacters.Contains(ch))
-            {
-                missing ??= new HashSet<char>();
-                missing.Add(ch);
-            }
+            if (richText && TrySkipTmpFontTag(value, i, ref noParse, out int tagEnd)) { i = tagEnd; continue; }
+            if (IsCjkFontCharacter(value[i])) requested.Add(value[i]);
+        }
+        string requestedGlyphs = new string(requested.ToArray());
+        bool covered;
+        bool coverageKnown = DstUnity.TmpFontPopulation.TryGetCoverage(_fallbackAsset, requestedGlyphs,
+            (error, operation) => TmpFontFallbackPlugin.ReportCaughtException(error, "renderer=UnityIL2CPP phase=warm-fallback-glyphs", operation), out covered);
+        if (coverageKnown && covered)
+        {
+            foreach (char ch in requested) glyphsAdded |= WarmedFallbackCharacters.Add(ch);
+            return true;
+        }
+        // 游戏可清空同一个字体的图集；旧成功集合不能替代当前覆盖率。
+        if (coverageKnown) foreach (char ch in requested) WarmedFallbackCharacters.Remove(ch);
+        else TmpFontFallbackPlugin.ReportCaughtException(new NotSupportedException("TMP glyph coverage API is unavailable; retaining legacy successful-add tracking."),
+            "renderer=UnityIL2CPP phase=warm-fallback-glyphs", "tmp-font-coverage-unavailable");
+        HashSet<char> missing = null;
+        foreach (char ch in requested)
+        {
+            if (WarmedFallbackCharacters.Contains(ch)) continue;
+            missing ??= new HashSet<char>();
+            missing.Add(ch);
         }
         if (missing == null || missing.Count == 0)
         {
@@ -1864,11 +1929,12 @@ internal static class TmpFontFallbackInstaller
         {
             return false;
         }
-        if (!ContainsCjk(value))
+        bool richText = GetPropertyValue(text, "richText") is not bool enabledRichText || enabledRichText;
+        if (!NeedsCjkFont(value, richText))
         {
             return RestoreTmpOriginalFont(text);
         }
-        if (!TryWarmFallbackGlyphs(value, out bool glyphsAdded))
+        if (!TryWarmFallbackGlyphs(value, out bool glyphsAdded, richText))
         {
             return false;
         }
@@ -2042,6 +2108,7 @@ internal static class TmpFontFallbackInstaller
         int invisibleCount = 0;
         int createFailedCount = 0;
         int textWriteFailedCount = 0;
+        int stateFailedCount = 0;
         foreach (object text in FindUnityObjects(_tmpTextType))
         {
             scannedCount++;
@@ -2055,7 +2122,8 @@ internal static class TmpFontFallbackInstaller
             object enabledValue = GetPropertyValue(text, "enabled");
             bool enabled = enabledValue is not bool isEnabled || isEnabled;
             bool hiddenByOverlay = TmpUguiOverlayTextBySourceId.ContainsKey(sourceId);
-            if ((!enabled && !hiddenByOverlay) || !ContainsCjk(current))
+            bool richText = GetPropertyValue(text, "richText") is not bool enabledRichText || enabledRichText;
+            if ((!enabled && !hiddenByOverlay) || !NeedsCjkFont(current, richText))
             {
                 DestroyTmpUguiOverlay(sourceId);
                 continue;
@@ -2075,17 +2143,19 @@ internal static class TmpFontFallbackInstaller
                     case "invisible": invisibleCount++; break;
                     case "create": createFailedCount++; break;
                     case "text": textWriteFailedCount++; break;
+                    case "color":
+                    case "hide-source": stateFailedCount++; break;
                 }
             }
         }
 
-        string signature = scannedCount + ":" + cjkCount + ":" + visibleCount + ":" + noComponentCount + ":" + noRectCount + ":" + invisibleCount + ":" + createFailedCount + ":" + textWriteFailedCount;
+        string signature = scannedCount + ":" + cjkCount + ":" + visibleCount + ":" + noComponentCount + ":" + noRectCount + ":" + invisibleCount + ":" + createFailedCount + ":" + textWriteFailedCount + ":" + stateFailedCount;
         if (!string.Equals(signature, _lastTmpUguiScanSignature, StringComparison.Ordinal))
         {
             _lastTmpUguiScanSignature = signature;
             TmpFontFallbackPlugin.Logger.LogInfo("TMP UGUI fallback scan: scanned=" + scannedCount + "; cjk=" + cjkCount + "; overlays=" + visibleCount +
                 "; noComponent=" + noComponentCount + "; noRect=" + noRectCount + "; invisible=" + invisibleCount +
-                "; createFailed=" + createFailedCount + "; textWriteFailed=" + textWriteFailedCount + ".");
+                "; createFailed=" + createFailedCount + "; textWriteFailed=" + textWriteFailedCount + "; colorOrHideFailed=" + stateFailedCount + ".");
         }
 
         return visibleCount;
@@ -2115,15 +2185,17 @@ internal static class TmpFontFallbackInstaller
             return false;
         }
 
-        Color displayColor;
-        if (!TmpUguiOriginalColorBySourceId.TryGetValue(sourceId, out displayColor))
+        // 颜色始终归游戏所有。只隐藏源组件，不写入透明色，否则无法区分游戏淡出与插件隐藏。
+        if (!TryGetColor(sourceText, out Color displayColor))
         {
-            if (!TryGetColor(sourceText, out displayColor) || displayColor.a <= 0.01f)
-            {
-                failure = "invisible";
-                return false;
-            }
-            TmpUguiOriginalColorBySourceId[sourceId] = displayColor;
+            failure = "color";
+            DestroyTmpUguiOverlay(sourceId);
+            return false;
+        }
+        if (displayColor.a <= 0.01f && !TmpUguiHiddenSourceIds.Contains(sourceId))
+        {
+            failure = "invisible";
+            return false;
         }
 
         object overlayText = GetOrCreateTmpUguiOverlay(source, sourceRect, sourceId);
@@ -2172,7 +2244,14 @@ internal static class TmpFontFallbackInstaller
 
         TrySetPropertyIfExists(overlayText, "enabled", true);
         InvokeNoThrow(overlayText, "SetAllDirty");
-        HideTmpSourceForUguiOverlay(sourceText, sourceId);
+        if (!HideTmpSourceForUguiOverlay(sourceText, sourceId))
+        {
+            // 裁剪后的 IL2CPP 属性可能不可写，上游文本层无法补齐元数据。
+            // 保留源组件，撤销会重复绘制的覆盖层；扫描汇总和属性边界记录失败。
+            failure = "hide-source";
+            DestroyTmpUguiOverlay(sourceId);
+            return false;
+        }
         return true;
     }
 
@@ -2425,41 +2504,33 @@ internal static class TmpFontFallbackInstaller
         return "Middle" + horizontal;
     }
 
-    private static void HideTmpSourceForUguiOverlay(object sourceText, int sourceId)
+    private static bool HideTmpSourceForUguiOverlay(object sourceText, int sourceId)
     {
-        if (!TryGetColor(sourceText, out Color color))
+        if (!TrySetPropertyIfExists(sourceText, "enabled", false))
         {
-            return;
+            return false;
         }
-        if (!TmpUguiOriginalColorBySourceId.ContainsKey(sourceId) && color.a > 0.01f)
-        {
-            TmpUguiOriginalColorBySourceId[sourceId] = color;
-        }
-        color.a = 0.0f;
-        TrySetPropertyIfExists(sourceText, "color", color);
-        TrySetPropertyIfExists(sourceText, "enabled", false);
+        TmpUguiHiddenSourceIds.Add(sourceId);
+        return true;
     }
 
     private static void DestroyTmpUguiOverlay(int sourceId)
     {
-        if (!TmpUguiOriginalColorBySourceId.ContainsKey(sourceId) && !TmpUguiOverlayTextBySourceId.ContainsKey(sourceId))
+        if (!TmpUguiHiddenSourceIds.Contains(sourceId) && !TmpUguiOverlayTextBySourceId.ContainsKey(sourceId))
         {
             return;
         }
 
-        if (TmpUguiOriginalColorBySourceId.TryGetValue(sourceId, out Color originalColor))
+        if (TmpUguiHiddenSourceIds.Contains(sourceId))
         {
             foreach (object sourceText in FindUnityObjects(_tmpTextType))
             {
                 if (InstanceId(sourceText) == sourceId)
                 {
-                    /* 仅当源文本仍保持插件设置的隐藏状态（enabled==false 且 color.a≈0）
-                       才恢复；游戏在此期间自行改状态的，跳过恢复以免覆盖游戏状态。 */
-                    bool stillHidden = GetPropertyValue(sourceText, "enabled") is bool isEnabled && !isEnabled
-                        && TryGetColor(sourceText, out Color currentColor) && currentColor.a <= 0.01f;
+                    /* 只恢复插件拥有的 enabled 状态；游戏最新颜色与透明度从未被改写。 */
+                    bool stillHidden = GetPropertyValue(sourceText, "enabled") is bool isEnabled && !isEnabled;
                     if (stillHidden)
                     {
-                        TrySetPropertyIfExists(sourceText, "color", originalColor);
                         TrySetPropertyIfExists(sourceText, "enabled", true);
                     }
                     else
@@ -2469,7 +2540,7 @@ internal static class TmpFontFallbackInstaller
                     break;
                 }
             }
-            TmpUguiOriginalColorBySourceId.Remove(sourceId);
+            TmpUguiHiddenSourceIds.Remove(sourceId);
         }
 
         if (TmpUguiOverlayTextBySourceId.TryGetValue(sourceId, out object overlay))

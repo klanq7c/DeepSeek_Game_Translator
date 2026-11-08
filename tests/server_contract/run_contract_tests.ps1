@@ -405,11 +405,45 @@ function Test-Server([string]$label, [string]$exe, [int]$port) {
     $r = Invoke-Http 'POST' "$B/cache/import" (ConvertTo-Json -Compress @{ entries = @(@{ key = 'Imported line'; value = $IMPORTV }) }) $null
     $j = J $r.Body
     Check "$label healthy duplicate import is successful without another row" ($j.status -eq 'ok' -and $j.imported -eq 1 -and $j.memory_only -eq 0 -and (Get-Item -LiteralPath $S.Cache).Length -eq $size) $r.Body
+    # 字体兼容属于各引擎显示层；共享缓存必须逐码点保留中文、附标、图标与 emoji。
+    $glyphValue = [string][char]0x4E2D + [char]0xFE00 + [char]::ConvertFromUtf32(0xE0100) + [char]0x0301 + [char]0xEF0A + [char]::ConvertFromUtf32(0x1F600)
+    $glyphKeys = @('RenPy renderer glyphs', 'RPGMaker renderer glyphs', 'Unity renderer glyphs', 'Godot renderer glyphs')
+    $glyphEntries = @($glyphKeys | ForEach-Object { @{ key = $_; value = $glyphValue } })
+    $glyphImport = J (Invoke-Http 'POST' "$B/cache/import" (ConvertTo-Json -Compress -Depth 5 @{ entries = $glyphEntries }) $null).Body
+    $glyphLookup = ConvertTo-Json -Compress @{ texts = $glyphKeys }
+    $glyphHits = J (Invoke-Http 'POST' "$B/cache/lookup" $glyphLookup $null).Body
+    $glyphExact = $glyphImport.imported -eq 4 -and $glyphHits.hit_count -eq 4
+    foreach ($key in $glyphKeys) { $glyphExact = $glyphExact -and [string]::Equals($glyphHits.hits.$key, $glyphValue, [StringComparison]::Ordinal) }
+    Check "$label renderer glyph sequences survive shared cache import and lookup" $glyphExact ''
+    # 两种导出形状必须完整保留四引擎标记、控制字符和 Unicode；不依赖哈希桶顺序。
+    $exportKeys = @('Export RenPy {color=#fff}[name]{/color}', 'Export RPGMaker \C[2]\V[1]',
+        'Export Unity <link="a>b">{0}</link>', 'Export Godot [color=red]%s[/color]')
+    $exportVectors = @($exportKeys | ForEach-Object { @{ key = $_; value = $glyphValue + "`t`r`n" + $_ + ' "\' } })
+    $exportImport = J (Invoke-Http 'POST' "$B/cache/import" (ConvertTo-Json -Compress -Depth 5 @{ entries = $exportVectors }) $null).Body
+    Check "$label export fixture imports all four engine vectors" ($exportImport.imported -eq 4) ''
     $r = Invoke-Http 'GET' "$B/cache/dump" $null $null
     $j = J $r.Body
     Check "$label /cache/dump count matches health.cache_size" ($r.Status -eq 200 -and $j.count -eq (J (Invoke-Http 'GET' "$B/health" $null $null).Body).cache_size) ("count=" + $j.count)
+    $dump = $j
     $r = Invoke-Http 'POST' "$B/cache/export" '' $null
     Check "$label /cache/export 200" ($r.Status -eq 200) ("status=" + $r.Status + " body=" + $r.Body.Substring(0, [Math]::Min(120, $r.Body.Length)))
+    $export = J $r.Body
+    $exportMap = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $exportExact = $export.count -eq $dump.count -and @($export.entries).Count -eq $dump.count -and
+        @($dump.cache.PSObject.Properties).Count -eq $dump.count
+    foreach ($entry in $export.entries) {
+        if ($exportMap.ContainsKey($entry.key)) { $exportExact = $false }
+        else { $exportMap.Add($entry.key, $entry.value) }
+    }
+    foreach ($property in $dump.cache.PSObject.Properties) {
+        $exportExact = $exportExact -and $exportMap.ContainsKey($property.Name) -and
+            [string]::Equals($exportMap[$property.Name], $property.Value, [StringComparison]::Ordinal)
+    }
+    foreach ($entry in $exportVectors) {
+        $exportExact = $exportExact -and $exportMap.ContainsKey($entry.key) -and
+            [string]::Equals($exportMap[$entry.key], $entry.value, [StringComparison]::Ordinal)
+    }
+    Check "$label dump and export retain exact counts, unique keys and engine values" $exportExact ''
 
     # ---- 空闲连接必须由接收超时关闭
     # serve_one 对超时的不完整请求返回 400 incomplete_request 后关闭连接；
@@ -523,6 +557,10 @@ function Test-Server([string]$label, [string]$exe, [int]$port) {
     $S2 = Start-Server $exe $port $dir
     Check "$label restarts on persisted cache" $S2.Ready ''
     if ($S2.Ready) {
+        $glyphHits = J (Invoke-Http 'POST' "$B/cache/lookup" $glyphLookup $null).Body
+        $glyphExact = $glyphHits.hit_count -eq 4
+        foreach ($key in $glyphKeys) { $glyphExact = $glyphExact -and [string]::Equals($glyphHits.hits.$key, $glyphValue, [StringComparison]::Ordinal) }
+        Check "$label renderer glyph sequences survive shared cache restart" $glyphExact ''
         $lk = J (Invoke-Http 'POST' "$B/cache/lookup" (ConvertTo-Json -Compress @{ texts = @($t1, 'Imported line', $pf[3], $echoTexts[1]) }) $null).Body
         Check "$label persisted entries reload" ($lk.hit_count -eq 4 -and $lk.hits.$t1 -eq ($YI + ':' + $t1) -and $lk.hits.($echoTexts[1]) -eq $BARE) ("hit_count=" + $lk.hit_count)
         $burstReload = J (Invoke-Http 'POST' "$B/cache/lookup" (ConvertTo-Json -Compress @{ texts = $burst }) $null).Body

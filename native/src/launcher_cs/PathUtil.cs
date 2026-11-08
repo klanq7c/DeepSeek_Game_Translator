@@ -1,5 +1,4 @@
 using System;
-using System.Runtime.InteropServices;
 
 namespace DstLauncher
 {
@@ -8,7 +7,7 @@ namespace DstLauncher
      *
      * 刻意不用 Path.Combine：C 版 path_join 只在 a 不以反斜杠结尾时插入一个 '\'，
      * 不会因为 b 是绝对路径而丢弃 a，也不做规范化；检测结果（尤其是拼出来的
-     * 路径字符串）要与 C 版逐字节一致。属性查询直接走 GetFileAttributesW，与
+     * 路径字符串）要与 C 版逐字节一致。属性查询经 SafeFs 转换后调用 Win32，与
      * C 版对不存在/无权限路径的判定一致（File.Exists 会把无权限当不存在，且
      * 对目录返回 false）。
      */
@@ -16,9 +15,6 @@ namespace DstLauncher
     {
         private const uint INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
         private const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern uint GetFileAttributesW(string path);
 
         /* path_join：a + ('\' 若 a 非空且不以 '\' 结尾) + b。 */
         public static string Join(string a, string b)
@@ -32,14 +28,14 @@ namespace DstLauncher
         public static bool Exists(string path)
         {
             if (string.IsNullOrEmpty(path)) return false;
-            return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+            return SafeFs.Attributes(path) != INVALID_FILE_ATTRIBUTES;
         }
 
         /* is_dir：存在且带目录属性。 */
         public static bool IsDir(string path)
         {
             if (string.IsNullOrEmpty(path)) return false;
-            uint a = GetFileAttributesW(path);
+            uint a = SafeFs.Attributes(path);
             return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
         }
 
@@ -47,7 +43,7 @@ namespace DstLauncher
         public static bool IsFile(string path)
         {
             if (string.IsNullOrEmpty(path)) return false;
-            uint a = GetFileAttributesW(path);
+            uint a = SafeFs.Attributes(path);
             return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
         }
 

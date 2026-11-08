@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def method(source, name):
-    match = re.search(r'^\s*(?:private|internal)\s+(?:static\s+)?(?:string|bool|void|int)\s+' + name + r'(?:<[^>]+>)?\(', source, re.M)
+    match = re.search(r'^\s*(?:private|internal|public)\s+(?:static\s+)?(?:async\s+)?[\w<>,\[\] ()]+\s+' + name + r'(?:<[^>]+>)?\(', source, re.M)
     if not match:
         raise AssertionError('missing production method: ' + name)
     start = source.index('{', match.end())
@@ -39,6 +39,9 @@ using System.Text;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
+using System.IO;
+using Newtonsoft.Json.Linq;
 public sealed class MonoRendererSeam {
     private object _chineseTMPFont = new object();
     private static readonly char[] TmpPunctuationFallbackChars = {'，','。','！','？','“','”','…'};
@@ -57,19 +60,29 @@ text += '}\n'
 text += r'''
 // 仅模拟 Unity/原生属性和字体边界；属性设置器的决策使用生产代码。
 public class Object { public readonly TestLogger Logger = new TestLogger(); }
-public class TestLogger { public readonly List<string> Warnings = new List<string>(); public void LogWarning(string message) { Warnings.Add(message); } }
+public class TestLogger { public readonly List<string> Warnings = new List<string>(); public void LogWarning(string message) { Warnings.Add(message); } public void LogInfo(string message) { } }
 public class Component : Object { public T GetComponent<T>() where T : class { return null; } }
 public class Text : Component {
     public Object font;
+    public bool supportRichText { get; set; }
     public Action OnWrite;
     private string _text;
     public string text { get { return _text; } set { _text = value; var action = OnWrite; OnWrite = null; if (action != null) action(); } }
 }
+public class TmpText : Component { public bool richText { get; set; } }
 public class TmpOverlayMarker { }
+public struct Rect { }
+public class GUIStyle { public Object font; }
+public class GUIContent { public string text; }
 public sealed class MonoAnimatedSetterSeam : Object {
     public static MonoAnimatedSetterSeam _instance = new MonoAnimatedSetterSeam();
     public readonly Dictionary<string,string> Cache = new Dictionary<string,string>();
-    public int Debounced, Applied;
+    private Dictionary<string,string> _cache { get { return Cache; } }
+    private readonly Dictionary<string,string> _glossary = new Dictionary<string,string>();
+    private int _cacheMutationGeneration;
+    public bool UseProductionCacheLookup;
+    public int Debounced, Applied, FontCoverageChecks;
+    public bool TmpFontCoversText = true, PendingOverlay, OverlayRecordsCompletion;
     private int _hookCallCount;
     private Object _chineseFont = new Object();
     private bool CanHandleTmp() { return true; }
@@ -79,34 +92,74 @@ public sealed class MonoAnimatedSetterSeam : Object {
     private static void RestoreTmpParagraphLayout(object node, string value) { }
     private static void RestoreTmpShortLabelLayout(object node, string value) { }
     private static void RestoreUGUIShortLabelLayoutCompatibility(object node) { }
-    private void RestoreTmpOverlay(object node) { }
+    private void RestoreTmpOverlay(object node) { PendingOverlay = false; }
     private static int GetComponentInstanceId(object node) { return 1; }
     private bool TryRepairMixedTranslatedText(string value, out string original, out string repaired) { original = repaired = null; return false; }
     private static bool ContainsCjk(string value) { return value.Any(ch => ch >= 0x4e00 && ch <= 0x9fff); }
     private void ApplyTMPFont(object node) { Applied++; }
-    private void ApplyFont(object node) { Applied++; }
-    private static bool ShouldPreserveRichTextForDisplayWithColor(string value, string translated) { return true; }
-    private static string PrepareTranslatedTextForComponent(object node, string value, string original) { return value; }
-    private static string PrepareTranslatedTextForUGUIText(object node, string value, string original) { return value; }
-    private static string StripRichTextForPlainText(string value) { return value; }
+    private void ApplyFont(object node) { Applied++; if (node is Text text) text.font = _chineseFont; }
+    private void ApplyImGuiFont(GUIStyle style) { Applied++; if (style != null) style.font = _chineseFont; }
+    private void QueueImGuiTranslation(string value) { Debounced++; }
+    private static GUIStyle GetEffectiveGUILayoutLabelStyle(GUIStyle style) { return style; }
+    private static void PrepareImGuiTranslatedShortLabelLayout(ref Rect rect, GUIStyle style, string value, string original) { }
+    // 格式决策、文本清理和组件准备均取生产代码；这里只隔离原生布局边界。
+    public static readonly List<Exception> Errors = new List<Exception>();
+    private static void ReportCaughtException(Exception error) { Errors.Add(error); }
+    private static string RestoreOuterLineBreaks(string value, string original) { return value; }
+    private static void PrepareUGUITranslatedShortLabelLayout(Text node, string value, string original) { }
+    private static string ApplyUGUITextLayoutCompatibility(Text node, string value) { return value; }
+    private static string PreserveUguiTypewriterSourceLength(Text node, string value, string original) { return value; }
     private string NormalizeTmpPunctuationForMissingGlyphs(string value) { return value; }
-    private bool EnsureTMPFontCoversText(object node, string value) { return true; }
-    private bool ApplyTmpOverlay(object node, string value, string original, bool force = false) { return true; }
+    private bool EnsureTMPFontCoversText(object node, string value) { FontCoverageChecks++; return TmpFontCoversText; }
+    private bool ApplyTmpOverlay(object node, string value, string original, bool force = false, bool rememberCompletedOutput = true) { PendingOverlay = force; OverlayRecordsCompletion = rememberCompletedOutput; return true; }
     private static void RevealTmpText(object node, string value) { }
     private void MarkProcessed(int id, string value) { }
     private void TryMarkAppliedCacheKeyForPersist(string original, string value) { }
     private void ClearInProgress(int id, string value) { }
     private void ClearProcessedIfChanged(int id, string value) { }
     private void QueueDebouncedTextRequest(object node, int id, string value, bool isTmp) { Debounced++; }
-    private string Translate(string value) { return Cache.TryGetValue(value, out var result) ? result : value; }
+    private string Translate(string value) { if (UseProductionCacheLookup) return TryGetLocalTranslation(value, out var translated) ? translated : value; return Cache.TryGetValue(value, out var result) ? result : value; }
+    private static bool IsAcceptableTranslation(string source, string result) { return !string.IsNullOrWhiteSpace(result) && result != source; }
+    private bool TryTranslateQuantityListFromLocalTerms(string source, out string result) { result = null; return false; }
+    private void MarkLocalCacheKeyLocked(string key) { }
+    private void ClearMixedRepairMemo() { }
+    private void ClearTranslationRetryState(string key) { }
+    private void ScheduleLocalCachePersist() { }
+    private bool IsTranslationRetryCoolingDown(string value) { return false; }
     private void LogVerbose(string value) { }
     private static bool ShouldSkipText(string value) { return false; }
     private static string StripTrailingStatLines(string value) { return value; }
-    private static string GetVisibleText(string value) { return Regex.Replace(value, "<[^>]*>", "").Trim(); }
     private static bool EndsWithSentenceBoundary(string value) { return value.EndsWith(".") || value.EndsWith("!") || value.EndsWith("?"); }
 '''
-for name in ('LooksLikeTypewriterFragment', 'HasUnclosedOuterDialogueQuote', 'IsTranslatorOwnedTmpOverlay', 'TMPSetTextPrefix', 'UGUITextPrefix'):
+payload_type = re.search(r'private sealed class ProtectedTextPayload\b.*?\n\t}', mono, re.S)
+assert payload_type, 'missing production protected text payload'
+text += payload_type[0].replace('private sealed class', 'public sealed class', 1) + '\n'
+for field in ('_tmpLineStructureRejections', 'CompletedMixedOutputs', 'CompletedMixedOutputOrder', 'RichTextTagRegex', 'NumericTokenRegex', 'LooseColorOpenFragmentRegex', 'LooseColorCloseFragmentRegex',
+              'LooseSizeOpenFragmentRegex', 'LooseSizeCloseFragmentRegex', 'PlaceholderTokenRegex',
+              'NestedBrokenRichTextRegex', 'BrokenOpeningRichTextDashRegex', 'BareClosingRichTextRegex',
+              'BareOpeningRichTextRegex', 'EmptyAngleTagRegex', 'MalformedAngleFragmentRegex',
+              'DanglingTagSlashRegex', 'MojibakeSignalChars', 'TranslationPromptEchoPrefixes', 'UnityTextSupportedTags'):
+    declaration = re.search(r'^\s*private [^\r\n;]*\b' + field + r'\b[^;]*;', mono, re.M)
+    assert declaration, 'missing production field: ' + field
+    text += declaration[0] + '\n'
+for name in ('GetCompletedOutputKey', 'RememberCompletedOutput', 'IsLocalizedText', 'ContainsRichTextTags', 'ReplaceRichTextTags', 'HaveSameRichTextTags', 'ShouldPreserveRichTextForDisplay',
+             'ShouldPreserveRichTextForDisplayWithColor', 'ContainsColorRichTextTag',
+             'TryGetOuterRichTextWrapper', 'IsColorOpeningTag', 'IsTmpColorShorthandTagBody',
+             'GetVisibleText', 'NormalizeRequestText', 'LooksLikeUiText',
+             'PrepareTranslatedTextForComponent', 'TryEnableRichText', 'SanitizeRichTextForUnityText',
+             'SanitizeTranslationArtifacts', 'RepairUtf8DecodedAsGbk', 'GetMojibakeScore', 'CountCjkCharacters',
+             'StripTranslationPromptEchoPrefix', 'RestoreLeadingTextDecoration',
+             'ProtectTextForTranslation', 'RestoreProtectedText', 'IsTokenDominatedFragment', 'CollectWarmupRequestItems',
+             'StoreCachedTranslation', 'TryGetLocalTranslation',
+             'StripRichTextForPlainText', 'StripResidualRichTextFragments', 'NormalizeDisplayWhitespace',
+             'PrepareTranslatedTextForUGUIText', 'PreparePendingCjkDisplay', 'PrepareTranslatedTextForString',
+             'GUILabelPrefix', 'TranslateImGuiString', 'TranslateGUILayoutLabelContent', 'LooksLikeTypewriterFragment',
+             'HasUnclosedOuterDialogueQuote', 'IsTranslatorOwnedTmpOverlay', 'TMPSetTextPrefix', 'UGUITextPrefix',
+             'CountTextLineBreaks', 'TmpLineStructurePreserved', 'ReportTmpLineStructureRejection'):
     text += method(mono, name) + '\n'
+# 同名重载中使用实际显示路径调用的 string 版本。
+text += method(mono[mono.index('private static string RestoreOuterRichTextWrapper(string text, string originalText)'):], 'RestoreOuterRichTextWrapper') + '\n'
+text += method(mono[mono.index('private static string RestoreOuterRichTextWrapper(string text, ProtectedTextPayload payload)'):], 'RestoreOuterRichTextWrapper') + '\n'
 text += '}\n'
 out = ROOT / 'build/unity_runtime_contract/GeneratedSeams.cs'
 text += r'''
@@ -198,5 +251,62 @@ assert 'RunCacheApplyTicks();' in method(mono, 'PumpOnce')
 assert 'RunCacheApplyTicks();' in method(mono, 'OnWillRenderCanvases')
 assert 'InvalidateCacheApplySnapshot();' in method(mono, 'ResetSceneScopedState')
 out.parent.mkdir(parents=True, exist_ok=True)
+text += (ROOT / 'tests/unity_runtime_contract/CachePersistenceSeam.cs.txt').read_text(encoding='utf-8')
+for name in ('BootCacheLoadAsync', 'LoadServerCache', 'TryIsolateOversizedLocalCacheLocked',
+             'PrimeSmallLocalCacheForFirstFrame', 'ScheduleLocalCachePersist', 'PersistLocalCacheAsync',
+             'FlushLocalCacheToDisk', 'WriteLocalCacheSnapshot', 'SerializeStringMap', 'EscapeJson'):
+    text += method(mono, name) + '\n'
+text += '}\n'
+text += (ROOT / 'tests/unity_runtime_contract/TmpOverlaySeam.cs.txt').read_text(encoding='utf-8')
+for name in ('TryUpdateTmpUguiOverlay', 'HideTmpSourceForUguiOverlay', 'DestroyTmpUguiOverlay'):
+    text += method(tmp, name) + '\n'
+text += '}\n'
+for class_name, source in (('MonoFontPopulationSeam', mono), ('Il2CppFontPopulationSeam', tmp)):
+    text += 'public static class ' + class_name + ' {\n'
+    text += '''
+    public static readonly List<Exception> Errors = new List<Exception>();
+    private static string GetVisibleText(string value) { return value; }
+    private static void ReportCaughtException(Exception error, string context = null, string operation = null) { Errors.Add(error); }
+    private static class TmpFontFallbackPlugin {
+        public static void ReportCaughtException(Exception error, string context = null, string operation = null) { Errors.Add(error); }
+    }
+'''
+    text += method(source, 'TryAddCharactersToTmpFontAsset') + '\n'
+    if source is mono:
+        text += method(source, 'ContainsCjk') + '\n'
+    if source is tmp:
+        text += method(source, 'BuildTryAddCharactersArgs') + '\n'
+        text += 'public static object _fallbackAsset;\n'
+        declaration = re.search(r'^\s*private [^\r\n;]*\bWarmedFallbackCharacters\b[^;]*;', tmp, re.M)
+        text += declaration[0].replace('private ', 'public ', 1) + '\n'
+        declaration = re.search(r'^\s*private const string CjkWarmupText[^;]*;', tmp, re.M)
+        text += declaration[0] + '\n'
+        for name in ('ContainsCjk', 'IsCjkFontCharacter', 'FontTagNameIs', 'TrySkipTmpFontTag', 'NeedsCjkFont', 'TryWarmFallbackGlyphs'):
+            text += method(source, name) + '\n'
+    text += '}\n'
+for name in ('LoadFallbackFontAsset', 'TryCompleteFallbackBundleAsync'):
+    assert '"atlasPopulationMode", "Dynamic"' not in method(tmp, name), 'loaded static font must retain its native population mode'
+assert 'WarmedFallbackCharacters.Clear();' in method(tmp, 'Apply')
+for name in ('PatchUguiTexts', 'PatchTmpHostFontFromText', 'RefreshTmpTextsWithUguiOverlay'):
+    assert 'NeedsCjkFont(' in method(tmp, name), 'font consumer must include punctuation: ' + name
+assert 'NeedsCjkFont(value, false)' in method(tmp, 'PatchUguiTexts'), 'UGUI must not discard unsupported TMP tag text'
+text += (ROOT / 'tests/unity_runtime_contract/DeepPrefetchSeam.cs.txt').read_text(encoding='utf-8')
+for field in ('_deepPrefetchEnabled', '_deepScannedObjects', '_deepPrefetchSeen', '_deepPrefetchQueue',
+              '_lastDeepPrefetchRealtime', '_deepPrefetchActive', 'DeepPrefetchInitialDelaySeconds',
+              'DeepPrefetchScanIntervalSeconds', 'DeepPrefetchChunkPauseSeconds',
+              'DeepPrefetchMaxObjectsPerScan', 'DeepPrefetchMaxTextsPerScan', 'DeepPrefetchBatchSize'):
+    declaration = re.search(r'^\s*private [^\r\n;]*\b' + field + r'\b[^\r\n;]*;', mono, re.M)
+    assert declaration, 'missing production field: ' + field
+    text += declaration[0].replace('private ', 'public ', 1) + '\n'
+# 可选的新窗口声明让同一测量夹具也能运行修复前的生产源。
+window = re.search(r'^\s*private readonly DeepPrefetchScanWindow _deepPrefetchScanWindow[^;]*;', mono, re.M)
+if window:
+    text += window[0].replace('private ', 'internal ', 1) + '\n'
+    assert '_deepPrefetchScanWindow.Reset();' in method(mono, 'ResetSceneScopedState')
+assert '"DeepPrefetchRuntime", defaultValue: false' in mono, 'deep prefetch must remain opt-in'
+for name in ('CollectDeepPrefetchCandidates', 'TryMarkDeepScanned', 'ExtractDeepObjectStrings',
+             'ExtractDeepPrefetchText', 'ExtractQuotedSegments', 'RunDeepPrefetchTick', 'ProcessDeepPrefetchQueueAsync'):
+    text += method(mono, name) + '\n'
+text += '}\n'
 out.write_text(text, encoding='utf-8', newline='\n')
 print('Source-linked Unity renderer seams generated')

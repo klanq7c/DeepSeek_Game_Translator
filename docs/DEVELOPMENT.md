@@ -31,6 +31,12 @@
 5. 按 AGENTS.md 的验证要求运行检查，报告失败和跳过原因，不删除或放宽失败断言。
    自动检查结果不能写成“所有游戏无 bug”或完整游玩结论。
 6. 说明性代码注释使用中文；技术标识、协议字段、第三方版权与许可原文保持原样。
+7. 启动器二级窗口沿用首页的星夜、暖金与暖白卡片主题；API 配置、确认和错误提示
+   复用 `dialog_theme.c` / `DialogTheme.cs`。保留原生输入能力、密码遮罩、键盘导航、
+   取消语义和 DPI 适配；Windows 文件夹选择器仍使用系统界面。
+8. API 提供商预设切换时隔离各家的 Key；窗口内的草稿不能自动写入配置。
+   模型目录错误保留 HTTP/传输错误码并给出对应原因，不把认证或访问失败描述为
+   模型过期，也不能用静态模型列表冒充请求成功。涉及真实账号的验证须另行说明边界。
 
 常用验证入口：
 
@@ -118,3 +124,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare_open_source_
 ## 六、已有开发记录
 
 - [0.4.1.0 验证与发布复盘](development/VERIFICATION_0.4.1.0.md)
+- [二级窗口主题统一](development/SECONDARY_UI_2026-10-14.md)
+- [模型刷新与官方显示名称](development/MODEL_CATALOG_2026-10-14.md)
+- [提供商切换与模型刷新报错](development/PROVIDER_REFRESH_2026-10-14.md)

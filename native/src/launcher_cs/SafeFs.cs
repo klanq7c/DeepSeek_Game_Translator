@@ -25,6 +25,8 @@ namespace DstLauncher
         public const int ERROR_ACCESS_DENIED = 5;
         public const int ERROR_INVALID_PARAMETER = 87;
         public const int ERROR_INSUFFICIENT_BUFFER = 122;
+        public const int ERROR_INVALID_NAME = 123;
+        public const int ERROR_FILENAME_EXCED_RANGE = 206;
         public const int ERROR_DIR_NOT_EMPTY = 145;
         public const int ERROR_ALREADY_EXISTS = 183;
         public const int ERROR_FILE_EXISTS = 80;
@@ -61,32 +63,32 @@ namespace DstLauncher
 
         #region P/Invoke
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern uint GetFileAttributesW(string path);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetFileAttributesW", SetLastError = true)]
+        private static extern uint RawGetFileAttributesW(string path);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "SetFileAttributesW", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool SetFileAttributesW(string path, uint attrs);
+        private static extern bool RawSetFileAttributesW(string path, uint attrs);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "CreateDirectoryW", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CreateDirectoryW(string path, IntPtr securityAttributes);
+        private static extern bool RawCreateDirectoryW(string path, IntPtr securityAttributes);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "RemoveDirectoryW", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool RemoveDirectoryW(string path);
+        private static extern bool RawRemoveDirectoryW(string path);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "DeleteFileW", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool DeleteFileW(string path);
+        private static extern bool RawDeleteFileW(string path);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "CopyFileW", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CopyFileW(string from, string to, [MarshalAs(UnmanagedType.Bool)] bool failIfExists);
+        private static extern bool RawCopyFileW(string from, string to, [MarshalAs(UnmanagedType.Bool)] bool failIfExists);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "MoveFileExW", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool MoveFileExW(string from, string to, uint flags);
+        private static extern bool RawMoveFileExW(string from, string to, uint flags);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern uint GetFullPathNameW(string path, uint cap, StringBuilder buffer, IntPtr filePart);
@@ -94,8 +96,8 @@ namespace DstLauncher
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern uint GetWindowsDirectoryW(StringBuilder buffer, uint cap);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr sa,
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "CreateFileW", SetLastError = true)]
+        private static extern SafeFileHandle RawCreateFileW(string path, uint access, uint share, IntPtr sa,
                                                          uint disposition, uint flags, IntPtr template);
 
         [StructLayout(LayoutKind.Sequential)]
@@ -114,6 +116,106 @@ namespace DstLauncher
         private static extern bool GetFileAttributesExW(string path, int infoLevel, out WIN32_FILE_ATTRIBUTE_DATA data);
 
         #endregion
+
+        [DllImport("kernel32.dll", EntryPoint = "SetLastError", SetLastError = true)]
+        private static extern void NativeSetLastError(uint code);
+
+        private static bool FilePathFailure(int code)
+        {
+            _lastError = code;
+            NativeSetLastError((uint)code);
+            return false;
+        }
+
+        /* 与 path_for_file_api 对齐：只在本机文件 API 边界使用扩展路径。
+           保持短路径语义；不把外部设备名、尾部点/空格变成新的文件目标。
+           重解析点检查与实际写入使用同一转换，失败由操作所属调用方记录。 */
+        public static bool TryFileApiPath(string path, out string native)
+        {
+            native = null;
+            if (string.IsNullOrEmpty(path)) return FilePathFailure(ERROR_INVALID_NAME);
+            const int cap = 260 * 4;
+            var buffer = new StringBuilder(cap);
+            uint count = GetFullPathNameW(path, cap, buffer, IntPtr.Zero);
+            if (count == 0) return FilePathFailure(Win32Error());
+            if (count >= cap) return FilePathFailure(ERROR_FILENAME_EXCED_RANGE);
+            if (count < 260 - 12 && path.Length < 260 - 12) {
+                native = path;
+                return true;
+            }
+            // 转换前拒绝会被 Win32 消去的歧义尾点；独立 . / .. 继续正常规范化。
+            foreach (string component in path.Replace('/', '\\').Split('\\')) {
+                if (component.Length == 0 || component == "." || component == "..") continue;
+                if (component.EndsWith(".", StringComparison.Ordinal) ||
+                    component.EndsWith(" ", StringComparison.Ordinal)) return FilePathFailure(ERROR_INVALID_NAME);
+            }
+            string full;
+            int rootLen;
+            if (!FullPathForSafetyCheck(path, out full, out rootLen)) return FilePathFailure(ERROR_INVALID_NAME);
+            string tail = full.Substring(rootLen);
+            if (tail.Length > 0) {
+                foreach (string part in tail.Split('\\')) {
+                    if (part.Length == 0 || part.EndsWith(".", StringComparison.Ordinal) ||
+                        part.EndsWith(" ", StringComparison.Ordinal) || part.IndexOf(':') >= 0)
+                        return FilePathFailure(ERROR_INVALID_NAME);
+                    int dot = part.IndexOf('.');
+                    string stem = dot < 0 ? part : part.Substring(0, dot);
+                    string upper = stem.ToUpperInvariant();
+                    bool device = upper == "CON" || upper == "PRN" || upper == "AUX" ||
+                        upper == "NUL" || upper == "CONIN$" || upper == "CONOUT$";
+                    if (upper.Length == 4 && (upper.StartsWith("COM", StringComparison.Ordinal) ||
+                        upper.StartsWith("LPT", StringComparison.Ordinal))) {
+                        char digit = upper[3];
+                        device |= (digit >= '1' && digit <= '9') || digit == '\u00b9' ||
+                            digit == '\u00b2' || digit == '\u00b3';
+                    }
+                    if (device) return FilePathFailure(ERROR_INVALID_NAME);
+                }
+            }
+            native = full.StartsWith(@"\\", StringComparison.Ordinal)
+                ? @"\\?\UNC\" + full.Substring(2) : @"\\?\" + full;
+            return true;
+        }
+
+        private static uint GetFileAttributesW(string path)
+        {
+            string native;
+            return TryFileApiPath(path, out native) ? RawGetFileAttributesW(native) : INVALID_FILE_ATTRIBUTES;
+        }
+
+        private static bool CreateDirectoryW(string path, IntPtr security)
+        {
+            string native;
+            return TryFileApiPath(path, out native) && RawCreateDirectoryW(native, security);
+        }
+
+        private static bool DeleteFileW(string path)
+        {
+            string native;
+            return TryFileApiPath(path, out native) && RawDeleteFileW(native);
+        }
+
+        private static bool CopyFileW(string from, string to, bool failIfExists)
+        {
+            string source, target;
+            return TryFileApiPath(from, out source) && TryFileApiPath(to, out target) &&
+                RawCopyFileW(source, target, failIfExists);
+        }
+
+        private static bool MoveFileExW(string from, string to, uint flags)
+        {
+            string source, target;
+            return TryFileApiPath(from, out source) && TryFileApiPath(to, out target) &&
+                RawMoveFileExW(source, target, flags);
+        }
+
+        private static SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security,
+                                                  uint disposition, uint flags, IntPtr template)
+        {
+            string native;
+            if (!TryFileApiPath(path, out native)) return new SafeFileHandle(new IntPtr(-1), true);
+            return RawCreateFileW(native, access, share, security, disposition, flags, template);
+        }
 
         /* file_size_at_most（warmup.c）：普通文件且大小 ≤ maxBytes；查不到属性、是目录、
            或高 32 位非零（≥ 4 GB）都视为不满足，扫描器据此跳过异常大的文件。 */
@@ -154,7 +256,9 @@ namespace DstLauncher
 
         public static bool SetAttributes(string path, uint attrs)
         {
-            if (SetFileAttributesW(path, attrs)) return true;
+            string native;
+            if (!TryFileApiPath(path, out native)) return false;
+            if (RawSetFileAttributesW(native, attrs)) return true;
             return Fail(Win32Error());
         }
 
@@ -436,7 +540,9 @@ namespace DstLauncher
 
         public static bool RemoveDirectory(string path)
         {
-            if (RemoveDirectoryW(path)) return true;
+            string native;
+            if (!TryFileApiPath(path, out native)) return false;
+            if (RawRemoveDirectoryW(native)) return true;
             return Fail(Win32Error());
         }
 
@@ -447,7 +553,7 @@ namespace DstLauncher
             if (!EnsureDir(to)) return false;
             bool ok = true;
             int firstError = ERROR_SUCCESS;
-            foreach (var entry in Win32Find.Enumerate(from, "*")) {
+            foreach (var entry in Win32Find.Enumerate(from, "*", true)) {
                 string src = PathUtil.Join(from, entry.Name);
                 string dst = PathUtil.Join(to, entry.Name);
                 if ((entry.Attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
@@ -515,10 +621,13 @@ namespace DstLauncher
         private static readonly IntPtr InvalidHandle = new IntPtr(-1);
 
         /* 返回 null 表示 FindFirstFileW 失败（目录不存在/无匹配），LastError 已设置。 */
-        public static System.Collections.Generic.List<Entry> EnumerateOrNull(string dir, string pattern)
+        public static System.Collections.Generic.List<Entry> EnumerateOrNull(string dir, string pattern, bool fileApiPath = false)
         {
             WIN32_FIND_DATAW fd;
-            IntPtr h = FindFirstFileW(PathUtil.Join(dir, pattern), out fd);
+            string native = PathUtil.Join(dir, pattern);
+            // 共享安全目录复制和部署/还原使用转换；扫描器保持各自的原入口。
+            if (fileApiPath && !SafeFs.TryFileApiPath(native, out native)) return null;
+            IntPtr h = FindFirstFileW(native, out fd);
             if (h == InvalidHandle) {
                 SafeFs.LastError = Marshal.GetLastWin32Error();
                 return null;
@@ -540,9 +649,9 @@ namespace DstLauncher
             return list;
         }
 
-        public static System.Collections.Generic.List<Entry> Enumerate(string dir, string pattern)
+        public static System.Collections.Generic.List<Entry> Enumerate(string dir, string pattern, bool fileApiPath = false)
         {
-            return EnumerateOrNull(dir, pattern) ?? new System.Collections.Generic.List<Entry>();
+            return EnumerateOrNull(dir, pattern, fileApiPath) ?? new System.Collections.Generic.List<Entry>();
         }
     }
 }

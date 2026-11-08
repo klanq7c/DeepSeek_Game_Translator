@@ -170,14 +170,8 @@ namespace DstLauncher
         }
 
         /* toggle_server：服务器按钮的回调，运行中则停止，否则启动。 */
-        public static void Toggle()
+        private static void ToggleWork()
         {
-            /* 一键翻译流程的工作线程正在执行 Start/Deploy 期间，拒绝并发切换，
-               避免与后台线程争抢进程句柄与 _started。 */
-            if (MainWindow.TranslationFlowRunning) {
-                Log.Status("状态：翻译流程正在进行，请稍候再操作服务器");
-                return;
-            }
             if (_started && Alive()) {
                 Stop();
                 if (_started && Alive()) {
@@ -190,6 +184,12 @@ namespace DstLauncher
             Log.Status("正在启动服务器...");
             if (Start()) Log.Status("状态：服务器运行中");
             else Log.Status("状态：服务器启动失败");
+        }
+
+        public static void Toggle()
+        {
+            if (!UiOperation.Reserve()) return;
+            UiOperation.Start(ToggleWork);
         }
 
         /* ---------------- 二进制选择 ---------------- */

@@ -53,7 +53,7 @@ namespace DstLauncher
         private static void Line(string text) { _out(text); }
 
         /* 32bpp 无压缩、自上而下的 BMP。像素直接来自 DIB section，无调色板与行填充歧义。 */
-        private static bool WriteBmp32(string path, IntPtr pixels, int width, int height)
+        internal static bool WriteBmp32(string path, IntPtr pixels, int width, int height, Action<string> report = null)
         {
             int imageBytes = width * height * 4;
             var managed = new byte[imageBytes];
@@ -81,10 +81,10 @@ namespace DstLauncher
                 }
                 return true;
             } catch (IOException ex) {
-                Line("bmp_error=" + ex.Message + "\n");
+                (report ?? Line)("bmp_error=" + ex.Message + "\n");
                 return false;
             } catch (UnauthorizedAccessException ex) {
-                Line("bmp_error=" + ex.Message + "\n");
+                (report ?? Line)("bmp_error=" + ex.Message + "\n");
                 return false;
             }
         }

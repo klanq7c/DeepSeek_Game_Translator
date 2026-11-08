@@ -24,7 +24,7 @@ def main() -> int:
     value = mix(value, b"\xfd")
     version = version_file.read_text(encoding="ascii").splitlines()[0]
     value = mix(value, version.encode("utf-8"))
-    expected = f"DST_GODOT_SOURCE_V4:{value:016x}\n".encode("ascii")
+    expected = f"DST_GODOT_SOURCE_V5:{value:016x}\n".encode("ascii")
     actual = marker.read_bytes()
     if actual != expected:
         print(f"Godot source/payload stamp mismatch: expected {expected!r}, got {actual!r}")

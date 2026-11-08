@@ -2,10 +2,12 @@
 #include <windows.h>
 
 /* 模型目录属于配置窗口；不修改服务器配置，也不调用翻译接口。 */
+typedef struct { WCHAR id[256], name[256]; } ApiModel;
 typedef struct {
-    WCHAR (*items)[256];
+    ApiModel *items;
     int count;
     WCHAR message[192];
+    int invalid_names;
 } ApiModels;
 int api_models_url(const WCHAR *endpoint, WCHAR *url, size_t cap);
 int api_models_fetch(const WCHAR *endpoint, const WCHAR *key, ApiModels *result);

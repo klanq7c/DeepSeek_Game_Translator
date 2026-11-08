@@ -202,7 +202,7 @@ static int remove_stale_renpy_hook_bytecode(const WCHAR *path) {
         SetLastError(ERROR_ACCESS_DENIED);
         return 0;
     }
-    DWORD attr = GetFileAttributesW(path);
+    DWORD attr = file_attributes(path);
     if (attr == INVALID_FILE_ATTRIBUTES) {
         DWORD error = GetLastError();
         if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return 1;
@@ -217,7 +217,7 @@ static int remove_stale_renpy_hook_bytecode(const WCHAR *path) {
 
     DWORD original_attr = attr;
     if ((attr & FILE_ATTRIBUTE_READONLY) &&
-        !SetFileAttributesW(path, attr & ~(DWORD)FILE_ATTRIBUTE_READONLY)) {
+        !file_set_attributes(path, attr & ~(DWORD)FILE_ATTRIBUTE_READONLY)) {
         append_log(L"Ren'Py: could not make stale launcher hook bytecode writable %s (Windows error %lu).",
                    path, GetLastError());
         return 0;
@@ -228,7 +228,7 @@ static int remove_stale_renpy_hook_bytecode(const WCHAR *path) {
     }
 
     DWORD error = GetLastError();
-    if (original_attr & FILE_ATTRIBUTE_READONLY) SetFileAttributesW(path, original_attr);
+    if (original_attr & FILE_ATTRIBUTE_READONLY) file_set_attributes(path, original_attr);
     append_log(L"Ren'Py: could not remove stale launcher hook bytecode %s (Windows error %lu).",
                path, error);
     return 0;
@@ -262,7 +262,7 @@ int deploy_renpy(const WCHAR *dir) {
 static int backup_file_once(const WCHAR *path, const WCHAR *suffix) {
     WCHAR backup[MAX_PATH * 4];
     if (!path_append_suffix(backup, MAX_PATH * 4, path, suffix)) return 0;
-    DWORD attr = GetFileAttributesW(backup);
+    DWORD attr = file_attributes(backup);
     if (attr != INVALID_FILE_ATTRIBUTES) return !(attr & FILE_ATTRIBUTE_DIRECTORY);
     if (copy_file_if_absent_safe(path, backup)) return 1;
     return GetLastError() == ERROR_FILE_EXISTS;
@@ -372,6 +372,17 @@ int deploy_rpgm(const WCHAR *dir) {
     if (!write_text_file_utf8(hook, rpgm_hook)) {
         append_log(L"RPGM MV/MZ：无法写入 hook 文件 %s（Windows 错误 %lu）。", hook, GetLastError());
         return 0;
+    }
+    const int image_ids[] = {IDR_SCRIPT_RPGM_IMAGE_OCR, IDR_SCRIPT_RPGM_IMAGE_TEXT};
+    const WCHAR *image_names[] = {L"dst_rpgm_ocr.ps1", L"rpgm_image_text.js"};
+    for (size_t i = 0; i < sizeof(image_ids) / sizeof(image_ids[0]); i++) {
+        WCHAR image_path[MAX_PATH * 4];
+        path_join(image_path, MAX_PATH * 4, jsdir, image_names[i]);
+        const char *image_script = embedded_script_text(image_ids[i]);
+        if (!image_script || !write_text_file_utf8(image_path, image_script)) {
+            append_log(L"RPGM MV/MZ：无法部署通用图片文字组件 %s（Windows 错误 %lu）。", image_path, GetLastError());
+            return 0;
+        }
     }
     deploy_rpgm_font(content_root);
 
@@ -791,7 +802,7 @@ static int detect_unity_major(const WCHAR *dir) {
     WCHAR pat[MAX_PATH * 4];
     path_join(pat, MAX_PATH * 4, dir, L"*_Data");
     WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(pat, &fd);
+    HANDLE h = file_find_first(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
     int major = 0;
     do {
@@ -976,7 +987,7 @@ static int find_unity_mscorlib(const WCHAR *dir, WCHAR *out, size_t cap) {
     WCHAR pattern[MAX_PATH * 4];
     path_join(pattern, MAX_PATH * 4, dir, L"*_Data");
     WIN32_FIND_DATAW fd;
-    HANDLE find = FindFirstFileW(pattern, &fd);
+    HANDLE find = file_find_first(pattern, &fd);
     if (find == INVALID_HANDLE_VALUE) return 0;
     int found = 0;
     do {
@@ -1665,7 +1676,7 @@ static int restore_delete_file(const WCHAR *path, RestoreStats *stats) {
         append_log(L"Restore: refused to delete through a directory reparse point: %s", path);
         return 0;
     }
-    DWORD attr = GetFileAttributesW(path);
+    DWORD attr = file_attributes(path);
     if (attr == INVALID_FILE_ATTRIBUTES) {
         DWORD error = GetLastError();
         if (path_missing_error(error)) return 1;
@@ -1681,7 +1692,7 @@ static int restore_delete_file(const WCHAR *path, RestoreStats *stats) {
 
     DWORD original_attr = attr;
     if (attr & FILE_ATTRIBUTE_READONLY) {
-        SetFileAttributesW(path, attr & ~(DWORD)FILE_ATTRIBUTE_READONLY);
+        file_set_attributes(path, attr & ~(DWORD)FILE_ATTRIBUTE_READONLY);
     }
     if (delete_file_safe(path)) {
         stats->removed++;
@@ -1690,7 +1701,7 @@ static int restore_delete_file(const WCHAR *path, RestoreStats *stats) {
     }
 
     DWORD error = GetLastError();
-    if (original_attr & FILE_ATTRIBUTE_READONLY) SetFileAttributesW(path, original_attr);
+    if (original_attr & FILE_ATTRIBUTE_READONLY) file_set_attributes(path, original_attr);
     stats->failed++;
     append_log(L"还原：无法删除 %s（Windows 错误 %lu）。", path, error);
     return 0;
@@ -1805,7 +1816,7 @@ static void restore_remove_verified_payload_files(const WCHAR *payload_dir,
     WCHAR pattern[MAX_PATH * 4];
     path_join(pattern, MAX_PATH * 4, payload_dir, L"*");
     WIN32_FIND_DATAW fd;
-    HANDLE find = FindFirstFileW(pattern, &fd);
+    HANDLE find = file_find_first(pattern, &fd);
     if (find == INVALID_HANDLE_VALUE) {
         DWORD error = GetLastError();
         stats->preserved++;
@@ -1820,7 +1831,7 @@ static void restore_remove_verified_payload_files(const WCHAR *payload_dir,
         path_join(payload_child, MAX_PATH * 4, payload_dir, fd.cFileName);
         path_join(installed_child, MAX_PATH * 4, installed_dir, fd.cFileName);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            DWORD installed_attr = GetFileAttributesW(installed_child);
+            DWORD installed_attr = file_attributes(installed_child);
             if (installed_attr == INVALID_FILE_ATTRIBUTES) continue;
             if (!(installed_attr & FILE_ATTRIBUTE_DIRECTORY) ||
                 (installed_attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
@@ -1847,14 +1858,14 @@ static void restore_prune_empty_dirs(const WCHAR *path, RestoreStats *stats) {
         append_log(L"Restore: refused to prune a directory through a reparse point: %s", path);
         return;
     }
-    DWORD attr = GetFileAttributesW(path);
+    DWORD attr = file_attributes(path);
     if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY) ||
         (attr & FILE_ATTRIBUTE_REPARSE_POINT)) return;
 
     WCHAR pattern[MAX_PATH * 4];
     path_join(pattern, MAX_PATH * 4, path, L"*");
     WIN32_FIND_DATAW fd;
-    HANDLE find = FindFirstFileW(pattern, &fd);
+    HANDLE find = file_find_first(pattern, &fd);
     if (find != INVALID_HANDLE_VALUE) {
         do {
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
@@ -1866,7 +1877,7 @@ static void restore_prune_empty_dirs(const WCHAR *path, RestoreStats *stats) {
         } while (FindNextFileW(find, &fd));
         FindClose(find);
     }
-    if (RemoveDirectoryW(path)) {
+    if (file_remove_directory(path)) {
         stats->removed++;
         append_log(L"还原：已移除空目录 %s", path);
     } else {
@@ -2009,7 +2020,9 @@ static void restore_rpgm(const WCHAR *dir, RestoreStats *stats) {
     if (index_ok && exists_path(index)) restore_delete_file(backup, stats);
 
     static const WCHAR *files[] = {
-        L"js\\hook_rpgm_mv.js"
+        L"js\\hook_rpgm_mv.js",
+        L"js\\dst_rpgm_ocr.ps1",
+        L"js\\rpgm_image_text.js"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         WCHAR path[MAX_PATH * 4];

@@ -48,16 +48,18 @@ checks = 0
 def run(exe, *argv):
     return subprocess.run([exe, *argv], capture_output=True, encoding='utf-8', timeout=25, check=True).stdout.splitlines()
 
-def check_case(name, data, expected, status=200, key='fake-secret', prefix='/v1', frame='length'):
+def check_case(name, data, expected, status=200, key='fake-secret', prefix='/v1', frame='length', mode='fetch', warning=None):
     global response, checks, framing
     framing = frame
     response = (status, data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=True).encode())
     before = len(requests)
-    outputs = [run(exe, 'fetch', base + prefix + '/chat/completions', key) for exe in (args.c, args.cs)]
+    outputs = [run(exe, mode, base + prefix + '/chat/completions', key) for exe in (args.c, args.cs)]
     for output in outputs:
         assert output[0] == 'count=' + str(len(expected)), (name, output)
         assert output[2:] == expected, (name, output)
         assert 'fake-secret' not in '\n'.join(output), name
+        if warning:
+            assert warning in output[1], (name, output)
     assert outputs[0] == outputs[1], (name, outputs)
     assert requests[before:] == [(prefix + '/models', 'Bearer fake-secret' if key else None)] * 2, (name, requests[before:])
     checks += 1
@@ -129,6 +131,15 @@ try:
     check_case('latest ids, dedup, nested id ignored', {'data': [{'id': 'new-model-2099', 'nested': {'id': 'wrong'}}, {'id': 'org/model:latest'}, {'id': 'new-model-2099'}]}, ['new-model-2099', 'org/model:latest'])
     check_case('refresh replaces outdated catalog', {'data': [{'id': 'newer-release'}]}, ['newer-release'])
     check_case('DeepSeek V4.1 Flash uses stable API id', {'data': [{'id': 'deepseek-flash'}, {'id': 'deepseek-v4-pro'}]}, ['deepseek-flash', 'deepseek-v4-pro'])
+    check_case('official version names reach picker', {'data': [{'id': 'deepseek-flash', 'name': 'DeepSeek-V4.1-Flash'}, {'id': 'deepseek-v4-pro', 'name': 'DeepSeek-V4-Pro'}]},
+               ['deepseek-flash\tDeepSeek-V4.1-Flash', 'deepseek-v4-pro\tDeepSeek-V4-Pro'], mode='labels')
+    check_case('refresh updates name of stable id without hardcoded versions', {'data': [{'id': 'stable-id', 'name': 'Future Model 2099'}, {'id': 'new-api-id', 'name': 'New release'}]},
+               ['stable-id\tFuture Model 2099', 'new-api-id\tNew release'], mode='labels')
+    check_case('optional names and duplicate ids stay aligned', {'data': [{'id': 'a'}, {'id': 'b', 'name': '中文名称'}, {'id': 'a', 'name': 'duplicate'}, {'id': 'c', 'name': None}]},
+               ['a\t', 'b\t中文名称', 'c\t'], mode='labels')
+    for bad_name in (42, 'bad\nname', 'x' * 256, 'bad\0name'):
+        check_case('invalid optional name is diagnosed without removing usable id', {'data': [{'id': 'valid-id', 'name': bad_name}]},
+                   ['valid-id\t'], mode='labels', warning='1 个显示名称无效')
     check_case('local keyless and custom prefix', {'data': [{'id': 'local:model'}]}, ['local:model'], key='', prefix='/proxy/compatible-mode/v1')
     check_case('unicode model ids', {'data': [{'id': '模型/最新'}]}, ['模型/最新'])
     check_case('empty list', {'data': []}, [])
@@ -147,14 +158,25 @@ try:
         ('has_more', b'{"data":[{"id":"one"}],"has_more":true,"has_more":true}'),
         ('data', b'{"data":[],"data":[{"id":"one"}]}'),
         ('id', b'{"data":[{"id":"one","id":"two"}]}'),
+        ('unused', b'{"data":[{"id":"one"}],"unused":1,"unused":2}'),
+        ('nested escaped unused', b'{"data":[{"id":"one"}],"unused":{"x":1,"\\u0078":2}}'),
+        ('NUL unused', b'{"data":[{"id":"one"}],"\\u0000":1,"\\u0000":2}'),
+        ('surrogate unused', b'{"data":[{"id":"one"}],"\\ud800":1,"\\ud800":2}'),
+        ('long unused', ('{"data":[{"id":"one"}],"' + 'k' * 80 + '":1,"' + 'k' * 80 + '":2}').encode()),
     ):
         check_case('duplicate ' + field + ' rejected', body, [])
-    for number in ('01', '+1', '.1', '1.', '1e', '--1'):
+    for number in ('01', '+1', '.1', '1.', '1e', '--1', '1e999', '-1e999'):
         check_case('invalid numeric metadata ' + number, ('{"data":[{"id":"one"}],"created":' + number + '}').encode(), [])
+    check_case('unused surrogate metadata remains ignored', {'data': [{'id': 'one'}], '\ud800': '\ud800'}, ['one'])
+    check_case('finite numeric metadata remains supported', {'data': [{'id': 'one'}], 'created': 1e308}, ['one'])
     for index, body in enumerate([b'{"data":[{"id":"x"}', b'{"data":[]} trailing', b'{"data":[{"id":"\\u', b'{"data":[{"id":"x\x00z"}]}', b'\xff', b'{"data":[{"id":"\\q"}]}']):
         check_case('malformed JSON ' + str(index), body, [])
     for status in (401, 403, 404, 429, 500, 302):
         check_case('HTTP ' + str(status), {'data': [{'id': 'not-success'}]}, [], status)
+    for status, detail in ((401, '认证失败'), (403, '访问被拒绝'), (404, '未找到模型目录'),
+                           (407, '代理要求认证'), (429, '请求受限'), (503, '服务暂时不可用')):
+        check_case('actionable HTTP diagnostic ' + str(status),
+                   {'error': {'message': 'provider may echo fake-secret'}}, [], status, warning=detail)
     check_case('response size bound', b' ' * (2 * 1024 * 1024 + 1), [])
     check_pages('Claude paginates, preserves API order and deduplicates', 1,
                 [(200, claude(['new', 'cursor'], True, 'cursor')), (200, claude(['cursor', 'old']))], ['new', 'cursor', 'old'], ['cursor'])
@@ -203,6 +225,14 @@ try:
         assert run(exe, 'fetch', base + '/v1/chat/completions', 'x' * 1024)[0] == 'count=0'
     assert len(requests) == before
     checks += 3
+    for host in ('127.1', '2130706433', '0x7f000001', '0177.0.0.1'):
+        before = len(requests)
+        endpoint = 'http://' + host + ':' + str(server.server_port) + '/v1/chat/completions'
+        outputs = [run(exe, 'fetch', endpoint, '') for exe in (args.c, args.cs)]
+        assert outputs[0] == outputs[1] and outputs[0][0] == 'count=0', (host, outputs)
+        assert '远程服务需要 HTTPS' in outputs[0][1], (host, outputs)
+        assert len(requests) == before, (host, requests[before:])
+        checks += 1
     print('[PASS] API models:', checks, 'scenarios, C/C# parity, no config/cache writes')
 finally:
     server.shutdown()

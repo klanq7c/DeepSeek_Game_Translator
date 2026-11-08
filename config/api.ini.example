@@ -16,6 +16,10 @@
 ;   - timeout_ms 未配置时服务器自动按回环端点取 180000（上限 300000），
 ;     因为本地推理一批文本可能需要数分钟；远程端点默认仍为 15000（上限 60000）。
 ;   - concurrency=1 或 2：本地推理通常只有一个计算槽，并发只会互相排队。
+;   - 本地默认每批最多 8 条、2048 个输入 UTF-8 字节；远程默认仍为 48 条/9600 字节。
+;     可用 batch_max_items（1..48）和 batch_char_budget（256..9600）覆盖。
+;     单条文本超出预算时仍单独发送，不会截断或丢弃。
+;   - 本机标准 Ollama /v1/chat/completions 接口（11434 端口）自动关闭思考。
 ;   - 建议配合启动器的预热（Ren'Py）在游戏启动前完成批量翻译。
 ;
 ; 本地模型配置示例（Ollama）：
@@ -23,6 +27,8 @@
 ;   model=qwen2.5:7b
 ;   key=
 ;   concurrency=1
+;   batch_max_items=8
+;   batch_char_budget=2048
 ;
 [api]
 endpoint=https://api.deepseek.com/v1/chat/completions

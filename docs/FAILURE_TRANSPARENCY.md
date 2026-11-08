@@ -1,5 +1,149 @@
 # Failure Transparency
 
+## 启动器文件 API 的长路径边界（2026-11-07）
+
+- **外部问题：** 普通 Win32 文件 API 的路径长度限制会拒绝深目录下的组件、临时文件和中间目录；路径缓冲足够大并不代表读写成功。
+- **上游限制：** 不能要求游戏、用户安装目录或系统注册表为启动器改名/改设置。`fsutil.c` / `SafeFs.cs` 在文件 API 边界把规范化的绝对长路径转换为 Windows 扩展形式；短路径继续使用原参数。属性检查、创建目录、读写、复制、移动、删除与枚举使用相同规则；组件字节比较同步转换。
+- **是否掩盖：** 不截断路径，也不把写入失败算成成功。保留原有 1040 字符路径缓冲上限、设备命名空间及逐级重解析点拒绝。长路径中的尾点/尾空格、保留设备名和备用数据流拒绝转换；独立 `.` / `..` 先按普通 Win32 规则规范化。UNC 只做语法转换，不据此宣称所有网络共享或第三方工具都兼容。
+- **诊断：** 无法转换时保留对应 Win32 错误码；操作边界沿用既有失败记录。自有组件同步会记录具体组件失败并返回 5，部署/还原维持原失败结果，不因为加入扩展前缀跳过所有权检查。
+
+依据：[Microsoft 路径长度限制](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation)、[文件路径与命名空间](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file)。
+
+## RPG Maker 命令对象与扫描边界（2026-11-07）
+
+- **外部问题：** 合法 JSON 的 `code` / `parameters` 属性可以重排，插件也可能添加嵌套元数据；损坏文件则可能有未闭合参数或过深嵌套。
+- **上游限制：** 启动器只读游戏资源，不能要求游戏重写属性顺序。C/C# 在当前对象闭合后配对字段，避免借用相邻或嵌套对象的命令码。
+- **是否掩盖：** 文件对象嵌套上限为 128 层；参数沿用 JSON 值扫描器的 32 层上限。超限或参数未闭合时停止当前文件扫描，已采集文本保留；未扫描内容仍依赖运行时钩子，不能当成已完成翻译。游戏文件与共享缓存不被这个扫描器改写。
+- **诊断：** 两版在扫描器所有权边界以 `RPGM JSON 预热未完成` 记录原因与文件路径，不输出文本内容。未完整闭合的命令不参与预热。
+
+## 损坏缓存文本的加载边界（2026-11-07）
+
+- **外部问题：** TSV 记录含非法或不完整 Base64、内嵌 NUL、无效 UTF-8；宽松解码会使键截断碰撞、坏值覆盖原译文，或使 HTTP 输出包含无效 UTF-8。C# 孤立代理也不能无损写入 UTF-8。
+- **上游限制：** 文件可能来自旧版本、外部编辑或损坏；当前进程不能推断原始文本。两版只接受完整可往返的编码，C# 入库同时拒绝 NUL 与孤立代理，C 入库拒绝无效 UTF-8。
+- **是否掩盖：** 跳过记录会使该条不可用，但不将损坏字节替换或截断后冒充译文，不覆盖之前的有效值，也不重写原文件。C 按实际读取字节确定换行，原始 NUL 或超长行只丢弃自身，不吞掉下一行。空白 Base64 和正常多行、制表、格式标记及 Unicode 仍可加载。
+- **诊断：** 启动加载边界以 `load-record-invalid` 向 stderr 记录次数和文件路径，前三次及二次幂计数输出，不记录原文或译文。API 批量入库沿用 rejected 计数；没有把拒绝条目算作成功或持久化。
+
+## 源码发布的已知布尔探针识别（2026-11-06）
+
+- **边界：** 文本凭据正则无法仅凭 `password` 字段名区分秘密与 UI 密码掩码状态；原规则还遗漏了单字符赋值。
+- **上游限制：** C/C# 探针已有相同诊断协议和消费者；源码审计不应为通过扫描改写该协议或源文件，也不能排除整份源文件。
+- **可见限制：** 共用扫描适配器只在固定相对路径和完整已评审表达式匹配时，将内存视图中的字段名替换为非凭据标识。值、条件和相邻文本均保留，其他规则继续扫描；探针值、条件、锚定形式或路径改变即失去识别资格。普通数字密码和单字符 Key/secret 继续拒绝。这是已知非秘密表达式的识别，不是通用秘密检测的完备性保证。
+- **诊断：** 识别输出 `recognized UI probe` 和相对路径；拒绝继续只报告路径和命中规则，不记录候选秘密正文。读取或适配器异常不能变为通过。准备脚本先执行反例守卫，再生成 staging，独立审计使用同一适配器。
+
+## Unity 构建引用发布（2026-11-01）
+
+- **外部边界：** Mono 的 `--no-incremental` 会清理输出依赖；外部文件写入、锁、复制、目录移动、指针替换可失败，另一个构建进程可能同时请求发布。`FOR /F` 不传递子进程退出码，Windows PowerShell 5.1 将普通 `$null` 字符串参数绑定为空路径。
+- **上游限制：** 构建器可以清理自己拥有的输出目录，不能要求编译器保留借来的引用；构建流程必须在外部持有验证过的引用。发布器不能修复损坏的磁盘内容，也不能忽略文件锁或沿重解析点写入其他目录。使用真实 null 修复参数绑定，不以失败重试代替修复。
+- **可见限制：** 仅输出缺失时允许使用已验证的 current；显式引用错误、已存在但损坏的 current/快照和路径类型错误直接失败。新版本在独占临时目录复制、校验并重新核对源后发布，指针最后原子更新。指针更新失败可能留下完整的未选中版本，但旧 current 仍有效；失败临时目录/文件保留诊断，不自动回收。锁拒绝并发发布，不锁整个编译流程；已发布引用不可变且不被此脚本删除。此机制不保证两个完整构建可同时改写相同输出目录。
+- **诊断：** helper 的异常直接到 stderr，成功 stdout 只有内容键；批处理还要求子进程退出成功标记及严格键格式，否则返回非零，不执行 Mono 编译。指针发布异常明确包含目标、临时路径与原错误。持锁作用域以 `finally` 释放。引用错误不会被报告为成功构建，更不改变运行时译文或用户缓存。
+
+## Ren'Py 中文分段补字（2026-10-31）
+
+- **外部边界：** 游戏可能用 FontGroup 的范围/remap、字体别名、粗体替换或字体变换显示图标和文字；统一覆盖会破坏这些语义。部分引擎可能缺少可调用的 TextSegment/FontGroup 分段 API。
+- **上游限制：** 只有引擎排版时知道当前样式、内联字体及变换结果；共享缓存不能推断字形来源。不能通过修改译文、游戏字体文件、存档或全局替换表解决。
+- **可见限制：** 只为普通中文片段和 FontGroup 未明确指定字体的中文目标补字；非中文、明确范围和原替换表继续交给引擎。组合附标/变体选择符跟随已补基字，Windows Python 2 代理项保持完整。此策略不探测每个字体的字形覆盖；显式指定的字体缺字或部署字体本身缺字仍可能显示空缺，不能据此宣称全部字体兼容。无法安装分段 API 时保留原引擎，不回退到全局字体覆盖；可能失去中文补字，但不会假报译文/缓存成功。
+- **诊断：** 安装边界以 `_ds_report_exception(..., 'install-font-segmentation')` 限频记录具体异常。真实分段、游戏字体变换及加载错误直接传播到引擎 traceback；不捕获整段绘制后伪造成功。线程局部上下文在原生成器推进的 `finally` 中释放，暂停、关闭和异常均不会遗留活动上下文。原组的独立调用保留原缺字错误。
+
+## 审计明细写入与候选追踪（2026-10-28）
+
+- **外部边界：** JSON 行编码、磁盘写入、Flush 或文件移动可以失败；其他进程也可能在扫描期间创建同名目标。坏缓存可能具有合法源键但无效的 base64/UTF-8 候选值。
+- **上游限制：** 只读 QA 不能修复外部磁盘/目标竞争，也不能把损坏候选改造成成功译文。旧摘要的示例数量上限不适合作为完整失败清单。
+- **可见限制：** 显式指定明细路径时，逐行写入同目录独占临时文件，全部完成后才以不覆盖方式移动到目标；任何编码/写入/发布错误均令命令失败，不返回成功汇总。拒绝游戏目录、已有目标以及游戏/输出路径上的重解析点，父目录须已存在。未指定明细路径时维持只读行为。有效旧缓存命中不因后来的拒绝行被清空；已解码源键的损坏值进入该键的诊断计数，无法恢复源键的坏行只计入原有全局统计。
+- **诊断：** 原异常继续向调用者报告；只清理本次独占创建的临时文件，清理失败发出带路径和原因的警告。JSONL 的 `translation_source`、`marker_review`、`issues` 及候选计数保留复核原因；未知运行时来源不伪装成字段位置。结构匹配仅为静态原文对照，不能隐藏语义、字体或实机问题。
+
+## Ren'Py 只读审计的原文对照（2026-10-25）
+
+- **外部边界：** 静态字符串可能是尚未求值的 `.format` 模板、插值模板或双开括号字面量，单独交给文本标签检查器会误判。反过来，通用标记正则会漏掉方括号变量、空/数字字段和过长标签。
+- **上游限制：** 审计读取预热转储与持久缓存，无法获知游戏随后采用哪种求值阶段，不能在共享缓存里替游戏规范或执行模板。
+- **可见限制：** 只在 Ren'Py QA 分支比较完整且有序的结构；双开括号内的可见文字可翻译。未闭合片段比较种类后继续检查后续变量，避免坏前缀吞掉其余检查。没有合法类型后缀的 `%(说明)` 不作为旧式格式项；无法推断游戏是否启用了旧式替换，不能证明原始语法正确。有意调换变量顺序也会列为人工复核线索，不自动修复或拒绝缓存。
+- **诊断：** 差异仍通过既有 `structural_marker_mismatch_suspects`、`marker_examples` 及中文审计输出记录。Ren'Py 的 `scope` 明示不执行模板、不推断旧式替换设置；原有的覆盖范围和未实测字形/布局说明继续保留，不产生“模板有效”或“实际渲染成功”的结论。
+
+## 经验优化复查：映射键与字面标签（2026-10-25）
+
+- **Godot 外部边界及上游限制：** 游戏可在 ready 前输出很长日志，或在 ready 与 ACK 间跨越文件读取块，不能要求游戏限制启动日志。预检独立读句柄持续前进，使用 64 字节行状态和 16 KiB 读缓冲，每轮最多读取 512 KiB，再检查退出和既有期限。超过行状态容量或含 NUL 的行不能是完整协议行，丢弃该行并在换行后恢复，不把截断片段认作证明；长日志不再挤掉后续完整凭据。协议仍缺失、读失败或进程自行退出时沿用既有诊断与失败回退，不将失败缓存为成功。内存及每轮处理有界，不屏蔽原有停止/退出错误。
+- **Ren'Py 外部边界及上游限制：** Python 旧式格式化允许平衡括号及空映射键，提供方可以改写这些键；共享服务器无法获知当前游戏的替换设置。Ren'Py 层按完整映射键还原，不将合法语法判错。非法输出仍保留原文，可能保持英文；由原有 `renpy-percent-mismatch` / `restore-renpy-tokens` 限频记录，而非记为成功译文。
+- **Unity 外部边界及上游限制：** TMP noparse、未识别样式和 Legacy UGUI 可以显示看似标签的字面字符。服务器及共享标签词法器不知道组件是否解释这些字符，故仅在 IL2CPP 字体入口保守扫描。可能额外检查无效样式中的字形，但不修复或隐藏游戏原标签错误；缺字、加字失败及覆盖查询仍由现有 `tmp-font-population-*`、`tmp-font-coverage-unavailable` 和字体应用边界诊断。失败不会记为成功字形覆盖或改写缓存。
+
+## Godot autoload 专用输入确认（2026-10-25）
+
+- **外部边界：** 子进程输出 ready 后可能自行退出；父进程若先调用 `TerminateProcess`，专用停止码也不能证明子进程本来会保持存活。只读到 ready 不再被当作完整凭据。
+- **上游限制：** 启动器不能推断外部进程未来的退出意图；改为私有参数分支读取专用 stdin 并输出 ACK。完整一行在创建进程前写入匿名管道并关闭写端，避免等待用户输入或在退出期间写入。普通游戏启动不读取该输入，脚本仍由父进程收尾，避免主动 `SceneTree.quit` 与游戏资源加载竞争。
+- **可见限制：** 缺失 ACK、输入接口不可用、管道错误或自行退出均不确认 autoload，也不缓存成功；继续现有兼容路径并保留未确认状态。握手只证明脚本执行和读取探针输入，不能证明游戏后续不会崩溃；现有退出码及停止所有权检查继续执行。
+- **诊断：** 脚本用 `push_error` 报告 stdin 接口缺失或握手不匹配；启动器记录 input pipe/write、捕获读取、退出码及停止错误。捕获文件按原有机制自动清理，失败进入既有 autoload 预检失败日志。缓存签名升级为 `autoload-ready-v3-stdio-ack`，来源指纹升级为 `DST_GODOT_SOURCE_V5`，旧成功结论和旧运行时包均不跳过新协议。
+
+## Ren'Py 完整标签与旧式映射字段（2026-10-25）
+
+- **外部边界：** 提供方可以新增长伪标签、第 64 个之后的标签、未闭合片段，或新增/丢失旧式 `%(name)s`，引发标签错误和映射求值异常。
+- **上游限制：** 共享响应适用于多种引擎，无法从统一服务器推断游戏的自定义标签和 `old_substitutions` 设置；原字段、标签和错拼标识必须由 Ren'Py 适配层保留。
+- **可见限制：** 完整检查失败保留原文，不记为成功译文；外部一直给出相同非法结果时可能保持英文，不能隐藏为覆盖完成。原文自身的游戏脚本错误仍保留，翻译器不自动改故事变量。
+- **诊断：** `renpy-token-injection`、`renpy-token-mismatch`、`renpy-token-unclosed`、`renpy-percent-mismatch` 和 `restore-renpy-tokens` 经现有限频器记录类型/数量或异常，不输出请求正文。原待处理/终态冷却流程继续处理被拒绝结果。
+
+## Godot 压缩脚本预热边界（2026-10-25）
+
+- **外部边界：** tokenizer v100 GDSC 的非零解压大小表示 Zstd 载荷，直接扫描可打印字节会得到虚假的文本候选；损坏载荷也不能作为明文处理。
+- **上游限制：** 当前启动器未提供该解压格式；文本过滤器无法恢复被压缩的常量。新增解压/重建能力需独立验证格式、体积上限和原包保护，不能用原始字节回退冒充支持。
+- **可见限制：** 跳过该容器的静态预热，保留现有运行时可见文本发现；不可见文本可能晚到。既不改包也不把片段排队为成功提取，普通场景与旧格式不受该判断影响。
+- **诊断：** C/C# 每个 TextList 发现操作各记录一次 `Godot warmup: compressed GDSC skipped`，明确解压不可用及实时发现边界；限频状态不进入协议或缓存。
+
+## Ren'Py 只读发现与语言字体生命周期（2026-10-24）
+
+下列字体清单和语言回调描述记录 10 月 24 日实现；10 月 31 日已移除这两条字体路径，当前边界见上方“Ren'Py 中文分段补字”。只读清单/预热边界仍有效。
+
+- **同日复查的边界：** 屏幕/输入采用 Python 字面量规则。动态拼接/格式化没有静态最终值，不进入猜测预热；命名 Unicode、NUL/孤立代理及版本相关 raw Unicode 无法在未装载对应 Python 的启动器中可靠解码。扫描器只跳过该项并记录“Python 字面量包含不可提交的转义”，由原有运行时发现补充，不改写共享键或报成功。
+- **已有翻译的只读边界：** 原生字符串表结构不可用时，`native-string-inventory` 限频记录异常并保留原文给实时发现。不能调用会在引擎更新模式登记未知项的 `translate_string` 作为上游替代；正常查询只读当前语言的字典及上下文候选，不增加字符串或 unknown 记录。缺少该元数据可能造成多余预取，不能据此认定游戏缺少原生译文。
+
+- **外部边界：** 源码字符串未闭合或扫描缓冲分配失败；导出版本没有兼容的原编译翻译块；字体清单枚举失败、超过 1024 个字体或没有语言变更回调。
+- **上游限制：** 启动器不能修复游戏源码或要求游戏重新导出，运行时不能重建原翻译标识或改写故事变量。字体样式重建由引擎语言生命周期管理，字体路径可能位于归档中。
+- **可见限制：** 静态预热失败保留原运行时发现；编译清单失败保留菜单与实时发现；字体清单失败仍使用已有 GUI/根目录字体，回调不可用时保留初始字体覆盖。均不把未发现或缺字文本写成成功译文；这些限制可能留下稍后才发现的文本或缺字。
+- **诊断：** C/C# 源码扫描记录分配或未闭合边界；运行时用 `_ds_report_exception` / `_ds_report_diagnostic` 限频记录 `collect-compiled-dialogue-inventory`、`collect-compiled-say`、`compiled-prefetch-capacity`、`compiled-prefetch-scan-capacity`、`font-resource-inventory`、`font-resource-capacity` 和 `register-language-font-coverage`。原有请求和样式错误保留各自边界。
+
+## Unity TMP 加字前的只读检查（2026-10-24）
+
+- **同日复查的覆盖记录边界：** 游戏可清空原字体图集，当前覆盖检查必须先于已见字符集合。查询 API 缺失或异常时无法要求游戏恢复元数据；`tmp-font-population-coverage` 记录查询错误，`tmp-font-coverage-unavailable` 限频记录沿用旧成功加字记录的限制。该兼容路径不能保证识别不可查询图集的后续清空，保留原有显示回退；已知缺字会移除旧记录，加字失败仍不成为成功覆盖或译文。
+
+- **外部边界：** Static 图集无法补字；Dynamic 字体可能缺少源 Font 和源路径；裁剪或旧版 TMP 的覆盖/模式属性可能缺失或 getter 抛错。
+- **上游限制：** 已导出字体和 TMP 接口归游戏所有，翻译器不能补回未打包的源数据。共享译文无法修复原生字形问题；仅在字体显示层判断是否调用 FontEngine。
+- **可见限制：** 已有本地图集覆盖直接使用，Static 缺字或确定缺源仍返回失败并保留既有显示回退，不假报成功。DynamicOS 和路径来源继续允许；元数据无法读取时沿用原加字入口，只有实际布尔成功才确认覆盖，不永久缓存失败状态。
+- **诊断：** 缺源和元数据异常经两插件既有的 `ReportCaughtException` 限频记录 `tmp-font-population-source` / `tmp-font-population-metadata`，带 Mono/IL2CPP 与加字操作上下文。未知原生结果记录 `tmp-font-population-result`；已有缺字/覆盖层诊断仍保留。预热常量不能成为未验证的成功记录，等价重载不用于重试正常失败。
+
+## 半汉化文本的中文保护（2026-10-23）
+
+- 外部边界：模型可能改写混合句里的原有中文，或丢弃、重复、重排已有中文的保护标记。提示词不能保证外部模型一定遵守保护要求，因此在 C/C# API 响应入缓存之前验证。
+- 处理：请求仅把原有连续汉字段替换为本次原文中不存在的稳定 ASCII 标记；结果必须按顺序完整保留每个标记且恰好一次，再逐字还原原有中文。纯中文和短缩写继续透传；标签、变量、控制码和 URL 不作为补译信号。新增逻辑不重写既有缓存。
+- 失败含义：保护校验失败返回未完成，游戏继续显示原文或已有安全命中，不写成功翻译或持久化记录；既有内容失败的有界拆分策略仍可处理同批健康条目。此边界可以留下未翻译英文，不能伪装为汉化完成。
+- 诊断：C API 使用限频 `batch-shape`，详情含 `mixed-cjk token mismatch`；C# API 使用限频 `mixed-cjk`，批量记录槽位。引擎原有控制符、富文本、网络和渲染诊断继续保留。
+- 同日复查：中文恢复后的缓存/显示清洗也必须携带原文，保留原文自有的提示词形状前缀；纯格式整理不能登记为已完成翻译。Ren'Py 显式 `engine: "renpy"` 请求按真实标签和插值识别正文，避免字面双括号被通用规则当变量；未知提示沿用原语义。实际提供商失败仍保留既有限频诊断与未完成状态，实时回队不会丢失引擎格式提示。
+
+## RPG Maker 独立渲染与无格式缓存（2026-10-21）
+
+- 2026-10-22 复查：控制安全检查扩展至完整带参插件指令，防止未知指令被无格式缓存吞掉。上游提供方无法保证第三方插件语法，拒绝只发生在 RPG Maker 显示缓存；仍显示原文或安全片段，由原有 `*-control-guard` 限频记录拒绝，不改写共享记忆。MZ 测量与插件行距修复直接遵循渲染状态，不增加静默回退。
+- 外部边界：第三方插件绕过普通文字入口，或者提供方仅有移除颜色等控制符的可见文字译文。把该结果直接用于对话重绘会丢掉原始样式；简化的中文绘制器也无法理解全部插件指令。
+- 上游限制：独立插件的循环、游戏控制符及消息状态由游戏管理。只在 RPG Maker 字符处理与页面规划边界匹配安全片段，所有实际样式继续由引擎解析，不改写共享缓存或游戏源码。
+- 不掩盖失败：移除控制符的整页结果拒绝用于富文本显示；安全片段不足时保留原文并继续既有异步查询。消息仍按页处理，独立插件可显示已完成的片段。不存在字符渲染 API 或引擎绘制抛错时，自动换行调用方保留原有插件回退，不把失败登记为成功译文。
+- 诊断：拒绝无格式覆盖记录 `visible-format-cache-rejected` / `message-format-cache-rejected`；字符规划、安装和换行绘制错误分别记录 `translate-character-page`、`install-character-renderer-hook`、`draw-cjk-auto-wrap`，沿用限频诊断。缓存、网络与未命中状态继续使用原有故障边界。
+
+## RPG Maker 自动图片文字识别（2026-10-18）
+
+- **后续译文与协议复查：** 布局放不下的新译文不能由共享缓存修复，因为同一译文在其他区域或引擎可能可用；本层保留此前已成功显示的值，并用 `image-text-fit` / `image-text-measure` 限频说明。只有提交成功后才记录显示值，暂存绘制失败不产生成功状态。识别进程的合法 JSON 也可能具有错误形状；对象、请求号、错误字符串和结果对象在读取前校验，失败由 `image-ocr-worker` 记录并保留原图。每背景 512 个候选的上限避免在游戏帧中进行无界两两比较，超限通过 `image-text-plan` 报告；该降级会留下未翻译图片，不伪装成功。
+- **外部边界：** 游戏把文字烘焙进图片，可能使用装饰字体、透明底或复杂背景；系统 OCR 语言缺失、进程启动、PNG 解码、字体加载及画布绘制也可能失败。
+- **上游限制：** 图片与插件布局属于已发布游戏，无法由普通文字 hook 恢复。识别放在 RPG Maker 层，保留引擎解密和色相处理，不更改共享缓存或恢复插件禁用的窗口绘制。PowerShell 5 不能依赖系统代码页读取无 BOM 中文脚本，父进程显式按 UTF-8 加载。
+- **不掩盖失败：** 系统能力缺失或识别超时使当前会话保留原图；候选词须来自当前游戏术语或通过双背景一致性校验，矛盾词、不可验证背景及放不下的译文不覆盖。字体未就绪和缓存未完成时保留原文；绘制先在独立画布完成，不提交半成品。以上分支不计为成功译文；已显示的成功译文不会被后续未命中擦除。识别仍可能误判，不承诺任意艺术字体或复杂图像可用。
+- **诊断：** 模块、工作进程、系统识别、图像快照、尺寸、背景、字体、场景节点、绘制和容量分别用 `image-ocr-*` / `image-text-*` 经 `reportRpgmError` 限频记录；工作进程逐请求输出错误号和操作。启动器部署失败返回文件和 Win32 错误，不能报告部署成功。进程有就绪/请求超时和空闲退出，事件按进程归属校验，旧进程错误不能使新任务失效。
+
+## RPG Maker 图片文字资源适配（2026-10-18）
+
+- **外部边界：** MOG 等菜单把文字烘焙进 PNG，并禁用普通文字绘制；文字 hook 无法拦截图片中的标签。NW.js 的文件读取还可能遇到权限、损坏、升级后的资源或错误适配清单。
+- **上游限制：** 已发布的游戏素材与菜单布局属于游戏作者。恢复其禁用的方法会叠字或改变排版；因此只在 `ImageManager.loadBitmap` 边界替换经核实的资源参数，继续由引擎管理加载、色相、平滑、缓存和刷新，不改消息或窗口生命周期。
+- **不掩盖失败：** 可选清单中的原图与译图都必须通过 SHA-256、路径及相同 PNG 尺寸检查；失败的条目保持原图。原图文件及缓存对象不被覆盖，未创建成功翻译或共享记忆记录；缺失清单明确表示未启用图片适配。指纹只在启动时核对，不支持运行中改写资源。游戏开启图片解密时不把普通译图送入解密器，保留原来的解密路径；图片加密协议属于上游引擎，本层不伪造加密资源，`image-overrides-encrypted-runtime` 限频记录该不兼容情况。
+- **诊断：** 初始化、清单、schema 和逐项资源验证分别记录 `image-overrides-runtime`、`image-overrides-manifest`、`image-overrides-schema`、`image-overrides-entry-N`，使用既有 `reportRpgmError` 限频并保留错误上下文。回归保护连续刷新时译图不消失、几何不变、禁用的文字方法不恢复，异常资源可回退而不影响普通文字翻译。
+
+## 全库复查修复边界（2026-10-16）
+
+- Unity Mono 本地缓存：文件锁、权限错误、JSON 损坏或超大缓存隔离失败会阻止覆盖旧文件。文件系统状态不能由翻译提供方修复；加载尝试结束与成功导入分别记录。失败保留脏状态，已有持久化去抖周期重新读取并合并，退出时仍未成功检查则保留原文件。`boundary=local-cache-load` / `oversized-local-cache-isolation` 限频记录异常，最终跳过落盘有明确日志，不把未保存内容报告为已持久化。
+- C# API 请求构造：用户可直接编辑端点配置，非法端口等 URI 错误必须在发送边界再次校验，不能依赖配置窗口。拒绝时返回未解决结果，不生成缓存成功项、不拆分重试；`request-uri` 限频记录错误类型且不输出可能包含凭据的完整地址。请求头和响应体的超时均由配置取消令牌负责。
+- Godot 静态资源：外部模型或旧缓存可能遗漏、注入或改写 BBCode。标签解释属于 Godot，不能在共享缓存中重写。资源生成器保留原字符串、不计入成功补丁，并按资源汇总 `incompatible tags or format tokens` 拒绝数量；两版实现使用相同判断和诊断。
+- IL2CPP UGUI 备用覆盖层：游戏控制原 TMP 的颜色与透明度，覆盖层只借用其显示位置并关闭源组件，不再用透明色覆盖游戏状态。若裁剪后的 IL2CPP 元数据使源 `enabled` 不可写，文本或服务器层无法补齐此属性；撤销覆盖层并返回 `hide-source`，避免叠字。颜色读取失败返回 `color`。属性异常记录保留，扫描汇总 `colorOrHideFailed` 按状态变化输出，错误不影响共享译文缓存。
+
 ## 启动器外部服务关闭确认（2026-10-07）
 
 - 外部边界：接管的本地服务可能接受 `/shutdown` 后仍持续响应 `/health`。HTTP 成功只表示请求被接受，不能表示进程已退出。
@@ -79,7 +223,7 @@ diagnose the real fault.
 | Godot 3/4 runtime sidecar | `HTTPRequest.request` error, non-200 response, invalid JSON/schema, or unknown callback ID | Export/runtime and local server are external to the generated sidecar | No; source text remains and failed batches enter network backoff | `_dst_report_error` emits rate-limited `push_warning` with request ID/result/status/error |
 | Godot export runtime-sidecar launch | A Godot export rejects or cannot parse the generated `--script` entry point, exits nonzero during hidden preflight, or does not finish preflight before the bounded deadline | Command-line script policy and GDScript parsing are owned by the external export template and its embedded engine version; the launcher cannot safely assume that a script accepted by another Godot version will run here | It can fall back to an existing static patch or the original export, so live translation coverage may be absent for that run, but the fallback never records source text, queued work, or an original echo as a successful translation | `godot_runtime_sidecar_preflight` records process creation failure, timeout, or exact exit code before the launcher names the selected static/original fallback; generated-script regression tests reject the Godot 4 `SceneTree is Node` parse incompatibility |
 | Godot PCK format 3 scan/patch | The pack-tail directory offset, entry count, path, or resource metadata is malformed or outside the copied pack | PCK structure is owned by the exported game and cannot be repaired in the shared server or another engine adapter | No; the original pack is never rewritten and an invalid copied patch is rejected | Godot patch/warmup logs identify unreadable PCK sources, missing overrides, and patch installation failures; `tests/godot_patch_probe.c` and `tests/warmup_probe.c` cover format 3 bounds |
-| Godot 4.6 restricted export autoload | The release template disables `--script`/`--main-pack`, rejects `override.cfg`, cannot create the owned matching executable, or does not execute the embedded autoload | These switches and project-override build flags are compiled into the external Godot export template | No; hidden preflight requires the autoload's private argument to exit with code 0, otherwise launch falls back to the script/static/original path without accepting a translation | `godot_runtime_autoload_preflight` logs create, timeout, and exit-code failures; patch creation logs override merge and launcher ownership failures |
+| Godot 4.6 restricted export autoload | The release template disables `--script`/`--main-pack`, rejects `override.cfg`, cannot create the owned matching executable, or does not execute the embedded autoload | These switches and project-override build flags are compiled into the external Godot export template | No; hidden preflight requires a complete autoload proof line and a probe stopped by its launcher with the matching final exit code. Independent exits and failed stop/query operations fall back to the script/static/original path without accepting a translation | `godot_runtime_autoload_preflight` logs create, timeout, stop/query, and independent exit-code failures; patch creation logs override merge and launcher ownership failures |
 | Server cache persistence write | `fopen`/`fprintf`/`fflush` on the TSV append path fails (permissions, disk full, file locking) | The OS owns the file system; the server cannot make a full or locked disk writable | It can leave a batch memory-only until a later batch retries the append; in-memory hits still work, but a restart loses the unflushed entries | `cache_diag` writes rate-limited reason/errno/path to stderr (first occurrences then powers of two), and load aborts with a `ferror` diagnostic instead of spinning |
 | XUnity pass-through identity terminal | The server answers `source:"pass"` for text that must not be translated; treating it as a failure failed whole batches, while completing it normally would let XUnity persist `source == result` into `_AutoGeneratedTranslations.txt` | The server's cache-first contract intentionally returns `pass` immediately, and only XUnity's private job owns the `SaveResultGlobally` persistence decision | The endpoint marks only pass jobs session-only before completing the original text. Reflection is restricted to the bundled XUnity compatibility boundary; if its private layout changes, the endpoint fails closed instead of completing or caching an identity | `TryKeepIdentityResultsSessionOnly` reports the exact unsupported XUnity field/closure layout through `context.Fail`; mixed-batch pending-subset behavior is executed by `test_unity_endpoint_state.ps1` |
 | Unity Mono batch source classification | A server `miss`/`queued`/`pass` source echo was counted as a rejected translation, abandoning the text for the whole session after three occurrences | The server must respond immediately while API work is pending; the plugin cannot make a miss synchronous | It can delay the next attempt by a transient cooldown, but the text is requested again and is never cached as translated | Per-item `sources[i]` classification is logged with `LogVerbose`; content rejections retain the existing `[RETRY]` diagnostics |
@@ -404,6 +548,14 @@ race. They must not be expanded into blind retry loops.
   Four threaded guards and real Ren'Py 7.2/8.3 isolated Text-token fixtures verify
   ownership, coalescing, preserved handlers, tags and late-result behavior.
 
+## Ren'Py 完成键与恢复对象的刷新依赖（2026-10-28）
+
+- **外部边界：** 引擎正常复制、历史快照和状态恢复可能复用已经分词的 Text，不再次调用构造或 `update`。第三方也可能直接复制对象，或重写 `update` 自行分词。只在构造时登记会漏掉恢复对象；只记录某一次原始字符串会漏掉插值和自定义标签生成的正文。真实插件 Text 守卫复现了绕过基础 `update` 时迟到译文不显示的问题。
+- **所有权与上游限制：** hook 不改变引擎的复制、存档和交互语义。实际 `update` 的线程局部栈记录 `_ds_fetch` 查询，成功更新后才替换弱键依赖；引擎 `_copy` 直接继承已知依赖。不在 Text 或存档数据上增加字段。无法继承依赖的干净对象首次进入 `per_interact` 时标脏并请求重绘，由正常分词重建自身依赖。
+- **可见性：** 重建只影响该对象。绕过基础分词的对象无法从引擎外恢复其真实查询关系，因此独立弱集合中的未捕获干净 Text 保留原有保守刷新；待分词的脏对象下一次绘制会读最新缓存，无需额外刷新。已捕获对象仍精确匹配。保守路径可能多做布局，且有显式诊断，不伪装翻译成功；缓存 miss、透传和令牌还原失败保持原有处理。引擎分词异常原样传播，捕获栈在 `finally` 释放，失败的半次更新不覆盖上次依赖。完成键只在锁内合并/取走，worker 不操作显示对象。
+- **诊断：** 未登记干净对象进入交互时记录限流 `text-dependency-rebuild`，干净插件对象保守刷新记录 `text-dependency-uncaptured`；依赖登记、未捕获登记、复制及重建失败分别记录 `track-text-dependencies`、`track-uncaptured-text`、`copy-text-dependencies`、`rebuild-text-dependencies`。原有主线程派发、旧版回调注册、布局/重绘和重启异常记录继续保留。
+- **范围：** 依赖表仍会被扫描；匹配键的隐藏/历史对象也可失效，有匹配时仍重启一次交互。没有全场景可见性索引，也没有据此推导游戏帧率。
+
 ## Unity renderer attributes, stripped atlas metadata and XUnity JSON (2026-09-30)
 
 - Incompatibility: TMP punctuation fallback previously also changed punctuation
@@ -432,6 +584,7 @@ race. They must not be expanded into blind retry loops.
 - **外部边界：** PCK v3 的目录可单独加密；把密文当作路径长度会使运行时补丁构建失败。兼容层依据 Godot 4.6.1 `FileAccessEncrypted` 的 AES-256-CFB128 包装，在匹配的导出程序可写初始化数据区寻找编译期 32 字节数组（8 字节对齐、扫描最多 32 MiB/100 万候选）。整个目录的 MD5 和全部条目边界必须通过校验。密钥仅在内存中使用，不写入文件、配置或日志。
 - **上游限制：** 已导出的游戏无法要求作者重新导出明文资源。仅在启动器自有 PCK 副本追加明文目录并清除目录加密位；原始 EXE/PCK 不变，文件级加密资源及其元数据原样保留，补丁层跳过这些资源。其他加密格式、异常标志、坏校验或无法定位数组均拒绝补丁。
 - **预检边界：** Godot .NET 游戏可在主场景启动时后台加载资源；autoload 的 `_ready` 中立即 `SceneTree.quit(73)` 会与这些工作竞争，实际样本触发 `0xC0000374`。自动加载预检改为专用用户参数、完整 stdout 证明行和仍存活的探测进程；启动器在确认脚本实际进入 `_ready` 后结束自己创建的独立探测。普通游戏启动不带该参数；侧车 `--script` 的退出码 73 协议保持不变。
+- **结束归属（2026-10-22 复查）：** Windows 可能接受对正在退出进程的 `TerminateProcess` 请求，但最终保留其自行退出码；也可能先拒绝请求、稍后才将进程句柄置为有信号。启动器用探针专用结束码并读取最终退出码，只有自己发起且最终匹配的结束才确认加载。拒绝停止后等待实际退出事件，沿用一秒收尾期限；未结束仍记录原始停止错误，绝不重试或延时放行。游戏退出由外部进程管理，无法从标签或脚本上游消除；日志区分真实退出、查询失败和停止失败。预检签名升级使旧结论失效，不更改译文或用户配置。
 - **不掩盖失败：** 证明仅表示补丁脚本已加载，不宣称远程翻译或整个游戏运行成功。缺少证明、脚本错误里引用证明字符串、已退出/崩溃的进程、创建/读取/结束探测失败均不确认自动加载，也不缓存成功。加密资源跳过不成为成功译文或缓存项。
 - **诊断与验证：** 加密目录和预检结果进入 C/C# 启动器日志，操作失败保留对应原因。`test_godot_encrypted_pack.py` 验证正常/损坏目录、不同密钥、边界、原文件保护和 C/C# 补丁字节一致；launcher parity 验证真实进程证明、误导性错误文本及提前崩溃。实际游戏另外验证 `/batch` 请求和控件文字应用。
 
@@ -450,6 +603,14 @@ race. They must not be expanded into blind retry loops.
 - **不掩盖失败：** 只显示已完成的缓存命中，缺少译文的余项保留当前原文并继续原有异步队列；原文不能成为成功译文。旧半词缓存记录不删除、不改写，只是不再用于完整选择器查询。没有完整箭头边界、图片/布局阻隔或路径判定时保持既有原文；不宣称其已翻译。该修复不改变共享服务器或其他引擎的文本拆分。
 - **诊断与回归：** 请求、HTTP、未命中退避、容量与绘制循环继续由原有 `batch-request`、`batch-http`、schema 和 `scene-draw-repeat` 边界限频记录；计划函数不联网、不写缓存、不隐藏异常。`test_godot_settings_text.py` 在 Godot 3/4、autoload/sidecar 各观察 60 个实际提交帧，覆盖已命中与未命中混排、晚到译文、旧半词缓存、动态颜色、独立链接、多词选择器、数字值、斜杠说明和资源路径。HardStuck 独立副本另外通过真实元数据点击切换五个分类并返回重进，缓存仅只读使用；未命中的项目在该缓存隔离试验中仍保持英文，远程译文质量不由此证明。
 
+## Godot 运行时译文新增标签（2026-10-22）
+
+- 同日复查：内置标签名按引擎的大小写与完整名称识别，避免 `[B]`、`[b option]` 等字面提示被误拒绝；真实 Godot 3/4 解析结果与响应回调共同验证此边界。
+- **外部边界：** 可见文本查询的外部结果可能带入新的 BBCode，迟到的颜色或链接标签会覆盖游戏当前格式，甚至替换已有安全译文。
+- **上游限制：** 共享翻译记忆供多个引擎使用，不能为 Godot 改写其中的文本；显示标签及自定义效果由 Godot 适配层判断。HTTP 回调在写入本地显示缓存前校验结果，拒绝引擎标签、带参数或成对的自定义效果；字面按键括号继续允许。
+- **可见限制：** 不安全结果不成为成功命中，保留已有安全译文；没有安全命中时保留原文并采用原有未命中退避。外部一直返回同一不安全结果时可能继续显示原文，不能宣称汉化完成。无参数、无闭合且不属于已知标签的自定义效果无法与字面括号可靠区分，仍按字面文本处理。
+- **诊断：** `batch-markup` 通过原有 `_dst_report_error` 限频记录请求编号、查询和响应字符数；不输出用户正文。`test_godot_settings_text.py` 调用正式响应回调并观察真实引擎 60 帧，覆盖新命中拒绝、旧命中保护、动态颜色、链接、字面括号与有效后续结果恢复。
+
 ## 启动器减少动画设置（2026-10-12）
 
 - 外部边界：Windows `SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION)` 读取失败。
@@ -457,3 +618,10 @@ race. They must not be expanded into blind retry loops.
 - 可见限制：星轨与呼吸灯不再运动，悬停仍直接反馈；不改变翻译、缓存或按钮操作结果。
 - 诊断：C `refresh_ui_motion` / C# `Theme.RefreshMotion` 用 `OutputDebugStringW`
   记录操作和 Win32 错误码，同一故障段只记录一次，读取恢复后重新允许报告。
+
+## 启动器后台操作与关闭所有权（2026-10-27）
+
+- **外部边界：** Win32 `CreateThread` 可能返回失败；托管线程创建/启动可能抛出 `OutOfMemoryException`、`ThreadStateException` 或 `SecurityException`。线程仍在服务就绪/停服、磁盘或游戏预热边界内时，窗口也可能收到关闭请求。
+- **上游限制：** UI 无法保证外部服务立即退出或 I/O 立即返回；线程资源失败不能在服务层修复。同步回退会再次冻结窗口，直接销毁 HWND 会让在途 UI 更新失去所有者。
+- **可见限制：** 线程创建失败时不执行后台操作，并释放预留供用户重试；已开始的操作持有窗口至真实线程完成，期间继续泵送消息。关闭请求会抑制最终弹窗，不能将失败改成成功。服务仍响应时取消缓存删除；成功删除但重启失败仍明确报告。执行器不捕获或吞掉整条业务流程的未知异常。
+- **诊断：** 创建失败记录操作边界、Win32 错误码或异常类型与消息，并在状态栏报告。等待自有线程句柄失败只记录一次 Win32 码，保留窗口和忙状态，不虚构完成；原服务/部署/持久化诊断继续输出。UI 记录延后关闭；工作线程不释放 UI 所有权或投递携带裸 HWND 的完成回调。

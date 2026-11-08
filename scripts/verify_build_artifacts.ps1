@@ -92,6 +92,7 @@ function Get-ManagedPayloadDefinitions {
     # 需要机器上具备 Unity/BepInEx 引用程序集。
     $recipeInputs = @(
         Get-Item -LiteralPath (Join-Path $repo "scripts\build_managed_payloads.bat")
+        Get-Item -LiteralPath (Join-Path $repo "scripts\stage_unity_references.ps1")
         Get-Item -LiteralPath (Join-Path $repo "scripts\install_runtime_payloads.ps1")
     )
     $monoRoot = Join-Path $repo "payloads\UnityTranslator\src"
@@ -397,6 +398,8 @@ if ($RequireComplete -or -not $ManagedPayloadsOnly) {
         (Join-Path $repo "VERSION"),
         (Join-Path $repo "payloads\RenPy\iron_deepseek.rpy"),
         (Join-Path $repo "payloads\RPGMaker\hook_rpgm_mv.js"),
+        (Join-Path $repo "payloads\RPGMaker\dst_rpgm_ocr.ps1"),
+        (Join-Path $repo "payloads\RPGMaker\rpgm_image_text.js"),
         (Join-Path $repo "payloads\Godot\dst_godot_runtime_g3.gd"),
         (Join-Path $repo "payloads\Godot\dst_godot_runtime_g4.gd"),
         (Join-Path $repo "payloads\UnityTranslator\UnityTranslator.dll"),
@@ -436,9 +439,11 @@ if ($RequireComplete -or -not $ManagedPayloadsOnly) {
         Assert-EmbeddedResourceMatches $launcher 107 (Join-Path $repo "assets\fonts\NotoSansCJKsc-Regular.otf")
         Assert-EmbeddedResourceMatches $launcher 108 (Join-Path $repo "assets\fonts\OFL.txt")
         Assert-EmbeddedResourceMatches $launcher 109 (Join-Path $repo "assets\fonts\manifest.json")
-        # 引擎运行时脚本：由 deploy.c/godot_patch.c 原样部署（resource.h 301-304）。
+        # 引擎运行时脚本：由 deploy.c/godot_patch.c 原样部署（resource.h 301-306）。
         Assert-EmbeddedResourceMatches $launcher 301 (Join-Path $repo "payloads\RenPy\iron_deepseek.rpy")
         Assert-EmbeddedResourceMatches $launcher 302 (Join-Path $repo "payloads\RPGMaker\hook_rpgm_mv.js")
+        Assert-EmbeddedResourceMatches $launcher 305 (Join-Path $repo "payloads\RPGMaker\dst_rpgm_ocr.ps1")
+        Assert-EmbeddedResourceMatches $launcher 306 (Join-Path $repo "payloads\RPGMaker\rpgm_image_text.js")
         Assert-EmbeddedResourceMatches $launcher 303 (Join-Path $repo "payloads\Godot\dst_godot_runtime_g3.gd")
         Assert-EmbeddedResourceMatches $launcher 304 (Join-Path $repo "payloads\Godot\dst_godot_runtime_g4.gd")
         Assert-EmbeddedResourceMatches $launcher 201 (Join-Path $repo "payloads\UnityTranslator\UnityTranslator.dll")
